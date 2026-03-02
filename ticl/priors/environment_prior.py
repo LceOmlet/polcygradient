@@ -359,7 +359,7 @@ class EnvironmentPrior:
             # keep slot layout homogeneous so reward/mask/action token positions
             # remain valid, but do not split by sampled family at this stage.
             # `_rollout_family_group_vectorized_with_policy` already performs
-            # inner structure grouping (family/depth/activation) for transition
+            # inner structure grouping (family) for transition
             # generators, so mixing families here preserves semantics while
             # avoiding tiny outer rollout groups.
             return (
@@ -374,13 +374,30 @@ class EnvironmentPrior:
         out_dims,
         h_list,
         device,
-        depth,
-        activation_name,
+        depth_values,
+        activation_names,
         generators=None,
         input_mask=None,
     ):
         batch_size = len(h_list)
-        depth = int(max(2, depth))
+        if torch.is_tensor(depth_values):
+            depth_per_sample = depth_values.to(device=device, dtype=torch.long)
+        elif isinstance(depth_values, (list, tuple)):
+            depth_per_sample = torch.tensor(
+                [max(2, int(d)) for d in depth_values],
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            depth_per_sample = torch.full(
+                (batch_size,),
+                int(max(2, int(depth_values))),
+                device=device,
+                dtype=torch.long,
+            )
+        if int(depth_per_sample.numel()) != batch_size:
+            raise ValueError("depth_values must match h_list length")
+        depth = int(depth_per_sample.max().item())
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
         if input_mask is not None:
@@ -393,10 +410,29 @@ class EnvironmentPrior:
         )
         init_std = torch.tensor([float(h["init_std"]) for h in h_list], device=device, dtype=torch.float32)
         noise_std = torch.tensor([float(h["noise_std"]) for h in h_list], device=device, dtype=torch.float32)
-        activation = self._resolve_activation(str(activation_name))
+        if isinstance(activation_names, str):
+            activation_values = [self._activation_name(activation_names)] * batch_size
+        else:
+            activation_values = [self._activation_name(v) for v in activation_names]
+        if len(activation_values) != batch_size:
+            raise ValueError("activation_names must match h_list length")
+        activation_codes = []
+        for name in activation_values:
+            if name == "relu":
+                activation_codes.append(1)
+            elif name == "identity":
+                activation_codes.append(2)
+            else:
+                activation_codes.append(0)
+        activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
+        activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
+        activation_relu_mask = (activation_codes == 1).unsqueeze(1)
+        activation_identity_mask = (activation_codes == 2).unsqueeze(1)
+        activation_single = int(activation_codes[0].item())
 
         layers = []
         for layer_idx in range(depth):
+            hidden_active = layer_idx < (depth_per_sample - 1)
             if layer_idx == 0:
                 if input_mask is None:
                     in_layer = in_dims
@@ -406,17 +442,15 @@ class EnvironmentPrior:
                     in_layer = in_dims
                     in_cap = int(input_mask.shape[1])
                     in_mask = input_mask.clone()
-                out_layer = hidden_dims
-            elif layer_idx < (depth - 1):
-                in_layer = hidden_dims
-                out_layer = hidden_dims
-                in_cap = int(in_layer.max().item())
-                in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
             else:
-                in_layer = hidden_dims
-                out_layer = out_dims
+                in_layer = torch.where(
+                    layer_idx <= (depth_per_sample - 1),
+                    hidden_dims,
+                    out_dims,
+                )
                 in_cap = int(in_layer.max().item())
                 in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+            out_layer = torch.where(hidden_active, hidden_dims, out_dims)
 
             out_cap = int(out_layer.max().item())
             w = torch.zeros((batch_size, in_cap, out_cap), device=device, dtype=torch.float32)
@@ -432,15 +466,22 @@ class EnvironmentPrior:
                 out_i = int(out_layer[bi].item())
                 if in_i <= 0 or out_i <= 0:
                     continue
-                g = None if generators is None else generators[bi]
-                if g is None:
-                    w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
-                    b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
+                post_layer = layer_idx > int(depth_per_sample[bi].item() - 1)
+                if post_layer:
+                    d = min(in_i, out_i)
+                    if d > 0:
+                        eye_idx = torch.arange(d, device=device, dtype=torch.long)
+                        w[bi, active_idx[:d], eye_idx] = 1.0
                 else:
-                    w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32, generator=g)
-                    b_b = torch.randn((out_i,), device=device, dtype=torch.float32, generator=g)
-                w[bi, active_idx, :out_i] = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
-                b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
+                    g = None if generators is None else generators[bi]
+                    if g is None:
+                        w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
+                        b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
+                    else:
+                        w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32, generator=g)
+                        b_b = torch.randn((out_i,), device=device, dtype=torch.float32, generator=g)
+                    w[bi, active_idx, :out_i] = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+                    b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
                 if layer_idx > 0 or input_mask is None:
                     in_mask[bi, :in_i] = 1.0
                 out_mask[bi, :out_i] = 1.0
@@ -451,6 +492,7 @@ class EnvironmentPrior:
                     "in_mask": in_mask,
                     "out_mask": out_mask,
                     "in_cap": in_cap,
+                    "activation_mask": hidden_active,
                 }
             )
 
@@ -463,7 +505,22 @@ class EnvironmentPrior:
                 z = torch.einsum("bi,bij->bj", z_in, layer["w"]) + layer["b"]
                 z = z * layer["out_mask"]
                 if li < (len(layers) - 1):
-                    z = activation(z)
+                    activation_mask = layer["activation_mask"].unsqueeze(1)
+                    if torch.any(activation_mask):
+                        if not activation_mixed:
+                            if activation_single == 1:
+                                z_act = torch.relu(z)
+                            elif activation_single == 2:
+                                z_act = z
+                            else:
+                                z_act = torch.tanh(z)
+                        else:
+                            z_linear = z
+                            z_tanh = torch.tanh(z_linear)
+                            z_relu = torch.relu(z_linear)
+                            z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
+                            z_act = torch.where(activation_identity_mask, z_linear, z_act)
+                        z = torch.where(activation_mask, z_act, z)
             if torch.any(noise_std > 0):
                 if generators_for_noise is None:
                     z = z + torch.randn_like(z) * noise_std[:, None]
@@ -623,19 +680,13 @@ class EnvironmentPrior:
         if family == "scm":
             depth_values = [max(2, int(h["num_layers"])) for h in h_list]
             activation_values = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
-            depth = int(depth_values[0])
-            activation_name = activation_values[0]
-            if any(int(d) != depth for d in depth_values):
-                raise ValueError("SCM family-coarse batch expects same depth in subgroup")
-            if any(str(a) != activation_name for a in activation_values):
-                raise ValueError("SCM family-coarse batch expects same activation in subgroup")
             x_generator = self._build_scm_hetero_batch_fn(
                 in_dims=in_dims,
                 out_dims=state_dims,
                 h_list=h_list,
                 device=device,
-                depth=depth,
-                activation_name=activation_name,
+                depth_values=depth_values,
+                activation_names=activation_values,
                 generators=generators,
                 input_mask=input_mask,
             )
@@ -644,8 +695,8 @@ class EnvironmentPrior:
                 out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
                 h_list=h_list,
                 device=device,
-                depth=depth,
-                activation_name=activation_name,
+                depth_values=depth_values,
+                activation_names=activation_values,
                 generators=generators,
                 input_mask=input_mask,
             )
@@ -654,8 +705,8 @@ class EnvironmentPrior:
                 out_dims=action_dims,
                 h_list=h_list,
                 device=device,
-                depth=depth,
-                activation_name=activation_name,
+                depth_values=depth_values,
+                activation_names=activation_values,
                 generators=generators,
                 input_mask=input_mask,
             )
@@ -1624,6 +1675,7 @@ class EnvironmentPrior:
                         action_t = action_t.detach()
                         reward_t = reward_t.detach()
                         reward_mask_t = reward_mask_t.detach()
+                        env_in = env_in.detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
                         tbptt_reward_sink(rewards_window)
@@ -1672,14 +1724,7 @@ class EnvironmentPrior:
         structure_groups = {}
         for bi, h in enumerate(h_list_effective):
             family = self._normalize_family(h.get("family", "scm"))
-            if family == "scm":
-                sig = (
-                    family,
-                    int(max(2, int(h["num_layers"]))),
-                    self._activation_name(h["prior_mlp_activations"]),
-                )
-            else:
-                sig = (family,)
+            sig = (family,)
             structure_groups.setdefault(sig, []).append((bi, h))
 
         rollout_generators = self._make_generators_from_seeds(rollout_rng_seeds, batch_size, device)
@@ -1791,6 +1836,52 @@ class EnvironmentPrior:
                     "rollout_generators": group_rollout_generators,
                 }
             )
+
+        # Keep transition subgroups contiguous in memory to avoid per-step
+        # index_select/scatter overhead in the rollout hot loop.
+        perm = torch.cat([g["indices"] for g in transition_groups], dim=0)
+        if int(perm.numel()) != batch_size:
+            raise RuntimeError("family-group rollout internal permutation size mismatch")
+        identity_perm = torch.arange(batch_size, device=device, dtype=torch.long)
+        needs_unpermute = not bool(torch.equal(perm, identity_perm))
+        inv_perm = torch.empty_like(perm)
+        inv_perm.scatter_(0, perm, identity_perm)
+        if needs_unpermute:
+            perm_cpu = perm.detach().cpu().tolist()
+            state_dims = state_dims.index_select(0, perm)
+            obs_dims = obs_dims.index_select(0, perm)
+            action_dims = action_dims.index_select(0, perm)
+            noise_dims = noise_dims.index_select(0, perm)
+            zero_pad_dims = zero_pad_dims.index_select(0, perm)
+            obs_slot_dims = obs_slot_dims.index_select(0, perm)
+            action_slot_dims = action_slot_dims.index_select(0, perm)
+            init_state_std = init_state_std.index_select(0, perm)
+            init_action_std = init_action_std.index_select(0, perm)
+            state_noise_std = state_noise_std.index_select(0, perm)
+            action_noise_train_std = action_noise_train_std.index_select(0, perm)
+            action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
+            reward_scale = reward_scale.index_select(0, perm)
+            alpha = alpha.index_select(0, perm)
+            state_clip = state_clip.index_select(0, perm)
+            reward_dropout_enabled = reward_dropout_enabled.index_select(0, perm)
+            reward_dropout_impute_zero = reward_dropout_impute_zero.index_select(0, perm)
+            reward_dropout_ratio = reward_dropout_ratio.index_select(0, perm)
+            family_list = [family_list[int(i)] for i in perm_cpu]
+            if rollout_generators is not None:
+                rollout_generators = [rollout_generators[int(i)] for i in perm_cpu]
+
+        group_cursor = 0
+        for group in transition_groups:
+            group_bs = int(group["indices"].numel())
+            group["start"] = int(group_cursor)
+            group["end"] = int(group_cursor + group_bs)
+            if rollout_generators is not None:
+                group["rollout_generators"] = rollout_generators[group_cursor: group_cursor + group_bs]
+            else:
+                group["rollout_generators"] = None
+            group_cursor += group_bs
+        if group_cursor != batch_size:
+            raise RuntimeError("family-group rollout internal subgroup cursor mismatch")
 
         max_state_dim = int(state_dims.max().item())
         max_obs_dim = int(obs_dims.max().item())
@@ -1986,17 +2077,18 @@ class EnvironmentPrior:
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
             for group in transition_groups:
-                idx = group["indices"]
+                start = int(group["start"])
+                end = int(group["end"])
                 env_g = group["env"]
                 state_dim_g = int(group["state_dim"])
                 obs_dim_g = int(group["obs_dim"])
                 action_dim_g = int(group["action_dim"])
                 noise_dim_g = int(group["noise_dim"])
 
-                state_in = state_t.index_select(0, idx)[:, :state_dim_g]
-                obs_in = obs_t.index_select(0, idx)[:, :obs_dim_g]
-                action_in = action_next.index_select(0, idx)[:, :action_dim_g]
-                noise_in = noise_t.index_select(0, idx)[:, :noise_dim_g]
+                state_in = state_t[start:end, :state_dim_g]
+                obs_in = obs_t[start:end, :obs_dim_g]
+                action_in = action_next[start:end, :action_dim_g]
+                noise_in = noise_t[start:end, :noise_dim_g]
 
                 env_in = group["env_in"]
                 env_obs_start = int(group["env_obs_start"])
@@ -2007,7 +2099,7 @@ class EnvironmentPrior:
                 env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
                 env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
 
-                reward_scale_g = reward_scale.index_select(0, idx)
+                reward_scale_g = reward_scale[start:end]
                 reward_next_raw = reward_scale_g * env_g["y_generator"](
                     env_in,
                     generators_for_noise=group["rollout_generators"],
@@ -2016,32 +2108,32 @@ class EnvironmentPrior:
                 reward_mask_next_g = torch.ones_like(reward_next_g)
 
                 if dropout_draws is not None:
-                    dropout_active_g = dropout_active.index_select(0, idx)
-                    ratio_g = reward_dropout_ratio.index_select(0, idx)
-                    drop_mask = dropout_active_g & (dropout_draws[t].index_select(0, idx) < ratio_g)
+                    dropout_active_g = dropout_active[start:end]
+                    ratio_g = reward_dropout_ratio[start:end]
+                    drop_mask = dropout_active_g & (dropout_draws[t, start:end] < ratio_g)
                     if torch.any(drop_mask):
-                        reward_drop_count.index_add_(0, idx, drop_mask.to(dtype=torch.int64))
+                        reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
                     reward_mask_next_g = torch.where(drop_mask, torch.zeros_like(reward_mask_next_g), reward_mask_next_g)
-                    impute_mask = drop_mask & reward_dropout_impute_zero.index_select(0, idx)
+                    impute_mask = drop_mask & reward_dropout_impute_zero[start:end]
                     reward_next_g = torch.where(impute_mask, torch.zeros_like(reward_next_g), reward_next_g)
 
                 x_next_g = env_g["x_generator"](
                     env_in,
                     generators_for_noise=group["rollout_generators"],
                 )
-                alpha_g = alpha.index_select(0, idx).unsqueeze(1)
+                alpha_g = alpha[start:end].unsqueeze(1)
                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                 if state_noise is not None:
-                    state_noise_std_g = state_noise_std.index_select(0, idx)
+                    state_noise_std_g = state_noise_std[start:end]
                     if torch.any(state_noise_std_g > 0):
-                        state_next_g = state_next_g + state_noise[t].index_select(0, idx)[:, :state_dim_g] * state_noise_std_g[:, None]
-                clip_g = state_clip.index_select(0, idx).unsqueeze(1)
+                        state_next_g = state_next_g + state_noise[t, start:end, :state_dim_g] * state_noise_std_g[:, None]
+                clip_g = state_clip[start:end].unsqueeze(1)
                 state_next_g = torch.maximum(torch.minimum(state_next_g, clip_g), -clip_g)
                 state_next_g = torch.tanh(state_next_g)
 
-                state_next[idx, :state_dim_g] = state_next_g
-                reward_next[idx] = reward_next_g
-                reward_mask_next[idx] = reward_mask_next_g
+                state_next[start:end, :state_dim_g] = state_next_g
+                reward_next[start:end] = reward_next_g
+                reward_mask_next[start:end] = reward_mask_next_g
 
             state_next = state_next * state_mask
             action_next = action_next * action_mask
@@ -2068,21 +2160,54 @@ class EnvironmentPrior:
                         action_t = action_t.detach()
                         reward_t = reward_t.detach()
                         reward_mask_t = reward_mask_t.detach()
+                        for group in transition_groups:
+                            group["env_in"] = group["env_in"].detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        tbptt_reward_sink(rewards_window)
+                        if needs_unpermute:
+                            tbptt_reward_sink(rewards_window.index_select(1, inv_perm))
+                        else:
+                            tbptt_reward_sink(rewards_window)
+
+        if needs_unpermute:
+            y_steps = y_steps.index_select(1, inv_perm)
+            state_abs_max = state_abs_max.index_select(1, inv_perm)
+            reward_values = reward_values.index_select(1, inv_perm)
+            reward_drop_count = reward_drop_count.index_select(0, inv_perm)
+            state_dims_meta = state_dims.index_select(0, inv_perm)
+            obs_dims_meta = obs_dims.index_select(0, inv_perm)
+            action_dims_meta = action_dims.index_select(0, inv_perm)
+            noise_dims_meta = noise_dims.index_select(0, inv_perm)
+            zero_pad_dims_meta = zero_pad_dims.index_select(0, inv_perm)
+            obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
+            action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
+            reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
+            inv_perm_cpu = inv_perm.detach().cpu().tolist()
+            family_meta = [family_list[int(i)] for i in inv_perm_cpu]
+            if collect_x:
+                x_steps = x_steps.index_select(1, inv_perm)
+        else:
+            state_dims_meta = state_dims
+            obs_dims_meta = obs_dims
+            action_dims_meta = action_dims
+            noise_dims_meta = noise_dims
+            zero_pad_dims_meta = zero_pad_dims
+            obs_slot_dims_meta = obs_slot_dims
+            action_slot_dims_meta = action_slot_dims
+            reward_dropout_ratio_meta = reward_dropout_ratio
+            family_meta = family_list
 
         reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
         env_meta = {
-            "family": family_list,
-            "state_dim": state_dims,
-            "obs_dim": obs_dims,
-            "action_dim": action_dims,
-            "noise_dim": noise_dims,
-            "zero_pad_dim": zero_pad_dims,
-            "obs_slot_dim": obs_slot_dims,
-            "action_slot_dim": action_slot_dims,
-            "reward_dropout_ratio": reward_dropout_ratio,
+            "family": family_meta,
+            "state_dim": state_dims_meta,
+            "obs_dim": obs_dims_meta,
+            "action_dim": action_dims_meta,
+            "noise_dim": noise_dims_meta,
+            "zero_pad_dim": zero_pad_dims_meta,
+            "obs_slot_dim": obs_slot_dims_meta,
+            "action_slot_dim": action_slot_dims_meta,
+            "reward_dropout_ratio": reward_dropout_ratio_meta,
         }
         infos = self._build_vectorized_runtime_info(
             env=env_meta,

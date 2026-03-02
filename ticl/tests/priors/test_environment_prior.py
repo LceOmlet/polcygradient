@@ -1145,5 +1145,5 @@ def test_environment_prior_rollout_with_policy_family_grouping_uses_coarse_subgr
         collect_x=False,
     )
     assert rollout["rewards"].shape == (8, 4)
-    # Coarse family subgrouping: scm(depth=2), scm(depth=3), gp -> 3 groups.
-    assert sorted(call_sizes) == [1, 1, 2]
+    # Coarse family subgrouping: scm + gp -> 2 groups.
+    assert sorted(call_sizes) == [1, 3]

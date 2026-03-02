@@ -871,7 +871,9 @@ def train_epoch_policy_gradient(
         or (kv_cache_mode == "paged")
     )
     checkpoint_reentrant_active = bool(policy_rollout_checkpoint_reentrant) and bool(mutable_reentrant_safe)
-    disable_inner_recompute = bool(policy_rollout_checkpoint)
+    # In TBPTT streaming mode the outer rollout checkpoint path is not used,
+    # so disabling inner recompute_attn would only increase peak memory.
+    disable_inner_recompute = bool(policy_rollout_checkpoint) and (not tbptt_streaming_default)
     recompute_snapshot = []
     if disable_inner_recompute:
         # Avoid nested checkpointing with policy rollout checkpoint, and avoid
@@ -990,9 +992,9 @@ def train_epoch_policy_gradient(
                                 else nullcontext()
                             ):
                                 if scaler is None:
-                                    window_loss_scaled.backward(retain_graph=True)
+                                    window_loss_scaled.backward()
                                 else:
-                                    scaler.scale(window_loss_scaled).backward(retain_graph=True)
+                                    scaler.scale(window_loss_scaled).backward()
                             if backward_cuda_start is not None:
                                 backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                 backward_cuda_end.record()
@@ -1777,12 +1779,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 or (kv_mode_print == "paged")
             )
             checkpoint_reentrant_active = bool(policy_rollout_checkpoint_reentrant) and bool(mutable_reentrant_safe)
-            disable_inner_recompute = bool(policy_rollout_checkpoint)
+            disable_inner_recompute = bool(policy_rollout_checkpoint) and (not tbptt_streaming_default)
             print("Policy rollout checkpoint reentrant:", checkpoint_reentrant_active)
             if disable_inner_recompute:
                 print(
                     "Policy inner forward_step recompute_attn: auto-disabled "
                     "(lossless memory route with rollout checkpoint)."
+                )
+            elif bool(policy_rollout_checkpoint) and bool(tbptt_streaming_default):
+                print(
+                    "Policy inner forward_step recompute_attn: kept enabled "
+                    "(TBPTT streaming path does not use outer rollout checkpoint)."
                 )
             print(
                 "Policy grad-mutable KV cache:",
