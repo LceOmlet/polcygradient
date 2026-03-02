@@ -105,5 +105,15 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
   - `20260302_142001_qkvfused_nortinfo_noseed_rel`: `62.83s` (new retained skyline).
   - `20260302_142125_qkvfused_nortinfo_noseed_rep2`: `65.92s` (still better than previous `66.10s` skyline).
   - Combined with seeded A/B above, this indicates the improvement is not a pure no-seed artifact.
+- Policy-rollout dtype-follow-autocast probe (`20260302_154000_rolloutdtype_auto`, `20260302_154600_rolloutdtype_auto_seeded`):
+  - Attempted to run vectorized policy rollout state/noise path in autocast-following dtype.
+  - No-seed run regressed badly (`75.23s`) and increased peak alloc/reserved (`27.01/35.11 GiB`).
+  - Seeded run (`66.92s`) was near existing seeded skyline, but gain was not stable and no memory reduction materialized.
+  - Reverted as unstable pseudo-optimization.
+- TBPTT deferred-backward probe (`20260302_160200_tbpttbwd_auto`):
+  - Attempted to reduce backward fragmentation by deferring TBPTT window backward.
+  - Triggered immediate OOM fallback (`[pg-oom] switching TBPTT backward mode to stream`), then retried in streaming mode.
+  - Peak alloc/reserved spiked to `45.39/46.38 GiB`, process memory reached `47972 MiB`, wallclock regressed to `102.75s`.
+  - Classified as pseudo-optimization with high OOM/system-stability risk; reverted.
 
 Current retained skyline is `20260302_142001_qkvfused_nortinfo_noseed_rel`.
