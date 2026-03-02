@@ -1,0 +1,77 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Seed set to 42
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/profiler.jsonl, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=122173, interval_sec=0.20, sample_output=benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu.csv, stage_output=benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu_stages.jsonl)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: True
+Policy TBPTT window: 128
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+Policy autocast dtype: fp16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu.csv stages_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu_stages.jsonl
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_b64_E1_n1_pgoomdebugraiseTrue_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_17_16_52
+AdamW fused: enabled
+/home/chen/RLPFN/ticl/ticl/train.py:2076: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+start of epoch 1
+/home/chen/RLPFN/ticl/ticl/train.py:1115: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+[pg-oom-debug] re-raising OOM for full traceback (set --pg-oom-debug-raise false to enable auto chunk fallback).
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/chen/RLPFN/ticl/ticl/fit_model.py", line 333, in <module>
+    main(sys.argv[1:])
+  File "/home/chen/RLPFN/ticl/ticl/fit_model.py", line 269, in main
+    total_loss, model, dl, epoch = get_model(
+                                   ^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/model_builder.py", line 312, in get_model
+    model = train(dl, model, criterion=criterion, optimizer_state=optimizer_state, scheduler=scheduler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 2104, in train
+    new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 1116, in train_epoch_policy_gradient
+    pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 566, in _compute_policy_rollout_chunk_loss
+    return env_prior.rollout_policy_gradient_loss(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 3424, in rollout_policy_gradient_loss
+    rollout = self.rollout_with_policy(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 3177, in rollout_with_policy
+    x_group, y_group, infos_group = self._rollout_family_group_vectorized_with_policy(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 2221, in _rollout_family_group_vectorized_with_policy
+    x_next_g = env_g["x_generator"](
+               ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 507, in fn
+    z = torch.einsum("bi,bij->bj", z_in, layer["w"]) + layer["b"]
+        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/functional.py", line 373, in einsum
+    return _VF.einsum(equation, operands)  # type: ignore[attr-defined]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+torch.OutOfMemoryError: CUDA out of memory. Tried to allocate 14.00 MiB. GPU 0 has a total capacity of 47.37 GiB of which 48.38 MiB is free. Including non-PyTorch memory, this process has 46.84 GiB memory in use. Of the allocated memory 45.02 GiB is allocated by PyTorch, and 1.36 GiB is reserved by PyTorch but unallocated. If reserved but unallocated memory is large try setting PYTORCH_ALLOC_CONF=expandable_segments:True to avoid fragmentation.  See documentation for Memory Management  (https://pytorch.org/docs/stable/notes/cuda.html#environment-variables)
+ERROR conda.cli.main_run:execute(125): `conda run python -u -m ticl.fit_model rlpfn --batch-size 64 --seed-everything True --epochs 1 --num-steps 1 --validate False --rl-validate-enabled False --progress-bar False --pg-oom-debug-raise True --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 --train-profiler-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/profiler.jsonl --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2 --train-gpu-observer-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu.csv --train-gpu-stage-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_184600_flashprefix_bs64_page48_seeded/gpu_stages.jsonl` failed. (See above for error)

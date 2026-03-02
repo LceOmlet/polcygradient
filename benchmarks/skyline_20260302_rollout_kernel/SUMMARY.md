@@ -147,8 +147,32 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
 - Dense attention OOM control (`20260302_173000_dense_bs64_oomprobe`):
   - Same `bs64` under dense paged-attention path fails with CUDA OOM during KV page COW append.
   - Confirms widened-batch throughput path is enabled by flash-prefix memory reduction rather than metric artifact.
+- Flash-prefix COW page-size knob implementation (code-level):
+  - Added `TICL_POLICY_PAGED_ATTN_FLASHPREFIX_PAGE_SIZE` for training paged-KV flash-prefix mode.
+  - Purpose: control mutable tail-page copy growth in COW append hot path without changing rollout chunk/TBPTT semantics.
+  - Default kept at `128` (no behavior change unless explicitly enabled).
+- Flash-prefix page-size sweep on throughput path (`batch_size=64`):
+  - `page32` (`20260302_174200_flashprefix_bs64_page32`): stable but slower (`85.81s`, `1.341s/batch-unit`).
+  - `page48` (`20260302_180500_flashprefix_bs64_page48`): faster (`82.34s`, `1.287s/batch-unit`), higher SM util.
+  - `page64/128` (`20260302_175800_flashprefix_bs64_page64`, `20260302_174900_flashprefix_bs64_page128`): triggered OOM fallback/instability, rejected.
+- Batch-width sweep under `flash_prefix + page48`:
+  - `bs68`:
+    - `20260302_181900_flashprefix_bs68_page48`: `79.94s` (`1.176s/batch-unit`)
+    - `20260302_183600_flashprefix_bs68_page48_rep2`: `87.38s` (`1.285s/batch-unit`)
+    - `20260302_190200_flashprefix_bs68_page48_rep3`: `82.89s` (`1.219s/batch-unit`)
+    - Aggregate: mean `83.40s` (`1.226s/batch-unit`), median `82.89s` (`1.219s/batch-unit`)
+  - `bs70`:
+    - `20260302_182600_flashprefix_bs70_page48_oomprobe`: one successful run `84.69s` (`1.210s/batch-unit`)
+    - `20260302_191100_flashprefix_bs70_page48_rep2`: CUDA OOM in backward, rejected for stability.
+  - `bs72` (`20260302_181200_flashprefix_bs72_page48_oomprobe`): CUDA OOM, rejected.
+- Stability controls / negative probes (kept for anti-regression evidence):
+  - `bs64 + page48 + seeded` (`20260302_184600_flashprefix_bs64_page48_seeded`): CUDA OOM (environment path pressure), indicates reduced safety margin at seeded heavy draws.
+  - `bs68 + page32` (`20260302_185200_flashprefix_bs68_page32`): CUDA OOM, rejected.
 
 ## Skyline status
 
 - Fixed-workload wallclock skyline (`n_samples=1024`, `batch_size=8` unchanged): `20260302_142001_qkvfused_nortinfo_noseed_rel` (`62.83s`).
-- Throughput-normalized skyline (`wallclock / batch_size`, enabled by reduced memory): `20260302_172200_flashprefix_bs64` (`1.299s` per batch-unit).
+- Throughput-normalized skyline (`wallclock / batch_size`, reduced-memory widened-batch path):
+  - Previous retained: `20260302_172200_flashprefix_bs64` (`83.13s`, `1.299s/batch-unit`).
+  - New retained (multi-run robust): `flash_prefix + page48 + bs68` with median `82.89s` (`1.219s/batch-unit`) and mean `83.40s` (`1.226s/batch-unit`).
+  - Best observed single run in this cohort: `20260302_181900_flashprefix_bs68_page48` (`79.94s`, `1.176s/batch-unit`).

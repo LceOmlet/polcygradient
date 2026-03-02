@@ -140,6 +140,11 @@ class TransformerEncoderLayer(Module):
         except Exception:
             chunk_tokens_env = 0
         self.paged_attn_train_chunk_tokens = int(max(0, chunk_tokens_env))
+        try:
+            flashprefix_page_size_env = int(os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_PAGE_SIZE", "128"))
+        except Exception:
+            flashprefix_page_size_env = 128
+        self.paged_attn_flashprefix_page_size = int(max(1, flashprefix_page_size_env))
 
         self.activation = _get_activation_fn(activation)
 
@@ -788,7 +793,15 @@ class TransformerEncoderLayer(Module):
                     # O(1) and avoids page-growth cat churn in TBPTT rollout.
                     effective_kv_page_size = int(max(1, max_cache_len))
                 else:
-                    effective_kv_page_size = int(max(8, kv_cache_page_size))
+                    if self.paged_attn_train_mode == "flash_prefix":
+                        # In COW mode, large pages amplify per-step cat/clone
+                        # growth on the mutable tail page. Use a smaller
+                        # training page only for flash-prefix mode to reduce
+                        # this copy overhead while keeping page-locality.
+                        target_page = int(max(8, self.paged_attn_flashprefix_page_size))
+                        effective_kv_page_size = int(max(8, min(int(kv_cache_page_size), target_page)))
+                    else:
+                        effective_kv_page_size = int(max(8, kv_cache_page_size))
             else:
                 effective_kv_page_size = kv_cache_page_size
         else:

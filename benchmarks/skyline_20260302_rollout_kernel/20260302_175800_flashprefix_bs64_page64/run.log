@@ -1,0 +1,44 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/profiler.jsonl, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=112795, interval_sec=0.20, sample_output=benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu.csv, stage_output=benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu_stages.jsonl)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 128
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+Policy autocast dtype: fp16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu.csv stages_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu_stages.jsonl
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_b64_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_17_07_23
+AdamW fused: enabled
+/home/chen/RLPFN/ticl/ticl/train.py:2076: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+start of epoch 1
+/home/chen/RLPFN/ticl/ticl/train.py:1115: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+[pg-oom] epoch=0 batch=0 reducing TBPTT window to 64 (keeping policy rollout chunk size unchanged)
+[pg-oom-retry] epoch=0 batch=0 attempt=2/8 chunk=64 tbptt=64
+/home/chen/RLPFN/ticl/ticl/train.py:1115: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+Terminated
+ERROR conda.cli.main_run:execute(125): `conda run python -u -m ticl.fit_model rlpfn --batch-size 64 --epochs 1 --num-steps 1 --validate False --rl-validate-enabled False --progress-bar False --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 --train-profiler-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/profiler.jsonl --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2 --train-gpu-observer-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu.csv --train-gpu-stage-output-path benchmarks/skyline_20260302_rollout_kernel/20260302_175800_flashprefix_bs64_page64/gpu_stages.jsonl` failed. (See above for error)
