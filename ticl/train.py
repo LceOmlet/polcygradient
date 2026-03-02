@@ -323,23 +323,78 @@ def _build_policy_step_fn(
                 f"fullgraph={bool(pg_torch_compile_fullgraph)}, dynamic={bool(pg_torch_compile_dynamic)})"
         )
 
+    # Reuse token buffers across rollout steps to avoid per-step cat/pad
+    # allocations in the hot loop.
+    token_buf = {
+        "x": None,
+        "y": None,
+        "batch_size": None,
+        "dtype": None,
+        "device": None,
+    }
+
     def policy_step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
         nonlocal policy_forward_step, compile_active
         del step_idx
         obs_slot_dim = int(env_info["obs_slot_dim"])
         action_slot_dim = int(env_info["action_slot_dim"])
         action_dim = int(env_info["action_dim"])
+        batch_size = int(obs_t.shape[0])
 
         # Keep policy-gradient semantics while preventing reward-token history
         # from being retained through PFN inputs.
-        reward_scalar = reward_t.reshape(obs_t.shape[0], 1).detach().to(dtype=obs_t.dtype)
-        reward_mask = reward_mask_t.reshape(obs_t.shape[0], 1).detach().to(dtype=obs_t.dtype)
+        reward_scalar = reward_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
+        reward_mask = reward_mask_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
 
-        obs_slot = _fit_last_dim(obs_t, obs_slot_dim)
-        action_slot = _fit_last_dim(action_t, action_slot_dim)
-        x_token = torch.cat([obs_slot, reward_scalar, reward_mask, action_slot], dim=-1)
-        x_token = _fit_last_dim(x_token, num_features).unsqueeze(0)
-        y_token = reward_scalar.reshape(1, obs_t.shape[0])
+        reuse_token_buf = not torch.is_grad_enabled()
+        if reuse_token_buf:
+            needs_realloc = (
+                token_buf["x"] is None
+                or token_buf["y"] is None
+                or token_buf["batch_size"] != batch_size
+                or token_buf["dtype"] != obs_t.dtype
+                or token_buf["device"] != obs_t.device
+            )
+            if needs_realloc:
+                token_buf["x"] = torch.zeros(
+                    (1, batch_size, num_features),
+                    device=obs_t.device,
+                    dtype=obs_t.dtype,
+                )
+                token_buf["y"] = torch.zeros(
+                    (1, batch_size),
+                    device=obs_t.device,
+                    dtype=obs_t.dtype,
+                )
+                token_buf["batch_size"] = batch_size
+                token_buf["dtype"] = obs_t.dtype
+                token_buf["device"] = obs_t.device
+            x_token = token_buf["x"]
+            y_token = token_buf["y"]
+        else:
+            x_token = torch.zeros(
+                (1, batch_size, num_features),
+                device=obs_t.device,
+                dtype=obs_t.dtype,
+            )
+            y_token = reward_scalar.reshape(1, batch_size).clone()
+        x_row = x_token[0]
+        x_row.zero_()
+
+        obs_copy = int(min(obs_t.shape[-1], obs_slot_dim, num_features))
+        if obs_copy > 0:
+            x_row[:, :obs_copy] = obs_t[:, :obs_copy]
+        if obs_slot_dim < num_features:
+            x_row[:, obs_slot_dim] = reward_scalar
+        if (obs_slot_dim + 1) < num_features:
+            x_row[:, obs_slot_dim + 1] = reward_mask
+        action_write_start = obs_slot_dim + 2
+        if action_write_start < num_features:
+            action_copy = int(min(action_t.shape[-1], action_slot_dim, num_features - action_write_start))
+            if action_copy > 0:
+                x_row[:, action_write_start: action_write_start + action_copy] = action_t[:, :action_copy]
+        if reuse_token_buf:
+            y_token[0].copy_(reward_scalar)
 
         if compile_active:
             try:

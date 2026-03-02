@@ -235,6 +235,14 @@ class TransformerEncoderLayer(Module):
         if remaining <= 0:
             raise ValueError("Paged KV attention requires valid_len > 0.")
 
+        # Fast path: single-page cache can directly dispatch to SDPA.
+        # This is important for no-grad/inference runs where we keep one large
+        # page and avoid the per-page python loop entirely.
+        if len(k_pages) == 1:
+            k_all = k_pages[0][:, :, :remaining, :]
+            v_all = v_pages[0][:, :, :remaining, :]
+            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
         if attn_dropout > 0.0:
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
@@ -451,43 +459,48 @@ class TransformerEncoderLayer(Module):
         """
         if valid_len >= max_cache_len:
             raise ValueError(f"KV cache capacity exceeded: {valid_len} >= max_cache_len={max_cache_len}.")
-
-        remaining_idx = int(valid_len)
-        page_idx = None
-        offset = None
-        for idx, k_page in enumerate(k_pages):
-            cap = int(k_page.shape[2])
-            if remaining_idx < cap:
-                page_idx = idx
-                offset = remaining_idx
-                break
-            remaining_idx -= cap
-
         new_k_pages = list(k_pages)
         new_v_pages = list(v_pages)
 
-        if page_idx is None:
-            used_cap = sum(int(page.shape[2]) for page in k_pages)
-            remaining_cap = int(max_cache_len) - used_cap
-            if remaining_cap <= 0:
-                raise ValueError(f"KV cache capacity exceeded: {valid_len} >= max_cache_len={max_cache_len}.")
-            page_cap = min(int(page_size), int(remaining_cap))
-            k_page = k_new_bhld.new_empty((k_new_bhld.shape[0], k_new_bhld.shape[1], page_cap, k_new_bhld.shape[3]))
-            v_page = v_new_bhld.new_empty((v_new_bhld.shape[0], v_new_bhld.shape[1], page_cap, v_new_bhld.shape[3]))
-            k_page[:, :, :1, :] = k_new_bhld
-            v_page[:, :, :1, :] = v_new_bhld
-            new_k_pages.append(k_page)
-            new_v_pages.append(v_page)
+        total_cap = sum(int(page.shape[2]) for page in k_pages)
+        has_preallocated_slack = int(total_cap) > int(valid_len)
+
+        if has_preallocated_slack:
+            # Compatibility path for caches converted from dense tensors:
+            # keep the old offset-based COW semantics.
+            remaining_idx = int(valid_len)
+            page_idx = None
+            offset = None
+            for idx, k_page in enumerate(k_pages):
+                cap = int(k_page.shape[2])
+                if remaining_idx < cap:
+                    page_idx = idx
+                    offset = remaining_idx
+                    break
+                remaining_idx -= cap
+            if page_idx is None:
+                raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
+            old_k_page = k_pages[page_idx]
+            old_v_page = v_pages[page_idx]
+            k_page = old_k_page.clone()
+            v_page = old_v_page.clone()
+            k_page[:, :, offset: offset + 1, :] = k_new_bhld
+            v_page[:, :, offset: offset + 1, :] = v_new_bhld
+            new_k_pages[page_idx] = k_page
+            new_v_pages[page_idx] = v_page
             return new_k_pages, new_v_pages, int(valid_len) + 1
 
-        old_k_page = k_pages[page_idx]
-        old_v_page = v_pages[page_idx]
-        k_page = old_k_page.clone()
-        v_page = old_v_page.clone()
-        k_page[:, :, offset: offset + 1, :] = k_new_bhld
-        v_page[:, :, offset: offset + 1, :] = v_new_bhld
-        new_k_pages[page_idx] = k_page
-        new_v_pages[page_idx] = v_page
+        # Packed-growth path: pages only store filled tokens.
+        # This avoids cloning full preallocated page capacity on every append.
+        if new_k_pages:
+            last_cap = int(new_k_pages[-1].shape[2])
+            if last_cap < int(page_size):
+                new_k_pages[-1] = torch.cat([new_k_pages[-1], k_new_bhld], dim=2)
+                new_v_pages[-1] = torch.cat([new_v_pages[-1], v_new_bhld], dim=2)
+                return new_k_pages, new_v_pages, int(valid_len) + 1
+
+        new_k_pages.append(k_new_bhld.clone())
+        new_v_pages.append(v_new_bhld.clone())
         return new_k_pages, new_v_pages, int(valid_len) + 1
 
     def forward_step(
@@ -543,9 +556,20 @@ class TransformerEncoderLayer(Module):
             and torch.is_grad_enabled()
             and bool(allow_grad_mutable_cache)
         )
-        effective_kv_page_size = int(
-            max(1, min(kv_cache_page_size, 16))
-        ) if mutable_paged_grad else kv_cache_page_size
+        if cache_mode == "paged":
+            # Throughput route:
+            # - no-grad path (including reentrant checkpoint forward pass) uses
+            #   a single dense page to avoid tiny-page python overhead;
+            # - grad + mutable path keeps bounded page size but avoids
+            #   pathological page_size=1 behavior.
+            if (not torch.is_grad_enabled()) and (max_cache_len is not None):
+                effective_kv_page_size = int(max(1, max_cache_len))
+            elif mutable_paged_grad:
+                effective_kv_page_size = int(max(8, min(kv_cache_page_size, 32)))
+            else:
+                effective_kv_page_size = kv_cache_page_size
+        else:
+            effective_kv_page_size = kv_cache_page_size
 
         def _paged_cache_public_views(k_pages_local, v_pages_local, valid_len_local):
             if k_pages_local is None or v_pages_local is None:
@@ -573,7 +597,12 @@ class TransformerEncoderLayer(Module):
                 k_pages = None
                 v_pages = None
             elif cache_mode == "paged":
-                page_cap = min(int(effective_kv_page_size), int(max_cache_len))
+                if torch.is_grad_enabled():
+                    # Start mutable COW pages with one filled token; page growth
+                    # happens via cat in _append_to_kv_pages_cow.
+                    page_cap = 1
+                else:
+                    page_cap = min(int(effective_kv_page_size), int(max_cache_len))
                 k_page = k_new_bhld.new_empty((k_new_bhld.shape[0], k_new_bhld.shape[1], page_cap, k_new_bhld.shape[3]))
                 v_page = v_new_bhld.new_empty((v_new_bhld.shape[0], v_new_bhld.shape[1], page_cap, v_new_bhld.shape[3]))
                 k_page[:, :, :1, :] = k_new_bhld
