@@ -35,3 +35,17 @@ CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
 2. `mutable_paged_grad` page-size cap was relaxed from hard upper bound `32` to configured `kv_cache_page_size` (default `128`) to reduce page fragmentation and per-step page-loop overhead.
 
 These two changes reduced tiny-kernel launch overhead in policy rollout without changing task scale.
+
+## Follow-up Probes (same workload, kept for regression tracking)
+
+- Kernel-profiler probe (`20260302_105332_kernelprof`):
+  - Used only for observability; profiling overhead inflated runtime (`rollout 137.378s`, `backward 89.367s`).
+  - Not considered skyline candidate.
+- QKV-fused projection probe (`20260302_105845_qkvfused`):
+  - `wallclock 70.96s` vs skyline `70.63s` (no gain).
+  - Reverted (did not keep code change).
+- Environment `einsum->bmm` probe (`20260302_110339_envbmm`):
+  - `wallclock 72.32s` vs skyline `70.63s` (regression on this workload).
+  - Reverted (did not keep code change).
+
+Current retained skyline remains `20260302_104751_layerpagedsdpa`.
