@@ -1,0 +1,63 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=benchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=59625, interval_sec=0.20, sample_output=benchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv, stage_output=benchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 128
+Policy TBPTT backward mode: auto
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+Policy autocast dtype: fp16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv stages_jsonl=benchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10
+AdamW fused: enabled
+/home/chen/RLPFN/ticl/ticl/train.py:2124: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+start of epoch 1
+/home/chen/RLPFN/ticl/ticl/train.py:1135: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+[pg-oom] epoch=0 batch=0 switching TBPTT backward mode to stream (auto fallback before shrinking TBPTT/chunk)
+[pg-oom-retry] epoch=0 batch=0 attempt=2/8 chunk=8 tbptt=128 tbptt_bwd=defer
+/home/chen/RLPFN/ticl/ticl/train.py:1135: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+[pg-gpu-stage] epoch=1 batch=0 stage=rollout  samples=215 gpu_util_avg=23.25 gpu_util_max=27.00 proc_mem_avg_mib=47972.0 proc_mem_max_mib=47972.0 proc_mem_share_avg=97.62 proc_sm_util_avg=22.48 cuda_ms=65175.41 cuda_busy_ratio=1.000
+[pg-gpu-stage] epoch=1 batch=0 stage=backward  samples=205 gpu_util_avg=23.44 gpu_util_max=27.00 proc_mem_avg_mib=47972.0 proc_mem_max_mib=47972.0 proc_mem_share_avg=97.62 proc_sm_util_avg=22.62 cuda_ms=39101.80 cuda_busy_ratio=0.631
+[pg-gpu-stage] epoch=1 batch=0 stage=step  samples=1 gpu_util_avg=24.00 gpu_util_max=24.00 proc_mem_avg_mib=47972.0 proc_mem_max_mib=47972.0 proc_mem_share_avg=97.62 proc_sm_util_avg=na cuda_ms=42.40 cuda_busy_ratio=0.996
+[pg-phase] epoch=0 batch=0 rollout_s=65.176 backward_s=39.105 step_s=0.043 backward_calls=8 chunk=8 tbptt=128 tbptt_bwd=stream status=grad_norm_nonfinite
+[train-skip] epoch=0 batch=0 reason=grad_norm_nonfinite
+ [profile-interval] epoch=1 batch=1 steps/s=0.01 samples/s=0.08 tokens/s=79.73
+[train-warn] all batches were skipped due to non-finite loss/grad.
+-----------------------------------------------------------------------------------------
+ peak gpu mem alloc/reserved 45.39GiB/46.38GiB |
+| end of epoch   1 | Wallclock time: 102.75s | GPU time: 102.75s | mean loss   inf | 
+ profile steps/s 0.01 (ema 0.01) | samples/s 0.08 | tokens/s 79.73 | valid/skipped 0/1
+ gpu-observer samples 342 | gpu_util_avg 22.96783625730994 | gpu_util_max 27.0 | proc_mem_avg_mib 34023.43274853801 | proc_mem_max_mib 47972.0 | proc_sm_util_avg 22.349056603773583 | proc_sm_util_max 26.0
+ lr 3.0000000000000002e-15 nan share  0.00 ignore share (for classification tasks) 0.0000
+-----------------------------------------------------------------------------------------
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:1195: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scheduler.step()
+Failed to write to log file ./log/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10.log: [Errno 2] No such file or directory: './log/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10.log'
+Failed to write to log file ./log/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10.log: [Errno 2] No such file or directory: './log/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10.log'
+WRITING TO MODEL FILE FAILED
+[Errno 2] No such file or directory: './log/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_traingpuobserveroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu.csv_traingpustageoutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/gpu_stages.jsonl_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofileroutputpathbenchmarks/skyline_20260302_rollout_kernel/20260302_160200_tbpttbwd_auto/profiler.jsonl_trainprofilerwandbFalse_03_02_2026_14_56_10.log'

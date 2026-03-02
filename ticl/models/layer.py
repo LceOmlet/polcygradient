@@ -1,4 +1,5 @@
 import math
+import os
 from functools import partial
 from typing import Optional
 
@@ -130,6 +131,15 @@ class TransformerEncoderLayer(Module):
         self.pre_norm = pre_norm
         self.recompute_attn = recompute_attn
         self.single_eval_causal = bool(single_eval_causal)
+        paged_mode_env = str(os.environ.get("TICL_POLICY_PAGED_ATTN_TRAIN_MODE", "dense")).strip().lower()
+        if paged_mode_env not in {"dense", "flash_merge", "flash_prefix"}:
+            paged_mode_env = "dense"
+        self.paged_attn_train_mode = paged_mode_env
+        try:
+            chunk_tokens_env = int(os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHMERGE_CHUNK_TOKENS", "0"))
+        except Exception:
+            chunk_tokens_env = 0
+        self.paged_attn_train_chunk_tokens = int(max(0, chunk_tokens_env))
 
         self.activation = _get_activation_fn(activation)
 
@@ -221,6 +231,159 @@ class TransformerEncoderLayer(Module):
         token_cap = int(max(1, target_bytes // bytes_per_token))
         return int(max(1, min(int(valid_len), token_cap)))
 
+    def _resolve_train_flashmerge_chunk_tokens(self, q_bhld: Tensor, valid_len: int):
+        if self.paged_attn_train_chunk_tokens > 0:
+            return int(max(1, min(int(valid_len), int(self.paged_attn_train_chunk_tokens))))
+        return self._resolve_paged_chunk_tokens(q_bhld, valid_len)
+
+    @staticmethod
+    def _normalize_flash_lse(lse: Tensor, q_len: int):
+        # PyTorch flash/efficient kernels return LSE padded to a backend-dependent
+        # token multiple (often 16). We only need the first q_len entries.
+        if lse.ndim != 3:
+            raise ValueError(f"unexpected flash LSE rank: {lse.ndim}")
+        lse_trim = lse[:, :, :int(q_len)]
+        return lse_trim.unsqueeze(-1).to(dtype=torch.float32)
+
+    @staticmethod
+    def _flash_sdpa_chunk_with_lse(q_bhld: Tensor, k_chunk: Tensor, v_chunk: Tensor):
+        # Prefer flash backend and fallback to efficient backend if needed.
+        try:
+            out, lse, *_ = torch.ops.aten._scaled_dot_product_flash_attention.default(
+                q_bhld,
+                k_chunk,
+                v_chunk,
+                0.0,
+                False,
+                False,
+            )
+            return out, lse
+        except Exception:
+            out, lse = torch.ops.aten._scaled_dot_product_efficient_attention.default(
+                q_bhld,
+                k_chunk,
+                v_chunk,
+                True,
+                False,
+            )
+            return out, lse
+
+    def _forward_step_attn_ff_paged_flash_merge(
+        self,
+        src_step: Tensor,
+        q_bhld: Tensor,
+        k_pages,
+        v_pages,
+        valid_len: int,
+        chunk_token_cap: int,
+        clone_kv_for_grad: bool = False,
+    ):
+        remaining = int(valid_len)
+        if remaining <= 0:
+            raise ValueError("Paged KV attention requires valid_len > 0.")
+
+        chunk_token_cap = int(max(1, min(int(valid_len), int(chunk_token_cap))))
+        q_len = int(q_bhld.shape[2])
+        merged_out = None
+        merged_lse = None
+        page_idx = 0
+        num_pages = len(k_pages)
+
+        while remaining > 0 and page_idx < num_pages:
+            k_chunks = []
+            v_chunks = []
+            chunk_tokens = 0
+            while remaining > 0 and page_idx < num_pages and chunk_tokens < chunk_token_cap:
+                k_page = k_pages[page_idx]
+                v_page = v_pages[page_idx]
+                page_cap = int(k_page.shape[2])
+                take = min(page_cap, remaining, chunk_token_cap - chunk_tokens)
+                k_chunks.append(k_page[:, :, :take, :])
+                v_chunks.append(v_page[:, :, :take, :])
+                remaining -= take
+                page_idx += 1
+                chunk_tokens += take
+
+            if len(k_chunks) == 1:
+                k_chunk = k_chunks[0]
+                v_chunk = v_chunks[0]
+            else:
+                k_chunk = torch.cat(k_chunks, dim=2)
+                v_chunk = torch.cat(v_chunks, dim=2)
+
+            if bool(clone_kv_for_grad):
+                # In-place paged-grad mode mutates cache pages every step.
+                # Clone read views so autograd sees stable versions.
+                k_chunk = k_chunk.clone()
+                v_chunk = v_chunk.clone()
+
+            out_chunk, lse_chunk = self._flash_sdpa_chunk_with_lse(q_bhld, k_chunk, v_chunk)
+            lse_chunk_f32 = self._normalize_flash_lse(lse_chunk, q_len=q_len)
+            out_chunk_f32 = out_chunk.to(dtype=torch.float32)
+
+            if merged_out is None:
+                merged_out = out_chunk_f32
+                merged_lse = lse_chunk_f32
+            else:
+                merged_lse_next = torch.logaddexp(merged_lse, lse_chunk_f32)
+                prev_scale = torch.exp(merged_lse - merged_lse_next)
+                curr_scale = torch.exp(lse_chunk_f32 - merged_lse_next)
+                merged_out = merged_out * prev_scale + out_chunk_f32 * curr_scale
+                merged_lse = merged_lse_next
+
+        if remaining != 0:
+            raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
+        if merged_out is None:
+            raise ValueError("Paged KV attention produced no chunk output.")
+        return self._finalize_forward_step(src_step, merged_out.to(dtype=q_bhld.dtype))
+
+    def _forward_step_attn_ff_paged_flash_prefix(
+        self,
+        src_step: Tensor,
+        q_bhld: Tensor,
+        k_pages,
+        v_pages,
+        valid_len: int,
+        prefix_k: Optional[Tensor] = None,
+        prefix_v: Optional[Tensor] = None,
+        clone_kv_for_grad: bool = False,
+    ):
+        valid_len = int(valid_len)
+        if valid_len <= 0:
+            raise ValueError("Paged KV attention requires valid_len > 0.")
+        prefix_len = 0
+        if prefix_k is not None and prefix_v is not None:
+            prefix_len = int(prefix_k.shape[2])
+        if prefix_len >= valid_len:
+            raise ValueError("Flash-prefix attention requires prefix_len < valid_len.")
+
+        tail_take = int(valid_len - prefix_len)
+        tail_k = k_pages[-1][:, :, :tail_take, :]
+        tail_v = v_pages[-1][:, :, :tail_take, :]
+        if bool(clone_kv_for_grad):
+            tail_k = tail_k.clone()
+            tail_v = tail_v.clone()
+
+        tail_out, tail_lse = self._flash_sdpa_chunk_with_lse(q_bhld, tail_k, tail_v)
+        merged_out = tail_out.to(dtype=torch.float32)
+        merged_lse = self._normalize_flash_lse(tail_lse, q_len=int(q_bhld.shape[2]))
+
+        if prefix_len > 0:
+            prefix_chunk_k = prefix_k
+            prefix_chunk_v = prefix_v
+            if bool(clone_kv_for_grad):
+                prefix_chunk_k = prefix_chunk_k.clone()
+                prefix_chunk_v = prefix_chunk_v.clone()
+            prefix_out, prefix_lse = self._flash_sdpa_chunk_with_lse(q_bhld, prefix_chunk_k, prefix_chunk_v)
+            prefix_out = prefix_out.to(dtype=torch.float32)
+            prefix_lse = self._normalize_flash_lse(prefix_lse, q_len=int(q_bhld.shape[2]))
+            merged_lse_next = torch.logaddexp(prefix_lse, merged_lse)
+            prefix_scale = torch.exp(prefix_lse - merged_lse_next)
+            tail_scale = torch.exp(merged_lse - merged_lse_next)
+            merged_out = prefix_out * prefix_scale + merged_out * tail_scale
+
+        return self._finalize_forward_step(src_step, merged_out.to(dtype=q_bhld.dtype))
+
     def _forward_step_attn_ff_paged(
         self,
         src_step: Tensor,
@@ -229,6 +392,8 @@ class TransformerEncoderLayer(Module):
         v_pages,
         valid_len: int,
         clone_kv_for_grad: bool = False,
+        prefix_k: Optional[Tensor] = None,
+        prefix_v: Optional[Tensor] = None,
     ):
         # Online softmax accumulation over KV pages (FlashAttention-style reduction),
         # avoids materializing full concatenated K/V every step.
@@ -252,6 +417,32 @@ class TransformerEncoderLayer(Module):
         # Training throughput route: dispatch fused SDPA on dense views.
         # This removes many tiny per-page kernels in the grad-enabled hot path.
         if torch.is_grad_enabled():
+            attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
+            if (
+                attn_dropout <= 0.0
+                and self.paged_attn_train_mode == "flash_prefix"
+                and (not bool(clone_kv_for_grad))
+            ):
+                return self._forward_step_attn_ff_paged_flash_prefix(
+                    src_step,
+                    q_bhld,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                    prefix_k=prefix_k,
+                    prefix_v=prefix_v,
+                    clone_kv_for_grad=False,
+                )
+            if attn_dropout <= 0.0 and self.paged_attn_train_mode == "flash_merge":
+                return self._forward_step_attn_ff_paged_flash_merge(
+                    src_step,
+                    q_bhld,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                    chunk_token_cap=self._resolve_train_flashmerge_chunk_tokens(q_bhld, valid_len),
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                )
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if bool(clone_kv_for_grad):
                 # Multi-page fallback for in-place paged-grad mode.
@@ -615,6 +806,9 @@ class TransformerEncoderLayer(Module):
         if kv_cache is None:
             if not append_to_cache:
                 raise ValueError("predict-only step requires a non-empty kv_cache.")
+            k_prefix = None
+            v_prefix = None
+            prefix_pages = 0
             k_new_bhld = self._split_heads(k_new_bld)
             v_new_bhld = self._split_heads(v_new_bld)
             if cache_mode == "static":
@@ -662,6 +856,12 @@ class TransformerEncoderLayer(Module):
             v_store = kv_cache.get("v_store", None)
             k_pages = kv_cache.get("k_pages", None)
             v_pages = kv_cache.get("v_pages", None)
+            k_prefix = kv_cache.get("k_prefix", None)
+            v_prefix = kv_cache.get("v_prefix", None)
+            try:
+                prefix_pages = int(kv_cache.get("prefix_pages", 0))
+            except Exception:
+                prefix_pages = 0
             if k_prev is None:
                 valid_len = int(kv_cache.get("valid_len", 0))
             else:
@@ -761,6 +961,50 @@ class TransformerEncoderLayer(Module):
                     v_pages = None
                     valid_len = int(k_all.shape[2])
 
+        if (
+            cache_mode == "paged"
+            and torch.is_grad_enabled()
+            and (not bool(inplace_paged_grad))
+            and self.paged_attn_train_mode == "flash_prefix"
+            and (k_pages is not None)
+            and (v_pages is not None)
+        ):
+            full_pages = int(max(0, len(k_pages) - 1))
+            if full_pages <= 0:
+                k_prefix = None
+                v_prefix = None
+                prefix_pages = 0
+            else:
+                rebuild_prefix = (
+                    (k_prefix is None)
+                    or (v_prefix is None)
+                    or (prefix_pages <= 0)
+                    or (full_pages < prefix_pages)
+                )
+                if rebuild_prefix:
+                    if full_pages == 1:
+                        k_prefix = k_pages[0]
+                        v_prefix = v_pages[0]
+                    else:
+                        k_prefix = torch.cat(k_pages[:full_pages], dim=2)
+                        v_prefix = torch.cat(v_pages[:full_pages], dim=2)
+                    prefix_pages = full_pages
+                elif full_pages > prefix_pages:
+                    for idx in range(prefix_pages, full_pages):
+                        k_full = k_pages[idx]
+                        v_full = v_pages[idx]
+                        if k_prefix is None or v_prefix is None:
+                            k_prefix = k_full
+                            v_prefix = v_full
+                        else:
+                            k_prefix = torch.cat([k_prefix, k_full], dim=2)
+                            v_prefix = torch.cat([v_prefix, v_full], dim=2)
+                    prefix_pages = full_pages
+        else:
+            k_prefix = None
+            v_prefix = None
+            prefix_pages = 0
+
         if cache_mode == "paged" and (k_pages is not None) and (v_pages is not None):
             src = self._forward_step_attn_ff_paged(
                 src_step,
@@ -769,6 +1013,8 @@ class TransformerEncoderLayer(Module):
                 v_pages,
                 valid_len,
                 clone_kv_for_grad=bool(inplace_paged_grad),
+                prefix_k=k_prefix,
+                prefix_v=v_prefix,
             )
         elif self.recompute_attn and torch.is_grad_enabled():
             src = checkpoint(
@@ -793,6 +1039,9 @@ class TransformerEncoderLayer(Module):
             "v_pages": v_pages,
             "page_size": int(effective_kv_page_size) if effective_kv_page_size is not None else None,
             "valid_len": int(valid_len),
+            "k_prefix": k_prefix,
+            "v_prefix": v_prefix,
+            "prefix_pages": int(prefix_pages),
             "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
             "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
         }

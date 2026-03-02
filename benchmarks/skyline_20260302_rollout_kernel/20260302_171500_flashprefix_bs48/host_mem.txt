@@ -1,0 +1,8 @@
+[host-mem-before]
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       5.6Gi        48Gi       115Mi       9.9Gi        57Gi
+Swap:          8.0Gi          0B       8.0Gi
+[host-mem-after]
+               total        used        free      shared  buff/cache   available
+Mem:            62Gi       5.8Gi        47Gi       114Mi       9.9Gi        56Gi
+Swap:          8.0Gi          0B       8.0Gi

@@ -123,5 +123,32 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
   - Reduced chunk count versus pure online mode by merging full-prefix and tail pages in two-way reduction.
   - Memory stayed low (`peak alloc/reserved 6.68/6.69 GiB`) but wallclock still regressed (`92.23s`).
   - Not a skyline candidate for same-workload speed; reverted.
+- Training paged-attention Flash-LSE merge probe (`20260302_163800_pagedattn_flashmerge`):
+  - Implemented exact chunk merge via FlashAttention LSE reduction.
+  - Wallclock regressed to `71.18s` (`rollout/backward 71.131/40.631s`, peak `27.38/34.63 GiB`).
+  - Not retained for fixed-workload skyline.
+- Flash-LSE merge with large chunk cap (`20260302_164300_flashmerge_chunk4096`):
+  - Reduced merge chunk count to near single-chunk behavior.
+  - Wallclock improved vs previous flash-merge probe (`68.32s`) but still slower than skyline `62.83s`.
+  - Not retained for fixed-workload skyline.
+- Flash prefix+tail exact merge probe (`20260302_165000_flashprefix`):
+  - Enabled exact two-way FlashAttention merge (`prefix + tail`) without dense KV concat.
+  - Strong memory reduction (`peak alloc/reserved 7.47/7.55 GiB`) but fixed-batch wallclock regressed (`79.51s`).
+- Flash prefix mode with widened batch (`20260302_165800_flashprefix_bs32`):
+  - `wallclock 76.23s`, peak `23.63/25.32 GiB`.
+  - Normalized metric improved: `76.23 / 32 = 2.382s` per batch-unit.
+- Flash prefix mode with widened batch (`20260302_171500_flashprefix_bs48`):
+  - `wallclock 87.12s`, peak `32.88/36.59 GiB`.
+  - Normalized metric improved further: `87.12 / 48 = 1.815s` per batch-unit.
+- Flash prefix mode with widened batch (`20260302_172200_flashprefix_bs64`):
+  - `wallclock 83.13s`, `rollout/backward 83.073/48.345s`, peak `40.03/45.79 GiB`.
+  - Normalized metric: `83.13 / 64 = 1.299s` per batch-unit (best observed).
+  - GPU memory stayed below OOM threshold while host memory remained stable (`~5.8 GiB` used).
+- Dense attention OOM control (`20260302_173000_dense_bs64_oomprobe`):
+  - Same `bs64` under dense paged-attention path fails with CUDA OOM during KV page COW append.
+  - Confirms widened-batch throughput path is enabled by flash-prefix memory reduction rather than metric artifact.
 
-Current retained skyline is `20260302_142001_qkvfused_nortinfo_noseed_rel`.
+## Skyline status
+
+- Fixed-workload wallclock skyline (`n_samples=1024`, `batch_size=8` unchanged): `20260302_142001_qkvfused_nortinfo_noseed_rel` (`62.83s`).
+- Throughput-normalized skyline (`wallclock / batch_size`, enabled by reduced memory): `20260302_172200_flashprefix_bs64` (`1.299s` per batch-unit).
