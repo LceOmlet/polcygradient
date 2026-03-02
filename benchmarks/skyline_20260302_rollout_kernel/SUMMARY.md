@@ -115,5 +115,13 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
   - Triggered immediate OOM fallback (`[pg-oom] switching TBPTT backward mode to stream`), then retried in streaming mode.
   - Peak alloc/reserved spiked to `45.39/46.38 GiB`, process memory reached `47972 MiB`, wallclock regressed to `102.75s`.
   - Classified as pseudo-optimization with high OOM/system-stability risk; reverted.
+- Training paged-attention online reduction probe (`20260302_161500_pagedattn_online`):
+  - Replaced training multi-page dense SDPA (with full `cat` views) by page-chunk online softmax reduction.
+  - Strongly reduced memory (`peak alloc/reserved 6.10/6.12 GiB`) but severely increased runtime (`162.89s`).
+  - Classified as pseudo-optimization for fixed-workload speed target; reverted.
+- Training paged-attention prefix+tail reduction probe (`20260302_162500_pagedattn_prefix`):
+  - Reduced chunk count versus pure online mode by merging full-prefix and tail pages in two-way reduction.
+  - Memory stayed low (`peak alloc/reserved 6.68/6.69 GiB`) but wallclock still regressed (`92.23s`).
+  - Not a skyline candidate for same-workload speed; reverted.
 
 Current retained skyline is `20260302_142001_qkvfused_nortinfo_noseed_rel`.
