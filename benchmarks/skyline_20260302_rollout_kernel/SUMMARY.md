@@ -176,3 +176,4 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
   - Previous retained: `20260302_172200_flashprefix_bs64` (`83.13s`, `1.299s/batch-unit`).
   - New retained (multi-run robust): `flash_prefix + page48 + bs68` with median `82.89s` (`1.219s/batch-unit`) and mean `83.40s` (`1.226s/batch-unit`).
   - Best observed single run in this cohort: `20260302_181900_flashprefix_bs68_page48` (`79.94s`, `1.176s/batch-unit`).
+  - Reproduce setting: `TICL_POLICY_PAGED_ATTN_TRAIN_MODE=flash_prefix TICL_POLICY_PAGED_ATTN_FLASHPREFIX_PAGE_SIZE=48` with `--batch-size 68`.
