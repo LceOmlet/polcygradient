@@ -117,7 +117,9 @@ class ClassificationAdapter:
         # num_features is constant for all batches, num_features_used is passed down to wrapped priors to change number of features
         if self.h['feature_curriculum']:
             num_features = min(num_features, epoch + 1)
-        if self.h['num_features_sampler'] == 'uniform':
+        if self.h['num_features_sampler'] == 'fixed':
+            num_features_used = int(num_features)
+        elif self.h['num_features_sampler'] == 'uniform':
             num_features_used = safe_randint(1, num_features)
         elif self.h['num_features_sampler'] == 'double_sample':
             num_features_used = safe_randint(1, safe_randint(1, num_features))

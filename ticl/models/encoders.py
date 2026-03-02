@@ -43,6 +43,34 @@ class Linear(nn.Linear):
         return super().forward(x)
 
 
+class SplitObsActionEncoder(nn.Module):
+    """
+    Two-head encoder for inputs laid out as:
+      [obs/reward/mask head | action head]
+    The two projected heads are summed in embedding space.
+    """
+
+    def __init__(self, obs_dim, action_dim, emsize, replace_nan_by_zero=True):
+        super().__init__()
+        self.obs_dim = int(obs_dim)
+        self.action_dim = int(action_dim)
+        if self.obs_dim <= 0 or self.action_dim <= 0:
+            raise ValueError(f"Invalid split dims: obs_dim={obs_dim}, action_dim={action_dim}")
+        self.obs_encoder = Linear(self.obs_dim, emsize, replace_nan_by_zero=replace_nan_by_zero)
+        self.action_encoder = Linear(self.action_dim, emsize, replace_nan_by_zero=replace_nan_by_zero)
+
+    def forward(self, x):
+        d = int(x.shape[-1])
+        required = self.obs_dim + self.action_dim
+        if d < required:
+            raise ValueError(
+                f"SplitObsActionEncoder expected at least {required} features, got {d}"
+            )
+        x_obs = x[..., :self.obs_dim]
+        x_action = x[..., self.obs_dim:self.obs_dim + self.action_dim]
+        return self.obs_encoder(x_obs) + self.action_encoder(x_action)
+
+
 class BinEmbeddingEncoder(nn.Module):
     def __init__(self, num_features, emsize, n_bins, rank, nonlinear=True, decoder_activation='relu'):
         super().__init__()

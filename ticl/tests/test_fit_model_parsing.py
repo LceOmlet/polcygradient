@@ -1,4 +1,8 @@
 from ticl.fit_model import main
+from ticl.cli_parsing import make_model_level_argparser
+from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
+from argparse import Namespace
+from ticl.fit_model import _cli_flag_is_set, _apply_continue_run_cli_overrides
 
 
 def test_fit_model_help():
@@ -8,3 +12,331 @@ def test_fit_model_help():
         assert e.code == 0
     else:
         assert False, "Expected SystemExit"
+
+
+def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--single-eval-causal", "false",
+            "--family", "gp",
+            "--state-dim", "12",
+            "--reward-norm-eps", "1e-5",
+            "--gp-rff-features", "64",
+            "--batch-parallel-backend", "torch_vectorized",
+            "--batch-shared-environment", "true",
+            "--batch-vectorized-strict-rng-match", "true",
+            "--rl-objective", "policy_gradient",
+        ]
+    )
+
+    assert args.transformer.single_eval_causal is False
+    assert args.prior.environment.family == "gp"
+    assert args.prior.environment.state_dim == 12
+    assert args.prior.environment.reward_norm_eps == 1e-5
+    assert args.prior.environment.gp_rff_features == 64
+    assert args.prior.environment.batch_parallel_backend == "torch_vectorized"
+    assert args.prior.environment.batch_shared_environment is True
+    assert args.prior.environment.batch_vectorized_strict_rng_match is True
+    assert args.prior.environment.batch_vectorized_grouping == "family"
+    assert args.optimizer.rl_objective == "policy_gradient"
+    assert args.optimizer.policy_rollout_chunk_size is None
+    assert args.optimizer.policy_rollout_chunk_autotune is False
+    assert args.optimizer.policy_rollout_chunk_grow_every == 8
+    assert args.optimizer.policy_rollout_chunk_grow_factor == 2.0
+    assert args.optimizer.policy_rollout_checkpoint_reentrant is True
+    assert args.optimizer.pg_grad_mutable_kv_cache is True
+    assert args.optimizer.pg_kv_cache_mode == "paged"
+    assert args.optimizer.pg_kv_cache_page_size == 128
+    assert args.optimizer.pg_torch_compile is False
+    assert args.optimizer.adamw_fused is True
+    assert args.optimizer.train_profiler_enabled is False
+    assert args.optimizer.train_profiler_output_path is None
+    assert args.optimizer.train_profiler_wandb is True
+    assert args.optimizer.train_profiler_ema_alpha == 0.2
+    assert args.optimizer.train_profiler_warmup_epochs == 0
+    assert args.optimizer.train_profiler_warmup_batches == 0
+    assert args.optimizer.train_profiler_log_every_batches == 0
+    assert args.optimizer.train_gpu_observer_enabled is False
+    assert args.optimizer.train_gpu_observer_interval_sec == 1.0
+    assert args.optimizer.train_gpu_observer_output_path is None
+    assert args.optimizer.train_gpu_stage_output_path is None
+    assert args.optimizer.pg_tbptt_window == 128
+    assert args.optimizer.pg_oom_reduce_tbptt_first is True
+    assert args.optimizer.pg_oom_debug_raise is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload is False
+    assert args.orchestration.rl_validate_enabled is True
+    assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
+
+
+def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-saved-tensors-cpu-offload", "true",
+            "--pg-saved-tensors-pin-memory", "false",
+        ]
+    )
+    assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_pin_memory is False
+
+
+def test_rlpfn_parser_accepts_pg_grad_mutable_kv_cache_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-grad-mutable-kv-cache", "false",
+        ]
+    )
+    assert args.optimizer.pg_grad_mutable_kv_cache is False
+
+
+def test_rlpfn_parser_accepts_pg_kv_cache_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-kv-cache-mode", "paged",
+            "--pg-kv-cache-page-size", "1",
+        ]
+    )
+    assert args.optimizer.pg_kv_cache_mode == "paged"
+    assert args.optimizer.pg_kv_cache_page_size == 1
+
+
+def test_rlpfn_parser_accepts_pg_tbptt_window_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-tbptt-window", "128",
+        ]
+    )
+    assert args.optimizer.pg_tbptt_window == 128
+
+
+def test_rlpfn_parser_accepts_pg_oom_reduce_tbptt_first_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-oom-reduce-tbptt-first", "false",
+        ]
+    )
+    assert args.optimizer.pg_oom_reduce_tbptt_first is False
+
+
+def test_rlpfn_parser_accepts_batch_vectorized_grouping_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--batch-vectorized-grouping", "structure",
+        ]
+    )
+    assert args.prior.environment.batch_vectorized_grouping == "structure"
+
+
+def test_rlpfn_parser_accepts_pg_oom_debug_raise_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-oom-debug-raise", "true",
+        ]
+    )
+    assert args.optimizer.pg_oom_debug_raise is True
+
+
+def test_rlpfn_parser_accepts_policy_rollout_checkpoint_reentrant_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--policy-rollout-checkpoint-reentrant", "false",
+        ]
+    )
+    assert args.optimizer.policy_rollout_checkpoint_reentrant is False
+
+
+def test_rlpfn_parser_accepts_pg_torch_compile_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-torch-compile", "true",
+            "--pg-torch-compile-backend", "eager",
+            "--pg-torch-compile-mode", "reduce-overhead",
+            "--pg-torch-compile-fullgraph", "false",
+            "--pg-torch-compile-dynamic", "false",
+        ]
+    )
+    assert args.optimizer.pg_torch_compile is True
+    assert args.optimizer.pg_torch_compile_backend == "eager"
+    assert args.optimizer.pg_torch_compile_mode == "reduce-overhead"
+    assert args.optimizer.pg_torch_compile_fullgraph is False
+    assert args.optimizer.pg_torch_compile_dynamic is False
+
+
+def test_rlpfn_parser_accepts_chunk_autotune_and_adamw_fused_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--policy-rollout-chunk-autotune", "false",
+            "--policy-rollout-chunk-grow-every", "3",
+            "--policy-rollout-chunk-grow-factor", "1.5",
+            "--adamw-fused", "false",
+        ]
+    )
+    assert args.optimizer.policy_rollout_chunk_autotune is False
+    assert args.optimizer.policy_rollout_chunk_grow_every == 3
+    assert args.optimizer.policy_rollout_chunk_grow_factor == 1.5
+    assert args.optimizer.adamw_fused is False
+
+
+def test_rlpfn_parser_accepts_train_profiler_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--train-profiler-enabled", "true",
+            "--train-profiler-output-path", "/tmp/rlpfn_profile.jsonl",
+            "--train-profiler-wandb", "false",
+            "--train-profiler-ema-alpha", "0.3",
+            "--train-profiler-warmup-epochs", "5",
+            "--train-profiler-warmup-batches", "7",
+            "--train-profiler-log-every-batches", "2",
+        ]
+    )
+    assert args.optimizer.train_profiler_enabled is True
+    assert args.optimizer.train_profiler_output_path == "/tmp/rlpfn_profile.jsonl"
+    assert args.optimizer.train_profiler_wandb is False
+    assert args.optimizer.train_profiler_ema_alpha == 0.3
+    assert args.optimizer.train_profiler_warmup_epochs == 5
+    assert args.optimizer.train_profiler_warmup_batches == 7
+    assert args.optimizer.train_profiler_log_every_batches == 2
+
+
+def test_rlpfn_parser_accepts_gpu_observer_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--train-gpu-observer-enabled", "true",
+            "--train-gpu-observer-interval-sec", "0.5",
+            "--train-gpu-observer-output-path", "/tmp/rlpfn_gpu_samples.jsonl",
+            "--train-gpu-stage-output-path", "/tmp/rlpfn_gpu_stages.jsonl",
+        ]
+    )
+    assert args.optimizer.train_gpu_observer_enabled is True
+    assert args.optimizer.train_gpu_observer_interval_sec == 0.5
+    assert args.optimizer.train_gpu_observer_output_path == "/tmp/rlpfn_gpu_samples.jsonl"
+    assert args.optimizer.train_gpu_stage_output_path == "/tmp/rlpfn_gpu_stages.jsonl"
+
+
+def test_cli_flag_is_set_detects_split_and_equals_forms():
+    assert _cli_flag_is_set(["rlpfn", "--policy-rollout-chunk-size", "1"], "--policy-rollout-chunk-size")
+    assert _cli_flag_is_set(["rlpfn", "--policy-rollout-chunk-size=1"], "--policy-rollout-chunk-size")
+    assert not _cli_flag_is_set(["rlpfn", "--batch-size", "8"], "--policy-rollout-chunk-size")
+
+
+def test_continue_run_cli_override_applies_policy_rollout_chunk_size():
+    config = {"optimizer": {"policy_rollout_chunk_size": 64}}
+    args = Namespace(optimizer=Namespace(policy_rollout_chunk_size=1))
+    argv = ["rlpfn", "--policy-rollout-chunk-size", "1"]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["policy_rollout_chunk_size"] == 1
+
+
+def test_continue_run_cli_override_keeps_old_chunk_size_when_flag_not_set():
+    config = {"optimizer": {"policy_rollout_chunk_size": 64}}
+    args = Namespace(optimizer=Namespace(policy_rollout_chunk_size=None))
+    argv = ["rlpfn", "--batch-size", "8"]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["policy_rollout_chunk_size"] == 64
+
+
+def test_continue_run_cli_override_applies_pg_tbptt_window():
+    config = {"optimizer": {"pg_tbptt_window": None}}
+    args = Namespace(optimizer=Namespace(pg_tbptt_window=128))
+    argv = ["rlpfn", "--pg-tbptt-window", "128"]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["pg_tbptt_window"] == 128
+
+
+def test_continue_run_cli_override_applies_train_profiler_flags():
+    config = {
+        "optimizer": {
+            "train_profiler_enabled": False,
+            "train_profiler_output_path": None,
+            "train_profiler_wandb": True,
+            "train_profiler_ema_alpha": 0.2,
+            "train_profiler_warmup_epochs": 0,
+            "train_profiler_warmup_batches": 0,
+            "train_profiler_log_every_batches": 0,
+        }
+    }
+    args = Namespace(
+        optimizer=Namespace(
+            train_profiler_enabled=True,
+            train_profiler_output_path="/tmp/profile.jsonl",
+            train_profiler_wandb=False,
+            train_profiler_ema_alpha=0.4,
+            train_profiler_warmup_epochs=3,
+            train_profiler_warmup_batches=11,
+            train_profiler_log_every_batches=2,
+        )
+    )
+    argv = [
+        "rlpfn",
+        "--train-profiler-enabled", "true",
+        "--train-profiler-output-path", "/tmp/profile.jsonl",
+        "--train-profiler-wandb", "false",
+        "--train-profiler-ema-alpha", "0.4",
+        "--train-profiler-warmup-epochs", "3",
+        "--train-profiler-warmup-batches", "11",
+        "--train-profiler-log-every-batches", "2",
+    ]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["train_profiler_enabled"] is True
+    assert out["optimizer"]["train_profiler_output_path"] == "/tmp/profile.jsonl"
+    assert out["optimizer"]["train_profiler_wandb"] is False
+    assert out["optimizer"]["train_profiler_ema_alpha"] == 0.4
+    assert out["optimizer"]["train_profiler_warmup_epochs"] == 3
+    assert out["optimizer"]["train_profiler_warmup_batches"] == 11
+    assert out["optimizer"]["train_profiler_log_every_batches"] == 2
+
+
+def test_continue_run_cli_override_applies_gpu_observer_flags():
+    config = {
+        "optimizer": {
+            "train_gpu_observer_enabled": False,
+            "train_gpu_observer_interval_sec": 1.0,
+            "train_gpu_observer_output_path": None,
+            "train_gpu_stage_output_path": None,
+        }
+    }
+    args = Namespace(
+        optimizer=Namespace(
+            train_gpu_observer_enabled=True,
+            train_gpu_observer_interval_sec=0.5,
+            train_gpu_observer_output_path="/tmp/gpu_samples.jsonl",
+            train_gpu_stage_output_path="/tmp/gpu_stages.jsonl",
+        )
+    )
+    argv = [
+        "rlpfn",
+        "--train-gpu-observer-enabled", "true",
+        "--train-gpu-observer-interval-sec", "0.5",
+        "--train-gpu-observer-output-path", "/tmp/gpu_samples.jsonl",
+        "--train-gpu-stage-output-path", "/tmp/gpu_stages.jsonl",
+    ]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["train_gpu_observer_enabled"] is True
+    assert out["optimizer"]["train_gpu_observer_interval_sec"] == 0.5
+    assert out["optimizer"]["train_gpu_observer_output_path"] == "/tmp/gpu_samples.jsonl"
+    assert out["optimizer"]["train_gpu_stage_output_path"] == "/tmp/gpu_stages.jsonl"

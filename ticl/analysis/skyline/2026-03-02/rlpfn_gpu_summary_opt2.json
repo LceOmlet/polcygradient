@@ -1,0 +1,42 @@
+{
+  "timestamp_unix": 1772384941.6187518,
+  "workload_id": "rlpfn_fit_e1s1",
+  "run_tag": "opt2_longrun",
+  "samples_summary": {
+    "samples": 2151,
+    "duration_sec": 1296.2358527183533,
+    "gpu_util": {
+      "avg": 20.13110181311018,
+      "p95": 27.0,
+      "max": 32.0,
+      "min": 3.0
+    },
+    "process_mem_mib": {
+      "avg": 46142.069735006975,
+      "p95": 47924.0,
+      "max": 47924.0,
+      "min": 500.0
+    },
+    "process_mem_share_percent": {
+      "avg": 93.899205809945,
+      "p95": 97.52543752543752,
+      "max": 97.52543752543752,
+      "min": 1.0175010175010175
+    },
+    "gpu_power_w": {
+      "avg": 93.97481636448164,
+      "p95": 96.4,
+      "max": 98.79,
+      "min": 40.57
+    }
+  },
+  "stages_summary": {
+    "stage_rows": 0,
+    "stages": {},
+    "batch_total_duration_sec": null
+  },
+  "source_files": {
+    "samples_jsonl": "/tmp/rlpfn_gpu_samples_opt2.jsonl",
+    "stages_jsonl": null
+  }
+}

@@ -23,12 +23,65 @@ from argparse import Namespace
 import pandas as pd
 import pdb
 
+
+def _merge_missing_keys(dst, src):
+    for k, v in src.items():
+        if k not in dst:
+            dst[k] = v
+        elif isinstance(dst.get(k), dict) and isinstance(v, dict):
+            _merge_missing_keys(dst[k], v)
+    return dst
+
+
+def _cli_flag_is_set(argv, flag):
+    if not argv:
+        return False
+    for tok in argv:
+        if tok == flag or str(tok).startswith(f"{flag}="):
+            return True
+    return False
+
+
+def _apply_continue_run_cli_overrides(config, args, argv):
+    # Continue-run keeps historical config semantics, but explicitly provided
+    # CLI safety knobs must override old checkpoint values.
+    if _cli_flag_is_set(argv, "--policy-rollout-chunk-size"):
+        if "optimizer" not in config:
+            config["optimizer"] = {}
+        config["optimizer"]["policy_rollout_chunk_size"] = args.optimizer.policy_rollout_chunk_size
+    if _cli_flag_is_set(argv, "--pg-tbptt-window"):
+        if "optimizer" not in config:
+            config["optimizer"] = {}
+        config["optimizer"]["pg_tbptt_window"] = args.optimizer.pg_tbptt_window
+    profiler_flags = (
+        ("--train-profiler-enabled", "train_profiler_enabled"),
+        ("--train-profiler-output-path", "train_profiler_output_path"),
+        ("--train-profiler-wandb", "train_profiler_wandb"),
+        ("--train-profiler-ema-alpha", "train_profiler_ema_alpha"),
+        ("--train-profiler-warmup-epochs", "train_profiler_warmup_epochs"),
+        ("--train-profiler-warmup-batches", "train_profiler_warmup_batches"),
+        ("--train-profiler-log-every-batches", "train_profiler_log_every_batches"),
+        ("--train-gpu-observer-enabled", "train_gpu_observer_enabled"),
+        ("--train-gpu-observer-interval-sec", "train_gpu_observer_interval_sec"),
+        ("--train-gpu-observer-output-path", "train_gpu_observer_output_path"),
+        ("--train-gpu-stage-output-path", "train_gpu_stage_output_path"),
+    )
+    for flag, key in profiler_flags:
+        if _cli_flag_is_set(argv, flag):
+            if "optimizer" not in config:
+                config["optimizer"] = {}
+            config["optimizer"][key] = getattr(args.optimizer, key)
+    return config
+
+
 def main(argv, extra_config=None):
     # extra config is used for testing purposes only
     # this is the generic entry point for training any model, so it has A LOT of options
     parser = make_model_level_argparser()
     args = parser.parse_args(args=argv or ['--help'])
-    model = args.linear_attention.model if 'linear_attention' in args.model_type else None
+    model = None
+    if hasattr(args, "linear_attention") and hasattr(args.linear_attention, "model"):
+        model = args.linear_attention.model
     config = get_model_default_config(args.model_type, model)
 
     device, rank, num_gpus = init_device(args.general.gpu_id, args.general.use_cpu)
@@ -76,7 +129,8 @@ def main(argv, extra_config=None):
         print('Setting regression parameters')
         config['prior']['classification']['max_num_classes'] = 0
         config[attention_type]['y_encoder'] = 'linear'
-        config['mothernet']['decoder_type'] = 'average'
+        if 'mothernet' in config:
+            config['mothernet']['decoder_type'] = 'average'
 
     warm_start_weights = orchestration.warm_start_from
     config[attention_type]['nhead'] = config[attention_type]['emsize'] // 128
@@ -101,6 +155,10 @@ def main(argv, extra_config=None):
         model_state = {k.replace(module_prefix, ''): v for k, v in model_state.items()}
         if args.orchestration.continue_run:
             config = old_config
+            # Forward compatibility: keep old run semantics, but fill newly
+            # introduced defaults so safety knobs (e.g. rollout chunking) exist.
+            new_defaults = get_model_default_config(args.model_type, model)
+            _merge_missing_keys(config, new_defaults)
             # we want to overwrite specific parts of the old config with current values
             config['device'] = device
             config['orchestration']['warm_start_from'] = warm_start_weights
@@ -109,6 +167,17 @@ def main(argv, extra_config=None):
             config['orchestration']['stop_after_epochs'] = args.orchestration.stop_after_epochs
             if not args.orchestration.restart_scheduler:
                 scheduler = old_scheduler
+            _apply_continue_run_cli_overrides(config, args, argv)
+            if _cli_flag_is_set(argv, "--policy-rollout-chunk-size"):
+                print(
+                    "[continue-run-override] policy_rollout_chunk_size set from CLI to",
+                    config["optimizer"]["policy_rollout_chunk_size"],
+                )
+            if _cli_flag_is_set(argv, "--pg-tbptt-window"):
+                print(
+                    "[continue-run-override] pg_tbptt_window set from CLI to",
+                    config["optimizer"]["pg_tbptt_window"],
+                )
         else:
             print("WARNING warm starting with new settings")
             compare_dicts(config, old_config)

@@ -27,7 +27,7 @@ def get_criterion(max_num_classes):
     if max_num_classes == 0:
         loss = nn.MSELoss(reduction='none')
     elif max_num_classes == 2:
-        loss = nn.BCEWthLogitsLoss(reduction='none')
+        loss = nn.BCEWithLogitsLoss(reduction='none')
     elif max_num_classes > 2:
         loss = nn.CrossEntropyLoss(reduction='none')
     else:
@@ -246,7 +246,7 @@ def get_model(
         model = MotherNetAdditive(
             n_out=n_out, n_features=n_features,
             y_encoder_layer=y_encoder, **config['transformer'], **config['mothernet'], **config['additive'])
-    elif model_type == "tabpfn":
+    elif model_type in ["tabpfn", "rlpfn"]:
         model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **config['transformer'])
     elif model_type == "batabpfn":
         # FIXME hack

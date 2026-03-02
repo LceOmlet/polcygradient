@@ -1,0 +1,52 @@
+{
+  "approx_wall_breakdown": {
+    "env_pct": 55.91193170633091,
+    "env_sec": 6.370975020021433,
+    "other_pct": 43.87513601535844,
+    "other_sec": 4.999422967928695,
+    "policy_pct": 0.21293227831065137,
+    "policy_sec": 0.024262911058031023
+  },
+  "batch_size": 8,
+  "device": "cuda",
+  "env_structure": {
+    "family_counts": {
+      "gp": 5,
+      "scm": 3
+    },
+    "max_group": 1,
+    "unique": 8
+  },
+  "grouping": "family",
+  "n_samples": 1024,
+  "policy_calls": {
+    "batch_size_hist": {
+      "8": 1024
+    },
+    "total": 1024,
+    "wall_sec": 0.024262911058031023
+  },
+  "policy_mode": "zero",
+  "repeats": 1,
+  "rollout_wall_sec": {
+    "mean": 11.394660899008159,
+    "p50": 11.394660899008159,
+    "p90": 11.394660899008159
+  },
+  "seed": 1234,
+  "single_eval_pos": 972,
+  "transition_groups": {
+    "mean_group_size": 2.0,
+    "p50": 1.0,
+    "p90": 3.8000000000000007,
+    "total": 4
+  },
+  "x_generator": {
+    "calls": 4096,
+    "wall_sec": 3.1488225181237794
+  },
+  "y_generator": {
+    "calls": 4096,
+    "wall_sec": 3.2221525018976536
+  }
+}

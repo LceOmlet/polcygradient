@@ -6,6 +6,38 @@ from ticl.config_utils import merge_dicts
 def get_optimizer_config():
     optimizer = {
         "aggregate_k_gradients": 1,
+        "rl_objective": "supervised",
+        "policy_rollout_chunk_size": None,
+        "policy_rollout_checkpoint": False,
+        "policy_rollout_checkpoint_reentrant": False,
+        "policy_rollout_chunk_autotune": True,
+        "policy_rollout_chunk_grow_every": 8,
+        "policy_rollout_chunk_grow_factor": 2.0,
+        "pg_grad_mutable_kv_cache": False,
+        "pg_saved_tensors_cpu_offload": False,
+        "pg_saved_tensors_pin_memory": True,
+        "pg_oom_debug_raise": False,
+        "pg_kv_cache_mode": "auto",
+        "pg_kv_cache_page_size": None,
+        "pg_tbptt_window": None,
+        "pg_oom_reduce_tbptt_first": False,
+        "pg_torch_compile": False,
+        "pg_torch_compile_backend": "inductor",
+        "pg_torch_compile_mode": "reduce-overhead",
+        "pg_torch_compile_fullgraph": False,
+        "pg_torch_compile_dynamic": False,
+        "adamw_fused": True,
+        "train_profiler_enabled": False,
+        "train_profiler_output_path": None,
+        "train_profiler_wandb": True,
+        "train_profiler_ema_alpha": 0.2,
+        "train_profiler_warmup_epochs": 0,
+        "train_profiler_warmup_batches": 0,
+        "train_profiler_log_every_batches": 0,
+        "train_gpu_observer_enabled": False,
+        "train_gpu_observer_interval_sec": 1.0,
+        "train_gpu_observer_output_path": None,
+        "train_gpu_stage_output_path": None,
         "learning_rate": 0.00003,
         "epochs": 4000,
         "train_mixed_precision": True,
@@ -36,8 +68,16 @@ def get_transformer_config():
         'y_encoder': "one_hot",
         'classification_task': True,
         'efficient_eval_masking': True,
+        # single-directional attention for single-eval masking path
+        'single_eval_causal': False,
         'input_normalization': False,
         'tabpfn_zero_weights': True,
+        # x encoder layout:
+        # - "single": one linear encoder over full num_features
+        # - "split_obs_action": two heads (obs/reward/mask + action)
+        'x_encoder_type': 'single',
+        'x_obs_dim': None,
+        'x_action_dim': None,
     #    'model': 'standard_attention',
     }
     return {'transformer': transformer}
@@ -118,6 +158,70 @@ def get_prior_config(max_features=100, n_samples=1024+128):
 
     prior['gp'] = gp_prior_config
 
+    environment_prior_config = {
+        # Family sampling: SCM-style MLP or GP-style random features.
+        "family": {"distribution": "meta_choice", "choice_values": ["scm", "gp"]},
+        # Required randomization ranges.
+        "action_dim": {"distribution": "uniform_int", "min": 1, "max": 30},
+        "state_dim": {"distribution": "uniform_int", "min": 1, "max": 400},
+        "obs_dim": {"distribution": "uniform_int", "min": 1, "max": 400},
+        "noise_dim": {"distribution": "uniform_int", "min": 1, "max": 64},
+        "zero_pad_dim": {"distribution": "uniform_int", "min": 0, "max": 400},
+        # Fixed token slots for PFN input:
+        # head-1 uses [s_t(obs slot), r_t, r_mask_t] => 402 dims by default.
+        # head-2 uses [a_t] => 30 dims by default.
+        "obs_slot_dim": 400,
+        "action_slot_dim": 30,
+        # Reward dropout for sparse-reward simulation.
+        "reward_dropout_enabled": True,
+        "reward_dropout_randomize": True,
+        "reward_dropout_ratio": 0.0,
+        "reward_dropout_ratio_min": 0.1,
+        "reward_dropout_ratio_max": 1.0,
+        "reward_dropout_impute_zero": True,
+        # Parallel generation across independent batch columns in get_batch().
+        "batch_parallel_workers": 4,
+        # Backend for per-column batch generation:
+        # - "python_thread": legacy ThreadPoolExecutor path
+        # - "torch_vectorized": torch tensorized rollout path (no python thread pool)
+        "batch_parallel_backend": "python_thread",
+        # Whether all columns in a batch share one sampled environment function family.
+        # This is required for strict tensorized vectorization.
+        "batch_shared_environment": False,
+        # When True, torch_vectorized path matches serial per-column RNG streams exactly.
+        # This is primarily for semantic A/B tests and is slower than the default fast path.
+        "batch_vectorized_strict_rng_match": False,
+        # Vectorized grouping for policy rollout:
+        # - "structure": strict homogeneous grouping (legacy behavior)
+        # - "family": coarser grouping for larger batched policy steps
+        "batch_vectorized_grouping": "structure",
+        # Rollout/randomization knobs.
+        "alpha": {"distribution": "uniform", "min": 0.05, "max": 0.35},
+        "init_state_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
+        "init_action_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
+        "state_noise_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
+        "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
+        "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.1},
+        "reward_scale": {"distribution": "log_uniform", "min": 1e-3, "max": 4.0},
+        "state_clip": 8.0,
+        # Policy-gradient stability knobs for differentiable rollout.
+        "reward_norm_eps": 1e-6,
+        "reward_norm_clip": 10.0,
+        "discount": 1.0,
+        # SCM (aligned with priors/mlp.py names).
+        "num_layers": {"distribution": "meta_gamma", "max_alpha": 2, "max_scale": 3, "round": True, "lower_bound": 2},
+        "prior_mlp_hidden_dim": {"distribution": "meta_gamma", "max_alpha": 3, "max_scale": 128, "round": True, "lower_bound": 8},
+        "prior_mlp_activations": {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity]},
+        "init_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
+        "noise_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
+        # GP (aligned with priors/fast_gp.py names).
+        "lengthscale": {"distribution": "log_uniform", "min": 1e-5, "max": 8},
+        "outputscale": {"distribution": "log_uniform", "min": 1e-5, "max": 8},
+        "noise": {"distribution": "meta_choice", "choice_values": [0.00001, 0.0001, 0.01]},
+        "gp_rff_features": {"distribution": "uniform_int", "min": 32, "max": 256},
+    }
+    prior['environment'] = environment_prior_config
+
     prior['step_function'] = {
         'max_steps': 1,
         'sampling': 'uniform',
@@ -143,8 +247,8 @@ def get_prior_config(max_features=100, n_samples=1024+128):
     prior['classification'] = classsification_prior
 
     dataloader = {
-        "batch_size": 8,
-        "num_steps": 8192,
+        "batch_size": 8 ,
+        "num_steps": 8192 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
         'n_test_samples': 0,
@@ -256,6 +360,86 @@ def get_tabpfn_default_config():
     config = get_shared_defaults()
     return config
 
+def get_rlpfn_default_config():
+    # RLPFN uses EnvironmentPrior directly with a split x-encoder:
+    # - obs/reward/mask head: 402 dims (400 + 1 + 1)
+    # - action head: 30 dims
+    config = get_shared_defaults()
+    config['prior']['prior_type'] = 'environment_only'
+    config['prior']['num_features'] = 432
+    # RLPFN default rollout horizon.
+    config['prior']['n_samples'] = 1024
+
+    env_cfg = config['prior']['environment']
+    env_cfg.update({
+        "obs_slot_dim": 400,
+        "action_slot_dim": 30,
+        "reward_dropout_enabled": True,
+        "reward_dropout_randomize": True,
+        "reward_dropout_ratio_min": 0.1,
+        "reward_dropout_ratio_max": 1.0,
+        "reward_dropout_impute_zero": True,
+        "batch_parallel_backend": "torch_vectorized",
+        "batch_shared_environment": False,
+        "batch_vectorized_grouping": "family",
+    })
+
+    # Keep a strict fixed feature width for split heads.
+    config['prior']['classification']['num_features_sampler'] = 'fixed'
+    config['prior']['classification']['pad_zeros'] = False
+    config['prior']['classification']['max_num_classes'] = 0
+    config['transformer']['classification_task'] = False
+    config['transformer']['y_encoder'] = 'linear'
+    config['transformer']['x_encoder_type'] = 'split_obs_action'
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
+    config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
+    config['transformer']['single_eval_causal'] = True
+    config['optimizer']['rl_objective'] = 'policy_gradient'
+    # Policy-gradient rollout chunking over batch columns.
+    # None means full-batch rollout chunk (max parallel width).
+    config['optimizer']['policy_rollout_chunk_size'] = None
+    # Recompute rollout forward during backward to reduce peak training memory.
+    # Semantics are preserved (same sampled environments via RNG state restore),
+    # with extra compute overhead.
+    config['optimizer']['policy_rollout_checkpoint'] = True
+    # Use reentrant checkpoint by default for rollout: it avoids building/storing
+    # the full inner autograd graph during forward.
+    config['optimizer']['policy_rollout_checkpoint_reentrant'] = True
+    # Enable grad-mutable KV cache on paged mode (stable default).
+    config['optimizer']['pg_grad_mutable_kv_cache'] = True
+    config['optimizer']['pg_kv_cache_mode'] = "paged"
+    config['optimizer']['pg_kv_cache_page_size'] = 128
+    # Keep rollout chunk fixed by default.
+    config['optimizer']['policy_rollout_chunk_autotune'] = False
+    config['optimizer']['policy_rollout_chunk_grow_every'] = 8
+    config['optimizer']['policy_rollout_chunk_grow_factor'] = 2.0
+    # Keep PG path on eager by default for stable startup latency; compile can be
+    # enabled explicitly when throughput profiling confirms a net gain.
+    config['optimizer']['pg_torch_compile'] = False
+    # Keep profiler opt-in by default so first-run training remains feasible.
+    config['optimizer']['train_profiler_enabled'] = False
+    config['optimizer']['train_profiler_output_path'] = None
+    config['optimizer']['train_profiler_wandb'] = True
+    config['optimizer']['train_profiler_ema_alpha'] = 0.2
+    config['optimizer']['train_profiler_warmup_epochs'] = 0
+    config['optimizer']['train_profiler_warmup_batches'] = 0
+    config['optimizer']['train_profiler_log_every_batches'] = 0
+    config['optimizer']['train_gpu_observer_enabled'] = False
+    config['optimizer']['train_gpu_observer_interval_sec'] = 1.0
+    config['optimizer']['train_gpu_observer_output_path'] = None
+    config['optimizer']['train_gpu_stage_output_path'] = None
+    # With reentrant rollout checkpoint defaulted on, saved-tensor CPU offload is
+    # not needed by default and can otherwise shift pressure to host RAM.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
+    # Enable TBPTT by default for memory/throughput tradeoff.
+    config['optimizer']['pg_tbptt_window'] = 128
+    # Keep rollout batch parallel width as large as possible under OOM:
+    # shrink TBPTT window first before shrinking rollout chunk.
+    config['optimizer']['pg_oom_reduce_tbptt_first'] = True
+    # Allow automatic OOM recovery (TBPTT/chunk shrink) by default.
+    config['optimizer']['pg_oom_debug_raise'] = False
+    return config
+
 
 def get_batabpfn_default_config():
     config = get_shared_defaults()
@@ -280,6 +464,8 @@ def get_model_default_config(model_type, model = None):
         config = get_batabpfn_default_config()
     elif model_type == 'tabpfn':
         config = get_tabpfn_default_config()
+    elif model_type == 'rlpfn':
+        config = get_rlpfn_default_config()
     elif model_type == 'additive':
         config = get_additive_default_config()
     elif model_type == 'baam':

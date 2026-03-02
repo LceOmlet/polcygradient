@@ -26,16 +26,20 @@ class PriorDataLoader(DataLoader):
             raise ValueError("random_n_samples and test_samples must be set together.")
         
         self.prior = prior
-        self.num_steps = num_steps
-        self.batch_size = batch_size
+        self.num_steps = int(num_steps)
+        if self.num_steps <= 0:
+            raise ValueError(f"num_steps must be positive, got {num_steps}")
+        self.batch_size = int(batch_size)
+        if self.batch_size <= 0:
+            raise ValueError(f"batch_size must be positive, got {batch_size}")
         self.min_eval_pos = min_eval_pos
 
         self.random_n_samples = random_n_samples
         if random_n_samples:
-            self.n_samples = np.random.randint(min_eval_pos, random_n_samples)
+            self.n_samples = int(np.random.randint(min_eval_pos, random_n_samples))
             self.n_test_samples = n_test_samples
         else:
-            self.n_samples = n_samples
+            self.n_samples = int(n_samples)
         self.device = device
         self.num_features = num_features
         self.epoch_count = 0
@@ -87,11 +91,14 @@ def get_dataloader(prior_config, dataloader_config, device, model = None):
     prior_type = prior_config['prior_type']
     gp_flexible = ClassificationAdapterPrior(priors.GPPrior(prior_config['gp']), num_features=prior_config['num_features'], **prior_config['classification'])
     mlp_flexible = ClassificationAdapterPrior(priors.MLPPrior(prior_config['mlp']), num_features=prior_config['num_features'], **prior_config['classification'])
+    env_flexible = ClassificationAdapterPrior(priors.EnvironmentPrior(prior_config['environment']), num_features=prior_config['num_features'], **prior_config['classification'])
 
     if prior_type == 'prior_bag':
         # Prior bag combines priors
         prior = BagPrior(base_priors={'gp': gp_flexible, 'mlp': mlp_flexible},
                          prior_weights={'mlp': 0.961, 'gp': 0.039})
+    elif prior_type == "environment_only":
+        prior = env_flexible
     elif prior_type == "step_function":
         prior = priors.StepFunctionPrior(prior_config['step_function'])
     elif prior_type == "boolean_only":

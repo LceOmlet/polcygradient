@@ -56,7 +56,7 @@ def test_get_dataloader_base_config():
 @pytest.mark.parametrize("batch_size", [16, 32])
 @pytest.mark.parametrize("n_samples", [7, 256, 512, 2200])
 @pytest.mark.parametrize("n_features", [5, 15, 100, 200, 311])
-@pytest.mark.parametrize("prior_type", ["prior_bag", "boolean_only", "bag_boolean"])
+@pytest.mark.parametrize("prior_type", ["prior_bag", "environment_only", "boolean_only", "bag_boolean"])
 def test_get_dataloader_parameters_passed(batch_size, n_samples, n_features, prior_type):
     L.seed_everything(42)
     config = get_prior_config()

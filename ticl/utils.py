@@ -1,4 +1,5 @@
 import datetime
+import json
 import os
 import random
 import shutil
@@ -17,6 +18,8 @@ from torch.optim.optimizer import Optimizer
 from ticl.model_configs import get_model_default_config
 from ticl.config_utils import flatten_dict
 import itertools
+
+from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
 
 class DownloadProgressBar(tqdm):
     def update_to(self, b=1, bsize=1, tsize=None):
@@ -398,6 +401,38 @@ def get_model_string(config, num_gpus, device, parser):
     return model_string
 
 
+def _load_checkpoint_metric_map(path):
+    if not os.path.exists(path):
+        return {"metric": None, "mode": None, "scores": {}}
+    try:
+        with open(path, "r") as f:
+            data = json.load(f)
+        if not isinstance(data, dict):
+            return {"metric": None, "mode": None, "scores": {}}
+        scores = data.get("scores", {})
+        if not isinstance(scores, dict):
+            scores = {}
+        return {
+            "metric": data.get("metric"),
+            "mode": data.get("mode"),
+            "scores": {str(k): float(v) for k, v in scores.items()},
+        }
+    except Exception:
+        return {"metric": None, "mode": None, "scores": {}}
+
+
+def _save_checkpoint_metric_map(path, data):
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "w") as f:
+        json.dump(data, f, indent=2, sort_keys=True)
+
+
+def _checkpoint_is_better(mode, lhs, rhs):
+    if mode == "max":
+        return float(lhs) > float(rhs)
+    return float(lhs) < float(rhs)
+
+
 def make_training_callback(
     save_every, 
     model_string, 
@@ -422,7 +457,10 @@ def make_training_callback(
         try:
             os.makedirs(f"{base_path}/log", exist_ok=True)
             with open(log_file, 'a') as f:
-                f.write(f'Epoch {epoch} loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
+                if config.get("model_type") == "rlpfn":
+                    f.write(f'Epoch {epoch} train_loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
+                else:
+                    f.write(f'Epoch {epoch} loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
         except Exception as e:
             print(f'Failed to write to log file {log_file}: {e}')
 
@@ -439,7 +477,10 @@ def make_training_callback(
                            "wallclock_ticker": wallclock_ticker, "epoch": epoch})
             if report is not None:
                 # synetune callback
-                report(epoch=epoch, loss=model.losses[-1], wallclock_time=wallclock_ticker)  # every 5 minutes
+                if config.get("model_type") == "rlpfn":
+                    report(epoch=epoch, train_loss=model.losses[-1], wallclock_time=wallclock_ticker)
+                else:
+                    report(epoch=epoch, loss=model.losses[-1], wallclock_time=wallclock_ticker)  # every 5 minutes
 
         if (epoch == "on_exit") or epoch % save_every == 0:
             if checkpoint_dir is not None:
@@ -473,6 +514,8 @@ def make_training_callback(
 
             if epoch != "on_exit":
                 inference_time = None
+                validation_score = None
+                per_dataset_score = {}
                 if on_cuda:
                     gpu_start_time = torch.cuda.Event(enable_timing=True)
                     gpu_end_time = torch.cuda.Event(enable_timing=True)
@@ -494,12 +537,32 @@ def make_training_callback(
                     else:
                         gpu_inference_time = 0
 
-                    print(f"Validation score: {validation_score}")
+                    if config.get("model_type") == "rlpfn":
+                        print(f"[ext-rl] mean_return_all={validation_score}")
+                        try:
+                            with open(log_file, "a") as f:
+                                f.write(f"Epoch {epoch} mean_return_all {validation_score}\n")
+                        except Exception:
+                            pass
+                    else:
+                        print(f"Validation score: {validation_score}")
 
                     if use_mlflow:
-                        mlflow.log_metric(key="val_score", value=validation_score, step=epoch)
+                        if np.isfinite(float(validation_score)):
+                            if config.get("model_type") == "rlpfn":
+                                mlflow.log_metric(key="mean_return_all", value=float(validation_score), step=epoch)
+                            mlflow.log_metric(key="val_score", value=float(validation_score), step=epoch)
                         for dataset, score in per_dataset_score.items():
-                            mlflow.log_metric(key=f"val_score_{dataset}", value=score, step=epoch)
+                            if isinstance(score, dict):
+                                for sub_key, sub_val in score.items():
+                                    if isinstance(sub_val, (int, float)) and np.isfinite(float(sub_val)):
+                                        mlflow.log_metric(
+                                            key=f"val_score_{dataset}_{sub_key}",
+                                            value=float(sub_val),
+                                            step=epoch,
+                                        )
+                            elif isinstance(score, (int, float)) and np.isfinite(float(score)):
+                                mlflow.log_metric(key=f"val_score_{dataset}", value=float(score), step=epoch)
                             
                     if wandb.run is not None:
                         val_metrics = {
@@ -508,26 +571,79 @@ def make_training_callback(
                             'inference_time': inference_time,
                             'gpu_inference_time': gpu_inference_time,
                         }
+                        if config.get("model_type") == "rlpfn":
+                            val_metrics["mean_return_all"] = validation_score
                         
                         for dataset, score in per_dataset_score.items():
-                            val_metrics[f"val_score_{dataset}"] = score
-                        wandb.log(val_metrics)
-                # remove checkpoints that are worse than current
-                if epoch - save_every > 0:
-                    this_loss = model.losses[-1]
-                    for i in range(epoch // save_every):
-                        loss = model.losses[i * save_every - 1]  # -1 because we start at epoch 1
-                        old_file_name = f'{base_path}/models_diff/{model_string}_epoch_{i * save_every}.cpkt'
-                        if os.path.exists(old_file_name):
-                            if loss > this_loss:
-                                try:
-                                    print(f"Removing old model file {old_file_name}")
-                                    os.remove(old_file_name)
-                                except Exception as e:
-                                    print(f"Failed to remove old model file {old_file_name}: {e}")
+                            if isinstance(score, dict):
+                                for sub_key, sub_val in score.items():
+                                    val_metrics[f"val_score_{dataset}_{sub_key}"] = sub_val
                             else:
-                                print(f"Not removing old model file {old_file_name} because loss is too high ({loss} < {this_loss})")
+                                val_metrics[f"val_score_{dataset}"] = score
+                        wandb.log(val_metrics)
+
+                metric_name = "loss"
+                metric_mode = "min"
+                metric_value = float(model.losses[-1])
+                if (
+                    config.get("model_type") == "rlpfn"
+                    and validate
+                    and validation_score is not None
+                    and np.isfinite(float(validation_score))
+                ):
+                    metric_name = "mean_return"
+                    metric_mode = "max"
+                    metric_value = float(validation_score)
+
+                if checkpoint_dir is None and os.path.exists(file_name):
+                    metric_map_path = f"{base_path}/models_diff/checkpoint_metrics.json"
+                    metric_map = _load_checkpoint_metric_map(metric_map_path)
+                    if metric_map.get("metric") != metric_name or metric_map.get("mode") != metric_mode:
+                        metric_map = {"metric": metric_name, "mode": metric_mode, "scores": {}}
+
+                    # Keep only entries that still exist on disk (resume-safe).
+                    cleaned_scores = {
+                        ckpt: score
+                        for ckpt, score in metric_map.get("scores", {}).items()
+                        if os.path.exists(ckpt)
+                    }
+                    metric_map = {"metric": metric_name, "mode": metric_mode, "scores": cleaned_scores}
+                    metric_map["scores"][file_name] = metric_value
+
+                    to_remove = []
+                    for old_ckpt, old_score in metric_map["scores"].items():
+                        if old_ckpt == file_name:
+                            continue
+                        if _checkpoint_is_better(metric_mode, metric_value, old_score):
+                            to_remove.append(old_ckpt)
+
+                    for old_ckpt in to_remove:
+                        try:
+                            if os.path.exists(old_ckpt):
+                                print(
+                                    f"Removing old checkpoint {old_ckpt} "
+                                    f"({metric_name}={metric_map['scores'][old_ckpt]:.6f})"
+                                )
+                                os.remove(old_ckpt)
+                        except Exception as e:
+                            print(f"Failed to remove old checkpoint {old_ckpt}: {e}")
+                        metric_map["scores"].pop(old_ckpt, None)
+
+                    _save_checkpoint_metric_map(metric_map_path, metric_map)
+                    try:
+                        with open(log_file, "a") as f:
+                            f.write(
+                                f"checkpoint_metric epoch={epoch} name={metric_name} mode={metric_mode} "
+                                f"value={metric_value:.6f}\n"
+                            )
+                    except Exception:
+                        pass
                 if validate: 
+                    if config.get("model_type") == "rlpfn":
+                        return {
+                            "inference_time": inference_time,
+                            "mean_return_all": validation_score,
+                        }
                     return inference_time
 
     return save_callback
@@ -572,6 +688,12 @@ def get_init_method(init_method):
 
 
 def validate_model(model, config):
+    if config.get("model_type") == "rlpfn":
+        enabled = bool(config.get("orchestration", {}).get("rl_validate_enabled", True))
+        if not enabled:
+            return float("nan"), {}
+        return evaluate_rlpfn_on_gym_envs(model=model, config=config)
+
     from ticl.datasets import load_openml_list, open_cc_valid_dids, open_cc_valid_dids_regression, open_cc_large_dids, new_valid_dids
 
     from ticl.models.gamformer import GAMformer

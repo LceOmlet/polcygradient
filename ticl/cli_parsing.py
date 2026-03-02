@@ -1,6 +1,7 @@
 import argparse
 from ticl.config_utils import str2bool
 from ticl.model_configs import get_model_default_config
+from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
 
 
 class GroupedArgParser(argparse.ArgumentParser):
@@ -43,6 +44,10 @@ def make_model_level_argparser(description="Train transformer-style model on syn
     tabpfn_parser.set_defaults(model_type='tabpfn')
     tabpfn_parser = argparser_from_config(description="Train tabpfn", parser=tabpfn_parser)
 
+    rlpfn_parser = subparsers.add_parser('rlpfn', help='Train an rlpfn model')
+    rlpfn_parser.set_defaults(model_type='rlpfn')
+    rlpfn_parser = argparser_from_config(description="Train rlpfn", parser=rlpfn_parser)
+
     additive_parser = subparsers.add_parser('additive', help='Train an additive mothernet model')
     additive_parser.set_defaults(model_type='additive')
     additive_parser = argparser_from_config(description="Train additive", parser=additive_parser)
@@ -82,6 +87,70 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient'],
+                           help='Training objective for RL-style models.')
+    optimizer.add_argument('--policy-rollout-chunk-size', type=int,
+                           help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')
+    optimizer.add_argument('--policy-rollout-chunk-autotune', type=str2bool,
+                           help='Auto-tune policy rollout chunk size after OOM by gradually growing it back on stable batches.')
+    optimizer.add_argument('--policy-rollout-chunk-grow-every', type=int,
+                           help='When chunk auto-tune is enabled, number of stable batches before growing chunk size.')
+    optimizer.add_argument('--policy-rollout-chunk-grow-factor', type=float,
+                           help='When chunk auto-tune is enabled, multiplicative factor for chunk-size growth.')
+    optimizer.add_argument('--policy-rollout-checkpoint', type=str2bool,
+                           help='Enable activation checkpointing for policy-gradient rollout chunks (recompute forward in backward to reduce peak memory).')
+    optimizer.add_argument('--policy-rollout-checkpoint-reentrant', type=str2bool,
+                           help='Use reentrant checkpoint for rollout chunks (typically lower memory, higher recompute overhead).')
+    optimizer.add_argument('--pg-grad-mutable-kv-cache', type=str2bool,
+                           help='Allow grad-enabled mutable KV cache during policy-gradient rollout (typically with paged mode). Only active with rollout checkpoint.')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload', type=str2bool,
+                           help='Offload autograd saved tensors to CPU during policy-gradient rollout (lower GPU memory, slower).')
+    optimizer.add_argument('--pg-saved-tensors-pin-memory', type=str2bool,
+                           help='When CPU-offloading saved tensors, use pinned host memory for faster H2D transfers.')
+    optimizer.add_argument('--pg-oom-debug-raise', type=str2bool,
+                           help='When true, re-raise policy-gradient OOM exceptions immediately for full traceback debugging.')
+    optimizer.add_argument('--pg-kv-cache-mode', type=str, choices=['auto', 'immutable', 'static', 'paged'],
+                           help='KV-cache mode used by policy forward_step during policy-gradient rollout.')
+    optimizer.add_argument('--pg-kv-cache-page-size', type=int,
+                           help='Paged KV-cache page size for policy-gradient rollout when pg-kv-cache-mode=paged.')
+    optimizer.add_argument('--pg-tbptt-window', type=int,
+                           help='Truncated-BPTT window length over rollout time steps; None/<=0 keeps full-horizon policy-gradient semantics.')
+    optimizer.add_argument('--pg-oom-reduce-tbptt-first', type=str2bool,
+                           help='When policy-gradient OOM fallback is enabled, reduce TBPTT window before shrinking rollout chunk size.')
+    optimizer.add_argument('--pg-torch-compile', type=str2bool,
+                           help='Compile policy step forward with torch.compile for policy-gradient training.')
+    optimizer.add_argument('--pg-torch-compile-backend', type=str,
+                           help='torch.compile backend for policy step (e.g., inductor, eager).')
+    optimizer.add_argument('--pg-torch-compile-mode', type=str,
+                           help='torch.compile mode for policy step (e.g., reduce-overhead, max-autotune).')
+    optimizer.add_argument('--pg-torch-compile-fullgraph', type=str2bool,
+                           help='Use fullgraph mode when compiling policy step.')
+    optimizer.add_argument('--pg-torch-compile-dynamic', type=str2bool,
+                           help='Enable dynamic-shape compile for policy step.')
+    optimizer.add_argument('--adamw-fused', type=str2bool,
+                           help='Use fused AdamW on CUDA when supported.')
+    optimizer.add_argument('--train-profiler-enabled', type=str2bool,
+                           help='Enable structured per-epoch training profiler.')
+    optimizer.add_argument('--train-profiler-output-path', type=str,
+                           help='Optional JSONL output path for training profiler records.')
+    optimizer.add_argument('--train-profiler-wandb', type=str2bool,
+                           help='When profiler is enabled, log profiler records to wandb with profile/* keys.')
+    optimizer.add_argument('--train-profiler-ema-alpha', type=float,
+                           help='EMA alpha for smoothed profiler throughput metrics.')
+    optimizer.add_argument('--train-profiler-warmup-epochs', type=int,
+                           help='Number of initial epochs excluded from EMA smoothing.')
+    optimizer.add_argument('--train-profiler-warmup-batches', type=int,
+                           help='Number of initial batches excluded from EMA smoothing.')
+    optimizer.add_argument('--train-profiler-log-every-batches', type=int,
+                           help='Emit interval profiler records every N batches (0 disables interval records).')
+    optimizer.add_argument('--train-gpu-observer-enabled', type=str2bool,
+                           help='Enable background GPU observer sampling for per-batch/stage JSONL observability.')
+    optimizer.add_argument('--train-gpu-observer-interval-sec', type=float,
+                           help='Sampling period in seconds for GPU observer.')
+    optimizer.add_argument('--train-gpu-observer-output-path', type=str,
+                           help='Optional JSONL output path for raw GPU observer samples.')
+    optimizer.add_argument('--train-gpu-stage-output-path', type=str,
+                           help='Optional JSONL output path for stage-window GPU observer records.')
     optimizer.add_argument('-A', '--adaptive-batch-size', help='Wether to progressively increase effective batch size.',
                            type=str2bool)
     optimizer.add_argument('-w', '--weight-decay', type=float, help='Weight decay for AdamW.')
@@ -118,6 +187,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
         transformer.add_argument('--tabpfn-zero-weights', help='Whether to use zeroing of weights from tabpfn code.', type=str2bool)
         transformer.add_argument('--pre-norm', action='store_true')
         transformer.add_argument('--classification-task', type=str2bool, help='Whether to use classification or regression.')
+        transformer.add_argument('--x-encoder-type', choices=['single', 'split_obs_action'],
+                                 help='X encoder layout: single head or split obs/action heads.')
+        transformer.add_argument('--x-obs-dim', type=int, help='Input width for obs/reward/mask head when using split encoder.')
+        transformer.add_argument('--x-action-dim', type=int, help='Input width for action head when using split encoder.')
+        transformer.add_argument('--single-eval-causal', type=str2bool,
+                                 help='Enable causal single-eval path with KV-cache inference.')
         transformer.set_defaults(**config['transformer'])
     elif 'linear_attention' in config:
         linear_attention = parser.add_argument_group('linear_attention')
@@ -191,12 +266,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
     prior = parser.add_argument_group('prior')
     prior.add_argument('--num-features', help="Maximum number of features in prior", type=int)
     prior.add_argument('--n-samples', help="Maximum Number of samples in prior", type=int)
-    prior.add_argument('--prior-type', help="Which prior to use, available ['prior_bag', 'boolean_only', 'bag_boolean', 'step_function'].", type=str)
+    prior.add_argument('--prior-type', help="Which prior to use, available ['prior_bag', 'environment_only', 'boolean_only', 'bag_boolean', 'step_function'].", type=str)
     prior.set_defaults(**config['prior'])
 
     classification_prior = parser.add_argument_group('prior.classification')
     classification_prior.add_argument('--multiclass-type', help="Which multiclass prior to use ['steps', 'rank'].", type=str)
-    classification_prior.add_argument('--num-features-sampler', help="How to sample number of features, 'uniform', 'double_sample'. ", type=str)
+    classification_prior.add_argument('--num-features-sampler', help="How to sample number of features, 'fixed', 'uniform', or 'double_sample'. ", type=str)
     classification_prior.add_argument('--multiclass-max-steps', help="Maximum number of steps in multiclass step prior", type=int)
     classification_prior.add_argument('--pad-zeros', help="Whether to pad data with zeros for consistent size", type=str2bool)
     classification_prior.add_argument('--max-num-classes', help="Maximum number of classes. 0 means regression.", type=int)
@@ -209,6 +284,54 @@ def argparser_from_config(parser, description="Train Mothernet"):
     mlp_prior = parser.add_argument_group('prior.mlp')
     mlp_prior.add_argument('--add-uninformative-features', help="Whether to add uniformative features in the MLP prior.", type=str2bool)
     mlp_prior.set_defaults(**config['prior']['mlp'])
+
+    environment_prior = parser.add_argument_group('prior.environment')
+    environment_prior.add_argument('--family', type=str, choices=['scm', 'gp'],
+                                   help='Environment generator family: scm or gp.')
+    environment_prior.add_argument('--action-dim', type=int, help='Fixed action dimension when overriding sampled range.')
+    environment_prior.add_argument('--state-dim', type=int, help='Fixed latent state dimension when overriding sampled range.')
+    environment_prior.add_argument('--obs-dim', type=int, help='Fixed observed state dimension when overriding sampled range.')
+    environment_prior.add_argument('--noise-dim', type=int, help='Fixed transition-noise dimension when overriding sampled range.')
+    environment_prior.add_argument('--zero-pad-dim', type=int, help='Fixed zero-pad dimension in env input.')
+    environment_prior.add_argument('--obs-slot-dim', type=int, help='Fixed observation slot width before reward/mask append.')
+    environment_prior.add_argument('--action-slot-dim', type=int, help='Fixed action slot width in PFN input token.')
+    environment_prior.add_argument('--alpha', type=float, help='State update mixing coefficient.')
+    environment_prior.add_argument('--init-state-std', type=float, help='Std for Gaussian initialization of s0.')
+    environment_prior.add_argument('--init-action-std', type=float, help='Std for Gaussian initialization of a0.')
+    environment_prior.add_argument('--state-noise-std', type=float, help='Std for additive state noise per step.')
+    environment_prior.add_argument('--action-noise-train-std', type=float, help='Std for action noise before eval split.')
+    environment_prior.add_argument('--action-noise-eval-std', type=float, help='Std for action noise after eval split.')
+    environment_prior.add_argument('--reward-scale', type=float, help='Scale multiplier for sampled rewards.')
+    environment_prior.add_argument('--state-clip', type=float, help='Clamp bound for latent state before tanh.')
+    environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
+    environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
+    environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')
+    environment_prior.add_argument('--num-layers', type=int, help='Depth for scm generator network.')
+    environment_prior.add_argument('--prior-mlp-hidden-dim', type=int, help='Hidden dim for scm generator network.')
+    environment_prior.add_argument('--prior-mlp-activations', type=str, choices=['tanh', 'relu', 'identity'],
+                                   help='Activation for scm generator network.')
+    environment_prior.add_argument('--init-std', type=float, help='Weight init std for scm generator network.')
+    environment_prior.add_argument('--noise-std', type=float, help='Output noise std for scm generator network.')
+    environment_prior.add_argument('--lengthscale', type=float, help='GP lengthscale for gp family.')
+    environment_prior.add_argument('--outputscale', type=float, help='GP output scale for gp family.')
+    environment_prior.add_argument('--noise', type=float, help='GP observation noise for gp family.')
+    environment_prior.add_argument('--gp-rff-features', type=int, help='Number of random Fourier features for gp family.')
+    environment_prior.add_argument('--reward-dropout-enabled', type=str2bool, help='Enable reward dropout masking in prior tokens.')
+    environment_prior.add_argument('--reward-dropout-randomize', type=str2bool, help='Sample reward dropout ratio per environment.')
+    environment_prior.add_argument('--reward-dropout-ratio', type=float, help='Fixed reward dropout ratio when randomization is off.')
+    environment_prior.add_argument('--reward-dropout-ratio-min', type=float, help='Minimum reward dropout ratio when randomizing.')
+    environment_prior.add_argument('--reward-dropout-ratio-max', type=float, help='Maximum reward dropout ratio when randomizing.')
+    environment_prior.add_argument('--reward-dropout-impute-zero', type=str2bool, help='Use zero imputation for dropped rewards.')
+    environment_prior.add_argument('--batch-parallel-workers', type=int, help='Parallel workers for independent per-column rollout in get_batch.')
+    environment_prior.add_argument('--batch-parallel-backend', type=str, choices=['python_thread', 'torch_vectorized'],
+                                   help='Backend for batch generation parallelism in environment prior.')
+    environment_prior.add_argument('--batch-shared-environment', type=str2bool,
+                                   help='Whether all columns in a batch share one sampled environment function.')
+    environment_prior.add_argument('--batch-vectorized-strict-rng-match', type=str2bool,
+                                   help='Match serial RNG stream exactly in torch_vectorized backend (slower; for A/B tests).')
+    environment_prior.add_argument('--batch-vectorized-grouping', type=str, choices=['structure', 'family'],
+                                   help='Grouping strategy for torch_vectorized backend.')
+    environment_prior.set_defaults(**config['prior']['environment'])
 
     boolean = parser.add_argument_group('prior.boolean')
     boolean.add_argument('--p-uninformative', help="Probability of adding uninformative features in boolean prior",
@@ -237,6 +360,31 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--validate', type=str2bool, help='Whether to perform validation.', default=True)
     orchestration.add_argument('--progress-bar', type=str2bool, help='Whether to show a progress bar.', default=False)
     orchestration.add_argument('--wandb-overwrite', help='Whether to overwrite wandb runs.', action='store_true', default=False)
+    orchestration.add_argument('--rl-validate-enabled', type=str2bool, help='Enable gym out-of-prior validation for rlpfn.')
+    orchestration.add_argument('--rl-validate-envs', type=str, help='Comma-separated gym env list for rlpfn validation.')
+    orchestration.add_argument('--rl-validate-episodes', type=int, help='Episodes per env during rlpfn validation.')
+    orchestration.add_argument('--rl-validate-max-steps', type=int, help='Max steps per episode during rlpfn validation.')
+    orchestration.add_argument('--rl-validate-action-candidates', type=int, help='Number of sampled continuous actions per step.')
+    orchestration.add_argument('--rl-validate-seed', type=int, help='Base random seed for rlpfn validation.')
+
+    if model_type == 'rlpfn':
+        orchestration.set_defaults(
+            rl_validate_enabled=True,
+            rl_validate_envs=",".join(RLPFN_DEFAULT_OOP_ENVS),
+            rl_validate_episodes=3,
+            rl_validate_max_steps=1000,
+            rl_validate_action_candidates=16,
+            rl_validate_seed=1,
+        )
+    else:
+        orchestration.set_defaults(
+            rl_validate_enabled=False,
+            rl_validate_envs=",".join(RLPFN_DEFAULT_OOP_ENVS),
+            rl_validate_episodes=3,
+            rl_validate_max_steps=1000,
+            rl_validate_action_candidates=16,
+            rl_validate_seed=1,
+        )
 
     # orchestration options are not part of the default config
     return parser

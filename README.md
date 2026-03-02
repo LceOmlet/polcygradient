@@ -69,6 +69,25 @@ The results in the paper correspond to ``python fit_model.py mothernet -L 2``, t
 Data-parallel Multi-GPU training is in principal supported using ``torchrun``.
 By default, experiments are tracked using MLFlow if the ``MLFLOW_HOSTNAME`` environment variable is set. 
 
+### Environment Prior (SCM/GP, minimal)
+This repository also includes a minimal ``EnvironmentPrior`` in ``ticl/priors/environment_prior.py`` and exposes it through ``prior_type=environment_only``.
+
+The input-side variables are explicitly partitioned for both SCM-style MLP and GP-style generators:
+``[state | obs | action | noise | zero_pad]``, where ``obs`` is always sampled as a subset of ``state``.
+
+Default randomization ranges in ``model_configs.py``:
+- ``action_dim`` in ``[1, 30]``
+- ``obs_dim`` in ``[1, 400]``
+- ``state_dim`` in ``[1, 400]`` with ``obs_dim <= state_dim``
+- ``noise_dim`` in ``[1, 64]``
+- ``zero_pad_dim`` in ``[0, 400]``
+
+The prior uses the same native hyperparameter sampling flow as other priors (``parse_distributions`` + ``sample_distributions``) and consumes ``single_eval_pos`` from the dataloader as part of rollout initialization.
+
+It also provides a minimal differentiable rollout API for policy optimization:
+- ``rollout_with_policy(...)`` for ``(s_t, a_t, r_t) -> a_{t+1} -> (s_{t+1}, r_{t+1})``
+- ``policy_gradient_loss_from_rewards(...)`` for normalized reward objective with stability knobs (eps/clip/discount)
+
 ## Papers
 This work is described in [MotherNet: A Foundational Hypernetwork for Tabular Classification](https://arxiv.org/pdf/2312.08598).
 Please cite that work when using this code. As this work rests on the TabPFN work, I would suggest you also cite their [paper](https://arxiv.org/abs/2207.01848),

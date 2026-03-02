@@ -1,0 +1,52 @@
+{
+  "approx_wall_breakdown": {
+    "env_pct": 14.901464248987981,
+    "env_sec": 3.570012112002587,
+    "other_pct": 16.83355734771091,
+    "other_sec": 4.03289251413662,
+    "policy_pct": 68.2649784033011,
+    "policy_sec": 16.354553864861373
+  },
+  "batch_size": 8,
+  "device": "cuda",
+  "env_structure": {
+    "family_counts": {
+      "gp": 5,
+      "scm": 3
+    },
+    "max_group": 1,
+    "unique": 8
+  },
+  "grouping": "family",
+  "n_samples": 1024,
+  "policy_calls": {
+    "batch_size_hist": {
+      "8": 1024
+    },
+    "total": 1024,
+    "wall_sec": 16.354553864861373
+  },
+  "policy_mode": "tabpfn",
+  "repeats": 1,
+  "rollout_wall_sec": {
+    "mean": 23.95745849100058,
+    "p50": 23.95745849100058,
+    "p90": 23.95745849100058
+  },
+  "seed": 1234,
+  "single_eval_pos": 972,
+  "transition_groups": {
+    "mean_group_size": 2.6666666666666665,
+    "p50": 2.0,
+    "p90": 4.4,
+    "total": 3
+  },
+  "x_generator": {
+    "calls": 3072,
+    "wall_sec": 1.7787831585737877
+  },
+  "y_generator": {
+    "calls": 3072,
+    "wall_sec": 1.7912289534287993
+  }
+}
