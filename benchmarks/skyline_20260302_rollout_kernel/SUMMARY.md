@@ -176,6 +176,14 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
     - Added a temporary inner checkpoint for paged flash attention (COW, non-inplace) to reduce activation pressure.
     - No OOM, but wallclock regressed badly to `127.68s` (`1.878s/batch-unit`) with `rollout/backward=127.619/77.131s`.
     - Peak alloc/reserved remained high (`42.81/46.36 GiB`), process memory max `47888 MiB`; reverted as pseudo-optimization.
+  - Step-FFN recompute probe (`20260302_185100_flashprefix_bs68_page48_ffnckpt`):
+    - Added temporary per-step FFN checkpointing (`TICL_POLICY_RECOMPUTE_STEP_FFN=1`) to reduce activation memory.
+    - Memory improved (`peak alloc 36.82 GiB`) but throughput regressed heavily (`100.48s`, `1.478s/batch-unit`).
+    - Reverted as pseudo-optimization for throughput skyline.
+  - Transition-group prebind + single-group fastpath probe (`20260302_193000_flashprefix_bs68_page48_groupfast`, `20260302_194100_flashprefix_bs70_page48_groupfast`, `20260302_194900_flashprefix_bs70_page48_groupfast_rep2`, `20260302_200500_flashprefix_bs70_page48_groupfast_rep3`, `20260302_195700_flashprefix_bs72_page48_groupfast`, `20260302_201200_flashprefix_bs68_page48_groupfast_rep2`):
+    - Targeted hot-loop Python/index overhead in `_rollout_family_group_vectorized_with_policy` by prebinding group constants and adding single-group transition fastpath.
+    - `bs70` became 3/3 successful (`84.73s`, `86.59s`, `87.11s`; no OOM), but normalized throughput stayed around `1.210~1.244s/batch-unit` and did not beat retained `bs68` robust median (`1.219`) by a meaningful margin.
+    - `bs72` still OOM (`20260302_195700...`), and `bs68` showed high variance including a slow outlier (`99.11s`), so the change was not kept.
 
 ## Skyline status
 
