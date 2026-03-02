@@ -323,6 +323,38 @@ def _build_policy_step_fn(
                 f"fullgraph={bool(pg_torch_compile_fullgraph)}, dynamic={bool(pg_torch_compile_dynamic)})"
         )
 
+    split_policy_forward_step = None
+    split_compile_active = False
+    split_obs_slot_dim = None
+    split_action_slot_dim = None
+    model_encoder = getattr(model_ref, "encoder", None)
+    model_x_encoder_type = str(getattr(model_ref, "x_encoder_type", "")).strip().lower()
+    split_fastpath_available = (
+        model_x_encoder_type == "split_obs_action"
+        and hasattr(model_ref, "forward_policy_step_split")
+        and model_encoder is not None
+        and hasattr(model_encoder, "obs_dim")
+        and hasattr(model_encoder, "action_dim")
+    )
+    if split_fastpath_available:
+        split_policy_forward_step = model_ref.forward_policy_step_split
+        split_policy_forward_step, split_compile_active = _compile_policy_forward_step(
+            split_policy_forward_step,
+            enabled=bool(pg_torch_compile),
+            backend=str(pg_torch_compile_backend),
+            mode=str(pg_torch_compile_mode),
+            fullgraph=bool(pg_torch_compile_fullgraph),
+            dynamic=bool(pg_torch_compile_dynamic),
+        )
+        if split_compile_active:
+            print(
+                "[pg-compile] enabled forward_policy_step_split compile "
+                f"(backend={pg_torch_compile_backend}, mode={pg_torch_compile_mode}, "
+                f"fullgraph={bool(pg_torch_compile_fullgraph)}, dynamic={bool(pg_torch_compile_dynamic)})"
+            )
+        split_obs_slot_dim = int(max(0, int(model_encoder.obs_dim) - 2))
+        split_action_slot_dim = int(model_encoder.action_dim)
+
     # Reuse token buffers across rollout steps to avoid per-step cat/pad
     # allocations in the hot loop.
     token_buf = {
@@ -335,6 +367,7 @@ def _build_policy_step_fn(
 
     def policy_step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
         nonlocal policy_forward_step, compile_active
+        nonlocal split_policy_forward_step, split_compile_active
         del step_idx
         obs_slot_dim = int(env_info["obs_slot_dim"])
         action_slot_dim = int(env_info["action_slot_dim"])
@@ -345,6 +378,46 @@ def _build_policy_step_fn(
         # from being retained through PFN inputs.
         reward_scalar = reward_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
         reward_mask = reward_mask_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
+
+        use_split_fastpath = (
+            bool(split_fastpath_available)
+            and split_policy_forward_step is not None
+            and split_obs_slot_dim is not None
+            and split_action_slot_dim is not None
+            and obs_slot_dim == int(split_obs_slot_dim)
+            and action_slot_dim == int(split_action_slot_dim)
+        )
+
+        def _call_split_forward_step():
+            return split_policy_forward_step(
+                obs_t,
+                action_t,
+                reward_scalar.reshape(batch_size, 1),
+                reward_mask.reshape(batch_size, 1),
+                kv_cache=cache,
+                max_cache_len=max_cache_len,
+                kv_cache_mode=kv_cache_mode,
+                kv_cache_page_size=kv_cache_page_size,
+                allow_grad_mutable_cache=allow_grad_mutable_cache,
+            )
+
+        if use_split_fastpath:
+            if split_compile_active:
+                try:
+                    compiler_mod = getattr(torch, "compiler", None)
+                    if compiler_mod is not None and hasattr(compiler_mod, "cudagraph_mark_step_begin"):
+                        compiler_mod.cudagraph_mark_step_begin()
+                    out, kv_cache = _call_split_forward_step()
+                except Exception as e:
+                    print(f"[pg-compile-warn] runtime compile failure on split policy step, fallback to eager: {e}")
+                    split_compile_active = False
+                    split_policy_forward_step = model_ref.forward_policy_step_split
+                    out, kv_cache = _call_split_forward_step()
+            else:
+                out, kv_cache = _call_split_forward_step()
+            action_raw = out.squeeze(0)
+            action_next = _fit_action_dim(action_raw, action_dim)
+            return action_next, kv_cache
 
         reuse_token_buf = not torch.is_grad_enabled()
         if reuse_token_buf:
@@ -396,35 +469,8 @@ def _build_policy_step_fn(
         if reuse_token_buf:
             y_token[0].copy_(reward_scalar)
 
-        if compile_active:
-            try:
-                compiler_mod = getattr(torch, "compiler", None)
-                if compiler_mod is not None and hasattr(compiler_mod, "cudagraph_mark_step_begin"):
-                    compiler_mod.cudagraph_mark_step_begin()
-                out, kv_cache = policy_forward_step(
-                    x_token,
-                    y_token,
-                    kv_cache=cache,
-                    max_cache_len=max_cache_len,
-                    kv_cache_mode=kv_cache_mode,
-                    kv_cache_page_size=kv_cache_page_size,
-                    allow_grad_mutable_cache=allow_grad_mutable_cache,
-                )
-            except Exception as e:
-                print(f"[pg-compile-warn] runtime compile failure, fallback to eager: {e}")
-                compile_active = False
-                policy_forward_step = model_ref.forward_policy_step
-                out, kv_cache = policy_forward_step(
-                    x_token,
-                    y_token,
-                    kv_cache=cache,
-                    max_cache_len=max_cache_len,
-                    kv_cache_mode=kv_cache_mode,
-                    kv_cache_page_size=kv_cache_page_size,
-                    allow_grad_mutable_cache=allow_grad_mutable_cache,
-                )
-        else:
-            out, kv_cache = policy_forward_step(
+        def _call_forward_step():
+            return policy_forward_step(
                 x_token,
                 y_token,
                 kv_cache=cache,
@@ -433,6 +479,20 @@ def _build_policy_step_fn(
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=allow_grad_mutable_cache,
             )
+
+        if compile_active:
+            try:
+                compiler_mod = getattr(torch, "compiler", None)
+                if compiler_mod is not None and hasattr(compiler_mod, "cudagraph_mark_step_begin"):
+                    compiler_mod.cudagraph_mark_step_begin()
+                out, kv_cache = _call_forward_step()
+            except Exception as e:
+                print(f"[pg-compile-warn] runtime compile failure, fallback to eager: {e}")
+                compile_active = False
+                policy_forward_step = model_ref.forward_policy_step
+                out, kv_cache = _call_forward_step()
+        else:
+            out, kv_cache = _call_forward_step()
         action_raw = out.squeeze(0)
         action_next = _fit_action_dim(action_raw, action_dim)
         return action_next, kv_cache

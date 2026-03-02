@@ -1,6 +1,7 @@
 
 import torch, wandb
 import torch.nn as nn
+import torch.nn.functional as F
 
 from ticl.models.layer import TransformerEncoderLayer, TransformerEncoderSimple
 from ticl.utils import SeqBN, get_init_method
@@ -202,6 +203,93 @@ class TabPFN(nn.Module):
 
         x_enc = self.encoder(x_token)
         y_enc = self.y_encoder(y_token.unsqueeze(-1) if len(y_token.shape) < len(x_enc.shape) else y_token)
+        token = x_enc + y_enc
+        if self.input_ln is not None:
+            token = self.input_ln(token)
+        hidden, kv_cache = self.transformer_encoder.forward_step(
+            token,
+            kv_cache=kv_cache,
+            append_to_cache=True,
+            max_cache_len=max_cache_len,
+            kv_cache_mode=kv_cache_mode,
+            kv_cache_page_size=kv_cache_page_size,
+            allow_grad_mutable_cache=allow_grad_mutable_cache,
+        )
+        return self.decoder(hidden), kv_cache
+
+    def forward_policy_step_split(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode: str = "auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache: bool = False,
+    ):
+        """
+        Incremental single-step forward optimized for split_obs_action layout.
+        Inputs are per-step components (B, D) instead of a materialized (1, B, F) token.
+        """
+        if not self.single_eval_causal:
+            raise ValueError("forward_policy_step_split requires single_eval_causal=True.")
+        if self.x_encoder_type != "split_obs_action" or (not isinstance(self.encoder, SplitObsActionEncoder)):
+            raise ValueError("forward_policy_step_split requires split_obs_action encoder.")
+        if obs_t.ndim != 2 or action_t.ndim != 2:
+            raise ValueError(
+                f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
+            )
+
+        batch_size = int(obs_t.shape[0])
+        if int(action_t.shape[0]) != batch_size:
+            raise ValueError("obs_t and action_t batch size mismatch")
+
+        reward_scalar = reward_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        reward_mask_scalar = reward_mask_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+
+        obs_encoder = self.encoder.obs_encoder
+        action_encoder = self.encoder.action_encoder
+        obs_weight = obs_encoder.weight
+        obs_bias = obs_encoder.bias
+        action_weight = action_encoder.weight
+        action_bias = action_encoder.bias
+        obs_dim = int(self.encoder.obs_dim)
+        action_dim = int(self.encoder.action_dim)
+        obs_slot_dim = int(max(0, obs_dim - 2))
+        reward_idx = obs_slot_dim
+        mask_idx = obs_slot_dim + 1
+
+        obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
+        action_copy = int(min(int(action_t.shape[-1]), action_dim))
+
+        if bool(getattr(obs_encoder, "replace_nan_by_zero", False)):
+            obs_src = torch.nan_to_num(obs_t, nan=0.0)
+        else:
+            obs_src = obs_t
+        if bool(getattr(action_encoder, "replace_nan_by_zero", False)):
+            action_src = torch.nan_to_num(action_t, nan=0.0)
+        else:
+            action_src = action_t
+
+        if obs_copy > 0:
+            obs_enc = F.linear(obs_src[:, :obs_copy], obs_weight[:, :obs_copy], obs_bias)
+        else:
+            obs_enc = obs_bias.unsqueeze(0).expand(batch_size, -1)
+        if reward_idx < obs_dim:
+            obs_enc = obs_enc + reward_scalar * obs_weight[:, reward_idx].unsqueeze(0)
+        if mask_idx < obs_dim:
+            obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+
+        if action_copy > 0:
+            action_enc = F.linear(action_src[:, :action_copy], action_weight[:, :action_copy], action_bias)
+        else:
+            action_enc = action_bias.unsqueeze(0).expand(batch_size, -1)
+
+        x_enc = (obs_enc + action_enc).unsqueeze(0)
+        y_in = reward_scalar.reshape(1, batch_size)
+        y_enc = self.y_encoder(y_in.unsqueeze(-1) if len(y_in.shape) < len(x_enc.shape) else y_in)
         token = x_enc + y_enc
         if self.input_ln is not None:
             token = self.input_ln(token)

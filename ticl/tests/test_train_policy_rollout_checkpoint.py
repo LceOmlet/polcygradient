@@ -353,6 +353,72 @@ def test_policy_step_fn_detaches_reward_and_mask_before_pfn():
     assert grad_reward_mask is None
 
 
+def test_policy_step_fn_prefers_split_fastpath_and_falls_back_on_slot_mismatch():
+    class _DummyEncoder:
+        obs_dim = 8   # obs slots + reward/mask
+        action_dim = 4
+
+    class _DummyModel:
+        def __init__(self):
+            self.x_encoder_type = "split_obs_action"
+            self.encoder = _DummyEncoder()
+            self.calls = {"split": 0, "legacy": 0}
+
+        def forward_policy_step_split(
+            self,
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            kv_cache=None,
+            **kwargs,
+        ):
+            del action_t, reward_t, reward_mask_t, kwargs
+            self.calls["split"] += 1
+            out = torch.full((1, obs_t.shape[0], 4), 7.0, dtype=obs_t.dtype, device=obs_t.device)
+            return out, kv_cache
+
+        def forward_policy_step(
+            self,
+            x_token,
+            y_token,
+            kv_cache=None,
+            **kwargs,
+        ):
+            del y_token, kwargs
+            self.calls["legacy"] += 1
+            out = torch.full((1, x_token.shape[1], 4), 3.0, dtype=x_token.dtype, device=x_token.device)
+            return out, kv_cache
+
+    model = _DummyModel()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=16,
+        max_cache_len=12,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    obs_t = torch.randn(2, 6, dtype=torch.float32)
+    action_t = torch.randn(2, 4, dtype=torch.float32)
+    reward_t = torch.randn(2, 1, dtype=torch.float32, requires_grad=True)
+    reward_mask_t = torch.randn(2, 1, dtype=torch.float32, requires_grad=True)
+
+    env_info_match = {"obs_slot_dim": 6, "action_slot_dim": 4, "action_dim": 4}
+    action_next_match, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 0, env_info_match)
+    assert torch.allclose(action_next_match, torch.full((2, 4), 7.0))
+    assert model.calls["split"] == 1
+    assert model.calls["legacy"] == 0
+
+    env_info_mismatch = {"obs_slot_dim": 5, "action_slot_dim": 4, "action_dim": 4}
+    action_next_mismatch, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 1, env_info_mismatch)
+    assert torch.allclose(action_next_mismatch, torch.full((2, 4), 3.0))
+    assert model.calls["split"] == 1
+    assert model.calls["legacy"] == 1
+
+
 def test_policy_rollout_chunk_torch_vectorized_matches_serial_semantics():
     env_cfg_serial = _fixed_env_cfg()
     env_cfg_serial["batch_parallel_backend"] = "python_thread"

@@ -243,6 +243,12 @@ class TransformerEncoderLayer(Module):
             v_all = v_pages[0][:, :, :remaining, :]
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
+        # Training throughput route: dispatch fused SDPA on dense views.
+        # This removes many tiny per-page kernels in the grad-enabled hot path.
+        if torch.is_grad_enabled():
+            k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
+            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
         if attn_dropout > 0.0:
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
@@ -565,7 +571,7 @@ class TransformerEncoderLayer(Module):
             if (not torch.is_grad_enabled()) and (max_cache_len is not None):
                 effective_kv_page_size = int(max(1, max_cache_len))
             elif mutable_paged_grad:
-                effective_kv_page_size = int(max(8, min(kv_cache_page_size, 32)))
+                effective_kv_page_size = int(max(8, kv_cache_page_size))
             else:
                 effective_kv_page_size = kv_cache_page_size
         else:
