@@ -1344,6 +1344,7 @@ class EnvironmentPrior:
         single_eval_pos,
         device,
         collect_x=True,
+        collect_runtime_info=True,
         rng_seeds=None,
         tbptt_window=None,
         tbptt_reward_sink=None,
@@ -1351,6 +1352,7 @@ class EnvironmentPrior:
         n_samples = int(n_samples)
         batch_size = int(batch_size)
         num_features = int(num_features)
+        collect_runtime_info = bool(collect_runtime_info)
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
 
@@ -1396,9 +1398,21 @@ class EnvironmentPrior:
             else None
         )
         y_steps = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        state_abs_max = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        reward_values = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        reward_drop_count = torch.zeros((batch_size,), device=device, dtype=torch.int64)
+        state_abs_max = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_runtime_info
+            else None
+        )
+        reward_values = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_runtime_info
+            else None
+        )
+        reward_drop_count = (
+            torch.zeros((batch_size,), device=device, dtype=torch.int64)
+            if collect_runtime_info
+            else None
+        )
         tbptt_window_active = False
         tbptt_window_size = n_samples
         if tbptt_window is not None:
@@ -1651,13 +1665,15 @@ class EnvironmentPrior:
             if strict_seed_mode and dropout_draw_generators is not None:
                 drop_draw = _draw_step_rand_with_optional_generators(dropout_draw_generators)
                 drop_mask = dropout_active & (drop_draw < env["reward_dropout_ratio"])
-                reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
+                if collect_runtime_info:
+                    reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
             elif dropout_draws is not None:
                 drop_mask = dropout_active & (dropout_draws[t] < env["reward_dropout_ratio"])
-                reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
+                if collect_runtime_info:
+                    reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
@@ -1685,8 +1701,9 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
             else:
                 y_steps[t] = reward_next
-            reward_values[t] = reward_next.detach()
-            state_abs_max[t] = state_next.detach().abs().amax(dim=1)
+            if collect_runtime_info:
+                reward_values[t] = reward_next.detach()
+                state_abs_max[t] = state_next.detach().abs().amax(dim=1)
 
             state_t = state_next
             action_t = action_next
@@ -1708,14 +1725,17 @@ class EnvironmentPrior:
                     if tbptt_reward_sink is not None:
                         tbptt_reward_sink(rewards_window)
 
-        reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
-        infos = self._build_vectorized_runtime_info(
-            env=env,
-            reward_values=reward_values,
-            state_abs_max=state_abs_max,
-            reward_drop_frac=reward_drop_frac,
-            single_eval_pos=single_eval_pos,
-        )
+        if collect_runtime_info:
+            reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
+            infos = self._build_vectorized_runtime_info(
+                env=env,
+                reward_values=reward_values,
+                state_abs_max=state_abs_max,
+                reward_drop_frac=reward_drop_frac,
+                single_eval_pos=single_eval_pos,
+            )
+        else:
+            infos = [None] * batch_size
         rollout_profile = None
         if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
             torch.cuda.synchronize(device=device_obj)
@@ -1739,6 +1759,7 @@ class EnvironmentPrior:
         single_eval_pos,
         device,
         collect_x=True,
+        collect_runtime_info=True,
         env_rng_seeds=None,
         rollout_rng_seeds=None,
         tbptt_window=None,
@@ -1747,6 +1768,7 @@ class EnvironmentPrior:
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
         num_features = int(num_features)
+        collect_runtime_info = bool(collect_runtime_info)
         if batch_size <= 0:
             raise ValueError("h_list must be non-empty for family-group rollout")
 
@@ -1975,9 +1997,21 @@ class EnvironmentPrior:
             else None
         )
         y_steps = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        state_abs_max = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        reward_values = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-        reward_drop_count = torch.zeros((batch_size,), device=device, dtype=torch.int64)
+        state_abs_max = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_runtime_info
+            else None
+        )
+        reward_values = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_runtime_info
+            else None
+        )
+        reward_drop_count = (
+            torch.zeros((batch_size,), device=device, dtype=torch.int64)
+            if collect_runtime_info
+            else None
+        )
 
         tbptt_window_active = False
         tbptt_window_size = n_samples
@@ -2178,7 +2212,8 @@ class EnvironmentPrior:
                     dropout_active_g = dropout_active[start:end]
                     ratio_g = reward_dropout_ratio[start:end]
                     drop_mask = dropout_active_g & (dropout_draws[t, start:end] < ratio_g)
-                    reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
+                    if collect_runtime_info:
+                        reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
                     reward_mask_next_g = torch.where(drop_mask, torch.zeros_like(reward_mask_next_g), reward_mask_next_g)
                     impute_mask = drop_mask & reward_dropout_impute_zero[start:end]
                     reward_next_g = torch.where(impute_mask, torch.zeros_like(reward_next_g), reward_next_g)
@@ -2211,8 +2246,9 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
             else:
                 y_steps[t] = reward_next
-            reward_values[t] = reward_next.detach()
-            state_abs_max[t] = state_next.detach().abs().amax(dim=1)
+            if collect_runtime_info:
+                reward_values[t] = reward_next.detach()
+                state_abs_max[t] = state_next.detach().abs().amax(dim=1)
 
             state_t = state_next
             action_t = action_next
@@ -2240,51 +2276,56 @@ class EnvironmentPrior:
 
         if needs_unpermute:
             y_steps = y_steps.index_select(1, inv_perm)
-            state_abs_max = state_abs_max.index_select(1, inv_perm)
-            reward_values = reward_values.index_select(1, inv_perm)
-            reward_drop_count = reward_drop_count.index_select(0, inv_perm)
-            state_dims_meta = state_dims.index_select(0, inv_perm)
-            obs_dims_meta = obs_dims.index_select(0, inv_perm)
-            action_dims_meta = action_dims.index_select(0, inv_perm)
-            noise_dims_meta = noise_dims.index_select(0, inv_perm)
-            zero_pad_dims_meta = zero_pad_dims.index_select(0, inv_perm)
-            obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
-            action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
-            reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
-            inv_perm_cpu = inv_perm.detach().cpu().tolist()
-            family_meta = [family_list[int(i)] for i in inv_perm_cpu]
             if collect_x:
                 x_steps = x_steps.index_select(1, inv_perm)
-        else:
-            state_dims_meta = state_dims
-            obs_dims_meta = obs_dims
-            action_dims_meta = action_dims
-            noise_dims_meta = noise_dims
-            zero_pad_dims_meta = zero_pad_dims
-            obs_slot_dims_meta = obs_slot_dims
-            action_slot_dims_meta = action_slot_dims
-            reward_dropout_ratio_meta = reward_dropout_ratio
-            family_meta = family_list
 
-        reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
-        env_meta = {
-            "family": family_meta,
-            "state_dim": state_dims_meta,
-            "obs_dim": obs_dims_meta,
-            "action_dim": action_dims_meta,
-            "noise_dim": noise_dims_meta,
-            "zero_pad_dim": zero_pad_dims_meta,
-            "obs_slot_dim": obs_slot_dims_meta,
-            "action_slot_dim": action_slot_dims_meta,
-            "reward_dropout_ratio": reward_dropout_ratio_meta,
-        }
-        infos = self._build_vectorized_runtime_info(
-            env=env_meta,
-            reward_values=reward_values,
-            state_abs_max=state_abs_max,
-            reward_drop_frac=reward_drop_frac,
-            single_eval_pos=single_eval_pos,
-        )
+        if collect_runtime_info:
+            if needs_unpermute:
+                state_abs_max = state_abs_max.index_select(1, inv_perm)
+                reward_values = reward_values.index_select(1, inv_perm)
+                reward_drop_count = reward_drop_count.index_select(0, inv_perm)
+                state_dims_meta = state_dims.index_select(0, inv_perm)
+                obs_dims_meta = obs_dims.index_select(0, inv_perm)
+                action_dims_meta = action_dims.index_select(0, inv_perm)
+                noise_dims_meta = noise_dims.index_select(0, inv_perm)
+                zero_pad_dims_meta = zero_pad_dims.index_select(0, inv_perm)
+                obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
+                action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
+                reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
+                inv_perm_cpu = inv_perm.detach().cpu().tolist()
+                family_meta = [family_list[int(i)] for i in inv_perm_cpu]
+            else:
+                state_dims_meta = state_dims
+                obs_dims_meta = obs_dims
+                action_dims_meta = action_dims
+                noise_dims_meta = noise_dims
+                zero_pad_dims_meta = zero_pad_dims
+                obs_slot_dims_meta = obs_slot_dims
+                action_slot_dims_meta = action_slot_dims
+                reward_dropout_ratio_meta = reward_dropout_ratio
+                family_meta = family_list
+
+            reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
+            env_meta = {
+                "family": family_meta,
+                "state_dim": state_dims_meta,
+                "obs_dim": obs_dims_meta,
+                "action_dim": action_dims_meta,
+                "noise_dim": noise_dims_meta,
+                "zero_pad_dim": zero_pad_dims_meta,
+                "obs_slot_dim": obs_slot_dims_meta,
+                "action_slot_dim": action_slot_dims_meta,
+                "reward_dropout_ratio": reward_dropout_ratio_meta,
+            }
+            infos = self._build_vectorized_runtime_info(
+                env=env_meta,
+                reward_values=reward_values,
+                state_abs_max=state_abs_max,
+                reward_drop_frac=reward_drop_frac,
+                single_eval_pos=single_eval_pos,
+            )
+        else:
+            infos = [None] * batch_size
         rollout_profile = None
         if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
             torch.cuda.synchronize(device=device_obj)
@@ -2308,12 +2349,14 @@ class EnvironmentPrior:
         device,
         policy_step_fn=None,
         collect_x=True,
+        collect_runtime_info=True,
         rng_seed=None,
         tbptt_window=None,
         tbptt_reward_sink=None,
     ):
         n_samples = int(n_samples)
         num_features = int(num_features)
+        collect_runtime_info = bool(collect_runtime_info)
 
         local_generator = None
         if rng_seed is not None:
@@ -2351,9 +2394,9 @@ class EnvironmentPrior:
 
         x_steps = torch.empty((n_samples, num_features), device=device, dtype=state_t.dtype) if collect_x else None
         y_steps = torch.empty((n_samples,), device=device, dtype=state_t.dtype)
-        state_abs_max = torch.empty((n_samples,), device=device, dtype=state_t.dtype)
-        reward_values = torch.empty((n_samples,), device=device, dtype=state_t.dtype)
-        reward_drop_count = 0
+        state_abs_max = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
+        reward_values = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
+        reward_drop_count = 0 if collect_runtime_info else None
         tbptt_window_active = False
         tbptt_window_size = n_samples
         if (policy_step_fn is not None) and (tbptt_window is not None):
@@ -2561,7 +2604,8 @@ class EnvironmentPrior:
             reward_mask_next = torch.ones((), device=device, dtype=reward_next_raw.dtype)
             if dropout_draws is not None:
                 if bool(dropout_draws[t] < float(env["reward_dropout_ratio"])):
-                    reward_drop_count += 1
+                    if collect_runtime_info:
+                        reward_drop_count += 1
                     reward_mask_next = torch.zeros((), device=device, dtype=reward_next_raw.dtype)
                     if env["reward_dropout_impute_zero"]:
                         reward_next = torch.zeros_like(reward_next_raw)
@@ -2576,7 +2620,8 @@ class EnvironmentPrior:
                         generator=dropout_draw_generator,
                     )
                 if bool(drop_draw < float(env["reward_dropout_ratio"])):
-                    reward_drop_count += 1
+                    if collect_runtime_info:
+                        reward_drop_count += 1
                     reward_mask_next = torch.zeros((), device=device, dtype=reward_next_raw.dtype)
                     if env["reward_dropout_impute_zero"]:
                         reward_next = torch.zeros_like(reward_next_raw)
@@ -2604,8 +2649,9 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
             else:
                 y_steps[t] = reward_next
-            reward_values[t] = reward_next.detach()
-            state_abs_max[t] = torch.abs(state_next).max().detach()
+            if collect_runtime_info:
+                reward_values[t] = reward_next.detach()
+                state_abs_max[t] = torch.abs(state_next).max().detach()
 
             state_t = state_next
             action_t = action_next
@@ -2628,26 +2674,28 @@ class EnvironmentPrior:
 
         x = x_steps
         y = y_steps
-        rewards_for_stats = reward_values
-        state_abs_for_stats = state_abs_max
-
-        info = {
-            "family": env["family"],
-            "state_dim": env["state_dim"],
-            "obs_dim": env["obs_dim"],
-            "action_dim": env["action_dim"],
-            "noise_dim": env["noise_dim"],
-            "zero_pad_dim": env["zero_pad_dim"],
-            "obs_slot_dim": env["obs_slot_dim"],
-            "action_slot_dim": env["action_slot_dim"],
-            "single_eval_pos": int(single_eval_pos),
-            "reward_min": float(rewards_for_stats.min().cpu()),
-            "reward_max": float(rewards_for_stats.max().cpu()),
-            "reward_std": float(rewards_for_stats.std(unbiased=False).cpu()),
-            "state_abs_max": float(state_abs_for_stats.max().cpu()),
-            "reward_dropout_ratio": float(env["reward_dropout_ratio"]),
-            "reward_drop_frac_realized": float(reward_drop_count / max(1, int(n_samples))),
-        }
+        if collect_runtime_info:
+            rewards_for_stats = reward_values
+            state_abs_for_stats = state_abs_max
+            info = {
+                "family": env["family"],
+                "state_dim": env["state_dim"],
+                "obs_dim": env["obs_dim"],
+                "action_dim": env["action_dim"],
+                "noise_dim": env["noise_dim"],
+                "zero_pad_dim": env["zero_pad_dim"],
+                "obs_slot_dim": env["obs_slot_dim"],
+                "action_slot_dim": env["action_slot_dim"],
+                "single_eval_pos": int(single_eval_pos),
+                "reward_min": float(rewards_for_stats.min().cpu()),
+                "reward_max": float(rewards_for_stats.max().cpu()),
+                "reward_std": float(rewards_for_stats.std(unbiased=False).cpu()),
+                "state_abs_max": float(state_abs_for_stats.max().cpu()),
+                "reward_dropout_ratio": float(env["reward_dropout_ratio"]),
+                "reward_drop_frac_realized": float(reward_drop_count / max(1, int(n_samples))),
+            }
+        else:
+            info = None
         return x, y, info
 
     def _get_rollout_executor(self, workers):
@@ -3047,6 +3095,7 @@ class EnvironmentPrior:
                             device,
                             None,
                             True,
+                            True,
                             seed,
                         )
                     )
@@ -3068,6 +3117,7 @@ class EnvironmentPrior:
         epoch=None,
         single_eval_pos=None,
         collect_x=True,
+        collect_runtime_info=True,
         tbptt_window=None,
         tbptt_reward_sink=None,
     ):
@@ -3085,6 +3135,7 @@ class EnvironmentPrior:
         n_samples = int(n_samples)
         batch_size = int(batch_size)
         num_features = int(num_features)
+        collect_runtime_info = bool(collect_runtime_info)
         self.last_rollout_profile = None
         x = torch.empty((n_samples, batch_size, num_features), device=device, dtype=torch.float32) if collect_x else None
         rewards = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
@@ -3131,6 +3182,7 @@ class EnvironmentPrior:
                         single_eval_pos=single_eval_pos,
                         device=device,
                         collect_x=collect_x,
+                        collect_runtime_info=collect_runtime_info,
                         env_rng_seeds=group_env_seeds,
                         rollout_rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
@@ -3151,6 +3203,7 @@ class EnvironmentPrior:
                         single_eval_pos=single_eval_pos,
                         device=device,
                         collect_x=collect_x,
+                        collect_runtime_info=collect_runtime_info,
                         rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
                         tbptt_reward_sink=tbptt_reward_sink,
@@ -3172,7 +3225,7 @@ class EnvironmentPrior:
                     rollout_profile_acc["policy_cuda_ms"] += float(group_profile.get("policy_cuda_ms", 0.0))
                     rollout_profile_acc["transition_cuda_ms"] += float(group_profile.get("transition_cuda_ms", 0.0))
             self.last_rollout_profile = rollout_profile_acc
-            self.last_runtime_info = infos
+            self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
                 "x": x,
                 "rewards": rewards,
@@ -3196,6 +3249,7 @@ class EnvironmentPrior:
                 device=device,
                 policy_step_fn=policy_step_fn,
                 collect_x=collect_x,
+                collect_runtime_info=collect_runtime_info,
                 rng_seed=(rollout_seeds[b] if rollout_seeds is not None else None),
                 tbptt_window=tbptt_window,
                 tbptt_reward_sink=tbptt_reward_sink,
@@ -3204,7 +3258,7 @@ class EnvironmentPrior:
                 x[:, b] = x_one
             rewards[:, b] = y_one
             infos[b] = info
-        self.last_runtime_info = infos
+        self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
         self.last_rollout_profile = None
         return {
             "x": x,
@@ -3306,6 +3360,7 @@ class EnvironmentPrior:
                 epoch=epoch,
                 single_eval_pos=single_eval_pos,
                 collect_x=collect_x,
+                collect_runtime_info=False,
             )
             loss, stats = self.policy_gradient_loss_from_rewards(
                 rewards=rollout["rewards"],
@@ -3375,6 +3430,7 @@ class EnvironmentPrior:
             epoch=epoch,
             single_eval_pos=single_eval_pos,
             collect_x=collect_x,
+            collect_runtime_info=False,
             tbptt_window=tbptt_window_size,
             tbptt_reward_sink=_tbptt_reward_sink,
         )

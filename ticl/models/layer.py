@@ -545,7 +545,14 @@ class TransformerEncoderLayer(Module):
             src_norm = src_step
 
         src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
-        q_bld = self._project_q(src_norm_bld)
+        # Hot-path fusion for rollout append steps: compute q/k/v with one GEMM
+        # instead of separate q and kv projections.
+        if append_to_cache:
+            q_bld, k_new_bld, v_new_bld = self._project_qkv(src_norm_bld)
+        else:
+            q_bld = self._project_q(src_norm_bld)
+            k_new_bld = None
+            v_new_bld = None
         q_bhld = self._split_heads(q_bld)
         if max_cache_len is None and kv_cache is not None:
             max_cache_len = kv_cache.get("max_cache_len", None)
@@ -608,7 +615,6 @@ class TransformerEncoderLayer(Module):
         if kv_cache is None:
             if not append_to_cache:
                 raise ValueError("predict-only step requires a non-empty kv_cache.")
-            k_new_bld, v_new_bld = self._project_kv(src_norm_bld)
             k_new_bhld = self._split_heads(k_new_bld)
             v_new_bhld = self._split_heads(v_new_bld)
             if cache_mode == "static":
@@ -661,7 +667,6 @@ class TransformerEncoderLayer(Module):
             else:
                 valid_len = int(kv_cache.get("valid_len", k_prev.shape[2]))
             if append_to_cache:
-                k_new_bld, v_new_bld = self._project_kv(src_norm_bld)
                 k_new_bhld = self._split_heads(k_new_bld)
                 v_new_bhld = self._split_heads(v_new_bld)
                 if cache_mode == "static":
