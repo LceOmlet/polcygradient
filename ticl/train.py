@@ -1,4 +1,5 @@
 import math
+import os
 import time, wandb
 import random
 from contextlib import nullcontext
@@ -15,6 +16,7 @@ import ticl.utils as utils
 from ticl.utils import ExponentialLR, ReduceLROnSpike, init_dist
 from ticl.profiling import TrainProfiler, TrainProfilerConfig
 from ticl.gpu_observer import GPUProcessObserver
+from ticl.kernel_profiling import TrainKernelProfiler, TrainKernelProfilerConfig
 
 import pdb
 
@@ -218,6 +220,7 @@ def _format_gpu_stage_summary(prefix: str, rec: dict) -> str:
     proc_mem_avg = rec.get("process_mem_avg_mib", None)
     proc_mem_max = rec.get("process_mem_max_mib", None)
     mem_share_avg = rec.get("process_mem_share_avg", None)
+    proc_sm_avg = rec.get("process_sm_util_avg", None)
 
     def _fmt(v, digits=2):
         return "na" if v is None else f"{float(v):.{digits}f}"
@@ -226,8 +229,37 @@ def _format_gpu_stage_summary(prefix: str, rec: dict) -> str:
         f"{prefix} samples={samples} "
         f"gpu_util_avg={_fmt(util_avg)} gpu_util_max={_fmt(util_max)} "
         f"proc_mem_avg_mib={_fmt(proc_mem_avg, 1)} proc_mem_max_mib={_fmt(proc_mem_max, 1)} "
-        f"proc_mem_share_avg={_fmt(mem_share_avg)}"
+        f"proc_mem_share_avg={_fmt(mem_share_avg)} "
+        f"proc_sm_util_avg={_fmt(proc_sm_avg)}"
     )
+
+
+def _maybe_step_kernel_profiler(kernel_profiler, *, epoch_idx, batch_idx, verbose=False):
+    if kernel_profiler is None or not kernel_profiler.enabled():
+        return None
+    record = kernel_profiler.step(epoch=int(epoch_idx), batch=int(batch_idx))
+    if record is None:
+        return None
+    top_cuda_op = record.get("top_cuda_op")
+    top_cuda_time = record.get("top_cuda_self_time_us")
+    top_cpu_op = record.get("top_cpu_op")
+    top_cpu_time = record.get("top_cpu_self_time_us")
+    if verbose:
+        print(
+            f"[kernel-profile] epoch={int(epoch_idx)} batch={int(batch_idx)} "
+            f"top_cuda_op={top_cuda_op} top_cuda_self_us={float(top_cuda_time):.1f} "
+            f"top_cpu_op={top_cpu_op} top_cpu_self_us={float(top_cpu_time):.1f}"
+        )
+    if wandb.run is not None:
+        wandb.log(
+            {
+                "kernel_profile/epoch": int(epoch_idx),
+                "kernel_profile/batch": int(batch_idx),
+                "kernel_profile/top_cuda_self_time_us": float(top_cuda_time),
+                "kernel_profile/top_cpu_self_time_us": float(top_cpu_time),
+            }
+        )
+    return record
 
 
 def _compile_policy_forward_step(
@@ -504,6 +536,7 @@ def train_epoch(
     epoch_start_time=None,
     train_profiler_log_every_batches=0,
     verbose=False,
+    kernel_profiler=None,
 ):
     model.train()  # Turn on the train mode
     total_loss = torch.tensor(0., device = device)
@@ -521,6 +554,7 @@ def train_epoch(
         desc = f"Epoch {epoch_idx}" if epoch_idx is not None else "Epoch"
         dl = tqdm(dl, total=steps_per_epoch, desc=desc, unit="step")
     for batch, (data, targets, single_eval_pos) in enumerate(dl):
+        batch_epoch_for_profile = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
         # change the description of the progress bar
         if progress_bar and hasattr(dl, "set_postfix"):
             dl.set_postfix(
@@ -536,25 +570,30 @@ def train_epoch(
         else:
             cm = nullcontext()
         with cm:
-            with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
-                # for mothernet, la_mothernet, model is MLPModelPredictor from ticl.py
-                output = model(
-                    tuple(e.to(device) if torch.is_tensor(e) else e for e in data)
-                    if isinstance(data, tuple) else data.to(device), 
-                    single_eval_pos=single_eval_pos
-                )
+            with (
+                kernel_profiler.phase("train.forward")
+                if (kernel_profiler is not None and kernel_profiler.enabled())
+                else nullcontext()
+            ):
+                with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+                    # for mothernet, la_mothernet, model is MLPModelPredictor from ticl.py
+                    output = model(
+                        tuple(e.to(device) if torch.is_tensor(e) else e for e in data)
+                        if isinstance(data, tuple) else data.to(device),
+                        single_eval_pos=single_eval_pos
+                    )
 
-                targets = targets.to(device)
-                if single_eval_pos is not None:
-                    targets = targets[single_eval_pos:]
-                loss, nan_share = eval_criterion(
-                    criterion, 
-                    targets, 
-                    output, 
-                    device=device, 
-                    n_out=n_out
-                )
-                loss = loss / aggregate_k_gradients
+                    targets = targets.to(device)
+                    if single_eval_pos is not None:
+                        targets = targets[single_eval_pos:]
+                    loss, nan_share = eval_criterion(
+                        criterion,
+                        targets,
+                        output,
+                        device=device,
+                        n_out=n_out
+                    )
+                    loss = loss / aggregate_k_gradients
 
             if not torch.isfinite(loss).all():
                 skipped_steps += 1
@@ -575,11 +614,22 @@ def train_epoch(
                     )
                 if wandb.run is not None:
                     wandb.log({'train_skip': 1, 'train_skip_reason': 'loss_nonfinite', 'train_skip_loss': loss_val})
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
+                    batch_idx=batch,
+                    verbose=verbose,
+                )
                 continue
 
             if wandb.run:
                 wandb.log({'batch_loss': float(loss.detach().mean().cpu()) * aggregate_k_gradients})
-            loss.backward()
+            with (
+                kernel_profiler.phase("train.backward")
+                if (kernel_profiler is not None and kernel_profiler.enabled())
+                else nullcontext()
+            ):
+                loss.backward()
 
             if requires_midaccum_grad_finite_check and _has_nonfinite_gradients(model, device=device):
                 skipped_steps += 1
@@ -599,12 +649,23 @@ def train_epoch(
                     )
                 if wandb.run is not None:
                     wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_nonfinite'})
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
+                    batch_idx=batch,
+                    verbose=verbose,
+                )
                 continue
 
             grad_accum_steps += 1
 
             if grad_accum_steps == aggregate_k_gradients:
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
+                with (
+                    kernel_profiler.phase("train.step")
+                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                    else nullcontext()
+                ):
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
                 if not torch.isfinite(grad_norm):
                     skipped_steps += 1
                     optimizer.zero_grad(set_to_none=True)
@@ -623,8 +684,19 @@ def train_epoch(
                         )
                     if wandb.run is not None:
                         wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_norm_nonfinite'})
+                    _maybe_step_kernel_profiler(
+                        kernel_profiler,
+                        epoch_idx=batch_epoch_for_profile,
+                        batch_idx=batch,
+                        verbose=verbose,
+                    )
                     continue
-                optimizer.step()
+                with (
+                    kernel_profiler.phase("train.step")
+                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                    else nullcontext()
+                ):
+                    optimizer.step()
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
 
@@ -644,6 +716,12 @@ def train_epoch(
                     train_profiler_log_every_batches=train_profiler_log_every_batches,
                     verbose=verbose,
                 )
+            _maybe_step_kernel_profiler(
+                kernel_profiler,
+                epoch_idx=batch_epoch_for_profile,
+                batch_idx=batch,
+                verbose=verbose,
+            )
 
     if grad_accum_steps > 0:
         optimizer.zero_grad(set_to_none=True)
@@ -696,6 +774,7 @@ def train_epoch_policy_gradient(
     train_profiler_log_every_batches=0,
     verbose=False,
     gpu_observer=None,
+    kernel_profiler=None,
 ):
     model.train()
     total_loss = torch.tensor(0.0, device=device)
@@ -789,6 +868,7 @@ def train_epoch_policy_gradient(
         iterator = tqdm(iterator, total=steps_per_epoch, desc=desc, unit="step")
 
     for batch in iterator:
+        batch_epoch_for_profile = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
         if using_dist and not ((grad_accum_steps + 1) == aggregate_k_gradients):
             cm = model.no_sync()
         else:
@@ -849,10 +929,15 @@ def train_epoch_policy_gradient(
                             if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
                                 backward_cuda_start = torch.cuda.Event(enable_timing=True)
                                 backward_cuda_start.record()
-                            if scaler is None:
-                                window_loss_scaled.backward(retain_graph=True)
-                            else:
-                                scaler.scale(window_loss_scaled).backward(retain_graph=True)
+                            with (
+                                kernel_profiler.phase("pg.backward")
+                                if (kernel_profiler is not None and kernel_profiler.enabled())
+                                else nullcontext()
+                            ):
+                                if scaler is None:
+                                    window_loss_scaled.backward(retain_graph=True)
+                                else:
+                                    scaler.scale(window_loss_scaled).backward(retain_graph=True)
                             if backward_cuda_start is not None:
                                 backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                 backward_cuda_end.record()
@@ -874,27 +959,32 @@ def train_epoch_policy_gradient(
                         if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
                             rollout_cuda_start = torch.cuda.Event(enable_timing=True)
                             rollout_cuda_start.record()
-                        with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
-                            pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
-                                env_prior=env_prior,
-                                policy_step_fn=policy_step_fn,
-                                batch_size=chunk_bs,
-                                n_samples=n_samples,
-                                num_features=num_features,
-                                device=device,
-                                single_eval_pos=single_eval_pos,
-                                collect_x=False,
-                                policy_rollout_checkpoint=bool(policy_rollout_checkpoint) and (not tbptt_stream_backward_active),
-                                policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
-                                pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
-                                pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
-                                pg_tbptt_window=current_tbptt_window,
-                                tbptt_loss_sink=_tbptt_chunk_loss_sink,
-                            )
-                            weighted_pg_loss = pg_loss_chunk * chunk_weight
-                            loss = weighted_pg_loss / aggregate_k_gradients
-                            if tbptt_stream_backward_active and tbptt_window_backward_called:
-                                loss = loss.detach()
+                        with (
+                            kernel_profiler.phase("pg.rollout")
+                            if (kernel_profiler is not None and kernel_profiler.enabled())
+                            else nullcontext()
+                        ):
+                            with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+                                pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
+                                    env_prior=env_prior,
+                                    policy_step_fn=policy_step_fn,
+                                    batch_size=chunk_bs,
+                                    n_samples=n_samples,
+                                    num_features=num_features,
+                                    device=device,
+                                    single_eval_pos=single_eval_pos,
+                                    collect_x=False,
+                                    policy_rollout_checkpoint=bool(policy_rollout_checkpoint) and (not tbptt_stream_backward_active),
+                                    policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
+                                    pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                                    pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                                    pg_tbptt_window=current_tbptt_window,
+                                    tbptt_loss_sink=_tbptt_chunk_loss_sink,
+                                )
+                                weighted_pg_loss = pg_loss_chunk * chunk_weight
+                                loss = weighted_pg_loss / aggregate_k_gradients
+                                if tbptt_stream_backward_active and tbptt_window_backward_called:
+                                    loss = loss.detach()
                         if rollout_cuda_start is not None:
                             rollout_cuda_end = torch.cuda.Event(enable_timing=True)
                             rollout_cuda_end.record()
@@ -916,10 +1006,15 @@ def train_epoch_policy_gradient(
                             if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
                                 backward_cuda_start = torch.cuda.Event(enable_timing=True)
                                 backward_cuda_start.record()
-                            if scaler is None:
-                                loss.backward()
-                            else:
-                                scaler.scale(loss).backward()
+                            with (
+                                kernel_profiler.phase("pg.backward")
+                                if (kernel_profiler is not None and kernel_profiler.enabled())
+                                else nullcontext()
+                            ):
+                                if scaler is None:
+                                    loss.backward()
+                                else:
+                                    scaler.scale(loss).backward()
                             if backward_cuda_start is not None:
                                 backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                 backward_cuda_end.record()
@@ -940,10 +1035,15 @@ def train_epoch_policy_gradient(
                                 if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
                                     backward_cuda_start = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_start.record()
-                                if scaler is None:
-                                    loss.backward()
-                                else:
-                                    scaler.scale(loss).backward()
+                                with (
+                                    kernel_profiler.phase("pg.backward")
+                                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                                    else nullcontext()
+                                ):
+                                    if scaler is None:
+                                        loss.backward()
+                                    else:
+                                        scaler.scale(loss).backward()
                                 if backward_cuda_start is not None:
                                     backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_end.record()
@@ -1078,6 +1178,8 @@ def train_epoch_policy_gradient(
                             f"pg_gpu/{stage_name}_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
                             f"pg_gpu/{stage_name}_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
                             f"pg_gpu/{stage_name}_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
+                            f"pg_gpu/{stage_name}_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
+                            f"pg_gpu/{stage_name}_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
                         }
                         if cuda_ms is not None:
                             wandb_payload[f"pg_gpu/{stage_name}_cuda_elapsed_ms"] = float(cuda_ms)
@@ -1115,6 +1217,12 @@ def train_epoch_policy_gradient(
                             'policy_rollout_chunk_size': current_rollout_chunk_size,
                         }
                     )
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
+                    batch_idx=batch,
+                    verbose=verbose,
+                )
                 continue
 
             if progress_bar and hasattr(iterator, "set_postfix"):
@@ -1150,6 +1258,12 @@ def train_epoch_policy_gradient(
                     )
                 if wandb.run is not None:
                     wandb.log({'train_skip': 1, 'train_skip_reason': 'loss_nonfinite', 'train_skip_loss': loss_val})
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
+                    batch_idx=batch,
+                    verbose=verbose,
+                )
                 continue
 
             if wandb.run is not None:
@@ -1180,6 +1294,12 @@ def train_epoch_policy_gradient(
                     )
                 if wandb.run is not None:
                     wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_nonfinite'})
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
+                    batch_idx=batch,
+                    verbose=verbose,
+                )
                 continue
 
             grad_accum_steps += 1
@@ -1190,9 +1310,14 @@ def train_epoch_policy_gradient(
                 if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
                     step_cuda_start = torch.cuda.Event(enable_timing=True)
                     step_cuda_start.record()
-                if scaler is not None:
-                    scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
+                with (
+                    kernel_profiler.phase("pg.step")
+                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                    else nullcontext()
+                ):
+                    if scaler is not None:
+                        scaler.unscale_(optimizer)
+                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
                 if not torch.isfinite(grad_norm):
                     batch_step_wall += (time.perf_counter() - step_t0)
                     if step_cuda_start is not None:
@@ -1240,6 +1365,8 @@ def train_epoch_policy_gradient(
                                 "pg_gpu/step_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
                                 "pg_gpu/step_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
                                 "pg_gpu/step_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
+                                "pg_gpu/step_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
+                                "pg_gpu/step_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
                             }
                             if step_cuda_ms is not None:
                                 wandb_payload["pg_gpu/step_cuda_elapsed_ms"] = float(step_cuda_ms)
@@ -1272,12 +1399,23 @@ def train_epoch_policy_gradient(
                         )
                     if wandb.run is not None:
                         wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_norm_nonfinite'})
+                    _maybe_step_kernel_profiler(
+                        kernel_profiler,
+                        epoch_idx=batch_epoch_for_profile,
+                        batch_idx=batch,
+                        verbose=verbose,
+                    )
                     continue
-                if scaler is None:
-                    optimizer.step()
-                else:
-                    scaler.step(optimizer)
-                    scaler.update()
+                with (
+                    kernel_profiler.phase("pg.step")
+                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                    else nullcontext()
+                ):
+                    if scaler is None:
+                        optimizer.step()
+                    else:
+                        scaler.step(optimizer)
+                        scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
                 batch_step_wall += (time.perf_counter() - step_t0)
@@ -1326,6 +1464,8 @@ def train_epoch_policy_gradient(
                             "pg_gpu/step_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
                             "pg_gpu/step_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
                             "pg_gpu/step_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
+                            "pg_gpu/step_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
+                            "pg_gpu/step_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
                         }
                         if step_cuda_ms is not None:
                             wandb_payload["pg_gpu/step_cuda_elapsed_ms"] = float(step_cuda_ms)
@@ -1371,6 +1511,12 @@ def train_epoch_policy_gradient(
                             f"increasing policy rollout chunk size to {current_rollout_chunk_size}"
                         )
                     stable_batches_for_chunk_growth = 0
+            _maybe_step_kernel_profiler(
+                kernel_profiler,
+                epoch_idx=batch_epoch_for_profile,
+                batch_idx=batch,
+                verbose=verbose,
+            )
 
     if grad_accum_steps > 0:
         optimizer.zero_grad(set_to_none=True)
@@ -1404,6 +1550,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           train_gpu_observer_interval_sec=1.0,
           train_gpu_observer_output_path=None,
           train_gpu_stage_output_path=None,
+          train_kernel_profiler_enabled=False,
+          train_kernel_profiler_output_dir=None,
+          train_kernel_profiler_wait_steps=1,
+          train_kernel_profiler_warmup_steps=1,
+          train_kernel_profiler_active_steps=3,
+          train_kernel_profiler_repeat_steps=1,
+          train_kernel_profiler_record_shapes=True,
+          train_kernel_profiler_profile_memory=True,
+          train_kernel_profiler_with_stack=False,
+          train_kernel_profiler_with_flops=False,
+          train_kernel_profiler_log_every_batches=0,
           spike_tolerance=4, progress_bar=False, rl_objective='supervised',
           policy_rollout_chunk_size=None,
           policy_rollout_chunk_autotune=True,
@@ -1439,6 +1596,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     env_prior = None
     train_profiler = None
     gpu_observer = None
+    kernel_profiler = None
     if rank == 0:
         profiler_cfg = TrainProfilerConfig(
             enabled=bool(train_profiler_enabled),
@@ -1472,6 +1630,39 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"interval_sec={gpu_observer.sample_interval_sec:.2f}, "
                 f"sample_output={train_gpu_observer_output_path}, "
                 f"stage_output={train_gpu_stage_output_path})"
+            )
+        kernel_profiler_cfg = TrainKernelProfilerConfig(
+            enabled=bool(train_kernel_profiler_enabled),
+            output_dir=train_kernel_profiler_output_dir,
+            wait_steps=int(train_kernel_profiler_wait_steps),
+            warmup_steps=int(train_kernel_profiler_warmup_steps),
+            active_steps=int(train_kernel_profiler_active_steps),
+            repeat_steps=int(train_kernel_profiler_repeat_steps),
+            record_shapes=bool(train_kernel_profiler_record_shapes),
+            profile_memory=bool(train_kernel_profiler_profile_memory),
+            with_stack=bool(train_kernel_profiler_with_stack),
+            with_flops=bool(train_kernel_profiler_with_flops),
+            log_every_batches=int(train_kernel_profiler_log_every_batches),
+        )
+        kernel_profiler = TrainKernelProfiler(
+            kernel_profiler_cfg,
+            device=device,
+            worker_name=f"rank{rank}_pid{os.getpid()}",
+        )
+        kernel_profiler.start()
+        if kernel_profiler.enabled() and verbose:
+            print(
+                "Kernel profiler: enabled "
+                f"(output_dir={kernel_profiler_cfg.output_dir}, "
+                f"schedule={kernel_profiler_cfg.wait_steps}/"
+                f"{kernel_profiler_cfg.warmup_steps}/"
+                f"{kernel_profiler_cfg.active_steps}/"
+                f"{kernel_profiler_cfg.repeat_steps}, "
+                f"log_every_batches={kernel_profiler_cfg.log_every_batches}, "
+                f"record_shapes={kernel_profiler_cfg.record_shapes}, "
+                f"profile_memory={kernel_profiler_cfg.profile_memory}, "
+                f"with_stack={kernel_profiler_cfg.with_stack}, "
+                f"with_flops={kernel_profiler_cfg.with_flops})"
             )
     if rl_objective == 'policy_gradient':
         if using_dist:
@@ -1578,6 +1769,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     f"interval_sec={float(max(0.1, train_gpu_observer_interval_sec)):.2f}",
                     f"samples_jsonl={train_gpu_observer_output_path}",
                     f"stages_jsonl={train_gpu_stage_output_path}",
+                )
+            print("Kernel profiler enabled:", bool(train_kernel_profiler_enabled))
+            if bool(train_kernel_profiler_enabled):
+                print(
+                    "Kernel profiler schedule:",
+                    f"wait={int(max(0, train_kernel_profiler_wait_steps))}",
+                    f"warmup={int(max(0, train_kernel_profiler_warmup_steps))}",
+                    f"active={int(max(1, train_kernel_profiler_active_steps))}",
+                    f"repeat={int(max(1, train_kernel_profiler_repeat_steps))}",
+                    f"output_dir={train_kernel_profiler_output_dir}",
+                    f"log_every_batches={int(max(0, train_kernel_profiler_log_every_batches))}",
                 )
 
     n_out = model.n_out
@@ -1702,6 +1904,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     train_profiler_log_every_batches=train_profiler_log_every_batches,
                     verbose=verbose,
                     gpu_observer=gpu_observer,
+                    kernel_profiler=kernel_profiler,
                 )
             else:
                 new_loss, nan_share, ignore_share = train_epoch(
@@ -1720,6 +1923,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     epoch_start_time=epoch_start_time,
                     train_profiler_log_every_batches=train_profiler_log_every_batches,
                     verbose=verbose,
+                    kernel_profiler=kernel_profiler,
                 )
 
             total_loss = new_loss
@@ -1772,6 +1976,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                             "gpu_epoch/process_mem_avg_mib": gpu_epoch_record.get("process_mem_avg_mib"),
                             "gpu_epoch/process_mem_max_mib": gpu_epoch_record.get("process_mem_max_mib"),
                             "gpu_epoch/process_mem_share_avg": gpu_epoch_record.get("process_mem_share_avg"),
+                            "gpu_epoch/process_sm_util_avg": gpu_epoch_record.get("process_sm_util_avg"),
+                            "gpu_epoch/process_sm_util_max": gpu_epoch_record.get("process_sm_util_max"),
+                            "gpu_epoch/process_mem_util_avg": gpu_epoch_record.get("process_mem_util_avg"),
+                            "gpu_epoch/process_mem_util_max": gpu_epoch_record.get("process_mem_util_max"),
                         }
                     )
 
@@ -1799,7 +2007,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         f"gpu_util_avg {gpu_epoch_record.get('gpu_util_avg')} | "
                         f"gpu_util_max {gpu_epoch_record.get('gpu_util_max')} | "
                         f"proc_mem_avg_mib {gpu_epoch_record.get('process_mem_avg_mib')} | "
-                        f"proc_mem_max_mib {gpu_epoch_record.get('process_mem_max_mib')}"
+                        f"proc_mem_max_mib {gpu_epoch_record.get('process_mem_max_mib')} | "
+                        f"proc_sm_util_avg {gpu_epoch_record.get('process_sm_util_avg')} | "
+                        f"proc_sm_util_max {gpu_epoch_record.get('process_sm_util_max')}"
                     )
 
                 if wandb.run: 
@@ -1858,6 +2068,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     except KeyboardInterrupt:
         pass
     finally:
+        if kernel_profiler is not None:
+            kernel_profiler.stop()
         if gpu_observer is not None:
             gpu_observer.stop()
 

@@ -39,6 +39,17 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["train_gpu_observer_interval_sec"] == 1.0
     assert cfg["optimizer"]["train_gpu_observer_output_path"] is None
     assert cfg["optimizer"]["train_gpu_stage_output_path"] is None
+    assert cfg["optimizer"]["train_kernel_profiler_enabled"] is False
+    assert cfg["optimizer"]["train_kernel_profiler_output_dir"] is None
+    assert cfg["optimizer"]["train_kernel_profiler_wait_steps"] == 1
+    assert cfg["optimizer"]["train_kernel_profiler_warmup_steps"] == 1
+    assert cfg["optimizer"]["train_kernel_profiler_active_steps"] == 3
+    assert cfg["optimizer"]["train_kernel_profiler_repeat_steps"] == 1
+    assert cfg["optimizer"]["train_kernel_profiler_record_shapes"] is True
+    assert cfg["optimizer"]["train_kernel_profiler_profile_memory"] is True
+    assert cfg["optimizer"]["train_kernel_profiler_with_stack"] is False
+    assert cfg["optimizer"]["train_kernel_profiler_with_flops"] is False
+    assert cfg["optimizer"]["train_kernel_profiler_log_every_batches"] == 0
     assert cfg["optimizer"]["pg_tbptt_window"] == 128
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False

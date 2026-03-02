@@ -55,6 +55,9 @@ def main():
                 "gpu_power_w",
                 "process_mem_mib",
                 "process_mem_share_percent",
+                "process_sm_util_percent",
+                "process_mem_util_percent",
+                "process_util_available",
                 "stage_label",
             ]
         )
@@ -68,6 +71,9 @@ def main():
                     s.get("gpu_power_w"),
                     s.get("process_mem_mib"),
                     s.get("process_mem_share_percent"),
+                    s.get("process_sm_util_percent"),
+                    s.get("process_mem_util_percent"),
+                    int(bool(s.get("process_util_available", False))),
                     _stage_label(ts, stage_rows),
                 ]
             )

@@ -11,6 +11,11 @@ import torch
 import os
 root_dir = os.path.dirname(os.path.abspath(__file__))
 
+if hasattr(sys.stdout, "reconfigure"):
+    sys.stdout.reconfigure(line_buffering=True)
+if hasattr(sys.stderr, "reconfigure"):
+    sys.stderr.reconfigure(line_buffering=True)
+
 from git import Repo
 
 from ticl.model_builder import get_model
@@ -65,6 +70,17 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-gpu-observer-interval-sec", "train_gpu_observer_interval_sec"),
         ("--train-gpu-observer-output-path", "train_gpu_observer_output_path"),
         ("--train-gpu-stage-output-path", "train_gpu_stage_output_path"),
+        ("--train-kernel-profiler-enabled", "train_kernel_profiler_enabled"),
+        ("--train-kernel-profiler-output-dir", "train_kernel_profiler_output_dir"),
+        ("--train-kernel-profiler-wait-steps", "train_kernel_profiler_wait_steps"),
+        ("--train-kernel-profiler-warmup-steps", "train_kernel_profiler_warmup_steps"),
+        ("--train-kernel-profiler-active-steps", "train_kernel_profiler_active_steps"),
+        ("--train-kernel-profiler-repeat-steps", "train_kernel_profiler_repeat_steps"),
+        ("--train-kernel-profiler-record-shapes", "train_kernel_profiler_record_shapes"),
+        ("--train-kernel-profiler-profile-memory", "train_kernel_profiler_profile_memory"),
+        ("--train-kernel-profiler-with-stack", "train_kernel_profiler_with_stack"),
+        ("--train-kernel-profiler-with-flops", "train_kernel_profiler_with_flops"),
+        ("--train-kernel-profiler-log-every-batches", "train_kernel_profiler_log_every_batches"),
     )
     for flag, key in profiler_flags:
         if _cli_flag_is_set(argv, flag):

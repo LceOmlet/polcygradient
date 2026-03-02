@@ -7,6 +7,11 @@ from typing import Dict, List, Optional
 
 import torch
 
+try:
+    import pynvml  # type: ignore
+except Exception:  # pragma: no cover - optional dependency
+    pynvml = None
+
 
 def _parse_num(token: str) -> Optional[float]:
     t = str(token).strip()
@@ -38,8 +43,8 @@ class GPUProcessObserver:
 
     Notes:
     - `gpu_util_percent` is device-level utilization from nvidia-smi.
-    - process-level SM util is not exposed by `--query-compute-apps` on many
-      drivers; we track process memory and presence separately.
+    - process-level SM/MEM util is sampled from NVML when available, and falls
+      back to `nvidia-smi pmon` parsing otherwise.
     """
 
     def __init__(
@@ -61,11 +66,15 @@ class GPUProcessObserver:
         self.stage_output_path = stage_output_path
         self.pid = int(os.getpid() if pid is None else pid)
 
-        self._samples: List[Dict[str, float]] = []
+        self._samples: List[Dict[str, object]] = []
         self._lock = threading.Lock()
         self._stop_event = threading.Event()
         self._thread = None
         self._warned_sampling_failure = False
+        self._nvml_handle = None
+        self._nvml_last_ts_ms = 0
+        self._process_util_backend = "none"
+        self._init_nvml()
 
     def enabled(self) -> bool:
         return bool(self._enabled)
@@ -89,10 +98,128 @@ class GPUProcessObserver:
         self._stop_event.set()
         self._thread.join(timeout=5.0)
         self._thread = None
+        if self._nvml_handle is not None and pynvml is not None:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
+            self._nvml_handle = None
 
     def sample_count(self) -> int:
         with self._lock:
             return len(self._samples)
+
+    def _init_nvml(self) -> None:
+        if not self.enabled() or pynvml is None:
+            return
+        try:
+            pynvml.nvmlInit()
+            self._nvml_handle = pynvml.nvmlDeviceGetHandleByIndex(int(self.device_index))
+            self._process_util_backend = "nvml"
+        except Exception:
+            self._nvml_handle = None
+            self._process_util_backend = "pmon"
+
+    def _sample_process_util_nvml(self):
+        if self._nvml_handle is None or pynvml is None:
+            return False, None, None
+        try:
+            samples = pynvml.nvmlDeviceGetProcessUtilization(
+                self._nvml_handle,
+                int(self._nvml_last_ts_ms),
+            )
+        except Exception:
+            return False, None, None
+
+        proc_samples = []
+        for s in samples:
+            try:
+                if int(getattr(s, "pid", -1)) == int(self.pid):
+                    proc_samples.append(s)
+            except Exception:
+                continue
+        if samples:
+            try:
+                self._nvml_last_ts_ms = int(max(getattr(s, "timeStamp", 0) for s in samples))
+            except Exception:
+                pass
+        if not proc_samples:
+            return True, None, None
+
+        sm_vals = []
+        mem_vals = []
+        for s in proc_samples:
+            sm_v = _parse_num(getattr(s, "smUtil", None))
+            mem_v = _parse_num(getattr(s, "memUtil", None))
+            if sm_v is not None:
+                sm_vals.append(float(sm_v))
+            if mem_v is not None:
+                mem_vals.append(float(mem_v))
+        sm_util = (sum(sm_vals) / len(sm_vals)) if sm_vals else None
+        mem_util = (sum(mem_vals) / len(mem_vals)) if mem_vals else None
+        return True, sm_util, mem_util
+
+    def _sample_process_util_pmon(self):
+        cmd = [
+            "nvidia-smi",
+            "pmon",
+            "-i",
+            str(int(self.device_index)),
+            "-s",
+            "um",
+            "-c",
+            "1",
+        ]
+        try:
+            out = subprocess.check_output(
+                cmd,
+                text=True,
+                stderr=subprocess.DEVNULL,
+                timeout=2.0,
+            )
+        except Exception:
+            return False, None, None
+
+        found = False
+        sm_util = None
+        mem_util = None
+        for line in out.splitlines():
+            line = line.strip()
+            if (not line) or line.startswith("#"):
+                continue
+            parts = line.split()
+            if len(parts) < 6:
+                continue
+            row_gpu = _parse_num(parts[0])
+            row_pid = _parse_num(parts[1])
+            if row_gpu is None or row_pid is None:
+                continue
+            if int(row_gpu) != int(self.device_index):
+                continue
+            if int(row_pid) != int(self.pid):
+                continue
+            found = True
+            sm_util = _parse_num(parts[3])
+            mem_util = _parse_num(parts[4])
+            break
+        return True, (None if not found else sm_util), (None if not found else mem_util)
+
+    def _sample_process_util(self):
+        backend = str(self._process_util_backend)
+        if backend == "nvml":
+            ok, sm, mem = self._sample_process_util_nvml()
+            if ok:
+                return True, sm, mem, "nvml"
+            # NVML transient failure: try pmon before giving up.
+            ok2, sm2, mem2 = self._sample_process_util_pmon()
+            if ok2:
+                self._process_util_backend = "pmon"
+                return True, sm2, mem2, "pmon"
+            return False, None, None, "none"
+        ok, sm, mem = self._sample_process_util_pmon()
+        if ok:
+            return True, sm, mem, "pmon"
+        return False, None, None, "none"
 
     def _sample_loop(self) -> None:
         while not self._stop_event.is_set():
@@ -103,7 +230,7 @@ class GPUProcessObserver:
                 self._write_jsonl(self.output_path, sample)
             self._stop_event.wait(self.sample_interval_sec)
 
-    def _sample_once(self) -> Optional[Dict[str, float]]:
+    def _sample_once(self) -> Optional[Dict[str, object]]:
         gpu_cmd = [
             "nvidia-smi",
             "--query-gpu=index,uuid,utilization.gpu,utilization.memory,memory.used,memory.total,power.draw",
@@ -181,6 +308,8 @@ class GPUProcessObserver:
         else:
             process_mem_share_percent = None
 
+        proc_util_available, proc_sm_util, proc_mem_util, proc_util_backend = self._sample_process_util()
+
         sample = {
             "timestamp_unix": float(time.time()),
             "pid": int(self.pid),
@@ -194,11 +323,14 @@ class GPUProcessObserver:
             "process_present": bool(process_present),
             "process_mem_mib": float(process_mem_mib),
             "process_mem_share_percent": process_mem_share_percent,
-            "process_util_available": False,
+            "process_util_available": bool(proc_util_available),
+            "process_util_backend": str(proc_util_backend),
+            "process_sm_util_percent": (None if proc_sm_util is None else float(proc_sm_util)),
+            "process_mem_util_percent": (None if proc_mem_util is None else float(proc_mem_util)),
         }
         return sample
 
-    def window_stats(self, start_time_unix: float, end_time_unix: float) -> Dict[str, Optional[float]]:
+    def window_stats(self, start_time_unix: float, end_time_unix: float) -> Dict[str, object]:
         t0 = float(min(start_time_unix, end_time_unix))
         t1 = float(max(start_time_unix, end_time_unix))
         with self._lock:
@@ -216,6 +348,11 @@ class GPUProcessObserver:
                 "process_mem_avg_mib": None,
                 "process_mem_max_mib": None,
                 "process_mem_share_avg": None,
+                "process_sm_util_avg": None,
+                "process_sm_util_max": None,
+                "process_mem_util_avg": None,
+                "process_mem_util_max": None,
+                "process_util_available": None,
             }
 
         def _nums(key):
@@ -227,6 +364,9 @@ class GPUProcessObserver:
         gpu_power = _nums("gpu_power_w")
         process_mem = _nums("process_mem_mib")
         process_mem_share = _nums("process_mem_share_percent")
+        process_sm_util = _nums("process_sm_util_percent")
+        process_mem_util = _nums("process_mem_util_percent")
+        process_util_available = [bool(s.get("process_util_available", False)) for s in window]
 
         return {
             "samples": int(len(window)),
@@ -237,6 +377,11 @@ class GPUProcessObserver:
             "process_mem_avg_mib": (sum(process_mem) / len(process_mem)) if process_mem else None,
             "process_mem_max_mib": max(process_mem) if process_mem else None,
             "process_mem_share_avg": (sum(process_mem_share) / len(process_mem_share)) if process_mem_share else None,
+            "process_sm_util_avg": (sum(process_sm_util) / len(process_sm_util)) if process_sm_util else None,
+            "process_sm_util_max": max(process_sm_util) if process_sm_util else None,
+            "process_mem_util_avg": (sum(process_mem_util) / len(process_mem_util)) if process_mem_util else None,
+            "process_mem_util_max": max(process_mem_util) if process_mem_util else None,
+            "process_util_available": bool(any(process_util_available)),
         }
 
     def record_stage(
@@ -259,7 +404,7 @@ class GPUProcessObserver:
             "t_start_unix": float(start_time_unix),
             "t_end_unix": float(end_time_unix),
             "duration_sec": float(max(0.0, end_time_unix - start_time_unix)),
-            "process_util_available": False,
+            "process_util_available": bool(stats.get("process_util_available", False)),
             **stats,
         }
         if extra:

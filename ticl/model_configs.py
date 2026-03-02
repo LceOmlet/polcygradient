@@ -38,6 +38,17 @@ def get_optimizer_config():
         "train_gpu_observer_interval_sec": 1.0,
         "train_gpu_observer_output_path": None,
         "train_gpu_stage_output_path": None,
+        "train_kernel_profiler_enabled": False,
+        "train_kernel_profiler_output_dir": None,
+        "train_kernel_profiler_wait_steps": 1,
+        "train_kernel_profiler_warmup_steps": 1,
+        "train_kernel_profiler_active_steps": 3,
+        "train_kernel_profiler_repeat_steps": 1,
+        "train_kernel_profiler_record_shapes": True,
+        "train_kernel_profiler_profile_memory": True,
+        "train_kernel_profiler_with_stack": False,
+        "train_kernel_profiler_with_flops": False,
+        "train_kernel_profiler_log_every_batches": 0,
         "learning_rate": 0.00003,
         "epochs": 4000,
         "train_mixed_precision": True,
@@ -428,6 +439,17 @@ def get_rlpfn_default_config():
     config['optimizer']['train_gpu_observer_interval_sec'] = 1.0
     config['optimizer']['train_gpu_observer_output_path'] = None
     config['optimizer']['train_gpu_stage_output_path'] = None
+    config['optimizer']['train_kernel_profiler_enabled'] = False
+    config['optimizer']['train_kernel_profiler_output_dir'] = None
+    config['optimizer']['train_kernel_profiler_wait_steps'] = 1
+    config['optimizer']['train_kernel_profiler_warmup_steps'] = 1
+    config['optimizer']['train_kernel_profiler_active_steps'] = 3
+    config['optimizer']['train_kernel_profiler_repeat_steps'] = 1
+    config['optimizer']['train_kernel_profiler_record_shapes'] = True
+    config['optimizer']['train_kernel_profiler_profile_memory'] = True
+    config['optimizer']['train_kernel_profiler_with_stack'] = False
+    config['optimizer']['train_kernel_profiler_with_flops'] = False
+    config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     # With reentrant rollout checkpoint defaulted on, saved-tensor CPU offload is
     # not needed by default and can otherwise shift pressure to host RAM.
     config['optimizer']['pg_saved_tensors_cpu_offload'] = False

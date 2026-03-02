@@ -62,6 +62,17 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_gpu_observer_interval_sec == 1.0
     assert args.optimizer.train_gpu_observer_output_path is None
     assert args.optimizer.train_gpu_stage_output_path is None
+    assert args.optimizer.train_kernel_profiler_enabled is False
+    assert args.optimizer.train_kernel_profiler_output_dir is None
+    assert args.optimizer.train_kernel_profiler_wait_steps == 1
+    assert args.optimizer.train_kernel_profiler_warmup_steps == 1
+    assert args.optimizer.train_kernel_profiler_active_steps == 3
+    assert args.optimizer.train_kernel_profiler_repeat_steps == 1
+    assert args.optimizer.train_kernel_profiler_record_shapes is True
+    assert args.optimizer.train_kernel_profiler_profile_memory is True
+    assert args.optimizer.train_kernel_profiler_with_stack is False
+    assert args.optimizer.train_kernel_profiler_with_flops is False
+    assert args.optimizer.train_kernel_profiler_log_every_batches == 0
     assert args.optimizer.pg_tbptt_window == 128
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
@@ -238,6 +249,37 @@ def test_rlpfn_parser_accepts_gpu_observer_flags():
     assert args.optimizer.train_gpu_stage_output_path == "/tmp/rlpfn_gpu_stages.jsonl"
 
 
+def test_rlpfn_parser_accepts_kernel_profiler_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--train-kernel-profiler-enabled", "true",
+            "--train-kernel-profiler-output-dir", "/tmp/rlpfn_kernel_profile",
+            "--train-kernel-profiler-wait-steps", "2",
+            "--train-kernel-profiler-warmup-steps", "3",
+            "--train-kernel-profiler-active-steps", "4",
+            "--train-kernel-profiler-repeat-steps", "2",
+            "--train-kernel-profiler-record-shapes", "false",
+            "--train-kernel-profiler-profile-memory", "false",
+            "--train-kernel-profiler-with-stack", "true",
+            "--train-kernel-profiler-with-flops", "true",
+            "--train-kernel-profiler-log-every-batches", "5",
+        ]
+    )
+    assert args.optimizer.train_kernel_profiler_enabled is True
+    assert args.optimizer.train_kernel_profiler_output_dir == "/tmp/rlpfn_kernel_profile"
+    assert args.optimizer.train_kernel_profiler_wait_steps == 2
+    assert args.optimizer.train_kernel_profiler_warmup_steps == 3
+    assert args.optimizer.train_kernel_profiler_active_steps == 4
+    assert args.optimizer.train_kernel_profiler_repeat_steps == 2
+    assert args.optimizer.train_kernel_profiler_record_shapes is False
+    assert args.optimizer.train_kernel_profiler_profile_memory is False
+    assert args.optimizer.train_kernel_profiler_with_stack is True
+    assert args.optimizer.train_kernel_profiler_with_flops is True
+    assert args.optimizer.train_kernel_profiler_log_every_batches == 5
+
+
 def test_cli_flag_is_set_detects_split_and_equals_forms():
     assert _cli_flag_is_set(["rlpfn", "--policy-rollout-chunk-size", "1"], "--policy-rollout-chunk-size")
     assert _cli_flag_is_set(["rlpfn", "--policy-rollout-chunk-size=1"], "--policy-rollout-chunk-size")
@@ -340,3 +382,62 @@ def test_continue_run_cli_override_applies_gpu_observer_flags():
     assert out["optimizer"]["train_gpu_observer_interval_sec"] == 0.5
     assert out["optimizer"]["train_gpu_observer_output_path"] == "/tmp/gpu_samples.jsonl"
     assert out["optimizer"]["train_gpu_stage_output_path"] == "/tmp/gpu_stages.jsonl"
+
+
+def test_continue_run_cli_override_applies_kernel_profiler_flags():
+    config = {
+        "optimizer": {
+            "train_kernel_profiler_enabled": False,
+            "train_kernel_profiler_output_dir": None,
+            "train_kernel_profiler_wait_steps": 1,
+            "train_kernel_profiler_warmup_steps": 1,
+            "train_kernel_profiler_active_steps": 3,
+            "train_kernel_profiler_repeat_steps": 1,
+            "train_kernel_profiler_record_shapes": True,
+            "train_kernel_profiler_profile_memory": True,
+            "train_kernel_profiler_with_stack": False,
+            "train_kernel_profiler_with_flops": False,
+            "train_kernel_profiler_log_every_batches": 0,
+        }
+    }
+    args = Namespace(
+        optimizer=Namespace(
+            train_kernel_profiler_enabled=True,
+            train_kernel_profiler_output_dir="/tmp/kernel_profile",
+            train_kernel_profiler_wait_steps=2,
+            train_kernel_profiler_warmup_steps=3,
+            train_kernel_profiler_active_steps=4,
+            train_kernel_profiler_repeat_steps=5,
+            train_kernel_profiler_record_shapes=False,
+            train_kernel_profiler_profile_memory=False,
+            train_kernel_profiler_with_stack=True,
+            train_kernel_profiler_with_flops=True,
+            train_kernel_profiler_log_every_batches=7,
+        )
+    )
+    argv = [
+        "rlpfn",
+        "--train-kernel-profiler-enabled", "true",
+        "--train-kernel-profiler-output-dir", "/tmp/kernel_profile",
+        "--train-kernel-profiler-wait-steps", "2",
+        "--train-kernel-profiler-warmup-steps", "3",
+        "--train-kernel-profiler-active-steps", "4",
+        "--train-kernel-profiler-repeat-steps", "5",
+        "--train-kernel-profiler-record-shapes", "false",
+        "--train-kernel-profiler-profile-memory", "false",
+        "--train-kernel-profiler-with-stack", "true",
+        "--train-kernel-profiler-with-flops", "true",
+        "--train-kernel-profiler-log-every-batches", "7",
+    ]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["train_kernel_profiler_enabled"] is True
+    assert out["optimizer"]["train_kernel_profiler_output_dir"] == "/tmp/kernel_profile"
+    assert out["optimizer"]["train_kernel_profiler_wait_steps"] == 2
+    assert out["optimizer"]["train_kernel_profiler_warmup_steps"] == 3
+    assert out["optimizer"]["train_kernel_profiler_active_steps"] == 4
+    assert out["optimizer"]["train_kernel_profiler_repeat_steps"] == 5
+    assert out["optimizer"]["train_kernel_profiler_record_shapes"] is False
+    assert out["optimizer"]["train_kernel_profiler_profile_memory"] is False
+    assert out["optimizer"]["train_kernel_profiler_with_stack"] is True
+    assert out["optimizer"]["train_kernel_profiler_with_flops"] is True
+    assert out["optimizer"]["train_kernel_profiler_log_every_batches"] == 7

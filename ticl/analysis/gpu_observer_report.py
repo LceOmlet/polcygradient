@@ -38,6 +38,9 @@ def summarize_samples(rows):
     util = [r.get("gpu_util_percent") for r in rows]
     mem = [r.get("process_mem_mib") for r in rows]
     mem_share = [r.get("process_mem_share_percent") for r in rows]
+    process_sm_util = [r.get("process_sm_util_percent") for r in rows]
+    process_mem_util = [r.get("process_mem_util_percent") for r in rows]
+    process_util_available = [bool(r.get("process_util_available", False)) for r in rows]
     power = [r.get("gpu_power_w") for r in rows]
     t0 = float(rows[0].get("timestamp_unix", 0.0))
     t1 = float(rows[-1].get("timestamp_unix", t0))
@@ -47,6 +50,12 @@ def summarize_samples(rows):
         "gpu_util": _num_stats(util),
         "process_mem_mib": _num_stats(mem),
         "process_mem_share_percent": _num_stats(mem_share),
+        "process_sm_util_percent": _num_stats(process_sm_util),
+        "process_mem_util_percent": _num_stats(process_mem_util),
+        "process_util_available_ratio": float(
+            (sum(1 for x in process_util_available if x) / len(process_util_available))
+            if process_util_available else 0.0
+        ),
         "gpu_power_w": _num_stats(power),
     }
 
@@ -74,6 +83,11 @@ def summarize_stages(rows):
             "cuda_busy_ratio": _num_stats([x.get("cuda_busy_ratio") for x in recs]),
             "gpu_util_avg": _num_stats([x.get("gpu_util_avg") for x in recs]),
             "process_mem_avg_mib": _num_stats([x.get("process_mem_avg_mib") for x in recs]),
+            "process_sm_util_avg": _num_stats([x.get("process_sm_util_avg") for x in recs]),
+            "process_mem_util_avg": _num_stats([x.get("process_mem_util_avg") for x in recs]),
+            "process_util_available_ratio": float(
+                sum(1 for x in recs if bool(x.get("process_util_available", False))) / len(recs)
+            ),
         }
 
     batch_total = list(by_batch.values())
