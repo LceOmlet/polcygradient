@@ -1,0 +1,52 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Train profiler: enabled (output_path=None, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=1342008, interval_sec=0.20, sample_output=None, stage_output=None)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: auto-disabled (TBPTT streaming + paged mutable KV throughput route).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 128
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=None stages_jsonl=None
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_02_2026_11_39_50
+AdamW fused: enabled
+/home/chen/RLPFN/ticl/ticl/train.py:2031: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+start of epoch 1
+/home/chen/RLPFN/ticl/ticl/train.py:1093: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+[pg-gpu-stage] epoch=1 batch=0 stage=rollout  samples=241 gpu_util_avg=18.73 gpu_util_max=25.00 proc_mem_avg_mib=18631.9 proc_mem_max_mib=35744.0 proc_mem_share_avg=37.92 proc_sm_util_avg=18.53 cuda_ms=72314.75 cuda_busy_ratio=1.000
+[pg-gpu-stage] epoch=1 batch=0 stage=backward  samples=226 gpu_util_avg=19.18 gpu_util_max=25.00 proc_mem_avg_mib=19677.4 proc_mem_max_mib=35744.0 proc_mem_share_avg=40.04 proc_sm_util_avg=19.01 cuda_ms=43471.18 cuda_busy_ratio=0.643
+[pg-gpu-stage] epoch=1 batch=0 stage=step  samples=1 gpu_util_avg=21.00 gpu_util_max=21.00 proc_mem_avg_mib=35744.0 proc_mem_max_mib=35744.0 proc_mem_share_avg=72.74 proc_sm_util_avg=na cuda_ms=41.12 cuda_busy_ratio=0.996
+[pg-phase] epoch=0 batch=0 rollout_s=72.315 backward_s=43.473 step_s=0.041 backward_calls=8 chunk=8 tbptt=128 status=grad_norm_nonfinite
+[train-skip] epoch=0 batch=0 reason=grad_norm_nonfinite
+ [profile-interval] epoch=1 batch=1 steps/s=0.01 samples/s=0.11 tokens/s=113.19
+[train-warn] all batches were skipped due to non-finite loss/grad.
+-----------------------------------------------------------------------------------------
+ peak gpu mem alloc/reserved 27.04GiB/34.44GiB |
+| end of epoch   1 | Wallclock time: 72.37s | GPU time: 72.37s | mean loss   inf | 
+ profile steps/s 0.01 (ema 0.01) | samples/s 0.11 | tokens/s 113.19 | valid/skipped 0/1
+ gpu-observer samples 242 | gpu_util_avg 18.74380165289256 | gpu_util_max 25.0 | proc_mem_avg_mib 18702.603305785124 | proc_mem_max_mib 35744.0 | proc_sm_util_avg 18.534188034188034 | proc_sm_util_max 28.0
+ lr 3.0000000000000002e-15 nan share  0.00 ignore share (for classification tasks) 0.0000
+-----------------------------------------------------------------------------------------
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:1195: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scheduler.step()
+Saving model to ./models_diff/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_02_2026_11_39_50_epoch_on_exit.cpkt

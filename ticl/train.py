@@ -1014,6 +1014,8 @@ def train_epoch_policy_gradient(
                 batch_backward_wall = 0.0
                 batch_backward_calls = 0
                 batch_step_wall = 0.0
+                batch_rollout_policy_cuda_ms = 0.0
+                batch_rollout_transition_cuda_ms = 0.0
                 rollout_t_start_unix = None
                 rollout_t_end_unix = None
                 backward_t_start_unix = None
@@ -1228,6 +1230,18 @@ def train_epoch_policy_gradient(
                     batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
                     batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
                     batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
+                    policy_cuda_ms = pg_stats_chunk.get("rollout_policy_cuda_ms", None)
+                    if policy_cuda_ms is not None:
+                        try:
+                            batch_rollout_policy_cuda_ms += float(policy_cuda_ms)
+                        except Exception:
+                            pass
+                    transition_cuda_ms = pg_stats_chunk.get("rollout_transition_cuda_ms", None)
+                    if transition_cuda_ms is not None:
+                        try:
+                            batch_rollout_transition_cuda_ms += float(transition_cuda_ms)
+                        except Exception:
+                            pass
 
                 if batch_oom and batch_attempt < max_batch_oom_retries:
                     optimizer.zero_grad(set_to_none=True)
@@ -1251,6 +1265,16 @@ def train_epoch_policy_gradient(
                 if backward_cuda_pairs:
                     stage_cuda_ms["backward"] = float(sum(s.elapsed_time(e) for s, e in backward_cuda_pairs))
 
+            rollout_breakdown_suffix = ""
+            rollout_breakdown_total_ms = batch_rollout_policy_cuda_ms + batch_rollout_transition_cuda_ms
+            if rollout_breakdown_total_ms > 0.0:
+                rollout_policy_share = float(batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms))
+                rollout_breakdown_suffix = (
+                    f" rollout_policy_cuda_ms={batch_rollout_policy_cuda_ms:.2f}"
+                    f" rollout_transition_cuda_ms={batch_rollout_transition_cuda_ms:.2f}"
+                    f" rollout_policy_share={rollout_policy_share:.3f}"
+                )
+
             if gpu_observer_active:
                 epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
                 stage_windows = {
@@ -1266,26 +1290,37 @@ def train_epoch_policy_gradient(
                     cuda_busy_ratio = None
                     if cuda_ms is not None:
                         cuda_busy_ratio = float((cuda_ms / 1000.0) / duration_sec)
+                    stage_extra = {
+                        "status": batch_status,
+                        "chunk_size": int(current_rollout_chunk_size),
+                        "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
+                        "cuda_elapsed_ms": cuda_ms,
+                        "cuda_busy_ratio": cuda_busy_ratio,
+                    }
+                    if stage_name == "rollout" and rollout_breakdown_total_ms > 0.0:
+                        stage_extra["rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
+                        stage_extra["rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
+                        stage_extra["rollout_policy_share"] = float(
+                            batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                        )
                     stage_rec = gpu_observer.record_stage(
                         epoch=epoch_obs,
                         batch=int(batch),
                         stage=stage_name,
                         start_time_unix=float(stage_t0),
                         end_time_unix=float(stage_t1),
-                        extra={
-                            "status": batch_status,
-                            "chunk_size": int(current_rollout_chunk_size),
-                            "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
-                            "cuda_elapsed_ms": cuda_ms,
-                            "cuda_busy_ratio": cuda_busy_ratio,
-                        },
+                        extra=stage_extra,
                     )
                     if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                        breakdown_info = ""
+                        if stage_name == "rollout":
+                            breakdown_info = rollout_breakdown_suffix
                         print(
                             f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage={stage_name} "
                             f"{_format_gpu_stage_summary('', stage_rec)} "
                             f"cuda_ms={'na' if cuda_ms is None else f'{cuda_ms:.2f}'} "
                             f"cuda_busy_ratio={'na' if cuda_busy_ratio is None else f'{cuda_busy_ratio:.3f}'}"
+                            f"{breakdown_info}"
                         )
                     if wandb.run is not None:
                         wandb_payload = {
@@ -1302,6 +1337,12 @@ def train_epoch_policy_gradient(
                             wandb_payload[f"pg_gpu/{stage_name}_cuda_elapsed_ms"] = float(cuda_ms)
                         if cuda_busy_ratio is not None:
                             wandb_payload[f"pg_gpu/{stage_name}_cuda_busy_ratio"] = float(cuda_busy_ratio)
+                        if stage_name == "rollout" and rollout_breakdown_total_ms > 0.0:
+                            wandb_payload["pg_gpu/rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
+                            wandb_payload["pg_gpu/rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
+                            wandb_payload["pg_gpu/rollout_policy_share"] = float(
+                                batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                            )
                         wandb.log(wandb_payload)
 
             if batch_oom:
@@ -1315,6 +1356,7 @@ def train_epoch_policy_gradient(
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
+                        f"{rollout_breakdown_suffix}"
                     )
                 if epoch_profiler is not None:
                     epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
@@ -1361,6 +1403,7 @@ def train_epoch_policy_gradient(
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
+                        f"{rollout_breakdown_suffix}"
                     )
                 print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=loss_nonfinite loss={loss_val}")
                 if epoch_profiler is not None:
@@ -1502,6 +1545,7 @@ def train_epoch_policy_gradient(
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
+                            f"{rollout_breakdown_suffix}"
                         )
                     print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=grad_norm_nonfinite")
                     if epoch_profiler is not None:
@@ -1598,6 +1642,7 @@ def train_epoch_policy_gradient(
                     f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                     f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                     f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok"
+                    f"{rollout_breakdown_suffix}"
                 )
             if epoch_profiler is not None:
                 epoch_profiler.record_batch(valid=True, batch_size=batch_size, n_samples=n_samples)
@@ -1709,6 +1754,24 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     model.to(device)
     if criterion is not None:
         criterion.to(device)
+
+    policy_tf32_prev = None
+    if (
+        rl_objective == 'policy_gradient'
+        and ("cuda" in str(device))
+        and torch.cuda.is_available()
+    ):
+        tf32_flag = str(os.environ.get("TICL_POLICY_TF32", "1")).strip().lower()
+        policy_tf32_enabled = tf32_flag not in {"0", "false", "no", "off"}
+        if policy_tf32_enabled:
+            policy_tf32_prev = bool(torch.backends.cuda.matmul.allow_tf32)
+            torch.backends.cuda.matmul.allow_tf32 = True
+            if rank == 0 and verbose:
+                print(
+                    "Policy TF32 matmul:",
+                    bool(torch.backends.cuda.matmul.allow_tf32),
+                    f"(prev={policy_tf32_prev})",
+                )
 
     env_prior = None
     train_profiler = None
@@ -2194,6 +2257,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             kernel_profiler.stop()
         if gpu_observer is not None:
             gpu_observer.stop()
+        if policy_tf32_prev is not None:
+            torch.backends.cuda.matmul.allow_tf32 = bool(policy_tf32_prev)
 
     if rank == 0:  # trivially true for non-parallel training
         return total_loss, model.to('cpu'), dl, epoch

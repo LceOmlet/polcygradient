@@ -1,5 +1,6 @@
 import math
 import inspect
+import os
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -90,6 +91,7 @@ class EnvironmentPrior:
 
         self.config = parse_distributions(cfg)
         self.last_runtime_info = []
+        self.last_rollout_profile = None
         self._rollout_executor = None
         self._rollout_executor_workers = 0
 
@@ -1361,6 +1363,16 @@ class EnvironmentPrior:
         action_slot_dim = int(env["action_slot_dim"])
         rollout_generators = self._make_generators_from_seeds(rng_seeds, batch_size, device)
         policy_accepts_reward_mask = self._policy_step_accepts_reward_mask(policy_step_fn)
+        profile_rollout_breakdown_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_BREAKDOWN", "")).strip().lower()
+        profile_rollout_breakdown = profile_rollout_breakdown_flag in {"1", "true", "yes", "on"}
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        profile_rollout_breakdown_cuda = bool(
+            profile_rollout_breakdown
+            and device_obj.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        policy_cuda_pairs = []
+        transition_cuda_pairs = []
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
@@ -1550,6 +1562,10 @@ class EnvironmentPrior:
                         token_row[:, token_action_start: token_action_start + action_write] = action_t[:, :action_write].detach()
 
             policy_out = None
+            policy_cuda_start = None
+            if profile_rollout_breakdown_cuda:
+                policy_cuda_start = torch.cuda.Event(enable_timing=True)
+                policy_cuda_start.record()
             if policy_accepts_reward_mask:
                 policy_out = policy_step_fn(
                     obs_t,
@@ -1569,6 +1585,10 @@ class EnvironmentPrior:
                     t,
                     env,
                 )
+            if policy_cuda_start is not None:
+                policy_cuda_end = torch.cuda.Event(enable_timing=True)
+                policy_cuda_end.record()
+                policy_cuda_pairs.append((policy_cuda_start, policy_cuda_end))
             if isinstance(policy_out, tuple):
                 action_next, cache = policy_out
             else:
@@ -1605,6 +1625,10 @@ class EnvironmentPrior:
                 elif action_noise_eval is not None:
                     action_next = torch.tanh(action_next + action_noise_eval[t] * env["action_noise_eval_std"][:, None])
 
+            transition_cuda_start = None
+            if profile_rollout_breakdown_cuda:
+                transition_cuda_start = torch.cuda.Event(enable_timing=True)
+                transition_cuda_start.record()
             if strict_seed_mode:
                 noise_t = _draw_step_randn_with_optional_generators(
                     transition_noise_generators,
@@ -1651,6 +1675,10 @@ class EnvironmentPrior:
             state_clip = env["state_clip"][:, None]
             state_next = torch.maximum(torch.minimum(state_next, state_clip), -state_clip)
             state_next = torch.tanh(state_next)
+            if transition_cuda_start is not None:
+                transition_cuda_end = torch.cuda.Event(enable_timing=True)
+                transition_cuda_end.record()
+                transition_cuda_pairs.append((transition_cuda_start, transition_cuda_end))
 
             if tbptt_window_active:
                 y_steps[t] = reward_next.detach()
@@ -1688,6 +1716,18 @@ class EnvironmentPrior:
             reward_drop_frac=reward_drop_frac,
             single_eval_pos=single_eval_pos,
         )
+        rollout_profile = None
+        if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
+            torch.cuda.synchronize(device=device_obj)
+            policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
+            transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+            rollout_profile = {
+                "policy_cuda_ms": policy_cuda_ms,
+                "transition_cuda_ms": transition_cuda_ms,
+                "steps": int(n_samples),
+                "batch_size": int(batch_size),
+            }
+        self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
     def _rollout_family_group_vectorized_with_policy(
@@ -1728,6 +1768,16 @@ class EnvironmentPrior:
             structure_groups.setdefault(sig, []).append((bi, h))
 
         rollout_generators = self._make_generators_from_seeds(rollout_rng_seeds, batch_size, device)
+        profile_rollout_breakdown_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_BREAKDOWN", "")).strip().lower()
+        profile_rollout_breakdown = profile_rollout_breakdown_flag in {"1", "true", "yes", "on"}
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        profile_rollout_breakdown_cuda = bool(
+            profile_rollout_breakdown
+            and device_obj.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        policy_cuda_pairs = []
+        transition_cuda_pairs = []
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -2031,6 +2081,10 @@ class EnvironmentPrior:
                                 token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
 
             if policy_accepts_reward_mask:
+                policy_cuda_start = None
+                if profile_rollout_breakdown_cuda:
+                    policy_cuda_start = torch.cuda.Event(enable_timing=True)
+                    policy_cuda_start.record()
                 policy_out = policy_step_fn(
                     obs_t,
                     action_t,
@@ -2041,6 +2095,10 @@ class EnvironmentPrior:
                     env_info,
                 )
             else:
+                policy_cuda_start = None
+                if profile_rollout_breakdown_cuda:
+                    policy_cuda_start = torch.cuda.Event(enable_timing=True)
+                    policy_cuda_start.record()
                 policy_out = policy_step_fn(
                     obs_t,
                     action_t,
@@ -2049,6 +2107,10 @@ class EnvironmentPrior:
                     t,
                     env_info,
                 )
+            if policy_cuda_start is not None:
+                policy_cuda_end = torch.cuda.Event(enable_timing=True)
+                policy_cuda_end.record()
+                policy_cuda_pairs.append((policy_cuda_start, policy_cuda_end))
             if isinstance(policy_out, tuple):
                 action_next, cache = policy_out
             else:
@@ -2076,6 +2138,10 @@ class EnvironmentPrior:
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
+            transition_cuda_start = None
+            if profile_rollout_breakdown_cuda:
+                transition_cuda_start = torch.cuda.Event(enable_timing=True)
+                transition_cuda_start.record()
             for group in transition_groups:
                 start = int(group["start"])
                 end = int(group["end"])
@@ -2134,6 +2200,10 @@ class EnvironmentPrior:
                 state_next[start:end, :state_dim_g] = state_next_g
                 reward_next[start:end] = reward_next_g
                 reward_mask_next[start:end] = reward_mask_next_g
+            if transition_cuda_start is not None:
+                transition_cuda_end = torch.cuda.Event(enable_timing=True)
+                transition_cuda_end.record()
+                transition_cuda_pairs.append((transition_cuda_start, transition_cuda_end))
 
             state_next = state_next * state_mask
             action_next = action_next * action_mask
@@ -2216,6 +2286,18 @@ class EnvironmentPrior:
             reward_drop_frac=reward_drop_frac,
             single_eval_pos=single_eval_pos,
         )
+        rollout_profile = None
+        if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
+            torch.cuda.synchronize(device=device_obj)
+            policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
+            transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+            rollout_profile = {
+                "policy_cuda_ms": policy_cuda_ms,
+                "transition_cuda_ms": transition_cuda_ms,
+                "steps": int(n_samples),
+                "batch_size": int(batch_size),
+            }
+        self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
     def _rollout_single(
@@ -3004,6 +3086,7 @@ class EnvironmentPrior:
         n_samples = int(n_samples)
         batch_size = int(batch_size)
         num_features = int(num_features)
+        self.last_rollout_profile = None
         x = torch.empty((n_samples, batch_size, num_features), device=device, dtype=torch.float32) if collect_x else None
         rewards = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
         infos = [None] * batch_size
@@ -3025,6 +3108,7 @@ class EnvironmentPrior:
             for b, h in enumerate(h_list):
                 sig = self._environment_group_signature(h, effective_grouping_mode)
                 grouped.setdefault(sig, []).append((b, h))
+            rollout_profile_acc = None
 
             for group in grouped.values():
                 group_indices = [idx for idx, _ in group]
@@ -3077,8 +3161,26 @@ class EnvironmentPrior:
                 rewards[:, group_indices] = y_group
                 for local_idx, global_idx in enumerate(group_indices):
                     infos[global_idx] = infos_group[local_idx]
+                group_profile = self.last_rollout_profile
+                if isinstance(group_profile, dict):
+                    if rollout_profile_acc is None:
+                        rollout_profile_acc = {
+                            "policy_cuda_ms": 0.0,
+                            "transition_cuda_ms": 0.0,
+                            "steps": int(n_samples),
+                            "batch_size": int(batch_size),
+                        }
+                    rollout_profile_acc["policy_cuda_ms"] += float(group_profile.get("policy_cuda_ms", 0.0))
+                    rollout_profile_acc["transition_cuda_ms"] += float(group_profile.get("transition_cuda_ms", 0.0))
+            self.last_rollout_profile = rollout_profile_acc
             self.last_runtime_info = infos
-            return {"x": x, "rewards": rewards, "info": self.last_runtime_info, "single_eval_pos": single_eval_pos}
+            return {
+                "x": x,
+                "rewards": rewards,
+                "info": self.last_runtime_info,
+                "single_eval_pos": single_eval_pos,
+                "rollout_profile": self.last_rollout_profile,
+            }
 
         # Fallback serial baseline for explicit non-vectorized backend.
         for b, h in enumerate(h_list):
@@ -3104,7 +3206,14 @@ class EnvironmentPrior:
             rewards[:, b] = y_one
             infos[b] = info
         self.last_runtime_info = infos
-        return {"x": x, "rewards": rewards, "info": self.last_runtime_info, "single_eval_pos": single_eval_pos}
+        self.last_rollout_profile = None
+        return {
+            "x": x,
+            "rewards": rewards,
+            "info": self.last_runtime_info,
+            "single_eval_pos": single_eval_pos,
+            "rollout_profile": self.last_rollout_profile,
+        }
 
     def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True):
         if rewards.ndim != 2:
@@ -3207,6 +3316,10 @@ class EnvironmentPrior:
                 eps=eps,
                 clip=clip,
             )
+            rollout_profile = rollout.get("rollout_profile", None)
+            if isinstance(rollout_profile, dict):
+                stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
+                stats["rollout_transition_cuda_ms"] = float(rollout_profile.get("transition_cuda_ms", 0.0))
             return loss, rollout, stats
 
         reward_sum = None
@@ -3296,6 +3409,10 @@ class EnvironmentPrior:
             "reward_mean": reward_mean,
             "reward_std": reward_std,
         }
+        rollout_profile = rollout.get("rollout_profile", None)
+        if isinstance(rollout_profile, dict):
+            stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
+            stats["rollout_transition_cuda_ms"] = float(rollout_profile.get("transition_cuda_ms", 0.0))
         return loss, rollout, stats
 
     def get_last_coverage(self):

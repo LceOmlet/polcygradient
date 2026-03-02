@@ -1,0 +1,184 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Train profiler: enabled (output_path=None, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=1343794, interval_sec=0.20, sample_output=None, stage_output=None)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 128
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: True
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=None stages_jsonl=None
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_pgtorchcompileTrue_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_02_2026_11_41_57
+AdamW fused: enabled
+/home/chen/RLPFN/ticl/ticl/train.py:2011: FutureWarning: `torch.cuda.amp.GradScaler(args...)` is deprecated. Please use `torch.amp.GradScaler('cuda', args...)` instead.
+  scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+start of epoch 1
+[pg-compile] enabled forward_policy_step compile (backend=inductor, mode=reduce-overhead, fullgraph=False, dynamic=False)
+[pg-compile] enabled forward_policy_step_split compile (backend=inductor, mode=reduce-overhead, fullgraph=False, dynamic=False)
+/home/chen/RLPFN/ticl/ticl/train.py:1086: FutureWarning: `torch.cuda.amp.autocast(args...)` is deprecated. Please use `torch.amp.autocast('cuda', args...)` instead.
+  with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+[pg-compile-warn] runtime compile failure on split policy step, fallback to eager: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run. Stack trace: File "/home/chen/RLPFN/ticl/ticl/models/tabpfn.py", line 296, in forward_policy_step_split
+    hidden, kv_cache = self.transformer_encoder.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 1052, in forward_step
+    output, cache_next = layer.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 614, in forward_step
+    k_page[:, :, :1, :] = k_new_bhld. To prevent overwriting, clone the tensor outside of torch.compile() or call torch.compiler.cudagraph_mark_step_begin() before each model invocation.
+Traceback (most recent call last):
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 410, in policy_step_fn
+    out, kv_cache = _call_split_forward_step()
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 392, in _call_split_forward_step
+    return split_policy_forward_step(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 953, in compile_wrapper
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/models/tabpfn.py", line 220, in forward_policy_step_split
+    def forward_policy_step_split(
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_dynamo/eval_frame.py", line 1181, in _fn
+    return fn(*args, **kwargs)
+           ^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/aot_autograd.py", line 1148, in forward
+    return compiled_fn(full_args)
+           ^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 343, in runtime_wrapper
+    all_outs = call_func_at_runtime_with_args(
+               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 108, in g
+    return f(*args)
+           ^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/autograd/function.py", line 583, in apply
+    return super().apply(*args, **kwargs)  # type: ignore[misc]
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 2152, in forward
+    fw_outs = call_func_at_runtime_with_args(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/utils.py", line 134, in call_func_at_runtime_with_args
+    out = normalize_as_list(f(args))
+                            ^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 531, in wrapper
+    return compiled_fn(runtime_args)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_functorch/_aot_autograd/runtime_wrappers.py", line 729, in inner_fn
+    outs = compiled_fn(args)
+           ^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/output_code.py", line 638, in __call__
+    return self.current_callable(inputs)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/tmp/torchinductor_chen/yp/cypqh62xvauye5fe4cxk4wlwjvu34lboke7owpqw2ieypma2apwp.py", line 2881, in call
+    (buf0, buf1, buf3, buf4, buf6, buf10, buf11, buf13, buf14, buf17, buf20, buf21, buf23, buf24, buf25, buf26, buf28, buf33, buf34, buf485, buf35, buf37, buf38, buf39, buf45, buf46, buf484, buf47, buf49, buf50, buf53, buf56, buf57, buf59, buf60, buf61, buf62, buf64, buf70, buf71, buf483, buf72, buf74, buf75, buf76, buf82, buf83, buf482, buf84, buf86, buf87, buf90, buf93, buf94, buf96, buf97, buf98, buf99, buf101, buf107, buf108, buf481, buf109, buf111, buf112, buf113, buf119, buf120, buf480, buf121, buf123, buf124, buf127, buf130, buf131, buf133, buf134, buf135, buf136, buf138, buf144, buf145, buf479, buf146, buf148, buf149, buf150, buf156, buf157, buf478, buf158, buf160, buf161, buf164, buf167, buf168, buf170, buf171, buf172, buf173, buf175, buf181, buf182, buf477, buf183, buf185, buf186, buf187, buf193, buf194, buf476, buf195, buf197, buf198, buf201, buf204, buf205, buf207, buf208, buf209, buf210, buf212, buf218, buf219, buf475, buf220, buf222, buf223, buf224, buf230, buf231, buf474, buf232, buf234, buf235, buf238, buf241, buf242, buf244, buf245, buf246, buf247, buf249, buf255, buf256, buf473, buf257, buf259, buf260, buf261, buf267, buf268, buf472, buf269, buf271, buf272, buf275, buf278, buf279, buf281, buf282, buf283, buf284, buf286, buf292, buf293, buf471, buf294, buf296, buf297, buf298, buf304, buf305, buf470, buf306, buf308, buf309, buf312, buf315, buf316, buf318, buf319, buf320, buf321, buf323, buf329, buf330, buf469, buf331, buf333, buf334, buf335, buf341, buf342, buf468, buf343, buf345, buf346, buf349, buf352, buf353, buf355, buf356, buf357, buf358, buf360, buf366, buf367, buf467, buf368, buf370, buf371, buf372, buf378, buf379, buf466, buf380, buf382, buf383, buf386, buf389, buf390, buf392, buf393, buf394, buf395, buf397, buf403, buf404, buf465, buf405, buf407, buf408, buf409, buf415, buf416, buf464, buf417, buf419, buf420, buf423, buf426, buf427, buf429, buf430, buf431, buf432, buf434, buf440, buf441, buf463, buf442, buf444, buf445, buf446, buf452, buf453, buf462, buf454, buf456, buf457, buf458, buf461, buf486, buf487, primals_3, primals_4, primals_17, primals_23, primals_31, primals_37, primals_45, primals_51, primals_59, primals_65, primals_73, primals_79, primals_87, primals_93, primals_101, primals_107, primals_115, primals_121, primals_129, primals_135, primals_143, primals_149, primals_157, primals_163, primals_171, primals_177) = self.partitions[0](partition0_args)
+                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/compile_fx.py", line 1843, in run
+    return compiled_fn(new_inputs)  # type: ignore[arg-type]
+           ^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 404, in deferred_cudagraphify
+    fn, out = cudagraphify(model, inputs, new_static_input_idxs, *args, **kwargs)
+              ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 464, in cudagraphify
+    return manager.add_function(
+           ^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 2337, in add_function
+    return fn, fn(inputs)
+               ^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 2033, in run
+    out = self._run(new_inputs, function_id)
+          ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 2137, in _run
+    return self.run_eager(new_inputs, function_id)
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 2298, in run_eager
+    return node.run(new_inputs)
+           ^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 677, in run
+    non_cudagraph_inps_storages = get_non_cudagraph_inps()
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 669, in get_non_cudagraph_inps
+    non_cudagraph_inps = [
+                         ^
+  File "/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/_inductor/cudagraph_trees.py", line 673, in <listcomp>
+    and t.untyped_storage().data_ptr() not in existing_path_data_ptrs
+        ^^^^^^^^^^^^^^^^^^^
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run. Stack trace: File "/home/chen/RLPFN/ticl/ticl/models/tabpfn.py", line 296, in forward_policy_step_split
+    hidden, kv_cache = self.transformer_encoder.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 1052, in forward_step
+    output, cache_next = layer.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 614, in forward_step
+    k_page[:, :, :1, :] = k_new_bhld. To prevent overwriting, clone the tensor outside of torch.compile() or call torch.compiler.cudagraph_mark_step_begin() before each model invocation.
+
+During handling of the above exception, another exception occurred:
+
+Traceback (most recent call last):
+  File "<frozen runpy>", line 198, in _run_module_as_main
+  File "<frozen runpy>", line 88, in _run_code
+  File "/home/chen/RLPFN/ticl/ticl/fit_model.py", line 333, in <module>
+    main(sys.argv[1:])
+  File "/home/chen/RLPFN/ticl/ticl/fit_model.py", line 269, in main
+    total_loss, model, dl, epoch = get_model(
+                                   ^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/model_builder.py", line 312, in get_model
+    model = train(dl, model, criterion=criterion, optimizer_state=optimizer_state, scheduler=scheduler,
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 2039, in train
+    new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
+                                        ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 1087, in train_epoch_policy_gradient
+    pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
+                                                   ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 549, in _compute_policy_rollout_chunk_loss
+    return env_prior.rollout_policy_gradient_loss(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 3370, in rollout_policy_gradient_loss
+    rollout = self.rollout_with_policy(
+              ^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 3127, in rollout_with_policy
+    x_group, y_group, infos_group = self._rollout_family_group_vectorized_with_policy(
+                                    ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/priors/environment_prior.py", line 2088, in _rollout_family_group_vectorized_with_policy
+    policy_out = policy_step_fn(
+                 ^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 415, in policy_step_fn
+    out, kv_cache = _call_split_forward_step()
+                    ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/train.py", line 392, in _call_split_forward_step
+    return split_policy_forward_step(
+           ^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/models/tabpfn.py", line 296, in forward_policy_step_split
+    hidden, kv_cache = self.transformer_encoder.forward_step(
+                       ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 1052, in forward_step
+    output, cache_next = layer.forward_step(
+                         ^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 687, in forward_step
+    k_pages, v_pages, valid_len = self._append_to_kv_pages_cow(
+                                  ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 504, in _append_to_kv_pages_cow
+    new_k_pages[-1] = torch.cat([new_k_pages[-1], k_new_bhld], dim=2)
+                      ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+RuntimeError: Error: accessing tensor output of CUDAGraphs that has been overwritten by a subsequent run. Stack trace: File "/home/chen/RLPFN/ticl/ticl/models/tabpfn.py", line 296, in forward_policy_step_split
+    hidden, kv_cache = self.transformer_encoder.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 1052, in forward_step
+    output, cache_next = layer.forward_step(
+  File "/home/chen/RLPFN/ticl/ticl/models/layer.py", line 614, in forward_step
+    k_page[:, :, :1, :] = k_new_bhld. To prevent overwriting, clone the tensor outside of torch.compile() or call torch.compiler.cudagraph_mark_step_begin() before each model invocation.
+ERROR conda.cli.main_run:execute(125): `conda run python -u -m ticl.fit_model rlpfn --epochs 1 --num-steps 1 --validate False --rl-validate-enabled False --progress-bar False --pg-torch-compile True --pg-torch-compile-backend inductor --pg-torch-compile-mode reduce-overhead --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2` failed. (See above for error)
