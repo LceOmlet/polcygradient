@@ -168,6 +168,14 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
 - Stability controls / negative probes (kept for anti-regression evidence):
   - `bs64 + page48 + seeded` (`20260302_184600_flashprefix_bs64_page48_seeded`): CUDA OOM (environment path pressure), indicates reduced safety margin at seeded heavy draws.
   - `bs68 + page32` (`20260302_185200_flashprefix_bs68_page32`): CUDA OOM, rejected.
+  - In-place flash-prefix tail-clone probe (`20260302_193500_flashprefix_inplace_bs64_page48`, `20260302_194000_flashprefix_inplace_bs64_page32`):
+    - Experimental branch attempted to combine in-place paged-KV append with flash-prefix page-size control and reduced prefix cloning.
+    - Both runs failed with CUDA OOM at `bs64` (`page48`: rollout path OOM, `page32`: backward OOM).
+    - Process memory still climbed to ~`46.83 GiB`; rejected and not merged.
+  - Paged-attn recompute-checkpoint probe (`20260302_184300_flashprefix_bs68_page48_pagedckpt`):
+    - Added a temporary inner checkpoint for paged flash attention (COW, non-inplace) to reduce activation pressure.
+    - No OOM, but wallclock regressed badly to `127.68s` (`1.878s/batch-unit`) with `rollout/backward=127.619/77.131s`.
+    - Peak alloc/reserved remained high (`42.81/46.36 GiB`), process memory max `47888 MiB`; reverted as pseudo-optimization.
 
 ## Skyline status
 
