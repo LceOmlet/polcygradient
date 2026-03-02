@@ -47,5 +47,8 @@ These two changes reduced tiny-kernel launch overhead in policy rollout without 
 - Environment `einsum->bmm` probe (`20260302_110339_envbmm`):
   - `wallclock 72.32s` vs skyline `70.63s` (regression on this workload).
   - Reverted (did not keep code change).
+- Family subgroup CUDA-stream probe (`20260302_111025_groupstream`):
+  - `wallclock 71.20s` vs skyline `70.63s` (no gain, higher peak reserve).
+  - Reverted (did not keep code change).
 
 Current retained skyline remains `20260302_104751_layerpagedsdpa`.
