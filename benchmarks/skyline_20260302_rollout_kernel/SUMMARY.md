@@ -50,5 +50,11 @@ These two changes reduced tiny-kernel launch overhead in policy rollout without 
 - Family subgroup CUDA-stream probe (`20260302_111025_groupstream`):
   - `wallclock 71.20s` vs skyline `70.63s` (no gain, higher peak reserve).
   - Reverted (did not keep code change).
+- No-split policy-step probe (`20260302_112049_nosplitfastpath`):
+  - `wallclock 72.90s` vs skyline `70.63s` (regression).
+  - Reverted (kept split fast path enabled).
+- Static mutable KV probe (`20260302_112238_statickv`):
+  - Triggered autograd version conflict in backward (in-place mutation on cache tensor).
+  - Not adopted; kept paged mutable KV path.
 
 Current retained skyline remains `20260302_104751_layerpagedsdpa`.
