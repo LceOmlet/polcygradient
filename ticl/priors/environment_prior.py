@@ -1884,6 +1884,7 @@ class EnvironmentPrior:
                     "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
                     "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
                     "rollout_generators": group_rollout_generators,
+                    "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
                 }
             )
 
@@ -2177,8 +2178,7 @@ class EnvironmentPrior:
                     dropout_active_g = dropout_active[start:end]
                     ratio_g = reward_dropout_ratio[start:end]
                     drop_mask = dropout_active_g & (dropout_draws[t, start:end] < ratio_g)
-                    if torch.any(drop_mask):
-                        reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
+                    reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
                     reward_mask_next_g = torch.where(drop_mask, torch.zeros_like(reward_mask_next_g), reward_mask_next_g)
                     impute_mask = drop_mask & reward_dropout_impute_zero[start:end]
                     reward_next_g = torch.where(impute_mask, torch.zeros_like(reward_next_g), reward_next_g)
@@ -2189,10 +2189,9 @@ class EnvironmentPrior:
                 )
                 alpha_g = alpha[start:end].unsqueeze(1)
                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
-                if state_noise is not None:
+                if (state_noise is not None) and bool(group.get("state_noise_active", False)):
                     state_noise_std_g = state_noise_std[start:end]
-                    if torch.any(state_noise_std_g > 0):
-                        state_next_g = state_next_g + state_noise[t, start:end, :state_dim_g] * state_noise_std_g[:, None]
+                    state_next_g = state_next_g + state_noise[t, start:end, :state_dim_g] * state_noise_std_g[:, None]
                 clip_g = state_clip[start:end].unsqueeze(1)
                 state_next_g = torch.maximum(torch.minimum(state_next_g, clip_g), -clip_g)
                 state_next_g = torch.tanh(state_next_g)

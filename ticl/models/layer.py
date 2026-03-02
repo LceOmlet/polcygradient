@@ -228,6 +228,7 @@ class TransformerEncoderLayer(Module):
         k_pages,
         v_pages,
         valid_len: int,
+        clone_kv_for_grad: bool = False,
     ):
         # Online softmax accumulation over KV pages (FlashAttention-style reduction),
         # avoids materializing full concatenated K/V every step.
@@ -241,12 +242,21 @@ class TransformerEncoderLayer(Module):
         if len(k_pages) == 1:
             k_all = k_pages[0][:, :, :remaining, :]
             v_all = v_pages[0][:, :, :remaining, :]
+            if bool(clone_kv_for_grad) and torch.is_grad_enabled():
+                # In in-place paged-grad mode, cache pages are mutated every step.
+                # Clone read views so backward does not observe version bumps.
+                k_all = k_all.clone()
+                v_all = v_all.clone()
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         # Training throughput route: dispatch fused SDPA on dense views.
         # This removes many tiny per-page kernels in the grad-enabled hot path.
         if torch.is_grad_enabled():
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
+            if bool(clone_kv_for_grad):
+                # Multi-page fallback for in-place paged-grad mode.
+                k_all = k_all.clone()
+                v_all = v_all.clone()
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
@@ -518,6 +528,7 @@ class TransformerEncoderLayer(Module):
         kv_cache_mode: str = "auto",
         kv_cache_page_size: Optional[int] = None,
         allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
     ):
         """
         Incremental forward for a single token (seq length = 1) with KV cache.
@@ -543,6 +554,8 @@ class TransformerEncoderLayer(Module):
 
         if kv_cache is not None and "allow_grad_mutable_cache" in kv_cache:
             allow_grad_mutable_cache = bool(kv_cache.get("allow_grad_mutable_cache"))
+        if kv_cache is not None and "allow_grad_inplace_paged_cache" in kv_cache:
+            allow_grad_inplace_paged_cache = bool(kv_cache.get("allow_grad_inplace_paged_cache"))
         cache_mode = self._resolve_kv_cache_mode(
             kv_cache,
             kv_cache_mode,
@@ -562,6 +575,7 @@ class TransformerEncoderLayer(Module):
             and torch.is_grad_enabled()
             and bool(allow_grad_mutable_cache)
         )
+        inplace_paged_grad = bool(mutable_paged_grad and bool(allow_grad_inplace_paged_cache))
         if cache_mode == "paged":
             # Throughput route:
             # - no-grad path (including reentrant checkpoint forward pass) uses
@@ -571,7 +585,12 @@ class TransformerEncoderLayer(Module):
             if (not torch.is_grad_enabled()) and (max_cache_len is not None):
                 effective_kv_page_size = int(max(1, max_cache_len))
             elif mutable_paged_grad:
-                effective_kv_page_size = int(max(8, kv_cache_page_size))
+                if inplace_paged_grad and (max_cache_len is not None):
+                    # Keep one dense page in in-place mode so append stays
+                    # O(1) and avoids page-growth cat churn in TBPTT rollout.
+                    effective_kv_page_size = int(max(1, max_cache_len))
+                else:
+                    effective_kv_page_size = int(max(8, kv_cache_page_size))
             else:
                 effective_kv_page_size = kv_cache_page_size
         else:
@@ -604,9 +623,12 @@ class TransformerEncoderLayer(Module):
                 v_pages = None
             elif cache_mode == "paged":
                 if torch.is_grad_enabled():
-                    # Start mutable COW pages with one filled token; page growth
-                    # happens via cat in _append_to_kv_pages_cow.
-                    page_cap = 1
+                    if inplace_paged_grad:
+                        page_cap = min(int(effective_kv_page_size), int(max_cache_len))
+                    else:
+                        # Start mutable COW pages with one filled token; page growth
+                        # happens via cat in _append_to_kv_pages_cow.
+                        page_cap = 1
                 else:
                     page_cap = min(int(effective_kv_page_size), int(max_cache_len))
                 k_page = k_new_bhld.new_empty((k_new_bhld.shape[0], k_new_bhld.shape[1], page_cap, k_new_bhld.shape[3]))
@@ -683,7 +705,7 @@ class TransformerEncoderLayer(Module):
                             v_pages.append(v_page)
                             offset += take
                             remaining -= take
-                    if torch.is_grad_enabled():
+                    if torch.is_grad_enabled() and (not inplace_paged_grad):
                         k_pages, v_pages, valid_len = self._append_to_kv_pages_cow(
                             k_pages=k_pages,
                             v_pages=v_pages,
@@ -741,6 +763,7 @@ class TransformerEncoderLayer(Module):
                 k_pages,
                 v_pages,
                 valid_len,
+                clone_kv_for_grad=bool(inplace_paged_grad),
             )
         elif self.recompute_attn and torch.is_grad_enabled():
             src = checkpoint(
@@ -766,6 +789,7 @@ class TransformerEncoderLayer(Module):
             "page_size": int(effective_kv_page_size) if effective_kv_page_size is not None else None,
             "valid_len": int(valid_len),
             "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
+            "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
         }
         return src, new_cache
 
@@ -1040,6 +1064,7 @@ class TransformerEncoderSimple(Module):
         kv_cache_mode: str = "auto",
         kv_cache_page_size: Optional[int] = None,
         allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
     ):
         output = src_step
         if kv_cache is None:
@@ -1057,6 +1082,7 @@ class TransformerEncoderSimple(Module):
                 kv_cache_mode=kv_cache_mode,
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=allow_grad_mutable_cache,
+                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
             )
             new_cache.append(cache_next)
 

@@ -18,23 +18,36 @@ CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
 
 - Baseline: `benchmarks/skyline_20260302_rollout_contig/current_worktree_noretain_retry/run.log`
 - Split policy-step only: `benchmarks/skyline_20260302_rollout_kernel/20260302_104246_splitstep.log`
-- New skyline: `benchmarks/skyline_20260302_rollout_kernel/20260302_104751_layerpagedsdpa.log`
+- Previous skyline: `benchmarks/skyline_20260302_rollout_kernel/20260302_104751_layerpagedsdpa.log`
+- New skyline: `benchmarks/skyline_20260302_rollout_kernel/20260302_133739_mod_noseed_fp16/run.log`
 
-## Metrics (baseline -> new skyline)
+## Metrics (previous skyline -> new skyline)
 
-- Wallclock: `89.13s -> 70.63s` (`-20.8%`)
-- Rollout stage: `89.041s -> 70.577s` (`-20.7%`)
-- Backward stage: `53.544s -> 42.283s` (`-21.0%`)
-- GPU util avg: `16.84 -> 20.20` (`+19.9%`)
-- Process SM util avg: `16.94 -> 19.49` (`+15.0%`)
-- Peak alloc: `26.62 GiB -> 26.35 GiB` (`-1.0%`)
+- Wallclock: `70.63s -> 66.10s` (`-6.4%`)
+- Rollout stage (`cuda_elapsed_ms`): `70.576s -> 66.050s` (`-6.4%`)
+- Backward stage (`cuda_elapsed_ms`): `42.281s -> 39.486s` (`-6.6%`)
+- GPU util avg (rollout): `20.20 -> 22.77` (`+12.8%`)
+- Process SM util avg (rollout): `19.49 -> 22.06` (`+13.2%`)
+- Process mem max: `36080 MiB -> 35716 MiB` (`-1.0%`)
+- Peak alloc: `26.35 GiB -> 26.55 GiB` (`+0.8%`)
 
 ## Kernel-level change that produced the gain
 
-1. In paged KV + grad path, `forward_step` now prefers fused SDPA on dense paged views instead of multi-page manual attention reduction loop.
-2. `mutable_paged_grad` page-size cap was relaxed from hard upper bound `32` to configured `kv_cache_page_size` (default `128`) to reduce page fragmentation and per-step page-loop overhead.
+1. Policy-gradient autocast default on CUDA was switched to `fp16` for rollout/backward (`TICL_POLICY_AUTOCAST_DTYPE` override supported; set `bf16` to opt out).
+2. In `forward_policy_step_split`, y-encoder linear contribution is algebraically fused into reward column/bias to remove one per-step linear launch in the hot path.
+3. Family-group rollout hot loop removed per-step tensor-bool branches (`torch.any(...)` in python `if`) that forced synchronization.
 
-These two changes reduced tiny-kernel launch overhead in policy rollout without changing task scale.
+These changes reduce launch-bound overhead in policy rollout under fixed task scale (`n_samples=1024`, `batch_size=8`).
+
+## Seeded sanity check (same workload, `--seed-everything True`)
+
+- Baseline (detached worktree @ `189d9f3`):
+  - `20260302_133327_baseline_seeded_wt189d9f3`: `71.07s`
+  - `20260302_134246_baseline_seeded_wt189d9f3_rep2`: `72.76s`
+- New code:
+  - `20260302_133605_mod_seeded_fp16`: `70.68s`
+  - `20260302_134102_mod_seeded_fp16_rep2`: `70.45s`
+- Mean seeded wallclock: `71.91s -> 70.56s` (`-1.9%`)
 
 ## Follow-up Probes (same workload, kept for regression tracking)
 
@@ -84,5 +97,8 @@ These two changes reduced tiny-kernel launch overhead in policy rollout without 
     - TF32 off (`20260302_120346_reentrant_seeded_tf32off`, `20260302_120519_reentrant_seeded_tf32off_rep2`): `71.96s`, `73.47s`
   - Mean seeded wallclock improvement from TF32 enable is ~2%.
   - No-seed run (`20260302_120130_tf32default_noseed`) remained noisy (`73.74s`), so no-seed skyline is unchanged.
+- In-place paged-KV append probe (`20260302_131730_inplacepagedclone`):
+  - Increased rollout GPU util but regressed wallclock (`80.56s`).
+  - Classified as pseudo-optimization; kept behind explicit opt-in (`TICL_POLICY_INPLACE_PAGED_KV=1`) and disabled by default.
 
-Current retained skyline remains `20260302_104751_layerpagedsdpa`.
+Current retained skyline is `20260302_133739_mod_noseed_fp16`.

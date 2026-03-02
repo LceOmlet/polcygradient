@@ -1,0 +1,4 @@
+[benchmark] run_id=20260302_133739_mod_noseed_fp16
+[benchmark] out_dir=/home/chen/RLPFN/ticl/benchmarks/skyline_20260302_rollout_kernel/20260302_133739_mod_noseed_fp16
+[benchmark] git_head=189d9f3
+[benchmark] date=2026-03-02T13:37:39+08:00

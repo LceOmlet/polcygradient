@@ -71,6 +71,20 @@ def _is_oom_exception(exc: BaseException) -> bool:
     return any(marker in msg for marker in oom_markers)
 
 
+def _resolve_policy_autocast_dtype(device):
+    device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+    if device_obj.type != "cuda":
+        return None
+    dtype_env = str(os.environ.get("TICL_POLICY_AUTOCAST_DTYPE", "auto")).strip().lower()
+    if dtype_env in {"fp16", "float16", "half", "16"}:
+        return torch.float16
+    if dtype_env in {"bf16", "bfloat16"}:
+        return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    # Throughput default for policy rollout: prefer fp16 unless explicitly
+    # requesting bf16 via TICL_POLICY_AUTOCAST_DTYPE.
+    return torch.float16
+
+
 def _set_policy_inner_recompute_attn(model, enabled: bool):
     """
     Toggle per-layer forward_step attention recomputation used by policy rollout.
@@ -296,6 +310,7 @@ def _build_policy_step_fn(
     kv_cache_mode: str = "immutable",
     kv_cache_page_size=None,
     allow_grad_mutable_cache=False,
+    allow_grad_inplace_paged_cache=False,
     pg_torch_compile=False,
     pg_torch_compile_backend="inductor",
     pg_torch_compile_mode="reduce-overhead",
@@ -399,6 +414,7 @@ def _build_policy_step_fn(
                 kv_cache_mode=kv_cache_mode,
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=allow_grad_mutable_cache,
+                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
             )
 
         if use_split_fastpath:
@@ -478,6 +494,7 @@ def _build_policy_step_fn(
                 kv_cache_mode=kv_cache_mode,
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=allow_grad_mutable_cache,
+                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
             )
 
         if compile_active:
@@ -892,6 +909,7 @@ def train_epoch_policy_gradient(
     kernel_profiler=None,
 ):
     model.train()
+    policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
     total_loss = torch.tensor(0.0, device=device)
     valid_steps = torch.tensor(0.0, device=device)
     skipped_steps = 0
@@ -923,6 +941,16 @@ def train_epoch_policy_gradient(
         kv_cache_page_size = 128 if pg_kv_cache_page_size is None else int(max(1, pg_kv_cache_page_size))
     else:
         kv_cache_page_size = None
+    inplace_paged_kv_env = str(os.environ.get("TICL_POLICY_INPLACE_PAGED_KV", "auto")).strip().lower()
+    if inplace_paged_kv_env in {"1", "true", "yes", "on"}:
+        allow_grad_inplace_paged_kv = True
+    elif inplace_paged_kv_env in {"0", "false", "no", "off"}:
+        allow_grad_inplace_paged_kv = False
+    else:
+        # Conservative default: keep COW paged path unless explicitly enabled.
+        allow_grad_inplace_paged_kv = False
+    if (not allow_grad_mutable_kv) or (kv_cache_mode != "paged"):
+        allow_grad_inplace_paged_kv = False
 
     # Reentrant checkpoint is unsafe with in-place-updated static KV cache.
     # Paged cache uses copy-on-write appends and is safe for reentrant.
@@ -948,6 +976,7 @@ def train_epoch_policy_gradient(
         kv_cache_mode=kv_cache_mode,
         kv_cache_page_size=kv_cache_page_size,
         allow_grad_mutable_cache=allow_grad_mutable_kv,
+        allow_grad_inplace_paged_cache=allow_grad_inplace_paged_kv,
         pg_torch_compile=bool(pg_torch_compile),
         pg_torch_compile_backend=str(pg_torch_compile_backend),
         pg_torch_compile_mode=str(pg_torch_compile_mode),
@@ -1083,7 +1112,7 @@ def train_epoch_policy_gradient(
                             if (kernel_profiler is not None and kernel_profiler.enabled())
                             else nullcontext()
                         ):
-                            with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+                            with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
                                 pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
                                     env_prior=env_prior,
                                     policy_step_fn=policy_step_fn,
@@ -1897,6 +1926,15 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 page_size_print = 128 if pg_kv_cache_page_size is None else int(max(1, pg_kv_cache_page_size))
             else:
                 page_size_print = None
+            inplace_paged_kv_env = str(os.environ.get("TICL_POLICY_INPLACE_PAGED_KV", "auto")).strip().lower()
+            if inplace_paged_kv_env in {"1", "true", "yes", "on"}:
+                inplace_kv_print = True
+            elif inplace_paged_kv_env in {"0", "false", "no", "off"}:
+                inplace_kv_print = False
+            else:
+                inplace_kv_print = False
+            if (not allow_grad_mutable_kv) or (kv_mode_print != "paged"):
+                inplace_kv_print = False
             mutable_reentrant_safe = (
                 (not allow_grad_mutable_kv)
                 or (kv_mode_print == "paged")
@@ -1921,6 +1959,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print("Policy KV cache mode:", kv_mode_print)
             if kv_mode_print == "paged":
                 print("Policy KV cache page size:", int(page_size_print))
+                print("Policy KV cache in-place append:", bool(inplace_kv_print))
             if bool(policy_rollout_checkpoint_reentrant) and not checkpoint_reentrant_active:
                 print(
                     "[pg-checkpoint-note] reentrant checkpoint is disabled because the selected mutable KV mode "
@@ -1947,6 +1986,14 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         "long-horizon rollout memory high."
                     )
             print("Policy torch.compile:", bool(pg_torch_compile))
+            policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
+            if policy_autocast_dtype is not None:
+                if policy_autocast_dtype == torch.float16:
+                    print("Policy autocast dtype:", "fp16")
+                elif policy_autocast_dtype == torch.bfloat16:
+                    print("Policy autocast dtype:", "bf16")
+                else:
+                    print("Policy autocast dtype:", str(policy_autocast_dtype))
             print("GPU observer enabled:", bool(train_gpu_observer_enabled))
             if bool(train_gpu_observer_enabled):
                 print(

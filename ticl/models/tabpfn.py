@@ -1,3 +1,4 @@
+import os
 
 import torch, wandb
 import torch.nn as nn
@@ -143,6 +144,7 @@ class TabPFN(nn.Module):
         kv_cache_mode: str = "auto",
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
     ):
         """
         Append a single realized training token to existing KV cache.
@@ -164,6 +166,7 @@ class TabPFN(nn.Module):
             kv_cache_mode=kv_cache_mode,
             kv_cache_page_size=kv_cache_page_size,
             allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
         return kv_cache
 
@@ -189,6 +192,7 @@ class TabPFN(nn.Module):
         kv_cache_mode: str = "auto",
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
     ):
         """
         Incremental single-step forward for autoregressive policy rollout.
@@ -214,6 +218,7 @@ class TabPFN(nn.Module):
             kv_cache_mode=kv_cache_mode,
             kv_cache_page_size=kv_cache_page_size,
             allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
         return self.decoder(hidden), kv_cache
 
@@ -228,6 +233,7 @@ class TabPFN(nn.Module):
         kv_cache_mode: str = "auto",
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
     ):
         """
         Incremental single-step forward optimized for split_obs_action layout.
@@ -255,6 +261,13 @@ class TabPFN(nn.Module):
         obs_bias = obs_encoder.bias
         action_weight = action_encoder.weight
         action_bias = action_encoder.bias
+        fuse_y_linear = isinstance(self.y_encoder, nn.Linear) and int(getattr(self.y_encoder, "in_features", 0)) == 1
+        if fuse_y_linear:
+            y_weight_vec = self.y_encoder.weight[:, 0]
+            y_bias_vec = self.y_encoder.bias
+        else:
+            y_weight_vec = None
+            y_bias_vec = None
         obs_dim = int(self.encoder.obs_dim)
         action_dim = int(self.encoder.action_dim)
         obs_slot_dim = int(max(0, obs_dim - 2))
@@ -264,33 +277,47 @@ class TabPFN(nn.Module):
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
 
-        if bool(getattr(obs_encoder, "replace_nan_by_zero", False)):
-            obs_src = torch.nan_to_num(obs_t, nan=0.0)
-        else:
+        assume_finite_policy_inputs_env = str(os.environ.get("TICL_POLICY_ASSUME_FINITE_INPUTS", "1")).strip().lower()
+        assume_finite_policy_inputs = assume_finite_policy_inputs_env not in {"0", "false", "no", "off"}
+        if assume_finite_policy_inputs:
             obs_src = obs_t
-        if bool(getattr(action_encoder, "replace_nan_by_zero", False)):
-            action_src = torch.nan_to_num(action_t, nan=0.0)
-        else:
             action_src = action_t
+        else:
+            if bool(getattr(obs_encoder, "replace_nan_by_zero", False)):
+                obs_src = torch.nan_to_num(obs_t, nan=0.0)
+            else:
+                obs_src = obs_t
+            if bool(getattr(action_encoder, "replace_nan_by_zero", False)):
+                action_src = torch.nan_to_num(action_t, nan=0.0)
+            else:
+                action_src = action_t
 
         if obs_copy > 0:
             obs_enc = F.linear(obs_src[:, :obs_copy], obs_weight[:, :obs_copy], obs_bias)
         else:
             obs_enc = obs_bias.unsqueeze(0).expand(batch_size, -1)
         if reward_idx < obs_dim:
-            obs_enc = obs_enc + reward_scalar * obs_weight[:, reward_idx].unsqueeze(0)
+            reward_weight = obs_weight[:, reward_idx]
+            if y_weight_vec is not None:
+                reward_weight = reward_weight + y_weight_vec
+            obs_enc = obs_enc + reward_scalar * reward_weight.unsqueeze(0)
+        elif y_weight_vec is not None:
+            obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
         if mask_idx < obs_dim:
             obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+        if y_bias_vec is not None:
+            obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
 
         if action_copy > 0:
             action_enc = F.linear(action_src[:, :action_copy], action_weight[:, :action_copy], action_bias)
         else:
             action_enc = action_bias.unsqueeze(0).expand(batch_size, -1)
 
-        x_enc = (obs_enc + action_enc).unsqueeze(0)
-        y_in = reward_scalar.reshape(1, batch_size)
-        y_enc = self.y_encoder(y_in.unsqueeze(-1) if len(y_in.shape) < len(x_enc.shape) else y_in)
-        token = x_enc + y_enc
+        token = (obs_enc + action_enc).unsqueeze(0)
+        if not fuse_y_linear:
+            y_in = reward_scalar.reshape(1, batch_size)
+            y_enc = self.y_encoder(y_in.unsqueeze(-1) if len(y_in.shape) < len(token.shape) else y_in)
+            token = token + y_enc
         if self.input_ln is not None:
             token = self.input_ln(token)
         hidden, kv_cache = self.transformer_encoder.forward_step(
@@ -301,6 +328,7 @@ class TabPFN(nn.Module):
             kv_cache_mode=kv_cache_mode,
             kv_cache_page_size=kv_cache_page_size,
             allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
         return self.decoder(hidden), kv_cache
 
