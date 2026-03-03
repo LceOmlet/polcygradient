@@ -33,6 +33,7 @@ MEAN_LOSS_RE = re.compile(r"mean loss\s+([A-Za-z0-9+.\-eE]+)")
 VALID_SKIPPED_RE = re.compile(r"valid/skipped\s+(\d+)/(\d+)")
 TOKENS_PER_SEC_RE = re.compile(r"tokens/s=([0-9.]+)")
 HOST_RSS_RE = re.compile(r"Maximum resident set size \(kbytes\):\s*(\d+)")
+BATCH_SIZE_RE = re.compile(r"(?:^|\s)--batch-size(?:=|\s+)(\d+)(?:\s|$)")
 
 POLICY_AUTODTYPE_RE = re.compile(r"Policy autocast dtype:\s*([A-Za-z0-9_]+)")
 POLICY_FINALIZE2D_RE = re.compile(r"Policy finalize 2D fastpath:\s*(True|False)")
@@ -75,8 +76,8 @@ def _to_bool(v: str) -> Optional[bool]:
     return None
 
 
-def _parse_tail_metrics(tail: str) -> Dict[str, float]:
-    out: Dict[str, float] = {}
+def _parse_tail_metrics(tail: str) -> Dict[str, str]:
+    out: Dict[str, str] = {}
     if not tail:
         return out
     for token in tail.strip().split():
@@ -85,10 +86,15 @@ def _parse_tail_metrics(tail: str) -> Dict[str, float]:
         k, v = token.split("=", 1)
         if not k:
             continue
-        fv = _to_float(v)
-        if fv is not None:
-            out[k] = fv
+        out[k] = v
     return out
+
+
+def _tail_float(metrics: Dict[str, str], key: str) -> Optional[float]:
+    raw = metrics.get(key, None)
+    if raw is None:
+        return None
+    return _to_float(raw)
 
 
 def _read_text(path: Path) -> str:
@@ -101,6 +107,7 @@ class RunRecord:
     run_dir: str
     git_head: Optional[str]
     command: Optional[str]
+    batch_size: Optional[int]
     seeded: bool
     autocast_dtype: Optional[str]
     finalize_2d_fastpath: Optional[bool]
@@ -134,6 +141,7 @@ class RunRecord:
     policy_step_tf_layer_attnff_share: Optional[float]
     policy_step_tf_layer_attn_core_share: Optional[float]
     policy_step_tf_layer_finalize_share: Optional[float]
+    pg_loss_sig: Optional[str]
 
     @property
     def strict_valid(self) -> bool:
@@ -158,6 +166,14 @@ class RunRecord:
         return float(self.wallclock_s / float(self.chunk))
 
     @property
+    def wallclock_per_batch_s(self) -> Optional[float]:
+        if self.wallclock_s is None:
+            return None
+        if self.batch_size is None or self.batch_size <= 0:
+            return None
+        return float(self.wallclock_s / float(self.batch_size))
+
+    @property
     def cohort_key(self) -> str:
         parts = [
             f"seeded={int(bool(self.seeded))}",
@@ -172,6 +188,7 @@ class RunRecord:
             f"chunk={self.chunk if self.chunk is not None else 'na'}",
             f"tbptt={self.tbptt if self.tbptt is not None else 'na'}",
             f"fin2d={self.finalize_2d_fastpath if self.finalize_2d_fastpath is not None else 'na'}",
+            f"pgsig={self.pg_loss_sig or 'na'}",
         ]
         return "|".join(parts)
 
@@ -200,6 +217,12 @@ def _parse_run_dir(run_dir: Path) -> Optional[RunRecord]:
         m_cmd_timed = COMMAND_TIMED_RE.search(line)
         if m_cmd_timed:
             command = m_cmd_timed.group(1).strip()
+
+    batch_size = None
+    if command:
+        m_bs = BATCH_SIZE_RE.search(command)
+        if m_bs:
+            batch_size = _to_int(m_bs.group(1))
 
     seeded = any(SEED_SET_RE.match(line.strip()) for line in lines)
 
@@ -302,6 +325,7 @@ def _parse_run_dir(run_dir: Path) -> Optional[RunRecord]:
     policy_step_tf_layer_attnff_share = None
     policy_step_tf_layer_attn_core_share = None
     policy_step_tf_layer_finalize_share = None
+    pg_loss_sig = None
 
     if last_pg is not None:
         rollout_s = _to_float(last_pg.group("rollout_s"))
@@ -312,22 +336,24 @@ def _parse_run_dir(run_dir: Path) -> Optional[RunRecord]:
         tbptt = _to_int(last_pg.group("tbptt"))
         status = last_pg.group("status")
         tail_metrics = _parse_tail_metrics(last_pg.group("tail"))
-        rollout_policy_wall_ms = tail_metrics.get("rollout_policy_wall_ms")
-        rollout_transition_wall_ms = tail_metrics.get("rollout_transition_wall_ms")
-        rollout_transition_y_share = tail_metrics.get("rollout_transition_y_share")
-        rollout_transition_x_share = tail_metrics.get("rollout_transition_x_share")
-        policy_step_total_ms = tail_metrics.get("policy_step_total_ms")
-        policy_step_transformer_share = tail_metrics.get("policy_step_transformer_share")
-        policy_step_tf_layer_total_ms = tail_metrics.get("policy_step_tf_layer_total_ms")
-        policy_step_tf_layer_attnff_share = tail_metrics.get("policy_step_tf_layer_attnff_share")
-        policy_step_tf_layer_attn_core_share = tail_metrics.get("policy_step_tf_layer_attn_core_share")
-        policy_step_tf_layer_finalize_share = tail_metrics.get("policy_step_tf_layer_finalize_share")
+        rollout_policy_wall_ms = _tail_float(tail_metrics, "rollout_policy_wall_ms")
+        rollout_transition_wall_ms = _tail_float(tail_metrics, "rollout_transition_wall_ms")
+        rollout_transition_y_share = _tail_float(tail_metrics, "rollout_transition_y_share")
+        rollout_transition_x_share = _tail_float(tail_metrics, "rollout_transition_x_share")
+        policy_step_total_ms = _tail_float(tail_metrics, "policy_step_total_ms")
+        policy_step_transformer_share = _tail_float(tail_metrics, "policy_step_transformer_share")
+        policy_step_tf_layer_total_ms = _tail_float(tail_metrics, "policy_step_tf_layer_total_ms")
+        policy_step_tf_layer_attnff_share = _tail_float(tail_metrics, "policy_step_tf_layer_attnff_share")
+        policy_step_tf_layer_attn_core_share = _tail_float(tail_metrics, "policy_step_tf_layer_attn_core_share")
+        policy_step_tf_layer_finalize_share = _tail_float(tail_metrics, "policy_step_tf_layer_finalize_share")
+        pg_loss_sig = tail_metrics.get("pg_loss_sig", None)
 
     return RunRecord(
         run_id=run_dir.name,
         run_dir=str(run_dir),
         git_head=git_head,
         command=command,
+        batch_size=batch_size,
         seeded=seeded,
         autocast_dtype=autocast_dtype,
         finalize_2d_fastpath=finalize_2d_fastpath,
@@ -361,6 +387,7 @@ def _parse_run_dir(run_dir: Path) -> Optional[RunRecord]:
         policy_step_tf_layer_attnff_share=policy_step_tf_layer_attnff_share,
         policy_step_tf_layer_attn_core_share=policy_step_tf_layer_attn_core_share,
         policy_step_tf_layer_finalize_share=policy_step_tf_layer_finalize_share,
+        pg_loss_sig=pg_loss_sig,
     )
 
 
@@ -387,13 +414,14 @@ def _write_jsonl(path: Path, records: List[RunRecord]) -> None:
             payload = asdict(r)
             payload["strict_valid"] = bool(r.strict_valid)
             payload["wallclock_per_chunk_s"] = r.wallclock_per_chunk_s
+            payload["wallclock_per_batch_s"] = r.wallclock_per_batch_s
             payload["cohort_key"] = r.cohort_key
             f.write(json.dumps(payload, ensure_ascii=True))
             f.write("\n")
 
 
 def _render_table(records: List[RunRecord], title: str, max_rows: int) -> List[str]:
-    lines = [f"## {title}", "", "| rank | run_id | status | valid/skipped | wallclock(s) | rollout/backward(s) | chunk | wall/chunk | dtype | notes |", "|---:|---|---|---|---:|---|---:|---:|---|---|"]
+    lines = [f"## {title}", "", "| rank | run_id | status | valid/skipped | wallclock(s) | wall/batch(s) | rollout/backward(s) | chunk | wall/chunk | dtype | notes |", "|---:|---|---|---|---:|---:|---|---:|---:|---|---|"]
     sorted_rows = sorted(
         [r for r in records if r.wallclock_s is not None],
         key=lambda x: (x.wallclock_s if x.wallclock_s is not None else 1e18),
@@ -408,12 +436,14 @@ def _render_table(records: List[RunRecord], title: str, max_rows: int) -> List[s
             note_bits.append(
                 f"tr(y/x)={_fmt(100.0 * r.rollout_transition_y_share, 1)}/{_fmt(100.0 * r.rollout_transition_x_share, 1)}%"
             )
+        if r.pg_loss_sig:
+            note_bits.append(f"pg={r.pg_loss_sig}")
         notes = ", ".join(note_bits) if note_bits else "-"
         lines.append(
-            f"| {i} | `{r.run_id}` | `{r.status or 'na'}` | `{valid_skipped}` | `{_fmt(r.wallclock_s)}` | `{rb}` | `{r.chunk if r.chunk is not None else 'na'}` | `{_fmt(r.wallclock_per_chunk_s)}` | `{r.autocast_dtype or 'na'}` | {notes} |"
+            f"| {i} | `{r.run_id}` | `{r.status or 'na'}` | `{valid_skipped}` | `{_fmt(r.wallclock_s)}` | `{_fmt(r.wallclock_per_batch_s, 4)}` | `{rb}` | `{r.chunk if r.chunk is not None else 'na'}` | `{_fmt(r.wallclock_per_chunk_s)}` | `{r.autocast_dtype or 'na'}` | {notes} |"
         )
     if not sorted_rows:
-        lines.append("| - | - | - | - | - | - | - | - | - | - |")
+        lines.append("| - | - | - | - | - | - | - | - | - | - | - |")
     lines.append("")
     return lines
 
@@ -481,6 +511,7 @@ def _write_markdown(path: Path, records: List[RunRecord], max_rows: int) -> None
     lines.append("  - `status == ok` in `[pg-phase]`")
     lines.append("  - `valid/skipped` is `>=1/0`")
     lines.append("  - `mean loss` is finite")
+    lines.append("- Skyline cohorts are also separated by `pg_loss_sig` to avoid mixing different loss forms.")
     lines.append("- Purpose: prevent pre-stability `grad_norm_nonfinite/inf` runs from polluting skyline comparisons.")
     lines.append("")
     lines.append("## Summary")

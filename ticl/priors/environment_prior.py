@@ -3546,6 +3546,40 @@ class EnvironmentPrior:
             }
         return normalized
 
+    def policy_gradient_loss_signature(
+        self,
+        normalize,
+        discount,
+        detach_stats,
+        eps,
+        clip,
+    ):
+        def _fmt_float(x):
+            try:
+                return f"{float(x):.6g}"
+            except Exception:
+                return "na"
+
+        reward_clip_cfg = self.config.get("reward_clip", None)
+        reward_clip_value = None
+        if reward_clip_cfg is not None:
+            try:
+                reward_clip_value = float(max(0.0, self._resolve_scalar(reward_clip_cfg)))
+            except Exception:
+                reward_clip_value = None
+
+        # Bump this tag whenever PG loss form changes.
+        loss_form = str(self.config.get("policy_gradient_loss_form", "pg_v2"))
+        return (
+            f"{loss_form}"
+            f"|norm={int(bool(normalize))}"
+            f"|disc={_fmt_float(discount)}"
+            f"|detach={int(bool(detach_stats))}"
+            f"|eps={_fmt_float(eps)}"
+            f"|clip={_fmt_float(clip)}"
+            f"|rclip={_fmt_float(reward_clip_value)}"
+        )
+
     def policy_gradient_loss_from_rewards(
         self,
         rewards,
@@ -3560,6 +3594,10 @@ class EnvironmentPrior:
         if discount is None:
             discount = self._resolve_scalar(self.config.get("discount", 1.0))
         discount = float(max(0.0, min(1.0, discount)))
+        if eps is None:
+            eps = self._resolve_scalar(self.config.get("reward_norm_eps", 1e-6))
+        if clip is None:
+            clip = self._resolve_scalar(self.config.get("reward_norm_clip", 10.0))
 
         weighted = rewards
         if discount < 1.0:

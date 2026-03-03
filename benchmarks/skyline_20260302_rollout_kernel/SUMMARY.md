@@ -323,3 +323,114 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
 - Practical mapping to current ticl hotspot profile:
   - Upstream gains are dominated by attention/MLP fusion + reduced launch/sync overhead.
   - Our measured dominant path remains transformer layer finalize (`~48%` in latest strict-valid deep profile), while transition path shows non-trivial packing/update overhead (`env_pack ~7.2%`, `state_update ~16.3%` of transition wall), so current optimization order stays: `finalize fusion` -> `transition pack/update fusion`.
+
+## 2026-03-03 Rebuild v2: Loss-Form Fingerprint Gate
+
+- New risk acknowledged: loss-form changed (reward improvement path), so old/new runs must not share one skyline cohort.
+- Rebuild pipeline now separates cohorts by `pg_loss_sig` from `[pg-phase]` tail.
+  - New fields added in training/profile logs:
+    - `pg_loss_sig=...` in `[pg-phase]`
+    - `pg_loss_sig=...` in `[pg-gpu-stage]` rollout stage extra
+  - Rebuild parser now supports string tail metrics and includes `pgsig=...` in `cohort_key`.
+- New probe run with signature enabled:
+  - `20260303_113211_losssig_probe` (`55.56s`, strict-valid)
+  - `pg_loss_sig=pg_v2|norm=0|disc=1|detach=1|eps=1e-06|clip=10|rclip=10`
+  - stage profile:
+    - rollout `cuda_busy_ratio=1.000`, backward `0.611`
+    - `policy_step_transformer_share=0.905`
+    - `policy_step_tf_layer_finalize_share=0.476`
+    - transition shares: `y=0.378`, `x=0.375`, `env_pack=0.050`, `state_update=0.114`
+  - host safety: max RSS `2137220 kB` (`~2.04 GiB`).
+- Rebuilt ladder after this change:
+  - scanned runs: `99`
+  - strict-valid runs: `5`
+  - best strict-valid remains `20260303_012000_denseprefixcache_default_probe_rep2` (`48.36s`)
+  - new signed cohort appears separately in `REBUILT_SKYLINE.md` and no longer mixes with legacy unsigned runs.
+
+## 2026-03-03 Mainline Progress: bs64 Throughput Breakthrough
+
+- Main bottleneck identified on `batch_size=64` baseline (`20260303_115533_bs64_baseline_probe`):
+  - `Wallclock 162.38s`, `wall/batch=2.5372s`, strict-valid.
+  - OOM fallback forced `TBPTT 128 -> 64 -> 32 -> 16`, causing `backward_calls=64` (major pseudo-parallel symptom).
+  - Layer breakdown showed dominant `attnff` path and non-trivial cache/view overhead under paged dense route.
+- Kernel-path change implemented:
+  - `TransformerEncoderLayer._forward_step_attn_ff_paged` now supports `TICL_POLICY_PAGED_ATTN_TRAIN_MODE=auto`.
+  - `auto` policy:
+    - `batch >= 32`: `flash_prefix` exact merge (LSE merge, avoids repeated dense page-view materialization).
+    - `batch < 32`: keep `dense` path to avoid small-batch flash overhead.
+    - CPU path always forces `dense`.
+  - Added explicit observability in `[pg-phase]`:
+    - `rollout_cuda_busy_ratio`
+    - `backward_cuda_busy_ratio`
+  - Added startup log line:
+    - `Policy paged-attn train mode: ...`
+- Verified bs64 gain (`20260303_120432_bs64_auto_flashprefix_probe`):
+  - `Wallclock 61.19s` (from `162.38s`, about `-62.3%`).
+  - `wall/batch=0.9561s` (from `2.5372s`, about `-62.3%`).
+  - No OOM fallback; `tbptt=128`, `backward_calls=8`.
+  - Peak GPU memory reduced:
+    - alloc/reserved: `36.07/39.21 GiB` (from `45.29/46.27 GiB`).
+  - Throughput:
+    - `tokens/s 1070.94` (from `403.60`).
+- Skyline tooling update:
+  - `rebuild_skyline.py` now parses `--batch-size` from command and reports `wall/batch` in tables.
+- Rebuilt summary now:
+    - scanned runs: `103`
+    - strict-valid runs: `8`
+- Safety/observability note:
+  - One later probe (`20260303_121449_bs64_auto_threshold_probe`) failed before training due transient CUDA init error (`cudaGetDeviceCount error 304`), marked diagnostic only; not used for skyline retention.
+
+## 2026-03-03 Recovery Validation: Auto Threshold Path
+
+- GPU恢复后复测，确认 `auto` 分段策略在主线 workload 上可用：
+  - `batch_size=64`:
+    - `20260303_122829_bs64_auto_threshold_probe3`: `63.08s`, `wall/batch=0.9856s`, `tokens/s=1038.99`
+    - `20260303_122534_bs64_auto_threshold_probe2`: `70.26s`, `wall/batch=1.0978s`, `tokens/s=932.77`
+    - 与 `bs64` 老基线 `162.38s` (`2.5372s/batch`) 比，仍保持大幅领先。
+  - `batch_size=8`:
+    - `20260303_122704_bs8_auto_threshold_probe2`: `53.87s`（相比先前 `auto` 非分段版 `68.36s` 明显恢复）
+- 运行画像（bs64/bs8均一致）：
+  - `rollout_cuda_busy_ratio=1.000`
+  - `backward_cuda_busy_ratio≈0.61`
+  - rollout阶段仍以 `policy_step_transformer_share≈0.92` 为主，transition次之。
+- Rebuild后当前统计：
+  - scanned runs: `106`
+  - strict-valid runs: `11`
+  - `REBUILT_SKYLINE.md` 已包含 `wall/batch` 列并记录以上新运行。
+
+## 2026-03-03 Mainline Continuation: Finalize-Proj Reality Check
+
+- 按“finalize优先”主线先做了 `out_proj/residual + ffn/residual` 的 `addmm` 融合尝试：
+  - 运行：`20260303_132933_bs64_finalize_addmmfuse_probe`
+  - 结果：`tbptt=128` 稳定，但 `Wallclock 87.29s`，`wall/batch=1.3639s`，明显回退。
+  - 判定：伪优化，已回滚，不进入主线skyline。
+- 回滚后 sanity：
+  - 运行：`20260303_133218_bs64_finalize_revert_sanity_probe`
+  - 结果：`tbptt=128`，`Wallclock 78.19s`，`wall/batch=1.2217s`。
+- 紧接着落地主导项（真实投影融合）：
+  - 改动：`forward_step` 中 `q + kv` 两次GEMM 改为 `_project_qkv` 单次GEMM后切分。
+  - 运行：`20260303_133459_bs64_qkvfuse_probe`
+  - 结果：`tbptt=128`，`Wallclock 63.91s`，`wall/batch=0.9986s`，峰值显存 `34.03/36.44 GiB`。
+  - 画像变化（相对 `20260303_131129_bs64_cachecatfree_recover_probe2`）：
+    - `policy_step_tf_layer_proj_share: 0.297 -> 0.152`（投影主导项显著下降）
+    - `policy_step_total_ms: 18472.22 -> 16082.62`（policy_step总时长下降）
+  - 判定：真实增益，保留在主线并已纳入 `REBUILT_*`。
+
+## 2026-03-03 Mainline Continuation: Cache/Proj Layout Reuse Deep-Dive
+
+- `qkv -> heads` 单次布局复用（替代三次 `split_heads`）探测：
+  - 运行：`20260303_133916_bs64_qkvheads_layoutreuse_probe`
+  - 结果：`tbptt=128`，但 `Wallclock 71.56s`，`wall/batch=1.1181`，较 `qkvfuse` 主线退化。
+  - 判定：伪优化，已回滚。
+- `flash_merge` 路径直接切换探测（仅用于判断可行性）：
+  - 运行：`20260303_134104_bs64_flashmerge_probe`
+  - 结果：触发 `tbptt 128 -> 64 -> 32` 降级。
+  - 判定：违反门槛，终止并拒绝。
+- COW append `cat` 单核化探测（替换 `new_empty + slice copy`）：
+  - 运行：`20260303_134234_bs64_cachecow_catkernel_probe`
+  - 结果：`tbptt=128`，`Wallclock 68.59s`，`wall/batch=1.0717`；
+    `cache_share` 降到 `0.124`，但整体 wall 仍劣于当前主线 `63.91s`。
+  - 判定：局部指标改善但主指标回退，已回滚。
+
+- 当前保留的主线有效项：
+  - `q + kv -> qkv` 单次投影融合（`20260303_133459_bs64_qkvfuse_probe`）。

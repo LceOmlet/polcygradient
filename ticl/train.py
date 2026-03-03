@@ -2,13 +2,14 @@ import math
 import os
 import time, wandb
 import random
+import gc
 from contextlib import nullcontext
 
 import torch
 import numpy as np
 from torch import nn
 from tqdm import tqdm
-from torch.cuda.amp import GradScaler, autocast
+from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.checkpoint import checkpoint
 
@@ -103,6 +104,18 @@ def _resolve_policy_autocast_dtype(device):
     # Stability-first default for policy rollout: prefer bf16 on supported GPUs
     # (wider exponent than fp16), fallback to fp16 otherwise.
     return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+
+
+def _amp_autocast_context(scaler, *, device, dtype):
+    if scaler is None:
+        return nullcontext()
+    try:
+        device_type = torch.device(str(device)).type
+    except Exception:
+        device_type = "cuda"
+    if dtype is None:
+        return autocast(device_type=device_type)
+    return autocast(device_type=device_type, dtype=dtype)
 
 
 def _set_policy_inner_recompute_attn(model, enabled: bool):
@@ -765,7 +778,11 @@ def train_epoch(
                 if (kernel_profiler is not None and kernel_profiler.enabled())
                 else nullcontext()
             ):
-                with autocast(dtype=torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16) if scaler is not None else nullcontext():
+                with _amp_autocast_context(
+                    scaler,
+                    device=device,
+                    dtype=(torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16),
+                ):
                     # for mothernet, la_mothernet, model is MLPModelPredictor from ticl.py
                     output = model(
                         tuple(e.to(device) if torch.is_tensor(e) else e for e in data)
@@ -968,6 +985,7 @@ def train_epoch_policy_gradient(
 ):
     model.train()
     policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
+    device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
     total_loss = torch.tensor(0.0, device=device)
     valid_steps = torch.tensor(0.0, device=device)
     skipped_steps = 0
@@ -977,6 +995,7 @@ def train_epoch_policy_gradient(
     steps_per_epoch = len(dl)
     assert steps_per_epoch % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
     optimizer.zero_grad(set_to_none=True)
+    batch_size_hint = int(dl.batch_size)
 
     tbptt_streaming_default = False
     if pg_tbptt_window is not None:
@@ -1005,7 +1024,8 @@ def train_epoch_policy_gradient(
     elif inplace_paged_kv_env in {"0", "false", "no", "off"}:
         allow_grad_inplace_paged_kv = False
     else:
-        # Conservative default: keep COW paged path unless explicitly enabled.
+        # Auto mode stays conservative; in-place paged append is opt-in via env
+        # because it can raise peak memory under long-horizon PG rollout.
         allow_grad_inplace_paged_kv = False
     if (not allow_grad_mutable_kv) or (kv_cache_mode != "paged"):
         allow_grad_inplace_paged_kv = False
@@ -1072,6 +1092,27 @@ def train_epoch_policy_gradient(
     except Exception:
         pg_phase_log_every = 50
     pg_phase_log_every = max(1, pg_phase_log_every)
+    try:
+        pg_same_cfg_oom_retries = int(os.environ.get("TICL_PG_OOM_SAME_CFG_RETRIES", "0"))
+    except Exception:
+        pg_same_cfg_oom_retries = 0
+    pg_same_cfg_oom_retries = max(0, pg_same_cfg_oom_retries)
+    mem_guard_flag = str(os.environ.get("TICL_PG_MEM_GUARD", "1")).strip().lower()
+    pg_mem_guard_enabled = mem_guard_flag not in {"0", "false", "no", "off"}
+    try:
+        pg_mem_guard_reserved_frac = float(os.environ.get("TICL_PG_MEM_GUARD_RESERVED_FRAC", "0.90"))
+    except Exception:
+        pg_mem_guard_reserved_frac = 0.90
+    if (not math.isfinite(pg_mem_guard_reserved_frac)) or pg_mem_guard_reserved_frac <= 0.0:
+        pg_mem_guard_reserved_frac = 0.90
+    pg_mem_guard_reserved_frac = float(min(0.995, max(0.50, pg_mem_guard_reserved_frac)))
+    try:
+        pg_mem_guard_slack_gb = float(os.environ.get("TICL_PG_MEM_GUARD_SLACK_GB", "3.0"))
+    except Exception:
+        pg_mem_guard_slack_gb = 3.0
+    if (not math.isfinite(pg_mem_guard_slack_gb)) or pg_mem_guard_slack_gb < 0.0:
+        pg_mem_guard_slack_gb = 3.0
+    pg_mem_guard_slack_bytes = int(pg_mem_guard_slack_gb * (1024.0 ** 3))
 
     iterator = range(steps_per_epoch)
     if progress_bar:
@@ -1079,6 +1120,24 @@ def train_epoch_policy_gradient(
         iterator = tqdm(iterator, total=steps_per_epoch, desc=desc, unit="step")
 
     for batch in iterator:
+        if pg_mem_guard_enabled and device_obj.type == "cuda" and torch.cuda.is_available():
+            try:
+                mem_alloc = int(torch.cuda.memory_allocated(device_obj))
+                mem_reserved = int(torch.cuda.memory_reserved(device_obj))
+                mem_total = int(torch.cuda.get_device_properties(device_obj).total_memory)
+            except Exception:
+                mem_alloc = 0
+                mem_reserved = 0
+                mem_total = 0
+            slack_bytes = int(max(0, mem_reserved - mem_alloc))
+            need_cleanup = False
+            if mem_total > 0 and mem_reserved >= int(float(mem_total) * pg_mem_guard_reserved_frac):
+                need_cleanup = True
+            if slack_bytes >= pg_mem_guard_slack_bytes:
+                need_cleanup = True
+            if need_cleanup:
+                gc.collect()
+                torch.cuda.empty_cache()
         batch_epoch_for_profile = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
         should_log_phase = bool(
             verbose and (
@@ -1097,6 +1156,13 @@ def train_epoch_policy_gradient(
             batch_rng_state = _capture_rng_state(device)
             max_batch_oom_retries = 8
             batch_attempt = 0
+            same_cfg_oom_retries = 0
+            max_same_cfg_oom_retries = int(pg_same_cfg_oom_retries)
+            enable_same_cfg_oom_retry = (
+                max_same_cfg_oom_retries > 0
+                and device_obj.type == "cuda"
+                and torch.cuda.is_available()
+            )
             gpu_observer_active = (
                 gpu_observer is not None
                 and hasattr(gpu_observer, "enabled")
@@ -1144,6 +1210,38 @@ def train_epoch_policy_gradient(
                 batch_policy_step_transformer_layer_finalize_attn_outproj_ms = 0.0
                 batch_policy_step_transformer_layer_finalize_ffn_ms = 0.0
                 batch_policy_step_transformer_layer_total_ms = 0.0
+                batch_policy_step_layer_paged_single_page_calls = 0
+                batch_policy_step_layer_paged_flash_prefix_calls = 0
+                batch_policy_step_layer_paged_flash_merge_calls = 0
+                batch_policy_step_layer_paged_dense_calls = 0
+                batch_pg_loss_signature = None
+                try:
+                    sig_fn = getattr(env_prior, "policy_gradient_loss_signature", None)
+                    cfg = getattr(env_prior, "config", {})
+                    if callable(sig_fn):
+                        _resolve_scalar = getattr(env_prior, "_resolve_scalar", None)
+                        discount_cfg = cfg.get("discount", 1.0) if isinstance(cfg, dict) else 1.0
+                        eps_cfg = cfg.get("reward_norm_eps", 1e-6) if isinstance(cfg, dict) else 1e-6
+                        clip_cfg = cfg.get("reward_norm_clip", 10.0) if isinstance(cfg, dict) else 10.0
+                        if callable(_resolve_scalar):
+                            discount_v = _resolve_scalar(discount_cfg)
+                            eps_v = _resolve_scalar(eps_cfg)
+                            clip_v = _resolve_scalar(clip_cfg)
+                        else:
+                            discount_v = discount_cfg
+                            eps_v = eps_cfg
+                            clip_v = clip_cfg
+                        batch_pg_loss_signature = sig_fn(
+                            normalize=bool(cfg.get("policy_gradient_normalize_rewards", False)) if isinstance(cfg, dict) else False,
+                            discount=float(max(0.0, min(1.0, discount_v))),
+                            detach_stats=True,
+                            eps=eps_v,
+                            clip=clip_v,
+                        )
+                    else:
+                        batch_pg_loss_signature = "na"
+                except Exception:
+                    batch_pg_loss_signature = None
                 batch_grad_norm_value = None
                 batch_optimizer_step_value = None
                 batch_optimizer_stepped = False
@@ -1214,7 +1312,11 @@ def train_epoch_policy_gradient(
                             if (kernel_profiler is not None and kernel_profiler.enabled())
                             else nullcontext()
                         ):
-                            with autocast(dtype=policy_autocast_dtype) if scaler is not None else nullcontext():
+                            with _amp_autocast_context(
+                                scaler,
+                                device=device,
+                                dtype=policy_autocast_dtype,
+                            ):
                                 pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
                                     env_prior=env_prior,
                                     policy_step_fn=policy_step_fn,
@@ -1235,6 +1337,13 @@ def train_epoch_policy_gradient(
                                 loss = weighted_pg_loss / aggregate_k_gradients
                                 if tbptt_stream_backward_active and tbptt_window_backward_called:
                                     loss = loss.detach()
+                                metric_loss = loss.detach().mean()
+                                if tbptt_stream_backward_active and tbptt_window_backward_called:
+                                    # In streaming-TBPTT mode gradients are consumed inside
+                                    # tbptt_loss_sink; expose a meaningful monitor loss.
+                                    metric_loss = (
+                                        -pg_stats_chunk["objective"].detach() * float(chunk_weight)
+                                    ) / float(aggregate_k_gradients)
                         if rollout_cuda_start is not None:
                             rollout_cuda_end = torch.cuda.Event(enable_timing=True)
                             rollout_cuda_end.record()
@@ -1315,6 +1424,20 @@ def train_epoch_policy_gradient(
                                 "(set --pg-oom-debug-raise false to enable auto chunk fallback)."
                             )
                             raise
+                        # Some batches hit transient allocator pressure; retry once
+                        # with unchanged TBPTT/chunk before degrading configuration.
+                        if enable_same_cfg_oom_retry and same_cfg_oom_retries < max_same_cfg_oom_retries:
+                            same_cfg_oom_retries += 1
+                            batch_oom = True
+                            if "cuda" in str(device):
+                                torch.cuda.empty_cache()
+                            gc.collect()
+                            print(
+                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
+                                f"retrying same config once "
+                                f"(chunk={current_rollout_chunk_size}, tbptt={current_tbptt_window})"
+                            )
+                            break
                         if bool(pg_oom_reduce_tbptt_first):
                             if current_tbptt_window is None and n_samples > 1:
                                 current_tbptt_window = max(1, n_samples // 2)
@@ -1357,7 +1480,7 @@ def train_epoch_policy_gradient(
                                 "Memory is sequence-length dominated; batch chunking cannot reduce further."
                             )
                         break
-                    batch_loss += loss.detach().mean()
+                    batch_loss += metric_loss
                     batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
                     batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
                     batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
@@ -1496,6 +1619,18 @@ def train_epoch_policy_gradient(
                             batch_policy_step_transformer_layer_total_ms += float(
                                 step_profile.get("transformer_layer_total_wall_s", 0.0) or 0.0
                             ) * 1000.0
+                            batch_policy_step_layer_paged_single_page_calls += int(
+                                step_profile.get("transformer_layer_paged_path_single_page", 0) or 0
+                            )
+                            batch_policy_step_layer_paged_flash_prefix_calls += int(
+                                step_profile.get("transformer_layer_paged_path_flash_prefix", 0) or 0
+                            )
+                            batch_policy_step_layer_paged_flash_merge_calls += int(
+                                step_profile.get("transformer_layer_paged_path_flash_merge", 0) or 0
+                            )
+                            batch_policy_step_layer_paged_dense_calls += int(
+                                step_profile.get("transformer_layer_paged_path_dense", 0) or 0
+                            )
 
                 if batch_oom and batch_attempt < max_batch_oom_retries:
                     optimizer.zero_grad(set_to_none=True)
@@ -1549,6 +1684,18 @@ def train_epoch_policy_gradient(
                     batch_policy_step_transformer_layer_total_ms += float(
                         step_profile_tail.get("transformer_layer_total_wall_s", 0.0) or 0.0
                     ) * 1000.0
+                    batch_policy_step_layer_paged_single_page_calls += int(
+                        step_profile_tail.get("transformer_layer_paged_path_single_page", 0) or 0
+                    )
+                    batch_policy_step_layer_paged_flash_prefix_calls += int(
+                        step_profile_tail.get("transformer_layer_paged_path_flash_prefix", 0) or 0
+                    )
+                    batch_policy_step_layer_paged_flash_merge_calls += int(
+                        step_profile_tail.get("transformer_layer_paged_path_flash_merge", 0) or 0
+                    )
+                    batch_policy_step_layer_paged_dense_calls += int(
+                        step_profile_tail.get("transformer_layer_paged_path_dense", 0) or 0
+                    )
 
             stage_cuda_ms = {"rollout": None, "backward": None}
             if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
@@ -1559,6 +1706,12 @@ def train_epoch_policy_gradient(
                     stage_cuda_ms["rollout"] = float(sum(s.elapsed_time(e) for s, e in rollout_cuda_pairs))
                 if backward_cuda_pairs:
                     stage_cuda_ms["backward"] = float(sum(s.elapsed_time(e) for s, e in backward_cuda_pairs))
+            rollout_cuda_busy_ratio = None
+            backward_cuda_busy_ratio = None
+            if stage_cuda_ms["rollout"] is not None and batch_rollout_wall > 0.0:
+                rollout_cuda_busy_ratio = float((stage_cuda_ms["rollout"] / 1000.0) / max(1e-9, batch_rollout_wall))
+            if stage_cuda_ms["backward"] is not None and batch_backward_wall > 0.0:
+                backward_cuda_busy_ratio = float((stage_cuda_ms["backward"] / 1000.0) / max(1e-9, batch_backward_wall))
 
             rollout_breakdown_suffix = ""
             rollout_breakdown_total_ms = batch_rollout_policy_cuda_ms + batch_rollout_transition_cuda_ms
@@ -1648,6 +1801,26 @@ def train_epoch_policy_gradient(
                     f" policy_step_tf_layer_finalize_attn_outproj_share={policy_step_layer_finalize_attn_outproj_share:.3f}"
                     f" policy_step_tf_layer_finalize_ffn_share={policy_step_layer_finalize_ffn_share:.3f}"
                 )
+                paged_dispatch_total = int(
+                    batch_policy_step_layer_paged_single_page_calls
+                    + batch_policy_step_layer_paged_flash_prefix_calls
+                    + batch_policy_step_layer_paged_flash_merge_calls
+                    + batch_policy_step_layer_paged_dense_calls
+                )
+                if paged_dispatch_total > 0:
+                    rollout_breakdown_suffix += (
+                        f" policy_step_paged_dispatch(single/flashp/flashm/dense)="
+                        f"{batch_policy_step_layer_paged_single_page_calls}/"
+                        f"{batch_policy_step_layer_paged_flash_prefix_calls}/"
+                        f"{batch_policy_step_layer_paged_flash_merge_calls}/"
+                        f"{batch_policy_step_layer_paged_dense_calls}"
+                    )
+            if rollout_cuda_busy_ratio is not None:
+                rollout_breakdown_suffix += f" rollout_cuda_busy_ratio={rollout_cuda_busy_ratio:.3f}"
+            if backward_cuda_busy_ratio is not None:
+                rollout_breakdown_suffix += f" backward_cuda_busy_ratio={backward_cuda_busy_ratio:.3f}"
+            if batch_pg_loss_signature is not None:
+                rollout_breakdown_suffix += f" pg_loss_sig={batch_pg_loss_signature}"
 
             if gpu_observer_active:
                 epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
@@ -1744,6 +1917,8 @@ def train_epoch_policy_gradient(
                             batch_policy_step_transformer_layer_finalize_ffn_ms
                             / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                         )
+                    if stage_name == "rollout" and batch_pg_loss_signature is not None:
+                        stage_extra["pg_loss_sig"] = str(batch_pg_loss_signature)
                     stage_rec = gpu_observer.record_stage(
                         epoch=epoch_obs,
                         batch=int(batch),
@@ -1855,6 +2030,8 @@ def train_epoch_policy_gradient(
                                 batch_policy_step_transformer_layer_finalize_ffn_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
+                        if stage_name == "rollout" and batch_pg_loss_signature is not None:
+                            wandb_payload["pg_gpu/pg_loss_sig"] = str(batch_pg_loss_signature)
                         wandb.log(wandb_payload)
 
             if batch_oom:
@@ -2496,6 +2673,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print("Policy KV cache mode:", kv_mode_print)
             if kv_mode_print == "paged":
                 print("Policy KV cache page size:", int(page_size_print))
+                paged_train_mode = str(os.environ.get("TICL_POLICY_PAGED_ATTN_TRAIN_MODE", "auto")).strip().lower()
+                if paged_train_mode not in {"auto", "dense", "flash_merge", "flash_prefix"}:
+                    paged_train_mode = "auto"
+                print("Policy paged-attn train mode:", paged_train_mode)
                 try:
                     dense_page_cap = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
                 except Exception:
@@ -2528,6 +2709,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         "long-horizon rollout memory high."
                     )
             print("Policy torch.compile:", bool(pg_torch_compile))
+            try:
+                from torch.nn.attention import sdpa_kernel as _sdpa_kernel_probe  # noqa: F401
+                sdpa_api_available = True
+            except Exception:
+                sdpa_api_available = False
+            print("Policy runtime torch:", str(torch.__version__), f"(sdpa_kernel_api={sdpa_api_available})")
             finalize_fastpath_env = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
             finalize_fastpath_on = finalize_fastpath_env not in {"0", "false", "no", "off"}
             print("Policy finalize 2D fastpath:", bool(finalize_fastpath_on))
@@ -2620,7 +2807,11 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     if reduce_lr_on_spike:
         # In this case we're not properly restarting the scheduler when we load a checkpoint, sad
         spike_scheduler = ReduceLROnSpike(optimizer, smoothing=10, factor=0.5, min_lr=min_lr, tolerance=spike_tolerance, verbose=True)
-    scaler = GradScaler() if train_mixed_precision and device != "cpu" else None
+    try:
+        scaler_device_type = torch.device(str(device)).type
+    except Exception:
+        scaler_device_type = "cuda" if "cuda" in str(device) else "cpu"
+    scaler = GradScaler("cuda") if train_mixed_precision and scaler_device_type == "cuda" else None
 
     # check that everything uses up-to-date APIs
     utils.check_compatibility(dl)
@@ -2636,6 +2827,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
 
     try:
         train_time, inference_time, train_gpu_time = [], [], []
+        pg_warmup_note_emitted = False
         for epoch in range(start_epoch, epochs + 1):
             if verbose:
                 print(f"start of epoch {epoch}")
@@ -2711,6 +2903,20 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 last_lr = spike_scheduler.get_last_lr()[0]
             else:
                 last_lr = scheduler.get_last_lr()[0]
+            if (
+                rl_objective == 'policy_gradient'
+                and (not pg_warmup_note_emitted)
+                and warmup_epochs > 0
+                and epoch <= warmup_epochs
+                and learning_rate is not None
+                and float(last_lr) <= float(learning_rate) * 1e-3
+            ):
+                print(
+                    "[pg-note] learning rate is still in warmup phase "
+                    f"(epoch {epoch}/{warmup_epochs}, lr={last_lr:.3e}, base_lr={float(learning_rate):.3e}); "
+                    "early objective fluctuations are expected."
+                )
+                pg_warmup_note_emitted = True
 
             train_time.append(time.time() - epoch_start_time)
             if "cuda" in device:
@@ -2769,8 +2975,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     print(
                         f' peak gpu mem alloc/reserved {peak_alloc_gib:5.2f}GiB/{peak_reserved_gib:5.2f}GiB |',
                     )
+                if rl_objective == 'policy_gradient':
+                    mean_loss_str = f"{float(total_loss):+.6e}"
+                else:
+                    mean_loss_str = f"{float(total_loss):5.4f}"
                 print(
-                    f'| end of epoch {epoch:3d} | Wallclock time: {train_time[-1]:5.2f}s | GPU time: {train_gpu_time[-1]:5.2f}s | mean loss {total_loss:5.4f} | ')
+                    f'| end of epoch {epoch:3d} | Wallclock time: {train_time[-1]:5.2f}s | GPU time: {train_gpu_time[-1]:5.2f}s | mean loss {mean_loss_str} | ')
                 if profile_record is not None:
                     print(
                         " profile "
@@ -2818,14 +3028,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     aggregate_k_gradients *= 2
                     increased_batch_size = 2
                     print("increased aggregate_k_gradients size to", aggregate_k_gradients)
-                elif increased_batch_size == 2 and epoch >= 200:
+                elif increased_batch_size == 2 and epoch >= 200 and aggregate_k_gradients < 8:
                     aggregate_k_gradients *= 2
                     increased_batch_size = 3
                     print("increased aggregate_k_gradients size to", aggregate_k_gradients)
-                elif increased_batch_size == 3 and total_loss >= 1000:
-                    aggregate_k_gradients *= 2
-                    increased_batch_size = 4
-                    print("increased aggregate_k_gradients size to", aggregate_k_gradients)
+                if aggregate_k_gradients > 8:
+                    aggregate_k_gradients = 8
                     
             scheduler.step()
             if spike_scheduler is not None:
