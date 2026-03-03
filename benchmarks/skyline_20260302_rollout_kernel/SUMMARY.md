@@ -184,12 +184,142 @@ These changes reduce launch/sync overhead in policy rollout and improve fixed-wo
     - Targeted hot-loop Python/index overhead in `_rollout_family_group_vectorized_with_policy` by prebinding group constants and adding single-group transition fastpath.
     - `bs70` became 3/3 successful (`84.73s`, `86.59s`, `87.11s`; no OOM), but normalized throughput stayed around `1.210~1.244s/batch-unit` and did not beat retained `bs68` robust median (`1.219`) by a meaningful margin.
     - `bs72` still OOM (`20260302_195700...`), and `bs68` showed high variance including a slow outlier (`99.11s`), so the change was not kept.
+- True QKV in-proj fusion correction (`20260302_231000_qkvtruefusion_fixedcfg_plain`, `20260302_231300_qkvtruefusion_fixedcfg_plain_rep2`):
+  - Found a kernel-fusion gap in `TransformerEncoderLayer._project_qkv`: previous code still executed 3 separate `F.linear` launches (`q/k/v`) instead of a single `in_proj` GEMM.
+  - Fixed to `F.linear(..., in_proj_weight, in_proj_bias)` + feature-axis split; also fused `_project_kv` into one `F.linear` + split.
+  - Fixed-workload reruns (same command, `n_samples=1024`, `batch_size=8`):
+    - `20260302_231000...`: `55.77s`, rollout/backward `55.721/31.589s`, peak alloc/reserved `24.90/32.81 GiB`, process mem max `34076 MiB`.
+    - `20260302_231300...`: `57.14s`, rollout/backward `57.095/32.656s`, peak alloc/reserved `24.06/32.34 GiB`, process mem max `33590 MiB`.
+    - Aggregate: mean `56.46s` (about `-10.1%` vs previous `62.83s` skyline), median `56.46s`.
+  - Note: rollout `gpu_util_avg` remained around `23%` (not increased), but wallclock and per-batch throughput improved significantly, consistent with de-emphasizing raw GPU-Util as a proxy metric.
+- Policy-step decomposition confirmation run (`20260302_230500_qkvtruefusion_fixedcfg`, `TICL_PROFILE_ROLLOUT_TIMING=1 TICL_POLICY_STEP_PROFILE=1`):
+  - `wallclock 51.12s` (instrumented run), rollout/backward `51.076/29.019s`.
+  - `policy_step_total_ms=15067.63` vs prior `19353.99` (`20260302_220100...`, about `-22%`), with `policy_step_transformer_share` `0.929` vs `0.945`.
+  - Confirms the dominant hot path is still transformer forward-step, but true QKV projection fusion removed a substantial launch/compute overhead chunk.
+- Kernel-profiler summary-only retry (`20260302_233000_kernprof_after_qkvtruefusion`):
+  - Retried `torch.profiler` with `export_trace=False` and short schedule (`0/0/1/1`), still reproduced tail hang after stage logs.
+  - No usable profiler artifact was flushed to `kernel/`; process had to be terminated.
+  - Classified as observability-path instability; switched to low-overhead in-model timers.
+- Transformer layer-step low-overhead profile (code instrumentation):
+  - Added optional transformer-layer step profiling (`TICL_TRANSFORMER_LAYER_STEP_PROFILE=1`) and propagated to training logs:
+    - `policy_step_tf_layer_proj_share`
+    - `policy_step_tf_layer_cache_share`
+    - `policy_step_tf_layer_attnff_share`
+  - Probe run (`20260303_000100_fixedcfg_tf_layer_profile`) reported:
+    - `policy_step_tf_layer_proj_share=0.135`
+    - `policy_step_tf_layer_cache_share=0.135`
+    - `policy_step_tf_layer_attnff_share=0.707`
+  - This confirms remaining dominant bottleneck is attn+ffn core, while cache copy/update remains a secondary but non-trivial contributor.
+- Dense-prefix exact-merge probe (`20260302_235300_denseprefix_page48_fixedcfg_probe`):
+  - New `dense_prefix` attention path (prefix+tail exact merge via dense matmul) regressed heavily:
+    - `wallclock 96.90s`, `rollout/backward 96.823/60.973s`.
+  - Classified as pseudo-optimization; reverted from code path.
+- Dense paged-KV page-size sweep (fixed workload, no batch/chunk changes):
+  - `page32` (`20260303_003500_dense_pagesize32_fixedcfg_probe`): `58.62s` (regression).
+  - `page64` (`20260303_003100_dense_pagesize64_fixedcfg_probe`): `59.34s` (regression).
+  - `page48` probes:
+    - `20260303_000800...`: `50.07s` (best single run)
+    - `20260303_001200...`: `57.52s`
+    - `20260303_001500...`: `55.30s`
+    - `20260303_002700...`: `57.67s`
+  - `page48` showed high variance; best-case gain exists but median gain was not robust enough to make it a default on this evidence set alone.
+- Dense page-cap default A/B (seeded, to reduce variance):
+  - `cap48` (`20260303_010000_seeded_densecap48_ab`): `54.16s`
+  - `cap128` (`20260303_010400_seeded_densecap128_ab`): `53.45s`
+  - Seeded A/B did not support a stable `cap48` win; reverted default cap to `128` and kept `TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE` as explicit experimental knob.
+- Nsight kernel observability retry (`20260303_022500_nsys_fixedcfg_seeded`):
+  - Tried `nsys profile` for kernel-level top attribution.
+  - Environment lacked importer dependencies (`Importer error status...`), only `trace.qdstrm` was generated; no `nsys stats` kernel summary could be exported.
+  - Kept as observability artifact only; not used for skyline judgement.
+- Deep transformer-layer profile extension (`20260303_024200_tf_layer_deep_profile`):
+  - Added low-overhead sub-breakdown inside layer `attnff` hot path:
+    - `policy_step_tf_layer_attn_core_share=0.075`
+    - `policy_step_tf_layer_finalize_share=0.524`
+    - `policy_step_tf_layer_finalize_attn_outproj_share=0.201`
+    - `policy_step_tf_layer_finalize_ffn_share=0.314`
+  - Conclusion: true dominant hotspot is **finalize path** (out-proj + residual/norm + FFN), not SDPA core.
+- SDPA backend-forcing probe (rejected as pseudo-optimization):
+  - Added temporary length-aware `TICL_POLICY_SDPA_BACKEND` path (short contexts auto, long contexts CUDNN).
+  - Runtime probe (`20260303_023700_post_sdpa_backend_seeded`) stalled abnormally after epoch start with no stage logs; process was terminated.
+  - Cross-check with public PyTorch issue (`scaled_dot_product_attention and CUDNN_ATTENTION #154602`) is consistent with heavy overhead under changing sequence lengths.
+  - Fully reverted from mainline code.
+- Finalize single-token 2D fastpath (seeded A/B retained optimization):
+  - Implemented `forward_step` finalize hot-path specialization for `L=1`:
+    - avoid extra `permute/contiguous` and 3D linear path;
+    - run out-proj + residual/norm + FFN in 2D `(B, E)` and restore shape at return.
+  - Added explicit guard knob: `TICL_POLICY_FINALIZE_2D_FASTPATH` (default `1`, `0` disables for A/B).
+  - Seeded A/B (`on` vs `off`) under identical fixed config:
+    - `on` (`20260303_030500_finalize2d_ab_on`): `52.90s`, rollout/backward `52.855/29.743s`
+    - `off` (`20260303_030900_finalize2d_ab_off`): `54.32s`, rollout/backward `54.270/30.567s`
+    - Pairwise gain: about `-2.6%` wallclock.
+  - Main-command no-seed verification (`20260303_031700_finalize2d_noseed_maincmd`):
+    - `54.69s`, rollout/backward `54.636/31.039s`, peak alloc/reserved `24.52/32.73 GiB`.
+  - Main-command no-seed control with fastpath disabled (`20260303_032500_finalize2d_noseed_off_control`):
+    - `53.86s`, rollout/backward `53.813/30.334s`, peak alloc/reserved `25.00/32.62 GiB`.
+  - No-seed path remains high-variance; this change is retained based on seeded A/B evidence, not single no-seed runs.
+
+## 2026-03-02 Safety Note
+
+- Host memory (`/usr/bin/time -v` max RSS) during new fixed-workload runs stayed around `2.1 GiB`, while process GPU memory max dropped from previous skyline (`36070 MiB`) to `33590~34076 MiB`.
+- Experimental transition stream-fusion path is now disabled by default (`TICL_POLICY_TRANSITION_STREAM_FUSION=0`) and guarded to avoid per-sample generator concurrency hazards.
 
 ## Skyline status
 
-- Fixed-workload wallclock skyline (`n_samples=1024`, `batch_size=8` unchanged): `20260302_142001_qkvfused_nortinfo_noseed_rel` (`62.83s`).
+- Fixed-workload wallclock skyline (`n_samples=1024`, `batch_size=8` unchanged):
+  - No-seed retained remains `qkv true fusion` baseline pair:
+    - `20260302_231000_qkvtruefusion_fixedcfg_plain` (`55.77s`)
+    - `20260302_231300_qkvtruefusion_fixedcfg_plain_rep2` (`57.14s`)
+  - Seeded retained A/B for finalize fastpath:
+    - `on` (`20260303_030500_finalize2d_ab_on`): `52.90s`
+    - `off` (`20260303_030900_finalize2d_ab_off`): `54.32s`
+    - Deterministic gain: about `-2.6%`.
+  - Note: later exploratory runs observed lower single-run values (down to `49.73s`), but due high variance and seeded A/B inconsistency they are not retained as skyline yet.
 - Throughput-normalized skyline (`wallclock / batch_size`, reduced-memory widened-batch path):
   - Previous retained: `20260302_172200_flashprefix_bs64` (`83.13s`, `1.299s/batch-unit`).
   - New retained (multi-run robust): `flash_prefix + page48 + bs68` with median `82.89s` (`1.219s/batch-unit`) and mean `83.40s` (`1.226s/batch-unit`).
   - Best observed single run in this cohort: `20260302_181900_flashprefix_bs68_page48` (`79.94s`, `1.176s/batch-unit`).
   - Reproduce setting: `TICL_POLICY_PAGED_ATTN_TRAIN_MODE=flash_prefix TICL_POLICY_PAGED_ATTN_FLASHPREFIX_PAGE_SIZE=48` with `--batch-size 68`.
+
+## 2026-03-03 Rebuild: Post-Stability Skyline Ladder
+
+- Risk acknowledged: recent numerical-stability changes invalidate direct comparison against legacy `grad_norm_nonfinite/inf` runs.
+- Rebuild script added: `benchmarks/skyline_20260302_rollout_kernel/rebuild_skyline.py`.
+- Rebuilt artifacts:
+  - `benchmarks/skyline_20260302_rollout_kernel/REBUILT_RUNS.jsonl`
+  - `benchmarks/skyline_20260302_rollout_kernel/REBUILT_SKYLINE.md`
+- Strict validity gate (new canonical comparison):
+  - `[pg-phase] status == ok`
+  - `valid/skipped >= 1/0`
+  - finite `mean loss`
+- Current rebuilt dataset summary:
+  - scanned runs: `98`
+  - strict-valid runs: `4`
+  - status distribution: `grad_norm_nonfinite=77, ok=4, oom=1, unknown=16`
+- Current strict-valid best run:
+  - `20260303_012000_denseprefixcache_default_probe_rep2` (`48.36s`, `status=ok`, `valid/skipped=1/0`, `chunk=8`, `tbptt=128`)
+- New post-rebuild deep-profile validation run:
+  - `20260303_093756_post_rebuild_transition_profile_ok` (`49.47s`, `status=ok`, `valid/skipped=1/0`)
+  - New transition breakdown (same fixed workload) from `[pg-phase]`:
+    - `rollout_transition_y_share=0.337`
+    - `rollout_transition_x_share=0.334`
+    - `rollout_transition_env_pack_share=0.072`
+    - `rollout_transition_state_update_share=0.163`
+    - `rollout_transition_group_count=2`
+  - Transformer layer-step still dominated by finalize path:
+    - `policy_step_tf_layer_finalize_share=0.484`
+    - `policy_step_tf_layer_attn_core_share=0.080`
+- Rule update for future skyline submissions:
+  - keep two ladders in parallel:
+    - `Strict-Valid Skyline` for retained claims
+    - `Diagnostic Ladder` for speed-only invalid/oom probes (non-retained)
+
+## External Framework Signals (HF / Unsloth / FlashAttention)
+
+- Checked upstream references for high-performance autoregressive training kernels:
+  - Hugging Face docs on [PyTorch SDPA integration](https://huggingface.co/docs/transformers/v4.46.0/en/perf_infer_gpu_one#scaled-dot-product-attention-sdpa), [FlashAttention-2 usage](https://huggingface.co/docs/transformers/v4.46.0/en/perf_infer_gpu_one#flashattention-2), and [BetterTransformer fastpath](https://huggingface.co/docs/transformers/v4.46.0/en/perf_infer_gpu_one#bettertransformer).
+  - Unsloth performance/memory claims and training stack docs: [blog](https://huggingface.co/blog/unsloth-trl), [docs](https://docs.unsloth.ai/), [repo](https://github.com/unslothai/unsloth).
+  - FlashAttention repository/paper references: [repo](https://github.com/Dao-AILab/flash-attention), [paper](https://arxiv.org/abs/2205.14135).
+  - PyTorch compile graph-break and SDPA backend notes: [compile graph breaks](https://docs.pytorch.org/docs/stable/compile/programming_model.common_graph_breaks.html), [SDPA backend issue context](https://github.com/pytorch/pytorch/issues/154602).
+- Practical mapping to current ticl hotspot profile:
+  - Upstream gains are dominated by attention/MLP fusion + reduced launch/sync overhead.
+  - Our measured dominant path remains transformer layer finalize (`~48%` in latest strict-valid deep profile), while transition path shows non-trivial packing/update overhead (`env_pack ~7.2%`, `state_update ~16.3%` of transition wall), so current optimization order stays: `finalize fusion` -> `transition pack/update fusion`.

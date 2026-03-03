@@ -1496,6 +1496,9 @@ class EnvironmentPrior:
         transition_wall_s = 0.0
         transition_y_wall_s = 0.0
         transition_x_wall_s = 0.0
+        transition_group_wall_s = 0.0
+        transition_env_pack_wall_s = 0.0
+        transition_state_update_wall_s = 0.0
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
@@ -1934,6 +1937,9 @@ class EnvironmentPrior:
         transition_wall_s = 0.0
         transition_y_wall_s = 0.0
         transition_x_wall_s = 0.0
+        transition_group_wall_s = 0.0
+        transition_env_pack_wall_s = 0.0
+        transition_state_update_wall_s = 0.0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -2319,6 +2325,7 @@ class EnvironmentPrior:
                 transition_cuda_start = torch.cuda.Event(enable_timing=True)
                 transition_cuda_start.record()
             for group in transition_groups:
+                group_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 start = int(group["start"])
                 end = int(group["end"])
                 env_g = group["env"]
@@ -2327,6 +2334,7 @@ class EnvironmentPrior:
                 action_dim_g = int(group["action_dim"])
                 noise_dim_g = int(group["noise_dim"])
 
+                pack_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 state_in = state_t[start:end, :state_dim_g]
                 obs_in = obs_t[start:end, :obs_dim_g]
                 action_in = action_next[start:end, :action_dim_g]
@@ -2340,6 +2348,8 @@ class EnvironmentPrior:
                 env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
                 env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
                 env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                if profile_rollout_timing and pack_wall_t0 is not None:
+                    transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
 
                 reward_scale_g = reward_scale[start:end]
                 stream_y = group.get("stream_y", None)
@@ -2389,6 +2399,7 @@ class EnvironmentPrior:
                     )
                     if profile_rollout_timing and x_wall_t0 is not None:
                         transition_x_wall_s += (time.perf_counter() - x_wall_t0)
+                state_update_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 alpha_g = alpha[start:end].unsqueeze(1)
                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                 if (state_noise is not None) and bool(group.get("state_noise_active", False)):
@@ -2401,6 +2412,10 @@ class EnvironmentPrior:
                 state_next[start:end, :state_dim_g] = state_next_g
                 reward_next[start:end] = reward_next_g
                 reward_mask_next[start:end] = reward_mask_next_g
+                if profile_rollout_timing and state_update_wall_t0 is not None:
+                    transition_state_update_wall_s += (time.perf_counter() - state_update_wall_t0)
+                if profile_rollout_timing and group_wall_t0 is not None:
+                    transition_group_wall_s += (time.perf_counter() - group_wall_t0)
             if transition_cuda_start is not None:
                 transition_cuda_end = torch.cuda.Event(enable_timing=True)
                 transition_cuda_end.record()
@@ -2512,6 +2527,10 @@ class EnvironmentPrior:
                 rollout_profile["transition_wall_ms"] = float(transition_wall_s * 1000.0)
                 rollout_profile["transition_y_wall_ms"] = float(transition_y_wall_s * 1000.0)
                 rollout_profile["transition_x_wall_ms"] = float(transition_x_wall_s * 1000.0)
+                rollout_profile["transition_group_wall_ms"] = float(transition_group_wall_s * 1000.0)
+                rollout_profile["transition_env_pack_wall_ms"] = float(transition_env_pack_wall_s * 1000.0)
+                rollout_profile["transition_state_update_wall_ms"] = float(transition_state_update_wall_s * 1000.0)
+                rollout_profile["transition_group_count"] = int(len(transition_groups))
         self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
@@ -3398,6 +3417,10 @@ class EnvironmentPrior:
                             "transition_wall_ms": 0.0,
                             "transition_y_wall_ms": 0.0,
                             "transition_x_wall_ms": 0.0,
+                            "transition_group_wall_ms": 0.0,
+                            "transition_env_pack_wall_ms": 0.0,
+                            "transition_state_update_wall_ms": 0.0,
+                            "transition_group_count": 0,
                             "steps": int(n_samples),
                             "batch_size": int(batch_size),
                         }
@@ -3407,6 +3430,16 @@ class EnvironmentPrior:
                     rollout_profile_acc["transition_wall_ms"] += float(group_profile.get("transition_wall_ms", 0.0))
                     rollout_profile_acc["transition_y_wall_ms"] += float(group_profile.get("transition_y_wall_ms", 0.0))
                     rollout_profile_acc["transition_x_wall_ms"] += float(group_profile.get("transition_x_wall_ms", 0.0))
+                    rollout_profile_acc["transition_group_wall_ms"] += float(
+                        group_profile.get("transition_group_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_env_pack_wall_ms"] += float(
+                        group_profile.get("transition_env_pack_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_state_update_wall_ms"] += float(
+                        group_profile.get("transition_state_update_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
             self.last_rollout_profile = rollout_profile_acc
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
@@ -3561,6 +3594,16 @@ class EnvironmentPrior:
                 stats["rollout_transition_wall_ms"] = float(rollout_profile.get("transition_wall_ms", 0.0))
                 stats["rollout_transition_y_wall_ms"] = float(rollout_profile.get("transition_y_wall_ms", 0.0))
                 stats["rollout_transition_x_wall_ms"] = float(rollout_profile.get("transition_x_wall_ms", 0.0))
+                stats["rollout_transition_group_wall_ms"] = float(
+                    rollout_profile.get("transition_group_wall_ms", 0.0)
+                )
+                stats["rollout_transition_env_pack_wall_ms"] = float(
+                    rollout_profile.get("transition_env_pack_wall_ms", 0.0)
+                )
+                stats["rollout_transition_state_update_wall_ms"] = float(
+                    rollout_profile.get("transition_state_update_wall_ms", 0.0)
+                )
+                stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             return loss, rollout, stats
 
         reward_sum = None
@@ -3659,6 +3702,16 @@ class EnvironmentPrior:
             stats["rollout_transition_wall_ms"] = float(rollout_profile.get("transition_wall_ms", 0.0))
             stats["rollout_transition_y_wall_ms"] = float(rollout_profile.get("transition_y_wall_ms", 0.0))
             stats["rollout_transition_x_wall_ms"] = float(rollout_profile.get("transition_x_wall_ms", 0.0))
+            stats["rollout_transition_group_wall_ms"] = float(
+                rollout_profile.get("transition_group_wall_ms", 0.0)
+            )
+            stats["rollout_transition_env_pack_wall_ms"] = float(
+                rollout_profile.get("transition_env_pack_wall_ms", 0.0)
+            )
+            stats["rollout_transition_state_update_wall_ms"] = float(
+                rollout_profile.get("transition_state_update_wall_ms", 0.0)
+            )
+            stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
         return loss, rollout, stats
 
     def get_last_coverage(self):

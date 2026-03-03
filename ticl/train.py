@@ -1086,6 +1086,10 @@ def train_epoch_policy_gradient(
                 batch_rollout_transition_wall_ms = 0.0
                 batch_rollout_transition_y_wall_ms = 0.0
                 batch_rollout_transition_x_wall_ms = 0.0
+                batch_rollout_transition_group_wall_ms = 0.0
+                batch_rollout_transition_env_pack_wall_ms = 0.0
+                batch_rollout_transition_state_update_wall_ms = 0.0
+                batch_rollout_transition_group_count = 0
                 batch_policy_step_calls = 0
                 batch_policy_step_encode_ms = 0.0
                 batch_policy_step_transformer_ms = 0.0
@@ -1353,6 +1357,30 @@ def train_epoch_policy_gradient(
                             batch_rollout_transition_x_wall_ms += float(transition_x_wall_ms)
                         except Exception:
                             pass
+                    transition_group_wall_ms = pg_stats_chunk.get("rollout_transition_group_wall_ms", None)
+                    if transition_group_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_group_wall_ms += float(transition_group_wall_ms)
+                        except Exception:
+                            pass
+                    transition_env_pack_wall_ms = pg_stats_chunk.get("rollout_transition_env_pack_wall_ms", None)
+                    if transition_env_pack_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_env_pack_wall_ms += float(transition_env_pack_wall_ms)
+                        except Exception:
+                            pass
+                    transition_state_update_wall_ms = pg_stats_chunk.get("rollout_transition_state_update_wall_ms", None)
+                    if transition_state_update_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_state_update_wall_ms += float(transition_state_update_wall_ms)
+                        except Exception:
+                            pass
+                    transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
+                    if transition_group_count is not None:
+                        try:
+                            batch_rollout_transition_group_count += int(transition_group_count)
+                        except Exception:
+                            pass
                     if callable(policy_step_profile_consumer):
                         try:
                             step_profile = policy_step_profile_consumer()
@@ -1475,12 +1503,25 @@ def train_epoch_policy_gradient(
                 transition_x_share = float(
                     batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                 )
+                transition_group_share = float(
+                    batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                )
+                transition_env_pack_share = float(
+                    batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                )
+                transition_state_update_share = float(
+                    batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                )
                 rollout_breakdown_suffix += (
                     f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
                     f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
                     f" rollout_policy_wall_share={rollout_policy_wall_share:.3f}"
                     f" rollout_transition_y_share={transition_y_share:.3f}"
                     f" rollout_transition_x_share={transition_x_share:.3f}"
+                    f" rollout_transition_group_share={transition_group_share:.3f}"
+                    f" rollout_transition_env_pack_share={transition_env_pack_share:.3f}"
+                    f" rollout_transition_state_update_share={transition_state_update_share:.3f}"
+                    f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
                 )
             if batch_policy_step_total_ms > 0.0:
                 policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
@@ -1573,6 +1614,16 @@ def train_epoch_policy_gradient(
                         stage_extra["rollout_transition_x_share"] = float(
                             batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                         )
+                        stage_extra["rollout_transition_group_share"] = float(
+                            batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        stage_extra["rollout_transition_env_pack_share"] = float(
+                            batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        stage_extra["rollout_transition_state_update_share"] = float(
+                            batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
                     if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                         stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
                         stage_extra["policy_step_total_ms"] = float(batch_policy_step_total_ms)
@@ -1669,6 +1720,18 @@ def train_epoch_policy_gradient(
                             )
                             wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
                                 batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_group_share"] = float(
+                                batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_env_pack_share"] = float(
+                                batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_state_update_share"] = float(
+                                batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
+                                batch_rollout_transition_group_count
                             )
                         if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                             wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
@@ -2366,6 +2429,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         "long-horizon rollout memory high."
                     )
             print("Policy torch.compile:", bool(pg_torch_compile))
+            finalize_fastpath_env = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
+            finalize_fastpath_on = finalize_fastpath_env not in {"0", "false", "no", "off"}
+            print("Policy finalize 2D fastpath:", bool(finalize_fastpath_on))
             policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
             if policy_autocast_dtype is not None:
                 if policy_autocast_dtype == torch.float16:

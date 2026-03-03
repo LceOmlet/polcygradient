@@ -1,0 +1,7 @@
+[benchmark] run_id=20260303_093756_post_rebuild_transition_profile_ok
+[benchmark] out_dir=/home/chen/RLPFN/ticl/benchmarks/skyline_20260302_rollout_kernel/20260303_093756_post_rebuild_transition_profile_ok
+[benchmark] date=2026-03-03T09:37:56+08:00
+[benchmark] TICL_PROFILE_ROLLOUT_TIMING=1
+[benchmark] TICL_POLICY_STEP_PROFILE=1
+[benchmark] TICL_TRANSFORMER_LAYER_STEP_PROFILE=1
+[benchmark] cmd=CONDA_NO_PLUGINS=true TICL_PROFILE_ROLLOUT_TIMING=1 TICL_POLICY_STEP_PROFILE=1 TICL_TRANSFORMER_LAYER_STEP_PROFILE=1 conda run --no-capture-output -n rlpfn python -u -m ticl.fit_model rlpfn --epochs 1 --num-steps 1 --batch-size 8 --validate False --rl-validate-enabled False --progress-bar False --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2

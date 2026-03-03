@@ -1,4 +1,5 @@
 import os
+import time
 
 import torch, wandb
 import torch.nn as nn
@@ -64,7 +65,47 @@ class TabPFN(nn.Module):
         self.single_eval_causal = bool(single_eval_causal)
         self.n_out = n_out
         self.nhid = nhid
+        profile_flag = str(os.environ.get("TICL_POLICY_STEP_PROFILE", "")).strip().lower()
+        self._policy_step_profile_enabled = profile_flag in {"1", "true", "yes", "on"}
+        self._policy_step_profile_stats = {
+            "calls": 0,
+            "encode_wall_s": 0.0,
+            "transformer_wall_s": 0.0,
+            "decoder_wall_s": 0.0,
+            "total_wall_s": 0.0,
+            "transformer_layer_calls": 0,
+            "transformer_layer_proj_wall_s": 0.0,
+            "transformer_layer_cache_wall_s": 0.0,
+            "transformer_layer_attnff_wall_s": 0.0,
+            "transformer_layer_attn_core_wall_s": 0.0,
+            "transformer_layer_finalize_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_total_wall_s": 0.0,
+        }
         self.init_weights()
+
+    def consume_policy_step_profile(self):
+        if not bool(self._policy_step_profile_enabled):
+            return None
+        stats = dict(self._policy_step_profile_stats)
+        self._policy_step_profile_stats = {
+            "calls": 0,
+            "encode_wall_s": 0.0,
+            "transformer_wall_s": 0.0,
+            "decoder_wall_s": 0.0,
+            "total_wall_s": 0.0,
+            "transformer_layer_calls": 0,
+            "transformer_layer_proj_wall_s": 0.0,
+            "transformer_layer_cache_wall_s": 0.0,
+            "transformer_layer_attnff_wall_s": 0.0,
+            "transformer_layer_attn_core_wall_s": 0.0,
+            "transformer_layer_finalize_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_total_wall_s": 0.0,
+        }
+        return stats
 
     def _encode_xy(self, src):
         if len(src) == 3:  # style is given
@@ -205,11 +246,16 @@ class TabPFN(nn.Module):
         if x_token.ndim != 3 or x_token.shape[0] != 1:
             raise ValueError(f"x_token must have shape (1, B, F), got {tuple(x_token.shape)}")
 
+        profile_enabled = bool(self._policy_step_profile_enabled)
+        total_t0 = time.perf_counter() if profile_enabled else None
+        encode_t0 = time.perf_counter() if profile_enabled else None
         x_enc = self.encoder(x_token)
         y_enc = self.y_encoder(y_token.unsqueeze(-1) if len(y_token.shape) < len(x_enc.shape) else y_token)
         token = x_enc + y_enc
         if self.input_ln is not None:
             token = self.input_ln(token)
+        encode_dt = (time.perf_counter() - encode_t0) if encode_t0 is not None else 0.0
+        transformer_t0 = time.perf_counter() if profile_enabled else None
         hidden, kv_cache = self.transformer_encoder.forward_step(
             token,
             kv_cache=kv_cache,
@@ -220,7 +266,41 @@ class TabPFN(nn.Module):
             allow_grad_mutable_cache=allow_grad_mutable_cache,
             allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
-        return self.decoder(hidden), kv_cache
+        transformer_dt = (time.perf_counter() - transformer_t0) if transformer_t0 is not None else 0.0
+        transformer_layer_profile = None
+        if profile_enabled:
+            consume_tf_profile = getattr(self.transformer_encoder, "consume_step_profile", None)
+            if callable(consume_tf_profile):
+                transformer_layer_profile = consume_tf_profile()
+        decoder_t0 = time.perf_counter() if profile_enabled else None
+        out = self.decoder(hidden)
+        decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
+        if total_t0 is not None:
+            stats = self._policy_step_profile_stats
+            stats["calls"] += 1
+            stats["encode_wall_s"] += float(encode_dt)
+            stats["transformer_wall_s"] += float(transformer_dt)
+            stats["decoder_wall_s"] += float(decoder_dt)
+            stats["total_wall_s"] += float(time.perf_counter() - total_t0)
+            if isinstance(transformer_layer_profile, dict):
+                stats["transformer_layer_calls"] += int(transformer_layer_profile.get("calls", 0) or 0)
+                stats["transformer_layer_proj_wall_s"] += float(transformer_layer_profile.get("proj_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_cache_wall_s"] += float(transformer_layer_profile.get("cache_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_attnff_wall_s"] += float(transformer_layer_profile.get("attnff_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_attn_core_wall_s"] += float(
+                    transformer_layer_profile.get("attn_core_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_attn_outproj_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
+        return out, kv_cache
 
     def forward_policy_step_split(
         self,
@@ -248,6 +328,9 @@ class TabPFN(nn.Module):
                 f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
             )
 
+        profile_enabled = bool(self._policy_step_profile_enabled)
+        total_t0 = time.perf_counter() if profile_enabled else None
+        encode_t0 = time.perf_counter() if profile_enabled else None
         batch_size = int(obs_t.shape[0])
         if int(action_t.shape[0]) != batch_size:
             raise ValueError("obs_t and action_t batch size mismatch")
@@ -320,6 +403,8 @@ class TabPFN(nn.Module):
             token = token + y_enc
         if self.input_ln is not None:
             token = self.input_ln(token)
+        encode_dt = (time.perf_counter() - encode_t0) if encode_t0 is not None else 0.0
+        transformer_t0 = time.perf_counter() if profile_enabled else None
         hidden, kv_cache = self.transformer_encoder.forward_step(
             token,
             kv_cache=kv_cache,
@@ -330,7 +415,41 @@ class TabPFN(nn.Module):
             allow_grad_mutable_cache=allow_grad_mutable_cache,
             allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
-        return self.decoder(hidden), kv_cache
+        transformer_dt = (time.perf_counter() - transformer_t0) if transformer_t0 is not None else 0.0
+        transformer_layer_profile = None
+        if profile_enabled:
+            consume_tf_profile = getattr(self.transformer_encoder, "consume_step_profile", None)
+            if callable(consume_tf_profile):
+                transformer_layer_profile = consume_tf_profile()
+        decoder_t0 = time.perf_counter() if profile_enabled else None
+        out = self.decoder(hidden)
+        decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
+        if total_t0 is not None:
+            stats = self._policy_step_profile_stats
+            stats["calls"] += 1
+            stats["encode_wall_s"] += float(encode_dt)
+            stats["transformer_wall_s"] += float(transformer_dt)
+            stats["decoder_wall_s"] += float(decoder_dt)
+            stats["total_wall_s"] += float(time.perf_counter() - total_t0)
+            if isinstance(transformer_layer_profile, dict):
+                stats["transformer_layer_calls"] += int(transformer_layer_profile.get("calls", 0) or 0)
+                stats["transformer_layer_proj_wall_s"] += float(transformer_layer_profile.get("proj_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_cache_wall_s"] += float(transformer_layer_profile.get("cache_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_attnff_wall_s"] += float(transformer_layer_profile.get("attnff_wall_s", 0.0) or 0.0)
+                stats["transformer_layer_attn_core_wall_s"] += float(
+                    transformer_layer_profile.get("attn_core_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_attn_outproj_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
+        return out, kv_cache
 
     def forward_with_kv(self, src, single_eval_pos=None):
         """

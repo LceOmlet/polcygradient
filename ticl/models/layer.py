@@ -1,5 +1,6 @@
 import math
 import os
+import time
 from functools import partial
 from typing import Optional
 
@@ -145,19 +146,55 @@ class TransformerEncoderLayer(Module):
         except Exception:
             flashprefix_page_size_env = 128
         self.paged_attn_flashprefix_page_size = int(max(1, flashprefix_page_size_env))
+        try:
+            dense_page_size_env = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
+        except Exception:
+            dense_page_size_env = 48
+        self.paged_attn_dense_page_size = int(max(1, dense_page_size_env))
+        step_profile_flag = str(os.environ.get("TICL_TRANSFORMER_LAYER_STEP_PROFILE", "")).strip().lower()
+        self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
+        finalize_2d_flag = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
+        self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
+        self._layer_step_profile_stats = {
+            "calls": 0,
+            "proj_wall_s": 0.0,
+            "cache_wall_s": 0.0,
+            "attnff_wall_s": 0.0,
+            "attn_core_wall_s": 0.0,
+            "finalize_wall_s": 0.0,
+            "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_ffn_wall_s": 0.0,
+            "total_wall_s": 0.0,
+        }
 
         self.activation = _get_activation_fn(activation)
 
+    def consume_forward_step_profile(self):
+        if not bool(self.layer_step_profile_enabled):
+            return None
+        stats = dict(self._layer_step_profile_stats)
+        self._layer_step_profile_stats = {
+            "calls": 0,
+            "proj_wall_s": 0.0,
+            "cache_wall_s": 0.0,
+            "attnff_wall_s": 0.0,
+            "attn_core_wall_s": 0.0,
+            "finalize_wall_s": 0.0,
+            "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_ffn_wall_s": 0.0,
+            "total_wall_s": 0.0,
+        }
+        return stats
+
     def _project_qkv(self, x_bld: Tensor):
-        w_q, w_k, w_v = self.self_attn.in_proj_weight.chunk(3, dim=0)
-        if self.self_attn.in_proj_bias is not None:
-            b_q, b_k, b_v = self.self_attn.in_proj_bias.chunk(3, dim=0)
-        else:
-            b_q = b_k = b_v = None
-        q = F.linear(x_bld, w_q, b_q)
-        k = F.linear(x_bld, w_k, b_k)
-        v = F.linear(x_bld, w_v, b_v)
-        return q, k, v
+        # True projection fusion: one GEMM on (B, L, E) -> (B, L, 3E),
+        # then split Q/K/V on the feature axis.
+        qkv = F.linear(
+            x_bld,
+            self.self_attn.in_proj_weight,
+            self.self_attn.in_proj_bias,
+        )
+        return qkv.chunk(3, dim=-1)
 
     def _project_q(self, x_bld: Tensor):
         w_q = self.self_attn.in_proj_weight[: self.self_attn.embed_dim]
@@ -169,16 +206,13 @@ class TransformerEncoderLayer(Module):
 
     def _project_kv(self, x_bld: Tensor):
         embed_dim = self.self_attn.embed_dim
-        w_k = self.self_attn.in_proj_weight[embed_dim: 2 * embed_dim]
-        w_v = self.self_attn.in_proj_weight[2 * embed_dim:]
+        w_kv = self.self_attn.in_proj_weight[embed_dim:]
         if self.self_attn.in_proj_bias is not None:
-            b_k = self.self_attn.in_proj_bias[embed_dim: 2 * embed_dim]
-            b_v = self.self_attn.in_proj_bias[2 * embed_dim:]
+            b_kv = self.self_attn.in_proj_bias[embed_dim:]
         else:
-            b_k = b_v = None
-        k = F.linear(x_bld, w_k, b_k)
-        v = F.linear(x_bld, w_v, b_v)
-        return k, v
+            b_kv = None
+        kv = F.linear(x_bld, w_kv, b_kv)
+        return kv.chunk(2, dim=-1)
 
     def _split_heads(self, x_bld: Tensor):
         bsz, seq_len, emsize = x_bld.shape
@@ -192,27 +226,71 @@ class TransformerEncoderLayer(Module):
         return x_bhld.transpose(1, 2).contiguous().view(bsz, seq_len, n_heads * head_dim)
 
     def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
-        attn_bld = self._merge_heads(attn_bhld)
-        attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
-        src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
-
-        src = src_step + self.dropout1(src2)
+        profile_enabled = bool(self.layer_step_profile_enabled)
+        outproj_t0 = time.perf_counter() if profile_enabled else None
+        use_2d_fastpath = bool(self.finalize_2d_fastpath) and int(attn_bhld.shape[2]) == 1
+        if use_2d_fastpath:
+            # forward_step hot path uses single-token query (L=1); keep
+            # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
+            attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
+            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)  # (B, E)
+            if self.training and float(self.dropout1.p) > 0.0:
+                attn_bld = F.dropout(attn_bld, p=float(self.dropout1.p), training=True)
+            src = src_step.squeeze(0) + attn_bld  # (B, E)
+        else:
+            attn_bld = self._merge_heads(attn_bhld)
+            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
+            src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
+            src = src_step + self.dropout1(src2)
         if not self.pre_norm:
-            src = self.norm1(src)
+            src = F.layer_norm(
+                src,
+                self.norm1.normalized_shape,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        outproj_dt = (time.perf_counter() - outproj_t0) if outproj_t0 is not None else 0.0
 
+        ffn_t0 = time.perf_counter() if profile_enabled else None
         if self.pre_norm:
-            src_ff = self.norm2(src)
+            src_ff = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
         else:
             src_ff = src
-        src2_ff = self.linear2(self.dropout(self.activation(self.linear1(src_ff))))
-        src = src + self.dropout2(src2_ff)
+        src2_ff = F.linear(src_ff, self.linear1.weight, self.linear1.bias)
+        src2_ff = self.activation(src2_ff)
+        if self.training and float(self.dropout.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        if self.training and float(self.dropout2.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+        src = src + src2_ff
 
         if not self.pre_norm:
-            src = self.norm2(src)
-        return src
+            src = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        ffn_dt = (time.perf_counter() - ffn_t0) if ffn_t0 is not None else 0.0
+        if profile_enabled:
+            stats = self._layer_step_profile_stats
+            stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
+            stats["finalize_ffn_wall_s"] += float(ffn_dt)
+        return src.unsqueeze(0) if use_2d_fastpath else src
 
     def _forward_step_attn_ff(self, src_step: Tensor, q_bhld: Tensor, k_all: Tensor, v_all: Tensor):
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
+        profile_enabled = bool(self.layer_step_profile_enabled)
+        attn_t0 = time.perf_counter() if profile_enabled else None
         attn_bhld = F.scaled_dot_product_attention(
             q_bhld,
             k_all,
@@ -221,7 +299,15 @@ class TransformerEncoderLayer(Module):
             dropout_p=attn_dropout,
             is_causal=False,
         )
-        return self._finalize_forward_step(src_step, attn_bhld)
+        attn_dt = (time.perf_counter() - attn_t0) if attn_t0 is not None else 0.0
+        finalize_t0 = time.perf_counter() if profile_enabled else None
+        src = self._finalize_forward_step(src_step, attn_bhld)
+        finalize_dt = (time.perf_counter() - finalize_t0) if finalize_t0 is not None else 0.0
+        if profile_enabled:
+            stats = self._layer_step_profile_stats
+            stats["attn_core_wall_s"] += float(attn_dt)
+            stats["finalize_wall_s"] += float(finalize_dt)
+        return src
 
     @staticmethod
     def _resolve_paged_chunk_tokens(q_bhld: Tensor, valid_len: int):
@@ -448,6 +534,23 @@ class TransformerEncoderLayer(Module):
                     chunk_token_cap=self._resolve_train_flashmerge_chunk_tokens(q_bhld, valid_len),
                     clone_kv_for_grad=bool(clone_kv_for_grad),
                 )
+            if (
+                self.paged_attn_train_mode == "dense"
+                and (not bool(clone_kv_for_grad))
+                and (prefix_k is not None)
+                and (prefix_v is not None)
+            ):
+                prefix_len = int(prefix_k.shape[2])
+                if prefix_len >= int(valid_len):
+                    k_all = prefix_k[:, :, :int(valid_len), :]
+                    v_all = prefix_v[:, :, :int(valid_len), :]
+                else:
+                    tail_take = int(valid_len) - prefix_len
+                    tail_k = k_pages[-1][:, :, :tail_take, :]
+                    tail_v = v_pages[-1][:, :, :tail_take, :]
+                    k_all = torch.cat([prefix_k, tail_k], dim=2)
+                    v_all = torch.cat([prefix_v, tail_v], dim=2)
+                return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if bool(clone_kv_for_grad):
                 # Multi-page fallback for in-place paged-grad mode.
@@ -734,6 +837,8 @@ class TransformerEncoderLayer(Module):
             raise ValueError("forward_step requires single_eval_causal=True.")
         if src_step.ndim != 3 or src_step.shape[0] != 1:
             raise ValueError(f"src_step must have shape (1, B, E), got {tuple(src_step.shape)}")
+        profile_enabled = bool(self.layer_step_profile_enabled)
+        total_t0 = time.perf_counter() if profile_enabled else None
 
         if self.pre_norm:
             src_norm = self.norm1(src_step)
@@ -741,6 +846,7 @@ class TransformerEncoderLayer(Module):
             src_norm = src_step
 
         src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
+        proj_t0 = time.perf_counter() if profile_enabled else None
         # Hot-path fusion for rollout append steps: compute q/k/v with one GEMM
         # instead of separate q and kv projections.
         if append_to_cache:
@@ -750,6 +856,7 @@ class TransformerEncoderLayer(Module):
             k_new_bld = None
             v_new_bld = None
         q_bhld = self._split_heads(q_bld)
+        proj_dt = (time.perf_counter() - proj_t0) if proj_t0 is not None else 0.0
         if max_cache_len is None and kv_cache is not None:
             max_cache_len = kv_cache.get("max_cache_len", None)
         if kv_cache_page_size is None and kv_cache is not None:
@@ -800,6 +907,11 @@ class TransformerEncoderLayer(Module):
                         # this copy overhead while keeping page-locality.
                         target_page = int(max(8, self.paged_attn_flashprefix_page_size))
                         effective_kv_page_size = int(max(8, min(int(kv_cache_page_size), target_page)))
+                    elif self.paged_attn_train_mode == "dense":
+                        # Dense paged-attn still rebuilds multi-page views per step.
+                        # Cap mutable COW page growth to reduce tail-page cat cost.
+                        target_page = int(max(8, self.paged_attn_dense_page_size))
+                        effective_kv_page_size = int(max(8, min(int(kv_cache_page_size), target_page)))
                     else:
                         effective_kv_page_size = int(max(8, kv_cache_page_size))
             else:
@@ -816,6 +928,7 @@ class TransformerEncoderLayer(Module):
             tail_v = v_pages_local[-1][:, :, :1, :]
             return tail_k, tail_v
 
+        cache_t0 = time.perf_counter() if profile_enabled else None
         if kv_cache is None:
             if not append_to_cache:
                 raise ValueError("predict-only step requires a non-empty kv_cache.")
@@ -978,10 +1091,12 @@ class TransformerEncoderLayer(Module):
             cache_mode == "paged"
             and torch.is_grad_enabled()
             and (not bool(inplace_paged_grad))
-            and self.paged_attn_train_mode == "flash_prefix"
+            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):
+            # Maintain concatenated full-page prefix so hot path attention can
+            # consume [prefix + tail] instead of rebuilding all-page cat views.
             full_pages = int(max(0, len(k_pages) - 1))
             if full_pages <= 0:
                 k_prefix = None
@@ -1018,6 +1133,8 @@ class TransformerEncoderLayer(Module):
             v_prefix = None
             prefix_pages = 0
 
+        cache_dt = (time.perf_counter() - cache_t0) if cache_t0 is not None else 0.0
+        attnff_t0 = time.perf_counter() if profile_enabled else None
         if cache_mode == "paged" and (k_pages is not None) and (v_pages is not None):
             src = self._forward_step_attn_ff_paged(
                 src_step,
@@ -1040,6 +1157,7 @@ class TransformerEncoderLayer(Module):
             )
         else:
             src = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+        attnff_dt = (time.perf_counter() - attnff_t0) if attnff_t0 is not None else 0.0
 
         new_cache = {
             "k": k_all,
@@ -1058,6 +1176,13 @@ class TransformerEncoderLayer(Module):
             "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
             "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
         }
+        if total_t0 is not None:
+            stats = self._layer_step_profile_stats
+            stats["calls"] += 1
+            stats["proj_wall_s"] += float(proj_dt)
+            stats["cache_wall_s"] += float(cache_dt)
+            stats["attnff_wall_s"] += float(attnff_dt)
+            stats["total_wall_s"] += float(time.perf_counter() - total_t0)
         return src, new_cache
 
     def forward_causal_prefix(self, src_prefix: Tensor):
@@ -1294,6 +1419,50 @@ class TransformerEncoderSimple(Module):
         self.layers = nn.ModuleList([encoder_layer_creator() for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = norm
+
+    def consume_step_profile(self):
+        calls = 0
+        proj_wall_s = 0.0
+        cache_wall_s = 0.0
+        attnff_wall_s = 0.0
+        attn_core_wall_s = 0.0
+        finalize_wall_s = 0.0
+        finalize_attn_outproj_wall_s = 0.0
+        finalize_ffn_wall_s = 0.0
+        total_wall_s = 0.0
+        enabled = False
+        for layer in self.layers:
+            consume_fn = getattr(layer, "consume_forward_step_profile", None)
+            if not callable(consume_fn):
+                continue
+            layer_stats = consume_fn()
+            if not isinstance(layer_stats, dict):
+                continue
+            enabled = True
+            calls += int(layer_stats.get("calls", 0) or 0)
+            proj_wall_s += float(layer_stats.get("proj_wall_s", 0.0) or 0.0)
+            cache_wall_s += float(layer_stats.get("cache_wall_s", 0.0) or 0.0)
+            attnff_wall_s += float(layer_stats.get("attnff_wall_s", 0.0) or 0.0)
+            attn_core_wall_s += float(layer_stats.get("attn_core_wall_s", 0.0) or 0.0)
+            finalize_wall_s += float(layer_stats.get("finalize_wall_s", 0.0) or 0.0)
+            finalize_attn_outproj_wall_s += float(
+                layer_stats.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_wall_s += float(layer_stats.get("finalize_ffn_wall_s", 0.0) or 0.0)
+            total_wall_s += float(layer_stats.get("total_wall_s", 0.0) or 0.0)
+        if not enabled:
+            return None
+        return {
+            "calls": int(calls),
+            "proj_wall_s": float(proj_wall_s),
+            "cache_wall_s": float(cache_wall_s),
+            "attnff_wall_s": float(attnff_wall_s),
+            "attn_core_wall_s": float(attn_core_wall_s),
+            "finalize_wall_s": float(finalize_wall_s),
+            "finalize_attn_outproj_wall_s": float(finalize_attn_outproj_wall_s),
+            "finalize_ffn_wall_s": float(finalize_ffn_wall_s),
+            "total_wall_s": float(total_wall_s),
+        }
 
     def forward(
         self, 
