@@ -653,9 +653,27 @@ def _compute_policy_rollout_chunk_loss(
             pg_stats_inner["objective"].detach(),
             pg_stats_inner["reward_mean"].detach(),
             pg_stats_inner["reward_std"].detach(),
+            pg_stats_inner.get("reward_min", torch.zeros((), device=device, dtype=torch.float32)).detach(),
+            pg_stats_inner.get("reward_max", torch.zeros((), device=device, dtype=torch.float32)).detach(),
+            pg_stats_inner.get("reward_abs_max", torch.zeros((), device=device, dtype=torch.float32)).detach(),
+            pg_stats_inner.get("reward_clip_hit_share", torch.zeros((), device=device, dtype=torch.float32)).detach(),
+            pg_stats_inner.get(
+                "reward_norm_clip_hit_share",
+                torch.zeros((), device=device, dtype=torch.float32),
+            ).detach(),
         )
 
-    pg_loss_chunk, objective, reward_mean, reward_std = checkpoint(
+    (
+        pg_loss_chunk,
+        objective,
+        reward_mean,
+        reward_std,
+        reward_min,
+        reward_max,
+        reward_abs_max,
+        reward_clip_hit_share,
+        reward_norm_clip_hit_share,
+    ) = checkpoint(
         _rollout_loss_only,
         dummy,
         use_reentrant=bool(policy_rollout_checkpoint_reentrant),
@@ -665,6 +683,11 @@ def _compute_policy_rollout_chunk_loss(
         "objective": objective,
         "reward_mean": reward_mean,
         "reward_std": reward_std,
+        "reward_min": reward_min,
+        "reward_max": reward_max,
+        "reward_abs_max": reward_abs_max,
+        "reward_clip_hit_share": reward_clip_hit_share,
+        "reward_norm_clip_hit_share": reward_norm_clip_hit_share,
     }
     return pg_loss_chunk, None, pg_stats_chunk
 
@@ -767,7 +790,7 @@ def train_epoch(
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
                 loss_val = float(loss.detach().float().mean().cpu())
-                print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=loss_nonfinite loss={loss_val}")
+                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=loss_nonfinite loss={loss_val}")
                 if epoch_profiler is not None:
                     bs_prof, ns_prof = _infer_batch_shape_for_profile(data, targets)
                     epoch_profiler.record_batch(valid=False, batch_size=bs_prof, n_samples=ns_prof)
@@ -802,7 +825,7 @@ def train_epoch(
                 skipped_steps += 1
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
-                print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=grad_nonfinite")
+                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_nonfinite")
                 if epoch_profiler is not None:
                     bs_prof, ns_prof = _infer_batch_shape_for_profile(data, targets)
                     epoch_profiler.record_batch(valid=False, batch_size=bs_prof, n_samples=ns_prof)
@@ -837,7 +860,7 @@ def train_epoch(
                     skipped_steps += 1
                     optimizer.zero_grad(set_to_none=True)
                     grad_accum_steps = 0
-                    print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=grad_norm_nonfinite")
+                    print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_norm_nonfinite")
                     if epoch_profiler is not None:
                         bs_prof, ns_prof = _infer_batch_shape_for_profile(data, targets)
                         epoch_profiler.record_batch(valid=False, batch_size=bs_prof, n_samples=ns_prof)
@@ -1044,6 +1067,11 @@ def train_epoch_policy_gradient(
     if (not math.isfinite(rollout_chunk_grow_factor)) or rollout_chunk_grow_factor <= 1.0:
         rollout_chunk_grow_factor = 2.0
     stable_batches_for_chunk_growth = 0
+    try:
+        pg_phase_log_every = int(os.environ.get("TICL_PG_PHASE_LOG_EVERY_BATCHES", "50"))
+    except Exception:
+        pg_phase_log_every = 50
+    pg_phase_log_every = max(1, pg_phase_log_every)
 
     iterator = range(steps_per_epoch)
     if progress_bar:
@@ -1052,6 +1080,13 @@ def train_epoch_policy_gradient(
 
     for batch in iterator:
         batch_epoch_for_profile = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
+        should_log_phase = bool(
+            verbose and (
+                (batch == 0)
+                or ((batch + 1) == steps_per_epoch)
+                or (((batch + 1) % pg_phase_log_every) == 0)
+            )
+        )
         if using_dist and not ((grad_accum_steps + 1) == aggregate_k_gradients):
             cm = model.no_sync()
         else:
@@ -1075,6 +1110,11 @@ def train_epoch_policy_gradient(
                 batch_objective = torch.tensor(0.0, device=device)
                 batch_reward_mean = torch.tensor(0.0, device=device)
                 batch_reward_std = torch.tensor(0.0, device=device)
+                batch_reward_min_value = float("inf")
+                batch_reward_max_value = float("-inf")
+                batch_reward_absmax_value = 0.0
+                batch_reward_clip_hit_share = 0.0
+                batch_reward_norm_clip_hit_share = 0.0
                 batch_nonfinite = False
                 batch_rollout_wall = 0.0
                 batch_backward_wall = 0.0
@@ -1282,7 +1322,7 @@ def train_epoch_policy_gradient(
                                 if "cuda" in str(device):
                                     torch.cuda.empty_cache()
                                 print(
-                                    f"[pg-oom] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                                    f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
                                     f"reducing TBPTT window to {current_tbptt_window} "
                                     "(keeping policy rollout chunk size unchanged)"
                                 )
@@ -1295,7 +1335,7 @@ def train_epoch_policy_gradient(
                                     if "cuda" in str(device):
                                         torch.cuda.empty_cache()
                                     print(
-                                        f"[pg-oom] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                                        f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
                                         f"reducing TBPTT window to {current_tbptt_window} "
                                         "(keeping policy rollout chunk size unchanged)"
                                     )
@@ -1307,12 +1347,12 @@ def train_epoch_policy_gradient(
                         if new_chunk < current_rollout_chunk_size:
                             current_rollout_chunk_size = new_chunk
                             print(
-                                f"[pg-oom] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
                                 f"reducing policy rollout chunk size to {current_rollout_chunk_size}"
                             )
                         else:
                             print(
-                                f"[pg-oom] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
                                 "OOM at minimum policy rollout chunk size=1. "
                                 "Memory is sequence-length dominated; batch chunking cannot reduce further."
                             )
@@ -1321,6 +1361,41 @@ def train_epoch_policy_gradient(
                     batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
                     batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
                     batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
+                    chunk_reward_min = pg_stats_chunk.get("reward_min", None)
+                    if chunk_reward_min is not None:
+                        try:
+                            batch_reward_min_value = min(batch_reward_min_value, float(chunk_reward_min.detach().cpu()))
+                        except Exception:
+                            pass
+                    chunk_reward_max = pg_stats_chunk.get("reward_max", None)
+                    if chunk_reward_max is not None:
+                        try:
+                            batch_reward_max_value = max(batch_reward_max_value, float(chunk_reward_max.detach().cpu()))
+                        except Exception:
+                            pass
+                    chunk_reward_absmax = pg_stats_chunk.get("reward_abs_max", None)
+                    if chunk_reward_absmax is not None:
+                        try:
+                            batch_reward_absmax_value = max(
+                                batch_reward_absmax_value,
+                                float(chunk_reward_absmax.detach().cpu()),
+                            )
+                        except Exception:
+                            pass
+                    chunk_reward_clip_hit = pg_stats_chunk.get("reward_clip_hit_share", None)
+                    if chunk_reward_clip_hit is not None:
+                        try:
+                            batch_reward_clip_hit_share += float(chunk_reward_clip_hit.detach().cpu()) * chunk_weight
+                        except Exception:
+                            pass
+                    chunk_reward_norm_clip_hit = pg_stats_chunk.get("reward_norm_clip_hit_share", None)
+                    if chunk_reward_norm_clip_hit is not None:
+                        try:
+                            batch_reward_norm_clip_hit_share += (
+                                float(chunk_reward_norm_clip_hit.detach().cpu()) * chunk_weight
+                            )
+                        except Exception:
+                            pass
                     policy_cuda_ms = pg_stats_chunk.get("rollout_policy_cuda_ms", None)
                     if policy_cuda_ms is not None:
                         try:
@@ -1427,7 +1502,7 @@ def train_epoch_policy_gradient(
                     grad_accum_steps = 0
                     if verbose:
                         print(
-                            f"[pg-oom-retry] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                            f"[pg-oom-retry] epoch={batch_epoch_for_profile} batch={batch} "
                             f"attempt={batch_attempt + 1}/{max_batch_oom_retries} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window}"
                         )
@@ -1677,7 +1752,7 @@ def train_epoch_policy_gradient(
                         end_time_unix=float(stage_t1),
                         extra=stage_extra,
                     )
-                    if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                    if should_log_phase:
                         breakdown_info = ""
                         if stage_name == "rollout":
                             breakdown_info = rollout_breakdown_suffix
@@ -1787,9 +1862,9 @@ def train_epoch_policy_gradient(
                 stable_batches_for_chunk_growth = 0
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
-                if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                if should_log_phase:
                     print(
-                        f"[pg-phase] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
@@ -1834,15 +1909,15 @@ def train_epoch_policy_gradient(
                 stable_batches_for_chunk_growth = 0
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
-                if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                if should_log_phase:
                     print(
-                        f"[pg-phase] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
                         f"{rollout_breakdown_suffix}"
                     )
-                print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=loss_nonfinite loss={loss_val}")
+                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=loss_nonfinite loss={loss_val}")
                 if epoch_profiler is not None:
                     epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
                     _maybe_emit_profile_interval(
@@ -1864,21 +1939,28 @@ def train_epoch_policy_gradient(
                 continue
 
             if wandb.run is not None:
-                wandb.log(
-                    {
-                        'batch_loss': float(batch_loss.detach().mean().cpu()) * aggregate_k_gradients,
-                        'policy_objective': float(batch_objective.detach().cpu()),
-                        'policy_reward_mean': float(batch_reward_mean.detach().cpu()),
-                        'policy_reward_std': float(batch_reward_std.detach().cpu()),
-                    }
-                )
+                wandb_payload = {
+                    'batch_loss': float(batch_loss.detach().mean().cpu()) * aggregate_k_gradients,
+                    'policy_objective': float(batch_objective.detach().cpu()),
+                    'policy_reward_mean': float(batch_reward_mean.detach().cpu()),
+                    'policy_reward_std': float(batch_reward_std.detach().cpu()),
+                    'policy_reward_clip_hit_share': float(batch_reward_clip_hit_share),
+                    'policy_reward_norm_clip_hit_share': float(batch_reward_norm_clip_hit_share),
+                }
+                if math.isfinite(batch_reward_min_value):
+                    wandb_payload['policy_reward_min'] = float(batch_reward_min_value)
+                if math.isfinite(batch_reward_max_value):
+                    wandb_payload['policy_reward_max'] = float(batch_reward_max_value)
+                if math.isfinite(batch_reward_absmax_value):
+                    wandb_payload['policy_reward_absmax'] = float(batch_reward_absmax_value)
+                wandb.log(wandb_payload)
 
             if (scaler is None) and requires_midaccum_grad_finite_check and _has_nonfinite_gradients(model, device=device):
                 skipped_steps += 1
                 stable_batches_for_chunk_growth = 0
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
-                print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=grad_nonfinite")
+                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_nonfinite")
                 if epoch_profiler is not None:
                     epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
                     _maybe_emit_profile_interval(
@@ -1954,7 +2036,7 @@ def train_epoch_policy_gradient(
                                 "cuda_busy_ratio": step_busy_ratio,
                             },
                         )
-                        if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                        if should_log_phase:
                             print(
                                 f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage=step "
                                 f"{_format_gpu_stage_summary('', stage_rec)} "
@@ -1983,15 +2065,15 @@ def train_epoch_policy_gradient(
                     grad_accum_steps = 0
                     if scaler is not None:
                         scaler.update()
-                    if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                    if should_log_phase:
                         print(
-                            f"[pg-phase] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
                             f"{rollout_breakdown_suffix}"
                         )
-                    print(f"[train-skip] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} reason=grad_norm_nonfinite")
+                    print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_norm_nonfinite")
                     if epoch_profiler is not None:
                         epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
                         _maybe_emit_profile_interval(
@@ -2056,7 +2138,7 @@ def train_epoch_policy_gradient(
                             "cuda_busy_ratio": step_busy_ratio,
                         },
                     )
-                    if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                    if should_log_phase:
                         print(
                             f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage=step "
                             f"{_format_gpu_stage_summary('', stage_rec)} "
@@ -2082,16 +2164,26 @@ def train_epoch_policy_gradient(
 
             total_loss += batch_loss.detach().mean()
             valid_steps += 1
-            if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+            if should_log_phase:
                 grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
                 opt_step_info = "na" if batch_optimizer_step_value is None else f"{float(batch_optimizer_step_value):.0f}"
+                reward_min_info = "na" if not math.isfinite(batch_reward_min_value) else f"{batch_reward_min_value:+.3e}"
+                reward_max_info = "na" if not math.isfinite(batch_reward_max_value) else f"{batch_reward_max_value:+.3e}"
+                reward_absmax_info = (
+                    "na" if not math.isfinite(batch_reward_absmax_value) else f"{batch_reward_absmax_value:.3e}"
+                )
                 print(
-                    f"[pg-phase] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                    f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
                     f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                     f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                     f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
                     f"objective={float(batch_objective.detach().cpu()):+.3e} "
+                    f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
                     f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
+                    f"reward_min={reward_min_info} reward_max={reward_max_info} "
+                    f"reward_absmax={reward_absmax_info} "
+                    f"clip_hit={float(batch_reward_clip_hit_share):.3f} "
+                    f"norm_clip_hit={float(batch_reward_norm_clip_hit_share):.3f} "
                     f"grad_norm={grad_norm_info} "
                     f"stepped={int(bool(batch_optimizer_stepped))} "
                     f"opt_step={opt_step_info}"
@@ -2122,7 +2214,7 @@ def train_epoch_policy_gradient(
                     if grown > current_rollout_chunk_size:
                         current_rollout_chunk_size = grown
                         print(
-                            f"[pg-autotune] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
+                            f"[pg-autotune] epoch={batch_epoch_for_profile} batch={batch} "
                             f"increasing policy rollout chunk size to {current_rollout_chunk_size}"
                         )
                     stable_batches_for_chunk_growth = 0
@@ -2541,6 +2633,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             if verbose:
                 print(f"start of epoch {epoch}")
 
+            prev_total_loss = total_loss
             epoch_start_time = time.time()
             if train_profiler is not None and train_profiler.enabled():
                 train_profiler.start_epoch(epoch)
@@ -2701,7 +2794,11 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     f' nan share {nan_share:5.2f} ignore share (for classification tasks) {ignore_share:5.4f}')
                 print('-' * 89)
                 
-            if new_loss > 1.5 * total_loss:
+            if (
+                rl_objective != 'policy_gradient'
+                and math.isfinite(prev_total_loss)
+                and new_loss > 1.5 * prev_total_loss
+            ):
                 print("LOSS DIVERGED")
                 return total_loss, model.to('cpu'), dl, epoch
             

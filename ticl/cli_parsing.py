@@ -328,6 +328,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--action-noise-train-std', type=float, help='Std for action noise before eval split.')
     environment_prior.add_argument('--action-noise-eval-std', type=float, help='Std for action noise after eval split.')
     environment_prior.add_argument('--reward-scale', type=float, help='Scale multiplier for sampled rewards.')
+    environment_prior.add_argument('--reward-clip', type=float, help='Absolute clip bound applied to sampled rewards.')
     environment_prior.add_argument('--state-clip', type=float, help='Clamp bound for latent state before tanh.')
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')

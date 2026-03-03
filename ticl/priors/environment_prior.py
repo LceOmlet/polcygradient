@@ -60,7 +60,10 @@ class EnvironmentPrior:
         cfg.setdefault("state_noise_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
         cfg.setdefault("action_noise_train_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
         cfg.setdefault("action_noise_eval_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.1})
-        cfg.setdefault("reward_scale", {"distribution": "log_uniform", "min": 1e-3, "max": 4.0})
+        # Reward-scale is sampled per environment; final rewards are clipped
+        # to keep rollout targets in a stable bounded range.
+        cfg.setdefault("reward_scale", {"distribution": "uniform", "min": 0.1, "max": 10.0})
+        cfg.setdefault("reward_clip", 10.0)
         cfg.setdefault("state_clip", 8.0)
 
         # Reward normalization / policy-gradient stability.
@@ -363,6 +366,7 @@ class EnvironmentPrior:
             "action_noise_train_std": float(h["action_noise_train_std"]),
             "action_noise_eval_std": float(h["action_noise_eval_std"]),
             "reward_scale": float(h["reward_scale"]),
+            "reward_clip": float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0)))),
             "state_clip": float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))),
             "reward_dropout_enabled": bool(h.get("reward_dropout_enabled", True)),
             "reward_dropout_impute_zero": bool(h.get("reward_dropout_impute_zero", True)),
@@ -851,6 +855,11 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         reward_scale = torch.tensor([float(h["reward_scale"]) for h in h_list], device=device, dtype=torch.float32)
+        reward_clip = torch.tensor(
+            [float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0)))) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -908,6 +917,7 @@ class EnvironmentPrior:
             "action_noise_train_std": action_noise_train_std,
             "action_noise_eval_std": action_noise_eval_std,
             "reward_scale": reward_scale,
+            "reward_clip": reward_clip,
             "state_clip": state_clip,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
@@ -1108,6 +1118,11 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         reward_scale = torch.tensor([float(h["reward_scale"]) for h in h_list], device=device, dtype=torch.float32)
+        reward_clip = torch.tensor(
+            [float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0)))) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -1148,6 +1163,7 @@ class EnvironmentPrior:
             "action_noise_train_std": action_noise_train_std,
             "action_noise_eval_std": action_noise_eval_std,
             "reward_scale": reward_scale,
+            "reward_clip": reward_clip,
             "state_clip": state_clip,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
@@ -1382,7 +1398,10 @@ class EnvironmentPrior:
                 env_in,
                 generators_for_noise=rollout_generators,
             ).reshape(batch_size)
-            reward_next = reward_next_raw
+            reward_next = torch.maximum(
+                torch.minimum(reward_next_raw, env["reward_clip"]),
+                -env["reward_clip"],
+            )
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if dropout_draws is not None:
@@ -1783,7 +1802,10 @@ class EnvironmentPrior:
                 env_in,
                 generators_for_noise=env_noise_generators,
             ).reshape(batch_size)
-            reward_next = reward_next_raw
+            reward_next = torch.maximum(
+                torch.minimum(reward_next_raw, env["reward_clip"]),
+                -env["reward_clip"],
+            )
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if strict_seed_mode and dropout_draw_generators is not None:
@@ -1955,6 +1977,7 @@ class EnvironmentPrior:
         action_noise_train_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
         action_noise_eval_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_dropout_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -2021,6 +2044,7 @@ class EnvironmentPrior:
             action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
             action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
             reward_scale[group_idx] = env_batch["reward_scale"]
+            reward_clip[group_idx] = env_batch["reward_clip"]
             alpha[group_idx] = env_batch["alpha"]
             state_clip[group_idx] = env_batch["state_clip"]
             reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
@@ -2076,6 +2100,7 @@ class EnvironmentPrior:
             action_noise_train_std = action_noise_train_std.index_select(0, perm)
             action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
             reward_scale = reward_scale.index_select(0, perm)
+            reward_clip = reward_clip.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
             reward_dropout_enabled = reward_dropout_enabled.index_select(0, perm)
@@ -2352,6 +2377,7 @@ class EnvironmentPrior:
                     transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
 
                 reward_scale_g = reward_scale[start:end]
+                reward_clip_g = reward_clip[start:end]
                 stream_y = group.get("stream_y", None)
                 stream_x = group.get("stream_x", None)
                 reward_next_raw = None
@@ -2378,7 +2404,10 @@ class EnvironmentPrior:
                     ).reshape(-1)
                     if profile_rollout_timing and y_wall_t0 is not None:
                         transition_y_wall_s += (time.perf_counter() - y_wall_t0)
-                reward_next_g = reward_next_raw
+                reward_next_g = torch.maximum(
+                    torch.minimum(reward_next_raw, reward_clip_g),
+                    -reward_clip_g,
+                )
                 reward_mask_next_g = torch.ones_like(reward_next_g)
 
                 if dropout_draws is not None:
@@ -2794,7 +2823,11 @@ class EnvironmentPrior:
                 env_in = self._pack_env_input(state_t, obs_t, action_next, noise_t, zero_pad_t).unsqueeze(0)
 
             reward_next_raw = env["reward_scale"] * env["y_generator"](env_in, generator=local_generator).reshape(())
-            reward_next = reward_next_raw
+            reward_next = torch.clamp(
+                reward_next_raw,
+                -float(env["reward_clip"]),
+                float(env["reward_clip"]),
+            )
             reward_mask_next = torch.ones((), device=device, dtype=reward_next_raw.dtype)
             if dropout_draws is not None:
                 if bool(dropout_draws[t] < float(env["reward_dropout_ratio"])):
@@ -3064,6 +3097,7 @@ class EnvironmentPrior:
 
         alpha = float(env["alpha"])
         reward_scale = float(env["reward_scale"])
+        reward_clip = float(env.get("reward_clip", 10.0))
         state_clip = float(env["state_clip"])
         action_noise_train_std = float(env["action_noise_train_std"])
         action_noise_eval_std = float(env["action_noise_eval_std"])
@@ -3111,7 +3145,7 @@ class EnvironmentPrior:
                 reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
                 for bi, g in enumerate(rollout_generators):
                     reward_next_raw[bi] = reward_scale * env["y_generator"](env_in[bi: bi + 1], generator=g).reshape(())
-            reward_next = reward_next_raw
+            reward_next = torch.clamp(reward_next_raw, -reward_clip, reward_clip)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if dropout_draws is not None:
@@ -3484,7 +3518,7 @@ class EnvironmentPrior:
             "rollout_profile": self.last_rollout_profile,
         }
 
-    def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True):
+    def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True, return_stats=False):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
         if eps is None:
@@ -3497,9 +3531,17 @@ class EnvironmentPrior:
         if detach_stats:
             mean = mean.detach()
             std = std.detach()
-        normalized = (rewards - mean) / std
+        normalized_preclip = (rewards - mean) / std
+        normalized = normalized_preclip
+        normalized_clip_hit_share = torch.zeros((), device=rewards.device, dtype=torch.float32)
         if clip is not None and float(clip) > 0:
-            normalized = normalized.clamp(-float(clip), float(clip))
+            clip_f = float(clip)
+            normalized_clip_hit_share = (normalized_preclip.abs() > clip_f).to(torch.float32).mean()
+            normalized = normalized_preclip.clamp(-clip_f, clip_f)
+        if return_stats:
+            return normalized, {
+                "normalized_clip_hit_share": normalized_clip_hit_share.detach(),
+            }
         return normalized
 
     def policy_gradient_loss_from_rewards(
@@ -3523,11 +3565,33 @@ class EnvironmentPrior:
             weights = (discount ** t).unsqueeze(1)
             weighted = rewards * weights
 
-        objective_tensor = (
-            self.normalize_rewards(weighted, eps=eps, clip=clip, detach_stats=detach_stats)
-            if normalize
-            else weighted
-        )
+        reward_min = rewards.min().detach()
+        reward_max = rewards.max().detach()
+        reward_abs_max = rewards.abs().max().detach()
+        reward_clip_hit_share = torch.zeros((), device=rewards.device, dtype=torch.float32)
+        reward_clip_cfg = self.config.get("reward_clip", None)
+        if reward_clip_cfg is not None:
+            try:
+                reward_clip_bound = float(max(0.0, self._resolve_scalar(reward_clip_cfg)))
+            except Exception:
+                reward_clip_bound = 0.0
+            if reward_clip_bound > 0.0:
+                reward_clip_hit_share = (
+                    rewards.detach().abs() >= max(0.0, reward_clip_bound - 1e-6)
+                ).to(torch.float32).mean()
+
+        norm_clip_hit_share = torch.zeros((), device=rewards.device, dtype=torch.float32)
+        if normalize:
+            objective_tensor, norm_stats = self.normalize_rewards(
+                weighted,
+                eps=eps,
+                clip=clip,
+                detach_stats=detach_stats,
+                return_stats=True,
+            )
+            norm_clip_hit_share = norm_stats["normalized_clip_hit_share"].detach()
+        else:
+            objective_tensor = weighted
         objective = objective_tensor.mean()
         loss = -objective
 
@@ -3535,6 +3599,11 @@ class EnvironmentPrior:
             "objective": objective.detach(),
             "reward_mean": rewards.mean().detach(),
             "reward_std": rewards.std(unbiased=False).detach(),
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+            "reward_abs_max": reward_abs_max,
+            "reward_clip_hit_share": reward_clip_hit_share.detach(),
+            "reward_norm_clip_hit_share": norm_clip_hit_share.detach(),
         }
         return loss, stats
 

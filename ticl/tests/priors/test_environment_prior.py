@@ -118,6 +118,70 @@ def test_environment_prior_rollout_with_policy_is_differentiable():
     assert float(grad_sum) > 0.0
 
 
+def test_environment_prior_rollout_with_policy_clips_rewards():
+    _seed_everything(101)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 0, "max": 0}
+    env_cfg["reward_scale"] = 100.0
+    env_cfg["reward_clip"] = 0.1
+    env_cfg["reward_dropout_enabled"] = False
+    env_cfg["reward_dropout_randomize"] = False
+    prior = EnvironmentPrior(env_cfg)
+
+    class ZeroPolicy(nn.Module):
+        def step(self, obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+            del obs_t, reward_t, reward_mask_t, cache, step_idx, env_info
+            return torch.zeros_like(action_t)
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=ZeroPolicy().step,
+        batch_size=4,
+        n_samples=12,
+        num_features=16,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+    )
+    rewards = rollout["rewards"]
+    assert torch.isfinite(rewards).all()
+    assert float(rewards.abs().max()) <= 0.1000001
+
+
+def test_policy_gradient_reward_stats_include_clip_observability():
+    _seed_everything(202)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["reward_clip"] = 10.0
+    prior = EnvironmentPrior(env_cfg)
+
+    rewards = torch.tensor(
+        [
+            [10.0, 0.0, -10.0],
+            [5.0, -10.0, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+    loss, stats = prior.policy_gradient_loss_from_rewards(
+        rewards,
+        normalize=True,
+        clip=0.5,
+        detach_stats=True,
+    )
+
+    assert torch.isfinite(loss)
+    assert float(stats["reward_min"]) == -10.0
+    assert float(stats["reward_max"]) == 10.0
+    assert float(stats["reward_abs_max"]) == 10.0
+    assert float(stats["reward_clip_hit_share"]) > 0.0
+    assert float(stats["reward_norm_clip_hit_share"]) > 0.0
+
+
 def test_environment_prior_reward_dropout_mask_is_in_token():
     _seed_everything(3)
     config = get_prior_config()

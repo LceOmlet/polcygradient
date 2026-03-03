@@ -215,7 +215,8 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "state_noise_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.1},
-        "reward_scale": {"distribution": "log_uniform", "min": 1e-3, "max": 4.0},
+        "reward_scale": {"distribution": "uniform", "min": 0.1, "max": 10.0},
+        "reward_clip": 10.0,
         "state_clip": 8.0,
         # Policy-gradient stability knobs for differentiable rollout.
         "reward_norm_eps": 1e-6,
@@ -266,7 +267,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
 
     dataloader = {
         "batch_size": 8,
-        "num_steps": 1 ,
+        "num_steps": 8 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
         'n_test_samples': 0,
