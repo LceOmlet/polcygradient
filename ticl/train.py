@@ -80,9 +80,9 @@ def _resolve_policy_autocast_dtype(device):
         return torch.float16
     if dtype_env in {"bf16", "bfloat16"}:
         return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
-    # Throughput default for policy rollout: prefer fp16 unless explicitly
-    # requesting bf16 via TICL_POLICY_AUTOCAST_DTYPE.
-    return torch.float16
+    # Stability-first default for policy rollout: prefer bf16 on supported GPUs
+    # (wider exponent than fp16), fallback to fp16 otherwise.
+    return torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
 
 
 def _set_policy_inner_recompute_attn(model, enabled: bool):
@@ -258,12 +258,27 @@ def _maybe_step_kernel_profiler(kernel_profiler, *, epoch_idx, batch_idx, verbos
     top_cuda_time = record.get("top_cuda_self_time_us")
     top_cpu_op = record.get("top_cpu_op")
     top_cpu_time = record.get("top_cpu_self_time_us")
+    sync_cpu_share = record.get("sync_self_cpu_share", 0.0)
+    phase_ops = record.get("phase_ops", []) or []
+    top_phase = None
+    if isinstance(phase_ops, list) and phase_ops:
+        top_phase = max(
+            phase_ops,
+            key=lambda p: float(p.get("cuda_time_us", 0.0) or 0.0),
+        )
     if verbose:
-        print(
+        msg = (
             f"[kernel-profile] epoch={int(epoch_idx)} batch={int(batch_idx)} "
             f"top_cuda_op={top_cuda_op} top_cuda_self_us={float(top_cuda_time):.1f} "
-            f"top_cpu_op={top_cpu_op} top_cpu_self_us={float(top_cpu_time):.1f}"
+            f"top_cpu_op={top_cpu_op} top_cpu_self_us={float(top_cpu_time):.1f} "
+            f"sync_cpu_share={float(sync_cpu_share):.3f}"
         )
+        if isinstance(top_phase, dict) and top_phase.get("name") is not None:
+            msg += (
+                f" top_phase={top_phase.get('name')} "
+                f"top_phase_cuda_us={float(top_phase.get('cuda_time_us', 0.0) or 0.0):.1f}"
+            )
+        print(msg)
     if wandb.run is not None:
         wandb.log(
             {
@@ -983,6 +998,8 @@ def train_epoch_policy_gradient(
         pg_torch_compile_fullgraph=bool(pg_torch_compile_fullgraph),
         pg_torch_compile_dynamic=bool(pg_torch_compile_dynamic),
     )
+    model_ref = model.module if hasattr(model, "module") else model
+    policy_step_profile_consumer = getattr(model_ref, "consume_policy_step_profile", None)
     batch_size = int(dl.batch_size)
     n_samples = int(dl.n_samples)
     num_features = int(dl.num_features)
@@ -1045,6 +1062,24 @@ def train_epoch_policy_gradient(
                 batch_step_wall = 0.0
                 batch_rollout_policy_cuda_ms = 0.0
                 batch_rollout_transition_cuda_ms = 0.0
+                batch_rollout_policy_wall_ms = 0.0
+                batch_rollout_transition_wall_ms = 0.0
+                batch_rollout_transition_y_wall_ms = 0.0
+                batch_rollout_transition_x_wall_ms = 0.0
+                batch_policy_step_calls = 0
+                batch_policy_step_encode_ms = 0.0
+                batch_policy_step_transformer_ms = 0.0
+                batch_policy_step_decoder_ms = 0.0
+                batch_policy_step_total_ms = 0.0
+                batch_policy_step_transformer_layer_calls = 0
+                batch_policy_step_transformer_layer_proj_ms = 0.0
+                batch_policy_step_transformer_layer_cache_ms = 0.0
+                batch_policy_step_transformer_layer_attnff_ms = 0.0
+                batch_policy_step_transformer_layer_attn_core_ms = 0.0
+                batch_policy_step_transformer_layer_finalize_ms = 0.0
+                batch_policy_step_transformer_layer_finalize_attn_outproj_ms = 0.0
+                batch_policy_step_transformer_layer_finalize_ffn_ms = 0.0
+                batch_policy_step_transformer_layer_total_ms = 0.0
                 rollout_t_start_unix = None
                 rollout_t_end_unix = None
                 backward_t_start_unix = None
@@ -1271,6 +1306,70 @@ def train_epoch_policy_gradient(
                             batch_rollout_transition_cuda_ms += float(transition_cuda_ms)
                         except Exception:
                             pass
+                    policy_wall_ms = pg_stats_chunk.get("rollout_policy_wall_ms", None)
+                    if policy_wall_ms is not None:
+                        try:
+                            batch_rollout_policy_wall_ms += float(policy_wall_ms)
+                        except Exception:
+                            pass
+                    transition_wall_ms = pg_stats_chunk.get("rollout_transition_wall_ms", None)
+                    if transition_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_wall_ms += float(transition_wall_ms)
+                        except Exception:
+                            pass
+                    transition_y_wall_ms = pg_stats_chunk.get("rollout_transition_y_wall_ms", None)
+                    if transition_y_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_y_wall_ms += float(transition_y_wall_ms)
+                        except Exception:
+                            pass
+                    transition_x_wall_ms = pg_stats_chunk.get("rollout_transition_x_wall_ms", None)
+                    if transition_x_wall_ms is not None:
+                        try:
+                            batch_rollout_transition_x_wall_ms += float(transition_x_wall_ms)
+                        except Exception:
+                            pass
+                    if callable(policy_step_profile_consumer):
+                        try:
+                            step_profile = policy_step_profile_consumer()
+                        except Exception:
+                            step_profile = None
+                        if isinstance(step_profile, dict):
+                            batch_policy_step_calls += int(step_profile.get("calls", 0) or 0)
+                            batch_policy_step_encode_ms += float(step_profile.get("encode_wall_s", 0.0) or 0.0) * 1000.0
+                            batch_policy_step_transformer_ms += float(
+                                step_profile.get("transformer_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_decoder_ms += float(step_profile.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
+                            batch_policy_step_total_ms += float(step_profile.get("total_wall_s", 0.0) or 0.0) * 1000.0
+                            batch_policy_step_transformer_layer_calls += int(
+                                step_profile.get("transformer_layer_calls", 0) or 0
+                            )
+                            batch_policy_step_transformer_layer_proj_ms += float(
+                                step_profile.get("transformer_layer_proj_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_cache_ms += float(
+                                step_profile.get("transformer_layer_cache_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_attnff_ms += float(
+                                step_profile.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_attn_core_ms += float(
+                                step_profile.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_finalize_ms += float(
+                                step_profile.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
+                                step_profile.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_finalize_ffn_ms += float(
+                                step_profile.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
+                            ) * 1000.0
+                            batch_policy_step_transformer_layer_total_ms += float(
+                                step_profile.get("transformer_layer_total_wall_s", 0.0) or 0.0
+                            ) * 1000.0
 
                 if batch_oom and batch_attempt < max_batch_oom_retries:
                     optimizer.zero_grad(set_to_none=True)
@@ -1283,6 +1382,47 @@ def train_epoch_policy_gradient(
                         )
                     continue
                 break
+
+            if callable(policy_step_profile_consumer):
+                try:
+                    step_profile_tail = policy_step_profile_consumer()
+                except Exception:
+                    step_profile_tail = None
+                if isinstance(step_profile_tail, dict):
+                    batch_policy_step_calls += int(step_profile_tail.get("calls", 0) or 0)
+                    batch_policy_step_encode_ms += float(step_profile_tail.get("encode_wall_s", 0.0) or 0.0) * 1000.0
+                    batch_policy_step_transformer_ms += float(
+                        step_profile_tail.get("transformer_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_decoder_ms += float(step_profile_tail.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
+                    batch_policy_step_total_ms += float(step_profile_tail.get("total_wall_s", 0.0) or 0.0) * 1000.0
+                    batch_policy_step_transformer_layer_calls += int(
+                        step_profile_tail.get("transformer_layer_calls", 0) or 0
+                    )
+                    batch_policy_step_transformer_layer_proj_ms += float(
+                        step_profile_tail.get("transformer_layer_proj_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_cache_ms += float(
+                        step_profile_tail.get("transformer_layer_cache_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_attnff_ms += float(
+                        step_profile_tail.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_attn_core_ms += float(
+                        step_profile_tail.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_finalize_ms += float(
+                        step_profile_tail.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
+                        step_profile_tail.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_finalize_ffn_ms += float(
+                        step_profile_tail.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
+                    ) * 1000.0
+                    batch_policy_step_transformer_layer_total_ms += float(
+                        step_profile_tail.get("transformer_layer_total_wall_s", 0.0) or 0.0
+                    ) * 1000.0
 
             stage_cuda_ms = {"rollout": None, "backward": None}
             if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
@@ -1302,6 +1442,72 @@ def train_epoch_policy_gradient(
                     f" rollout_policy_cuda_ms={batch_rollout_policy_cuda_ms:.2f}"
                     f" rollout_transition_cuda_ms={batch_rollout_transition_cuda_ms:.2f}"
                     f" rollout_policy_share={rollout_policy_share:.3f}"
+                )
+            rollout_wall_total_ms = batch_rollout_policy_wall_ms + batch_rollout_transition_wall_ms
+            if rollout_wall_total_ms > 0.0:
+                rollout_policy_wall_share = float(batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms))
+                transition_y_share = float(
+                    batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                )
+                transition_x_share = float(
+                    batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                )
+                rollout_breakdown_suffix += (
+                    f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
+                    f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
+                    f" rollout_policy_wall_share={rollout_policy_wall_share:.3f}"
+                    f" rollout_transition_y_share={transition_y_share:.3f}"
+                    f" rollout_transition_x_share={transition_x_share:.3f}"
+                )
+            if batch_policy_step_total_ms > 0.0:
+                policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
+                policy_step_transformer_share = float(
+                    batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
+                )
+                policy_step_decoder_share = float(batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms))
+                rollout_breakdown_suffix += (
+                    f" policy_step_calls={int(batch_policy_step_calls)}"
+                    f" policy_step_total_ms={batch_policy_step_total_ms:.2f}"
+                    f" policy_step_encode_share={policy_step_encode_share:.3f}"
+                    f" policy_step_transformer_share={policy_step_transformer_share:.3f}"
+                    f" policy_step_decoder_share={policy_step_decoder_share:.3f}"
+                )
+            if batch_policy_step_transformer_layer_total_ms > 0.0:
+                policy_step_layer_proj_share = float(
+                    batch_policy_step_transformer_layer_proj_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_cache_share = float(
+                    batch_policy_step_transformer_layer_cache_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_attnff_share = float(
+                    batch_policy_step_transformer_layer_attnff_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_attn_core_share = float(
+                    batch_policy_step_transformer_layer_attn_core_ms
+                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_finalize_share = float(
+                    batch_policy_step_transformer_layer_finalize_ms
+                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_finalize_attn_outproj_share = float(
+                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms
+                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                policy_step_layer_finalize_ffn_share = float(
+                    batch_policy_step_transformer_layer_finalize_ffn_ms
+                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                )
+                rollout_breakdown_suffix += (
+                    f" policy_step_tf_layer_calls={int(batch_policy_step_transformer_layer_calls)}"
+                    f" policy_step_tf_layer_total_ms={batch_policy_step_transformer_layer_total_ms:.2f}"
+                    f" policy_step_tf_layer_proj_share={policy_step_layer_proj_share:.3f}"
+                    f" policy_step_tf_layer_cache_share={policy_step_layer_cache_share:.3f}"
+                    f" policy_step_tf_layer_attnff_share={policy_step_layer_attnff_share:.3f}"
+                    f" policy_step_tf_layer_attn_core_share={policy_step_layer_attn_core_share:.3f}"
+                    f" policy_step_tf_layer_finalize_share={policy_step_layer_finalize_share:.3f}"
+                    f" policy_step_tf_layer_finalize_attn_outproj_share={policy_step_layer_finalize_attn_outproj_share:.3f}"
+                    f" policy_step_tf_layer_finalize_ffn_share={policy_step_layer_finalize_ffn_share:.3f}"
                 )
 
             if gpu_observer_active:
@@ -1331,6 +1537,63 @@ def train_epoch_policy_gradient(
                         stage_extra["rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
                         stage_extra["rollout_policy_share"] = float(
                             batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                        )
+                    if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
+                        stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
+                        stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
+                        stage_extra["rollout_policy_wall_share"] = float(
+                            batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
+                        )
+                        stage_extra["rollout_transition_y_share"] = float(
+                            batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        stage_extra["rollout_transition_x_share"] = float(
+                            batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                    if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
+                        stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
+                        stage_extra["policy_step_total_ms"] = float(batch_policy_step_total_ms)
+                        stage_extra["policy_step_encode_share"] = float(
+                            batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms)
+                        )
+                        stage_extra["policy_step_transformer_share"] = float(
+                            batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
+                        )
+                        stage_extra["policy_step_decoder_share"] = float(
+                            batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms)
+                        )
+                    if stage_name == "rollout" and batch_policy_step_transformer_layer_total_ms > 0.0:
+                        stage_extra["policy_step_tf_layer_calls"] = int(batch_policy_step_transformer_layer_calls)
+                        stage_extra["policy_step_tf_layer_total_ms"] = float(
+                            batch_policy_step_transformer_layer_total_ms
+                        )
+                        stage_extra["policy_step_tf_layer_proj_share"] = float(
+                            batch_policy_step_transformer_layer_proj_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_cache_share"] = float(
+                            batch_policy_step_transformer_layer_cache_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_attnff_share"] = float(
+                            batch_policy_step_transformer_layer_attnff_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_attn_core_share"] = float(
+                            batch_policy_step_transformer_layer_attn_core_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_finalize_share"] = float(
+                            batch_policy_step_transformer_layer_finalize_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_finalize_attn_outproj_share"] = float(
+                            batch_policy_step_transformer_layer_finalize_attn_outproj_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                        )
+                        stage_extra["policy_step_tf_layer_finalize_ffn_share"] = float(
+                            batch_policy_step_transformer_layer_finalize_ffn_ms
+                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                         )
                     stage_rec = gpu_observer.record_stage(
                         epoch=epoch_obs,
@@ -1371,6 +1634,65 @@ def train_epoch_policy_gradient(
                             wandb_payload["pg_gpu/rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
                             wandb_payload["pg_gpu/rollout_policy_share"] = float(
                                 batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                            )
+                        if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
+                            wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
+                            wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
+                            wandb_payload["pg_gpu/rollout_policy_wall_share"] = float(
+                                batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_y_share"] = float(
+                                batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
+                                batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                        if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
+                            wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
+                            wandb_payload["pg_gpu/policy_step_total_ms"] = float(batch_policy_step_total_ms)
+                            wandb_payload["pg_gpu/policy_step_encode_share"] = float(
+                                batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_transformer_share"] = float(
+                                batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_decoder_share"] = float(
+                                batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms)
+                            )
+                        if stage_name == "rollout" and batch_policy_step_transformer_layer_total_ms > 0.0:
+                            wandb_payload["pg_gpu/policy_step_tf_layer_calls"] = int(
+                                batch_policy_step_transformer_layer_calls
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_total_ms"] = float(
+                                batch_policy_step_transformer_layer_total_ms
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_proj_share"] = float(
+                                batch_policy_step_transformer_layer_proj_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_cache_share"] = float(
+                                batch_policy_step_transformer_layer_cache_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_attnff_share"] = float(
+                                batch_policy_step_transformer_layer_attnff_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_attn_core_share"] = float(
+                                batch_policy_step_transformer_layer_attn_core_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_share"] = float(
+                                batch_policy_step_transformer_layer_finalize_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_attn_outproj_share"] = float(
+                                batch_policy_step_transformer_layer_finalize_attn_outproj_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                            )
+                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_ffn_share"] = float(
+                                batch_policy_step_transformer_layer_finalize_ffn_ms
+                                / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
                         wandb.log(wandb_payload)
 
@@ -1752,6 +2074,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           train_kernel_profiler_with_stack=False,
           train_kernel_profiler_with_flops=False,
           train_kernel_profiler_log_every_batches=0,
+          train_kernel_profiler_export_trace=True,
+          train_kernel_profiler_summary_top_k=20,
           spike_tolerance=4, progress_bar=False, rl_objective='supervised',
           policy_rollout_chunk_size=None,
           policy_rollout_chunk_autotune=True,
@@ -1806,6 +2130,14 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     train_profiler = None
     gpu_observer = None
     kernel_profiler = None
+    kernel_profiler_export_trace = (
+        True if train_kernel_profiler_export_trace is None else bool(train_kernel_profiler_export_trace)
+    )
+    kernel_profiler_summary_top_k = (
+        20
+        if train_kernel_profiler_summary_top_k is None
+        else int(max(1, train_kernel_profiler_summary_top_k))
+    )
     if rank == 0:
         profiler_cfg = TrainProfilerConfig(
             enabled=bool(train_profiler_enabled),
@@ -1852,6 +2184,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             with_stack=bool(train_kernel_profiler_with_stack),
             with_flops=bool(train_kernel_profiler_with_flops),
             log_every_batches=int(train_kernel_profiler_log_every_batches),
+            export_trace=kernel_profiler_export_trace,
+            summary_top_k=kernel_profiler_summary_top_k,
         )
         kernel_profiler = TrainKernelProfiler(
             kernel_profiler_cfg,
@@ -1871,7 +2205,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"record_shapes={kernel_profiler_cfg.record_shapes}, "
                 f"profile_memory={kernel_profiler_cfg.profile_memory}, "
                 f"with_stack={kernel_profiler_cfg.with_stack}, "
-                f"with_flops={kernel_profiler_cfg.with_flops})"
+                f"with_flops={kernel_profiler_cfg.with_flops}, "
+                f"export_trace={kernel_profiler_cfg.export_trace}, "
+                f"summary_top_k={kernel_profiler_cfg.summary_top_k})"
             )
     if rl_objective == 'policy_gradient':
         if using_dist:
@@ -1959,6 +2295,11 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print("Policy KV cache mode:", kv_mode_print)
             if kv_mode_print == "paged":
                 print("Policy KV cache page size:", int(page_size_print))
+                try:
+                    dense_page_cap = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
+                except Exception:
+                    dense_page_cap = 128
+                print("Policy paged-attn dense page cap:", int(max(1, dense_page_cap)))
                 print("Policy KV cache in-place append:", bool(inplace_kv_print))
             if bool(policy_rollout_checkpoint_reentrant) and not checkpoint_reentrant_active:
                 print(
@@ -2012,6 +2353,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     f"repeat={int(max(1, train_kernel_profiler_repeat_steps))}",
                     f"output_dir={train_kernel_profiler_output_dir}",
                     f"log_every_batches={int(max(0, train_kernel_profiler_log_every_batches))}",
+                    f"export_trace={kernel_profiler_export_trace}",
+                    f"summary_top_k={kernel_profiler_summary_top_k}",
                 )
 
     n_out = model.n_out

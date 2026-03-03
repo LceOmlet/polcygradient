@@ -173,6 +173,10 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Collect FLOPs estimates in profiler when available.')
     optimizer.add_argument('--train-kernel-profiler-log-every-batches', type=int,
                            help='Emit top-op kernel summary every N batches (0 disables summary emission).')
+    optimizer.add_argument('--train-kernel-profiler-export-trace', type=str2bool,
+                           help='Export tensorboard trace files for kernel profiler. Disable for low-overhead summary-only profiling.')
+    optimizer.add_argument('--train-kernel-profiler-summary-top-k', type=int,
+                           help='Number of top operators to keep in each kernel-profiler summary record.')
     optimizer.add_argument('-A', '--adaptive-batch-size', help='Wether to progressively increase effective batch size.',
                            type=str2bool)
     optimizer.add_argument('-w', '--weight-decay', type=float, help='Weight decay for AdamW.')
@@ -328,6 +332,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
     environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')
+    environment_prior.add_argument('--lipschitz-enforce', type=str2bool,
+                                   help='Enable Lipschitz safeguards for sampled environment generators.')
+    environment_prior.add_argument('--lipschitz-weight-fro-norm-max', type=float,
+                                   help='Per-layer Frobenius-norm cap for sampled SCM/GP linear maps.')
+    environment_prior.add_argument('--lipschitz-gp-outputscale-max', type=float,
+                                   help='Absolute cap for GP outputscale used by sampled transition/reward generators.')
     environment_prior.add_argument('--num-layers', type=int, help='Depth for scm generator network.')
     environment_prior.add_argument('--prior-mlp-hidden-dim', type=int, help='Hidden dim for scm generator network.')
     environment_prior.add_argument('--prior-mlp-activations', type=str, choices=['tanh', 'relu', 'identity'],

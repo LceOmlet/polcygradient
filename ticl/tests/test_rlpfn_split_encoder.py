@@ -53,6 +53,9 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_tbptt_window"] == 128
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["prior"]["environment"]["lipschitz_enforce"] is True
+    assert cfg["prior"]["environment"]["lipschitz_weight_fro_norm_max"] == 1.0
+    assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 
 
 def test_tabpfn_split_obs_action_encoder_forward():

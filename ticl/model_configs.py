@@ -49,6 +49,8 @@ def get_optimizer_config():
         "train_kernel_profiler_with_stack": False,
         "train_kernel_profiler_with_flops": False,
         "train_kernel_profiler_log_every_batches": 0,
+        "train_kernel_profiler_export_trace": True,
+        "train_kernel_profiler_summary_top_k": 20,
         "learning_rate": 0.00003,
         "epochs": 4000,
         "train_mixed_precision": True,
@@ -219,6 +221,11 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reward_norm_eps": 1e-6,
         "reward_norm_clip": 10.0,
         "discount": 1.0,
+        # Lipschitz safeguards: project sampled generator matrices by
+        # Frobenius norm and cap GP outputscale for bounded transition Jacobians.
+        "lipschitz_enforce": True,
+        "lipschitz_weight_fro_norm_max": 1.0,
+        "lipschitz_gp_outputscale_max": 1.0,
         # SCM (aligned with priors/mlp.py names).
         "num_layers": {"distribution": "meta_gamma", "max_alpha": 2, "max_scale": 3, "round": True, "lower_bound": 2},
         "prior_mlp_hidden_dim": {"distribution": "meta_gamma", "max_alpha": 3, "max_scale": 128, "round": True, "lower_bound": 8},
@@ -450,6 +457,8 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_with_stack'] = False
     config['optimizer']['train_kernel_profiler_with_flops'] = False
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
+    config['optimizer']['train_kernel_profiler_export_trace'] = True
+    config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
     # With reentrant rollout checkpoint defaulted on, saved-tensor CPU offload is
     # not needed by default and can otherwise shift pressure to host RAM.
     config['optimizer']['pg_saved_tensors_cpu_offload'] = False

@@ -1,6 +1,7 @@
 import math
 import inspect
 import os
+import time
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -66,6 +67,13 @@ class EnvironmentPrior:
         cfg.setdefault("reward_norm_eps", 1e-6)
         cfg.setdefault("reward_norm_clip", 10.0)
         cfg.setdefault("discount", 1.0)
+        # Lipschitz safeguards for differentiable rollout stability.
+        # Enabling this projects sampled linear maps by Frobenius norm:
+        # ||W||_2 <= ||W||_F <= lipschitz_weight_fro_norm_max.
+        cfg.setdefault("lipschitz_enforce", True)
+        cfg.setdefault("lipschitz_weight_fro_norm_max", 1.0)
+        # GP effective output-scale cap used in Jacobian bound.
+        cfg.setdefault("lipschitz_gp_outputscale_max", 1.0)
 
         # SCM-style knobs (aligned with names in priors/mlp.py).
         cfg.setdefault(
@@ -120,12 +128,70 @@ class EnvironmentPrior:
     def _resolve_scalar(value):
         return float(sample_distributions({"value": value})["value"])
 
+    @staticmethod
+    def _optional_positive_scalar(value):
+        if value is None:
+            return None
+        try:
+            v = float(value)
+        except (TypeError, ValueError):
+            return None
+        if (not math.isfinite(v)) or v <= 0.0:
+            return None
+        return v
+
+    @staticmethod
+    def _project_matrix_fro_norm(matrix, max_fro_norm):
+        """
+        Project matrix/matrix-batch to a Frobenius-norm ball.
+        This guarantees ||W||_2 <= ||W||_F <= max_fro_norm.
+        """
+        if max_fro_norm is None:
+            return matrix
+        if not torch.is_floating_point(matrix):
+            return matrix
+        eps = float(torch.finfo(matrix.dtype).eps)
+        if matrix.ndim == 2:
+            max_norm = float(max_fro_norm)
+            if (not math.isfinite(max_norm)) or max_norm <= 0.0:
+                return matrix
+            fro = torch.linalg.matrix_norm(matrix, ord="fro")
+            scale = torch.clamp(torch.as_tensor(max_norm, device=matrix.device, dtype=matrix.dtype) / (fro + eps), max=1.0)
+            return matrix * scale
+        if matrix.ndim == 3:
+            if torch.is_tensor(max_fro_norm):
+                max_norm = max_fro_norm.to(device=matrix.device, dtype=matrix.dtype).reshape(-1, 1)
+            else:
+                max_norm = torch.full(
+                    (matrix.shape[0], 1),
+                    float(max_fro_norm),
+                    device=matrix.device,
+                    dtype=matrix.dtype,
+                )
+            fro = torch.linalg.vector_norm(matrix.reshape(matrix.shape[0], -1), dim=1, keepdim=True)
+            scale = torch.clamp(max_norm / (fro + eps), max=1.0)
+            return matrix * scale.reshape(-1, 1, 1)
+        raise ValueError(f"expected 2D or 3D matrix tensor, got shape={tuple(matrix.shape)}")
+
+    @staticmethod
+    def _resolve_lipschitz_weight_cap(h):
+        if not bool(h.get("lipschitz_enforce", True)):
+            return None
+        return EnvironmentPrior._optional_positive_scalar(h.get("lipschitz_weight_fro_norm_max", 1.0))
+
+    @staticmethod
+    def _resolve_lipschitz_gp_outputscale_cap(h):
+        if not bool(h.get("lipschitz_enforce", True)):
+            return None
+        return EnvironmentPrior._optional_positive_scalar(h.get("lipschitz_gp_outputscale_max", 1.0))
+
     def _build_scm_fn(self, in_dim, out_dim, h, device, generator=None):
         depth = max(2, int(h["num_layers"]))
         hidden = max(int(out_dim), int(h["prior_mlp_hidden_dim"]))
         init_std = float(h["init_std"])
         noise_std = float(h["noise_std"])
         activation = self._resolve_activation(h["prior_mlp_activations"])
+        weight_cap = self._resolve_lipschitz_weight_cap(h)
 
         layer_dims = [in_dim] + [hidden] * (depth - 1) + [out_dim]
         weights = []
@@ -137,6 +203,7 @@ class EnvironmentPrior:
             else:
                 w = torch.randn(d_in, d_out, device=device, generator=generator) * (init_std / math.sqrt(max(1, d_in)))
                 b = torch.randn(d_out, device=device, generator=generator) * (init_std * 0.1)
+            w = self._project_matrix_fro_norm(w, weight_cap)
             weights.append(w)
             biases.append(b)
 
@@ -161,6 +228,10 @@ class EnvironmentPrior:
         lengthscale = max(1e-6, float(h["lengthscale"]))
         outputscale = float(h["outputscale"])
         noise = float(h["noise"])
+        weight_cap = EnvironmentPrior._resolve_lipschitz_weight_cap(h)
+        outputscale_cap = EnvironmentPrior._resolve_lipschitz_gp_outputscale_cap(h)
+        if outputscale_cap is not None:
+            outputscale = math.copysign(min(abs(outputscale), float(outputscale_cap)), outputscale)
 
         if generator is None:
             w = torch.randn(in_dim, m, device=device) / lengthscale
@@ -170,6 +241,8 @@ class EnvironmentPrior:
             w = torch.randn(in_dim, m, device=device, generator=generator) / lengthscale
             b = 2.0 * math.pi * torch.rand(m, device=device, generator=generator)
             a = torch.randn(m, out_dim, device=device, generator=generator) / math.sqrt(max(1, m))
+        w = EnvironmentPrior._project_matrix_fro_norm(w, weight_cap)
+        a = EnvironmentPrior._project_matrix_fro_norm(a, weight_cap)
 
         def fn(x, generator=None):
             phi = torch.cos(x @ w + b)
@@ -412,6 +485,11 @@ class EnvironmentPrior:
         )
         init_std = torch.tensor([float(h["init_std"]) for h in h_list], device=device, dtype=torch.float32)
         noise_std = torch.tensor([float(h["noise_std"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        for h in h_list:
+            cap = self._resolve_lipschitz_weight_cap(h)
+            weight_cap_values.append(float(cap) if cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         if isinstance(activation_names, str):
             activation_values = [self._activation_name(activation_names)] * batch_size
         else:
@@ -482,7 +560,9 @@ class EnvironmentPrior:
                     else:
                         w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32, generator=g)
                         b_b = torch.randn((out_i,), device=device, dtype=torch.float32, generator=g)
-                    w[bi, active_idx, :out_i] = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+                    w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+                    w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+                    w[bi, active_idx, :out_i] = w_b
                     b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
                 if layer_idx > 0 or input_mask is None:
                     in_mask[bi, :in_i] = 1.0
@@ -558,6 +638,16 @@ class EnvironmentPrior:
         )
         outputscale = torch.tensor([float(h["outputscale"]) for h in h_list], device=device, dtype=torch.float32)
         noise = torch.tensor([float(h["noise"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        outputscale_cap_values = []
+        for h in h_list:
+            w_cap = self._resolve_lipschitz_weight_cap(h)
+            s_cap = self._resolve_lipschitz_gp_outputscale_cap(h)
+            weight_cap_values.append(float(w_cap) if w_cap is not None else float("inf"))
+            outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
+        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
 
         if input_mask is not None:
             in_cap = int(input_mask.shape[1])
@@ -591,9 +681,13 @@ class EnvironmentPrior:
                 w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32, generator=g)
                 b_b = torch.rand((m_i,), device=device, dtype=torch.float32, generator=g)
                 a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32, generator=g)
-            w[bi, active_idx, :m_i] = w_b / lengthscale[bi]
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            w[bi, active_idx, :m_i] = w_b
             b[bi, :m_i] = 2.0 * math.pi * b_b
-            a[bi, :m_i, :out_i] = a_b / math.sqrt(max(1, m_i))
+            a[bi, :m_i, :out_i] = a_b
             if input_mask is None:
                 in_mask[bi, :in_i] = 1.0
             m_mask[bi, :m_i] = 1.0
@@ -837,6 +931,11 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        weight_cap_values = []
+        for h in h_list:
+            cap = self._resolve_lipschitz_weight_cap(h)
+            weight_cap_values.append(float(cap) if cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
 
         layer_dims = [in_dim] + [hidden] * (depth - 1) + [out_dim]
         weights = []
@@ -845,6 +944,7 @@ class EnvironmentPrior:
             for d_in, d_out in zip(layer_dims[:-1], layer_dims[1:]):
                 scale = init_std[:, None, None] / math.sqrt(max(1, d_in))
                 w = torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32) * scale
+                w = self._project_matrix_fro_norm(w, weight_cap)
                 b = torch.randn((batch_size, d_out), device=device, dtype=torch.float32) * (init_std[:, None] * 0.1)
                 weights.append(w)
                 biases.append(b)
@@ -856,7 +956,8 @@ class EnvironmentPrior:
                     g = generators[bi]
                     w_b = torch.randn((d_in, d_out), device=device, dtype=torch.float32, generator=g)
                     b_b = torch.randn((d_out,), device=device, dtype=torch.float32, generator=g)
-                    w[bi] = w_b * (init_std[bi] / math.sqrt(max(1, d_in)))
+                    w_b = w_b * (init_std[bi] / math.sqrt(max(1, d_in)))
+                    w[bi] = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                     b[bi] = b_b * (init_std[bi] * 0.1)
                 weights.append(w)
                 biases.append(b)
@@ -905,10 +1006,22 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        weight_cap_values = []
+        outputscale_cap_values = []
+        for h in h_list:
+            w_cap = self._resolve_lipschitz_weight_cap(h)
+            s_cap = self._resolve_lipschitz_gp_outputscale_cap(h)
+            weight_cap_values.append(float(w_cap) if w_cap is not None else float("inf"))
+            outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
+        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
         if generators is None:
             w = torch.randn((batch_size, in_dim, m), device=device, dtype=torch.float32) / lengthscale[:, None, None]
             b = 2.0 * math.pi * torch.rand((batch_size, m), device=device, dtype=torch.float32)
             a = torch.randn((batch_size, m, out_dim), device=device, dtype=torch.float32) / math.sqrt(max(1, m))
+            w = self._project_matrix_fro_norm(w, weight_cap)
+            a = self._project_matrix_fro_norm(a, weight_cap)
         else:
             w = torch.empty((batch_size, in_dim, m), device=device, dtype=torch.float32)
             b = torch.empty((batch_size, m), device=device, dtype=torch.float32)
@@ -918,9 +1031,11 @@ class EnvironmentPrior:
                 w_b = torch.randn((in_dim, m), device=device, dtype=torch.float32, generator=g)
                 b_b = torch.rand((m,), device=device, dtype=torch.float32, generator=g)
                 a_b = torch.randn((m, out_dim), device=device, dtype=torch.float32, generator=g)
-                w[bi] = w_b / lengthscale[bi]
+                w_b = w_b / lengthscale[bi]
+                w[bi] = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                 b[bi] = 2.0 * math.pi * b_b
-                a[bi] = a_b / math.sqrt(max(1, m))
+                a_b = a_b / math.sqrt(max(1, m))
+                a[bi] = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
 
         def fn(x, generators_for_noise=None):
             phi = torch.cos(torch.einsum("bi,bij->bj", x, w) + b)
@@ -1367,6 +1482,8 @@ class EnvironmentPrior:
         policy_accepts_reward_mask = self._policy_step_accepts_reward_mask(policy_step_fn)
         profile_rollout_breakdown_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_BREAKDOWN", "")).strip().lower()
         profile_rollout_breakdown = profile_rollout_breakdown_flag in {"1", "true", "yes", "on"}
+        profile_rollout_timing_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_TIMING", "")).strip().lower()
+        profile_rollout_timing = profile_rollout_timing_flag in {"1", "true", "yes", "on"}
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
         profile_rollout_breakdown_cuda = bool(
             profile_rollout_breakdown
@@ -1375,6 +1492,10 @@ class EnvironmentPrior:
         )
         policy_cuda_pairs = []
         transition_cuda_pairs = []
+        policy_wall_s = 0.0
+        transition_wall_s = 0.0
+        transition_y_wall_s = 0.0
+        transition_x_wall_s = 0.0
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
@@ -1792,14 +1913,27 @@ class EnvironmentPrior:
         rollout_generators = self._make_generators_from_seeds(rollout_rng_seeds, batch_size, device)
         profile_rollout_breakdown_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_BREAKDOWN", "")).strip().lower()
         profile_rollout_breakdown = profile_rollout_breakdown_flag in {"1", "true", "yes", "on"}
+        profile_rollout_timing_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_TIMING", "")).strip().lower()
+        profile_rollout_timing = profile_rollout_timing_flag in {"1", "true", "yes", "on"}
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
         profile_rollout_breakdown_cuda = bool(
             profile_rollout_breakdown
             and device_obj.type == "cuda"
             and torch.cuda.is_available()
         )
+        transition_stream_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION", "0")).strip().lower()
+        transition_stream_fusion = bool(
+            transition_stream_fusion_flag in {"1", "true", "yes", "on"}
+            and device_obj.type == "cuda"
+            and torch.cuda.is_available()
+            and rollout_generators is None
+        )
         policy_cuda_pairs = []
         transition_cuda_pairs = []
+        policy_wall_s = 0.0
+        transition_wall_s = 0.0
+        transition_y_wall_s = 0.0
+        transition_x_wall_s = 0.0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -1907,6 +2041,8 @@ class EnvironmentPrior:
                     "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
                     "rollout_generators": group_rollout_generators,
                     "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
+                    "stream_y": (torch.cuda.Stream(device=device_obj) if transition_stream_fusion else None),
+                    "stream_x": (torch.cuda.Stream(device=device_obj) if transition_stream_fusion else None),
                 }
             )
 
@@ -2117,6 +2253,7 @@ class EnvironmentPrior:
 
             if policy_accepts_reward_mask:
                 policy_cuda_start = None
+                policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
                     policy_cuda_start = torch.cuda.Event(enable_timing=True)
                     policy_cuda_start.record()
@@ -2131,6 +2268,7 @@ class EnvironmentPrior:
                 )
             else:
                 policy_cuda_start = None
+                policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
                     policy_cuda_start = torch.cuda.Event(enable_timing=True)
                     policy_cuda_start.record()
@@ -2142,6 +2280,8 @@ class EnvironmentPrior:
                     t,
                     env_info,
                 )
+            if profile_rollout_timing and policy_wall_t0 is not None:
+                policy_wall_s += (time.perf_counter() - policy_wall_t0)
             if policy_cuda_start is not None:
                 policy_cuda_end = torch.cuda.Event(enable_timing=True)
                 policy_cuda_end.record()
@@ -2174,6 +2314,7 @@ class EnvironmentPrior:
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
             transition_cuda_start = None
+            transition_wall_t0 = time.perf_counter() if profile_rollout_timing else None
             if profile_rollout_breakdown_cuda:
                 transition_cuda_start = torch.cuda.Event(enable_timing=True)
                 transition_cuda_start.record()
@@ -2201,10 +2342,32 @@ class EnvironmentPrior:
                 env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
 
                 reward_scale_g = reward_scale[start:end]
-                reward_next_raw = reward_scale_g * env_g["y_generator"](
-                    env_in,
-                    generators_for_noise=group["rollout_generators"],
-                ).reshape(-1)
+                stream_y = group.get("stream_y", None)
+                stream_x = group.get("stream_x", None)
+                reward_next_raw = None
+                x_next_g = None
+                if (stream_y is not None) and (stream_x is not None):
+                    with torch.cuda.stream(stream_y):
+                        reward_next_raw = reward_scale_g * env_g["y_generator"](
+                            env_in,
+                            generators_for_noise=group["rollout_generators"],
+                        ).reshape(-1)
+                    with torch.cuda.stream(stream_x):
+                        x_next_g = env_g["x_generator"](
+                            env_in,
+                            generators_for_noise=group["rollout_generators"],
+                        )
+                    cur_stream = torch.cuda.current_stream(device=device_obj)
+                    cur_stream.wait_stream(stream_y)
+                    cur_stream.wait_stream(stream_x)
+                else:
+                    y_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                    reward_next_raw = reward_scale_g * env_g["y_generator"](
+                        env_in,
+                        generators_for_noise=group["rollout_generators"],
+                    ).reshape(-1)
+                    if profile_rollout_timing and y_wall_t0 is not None:
+                        transition_y_wall_s += (time.perf_counter() - y_wall_t0)
                 reward_next_g = reward_next_raw
                 reward_mask_next_g = torch.ones_like(reward_next_g)
 
@@ -2218,10 +2381,14 @@ class EnvironmentPrior:
                     impute_mask = drop_mask & reward_dropout_impute_zero[start:end]
                     reward_next_g = torch.where(impute_mask, torch.zeros_like(reward_next_g), reward_next_g)
 
-                x_next_g = env_g["x_generator"](
-                    env_in,
-                    generators_for_noise=group["rollout_generators"],
-                )
+                if x_next_g is None:
+                    x_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                    x_next_g = env_g["x_generator"](
+                        env_in,
+                        generators_for_noise=group["rollout_generators"],
+                    )
+                    if profile_rollout_timing and x_wall_t0 is not None:
+                        transition_x_wall_s += (time.perf_counter() - x_wall_t0)
                 alpha_g = alpha[start:end].unsqueeze(1)
                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                 if (state_noise is not None) and bool(group.get("state_noise_active", False)):
@@ -2238,6 +2405,8 @@ class EnvironmentPrior:
                 transition_cuda_end = torch.cuda.Event(enable_timing=True)
                 transition_cuda_end.record()
                 transition_cuda_pairs.append((transition_cuda_start, transition_cuda_end))
+            if profile_rollout_timing and transition_wall_t0 is not None:
+                transition_wall_s += (time.perf_counter() - transition_wall_t0)
 
             state_next = state_next * state_mask
             action_next = action_next * action_mask
@@ -2327,16 +2496,22 @@ class EnvironmentPrior:
         else:
             infos = [None] * batch_size
         rollout_profile = None
-        if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
-            torch.cuda.synchronize(device=device_obj)
-            policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
-            transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+        if (profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs)) or profile_rollout_timing:
             rollout_profile = {
-                "policy_cuda_ms": policy_cuda_ms,
-                "transition_cuda_ms": transition_cuda_ms,
                 "steps": int(n_samples),
                 "batch_size": int(batch_size),
             }
+            if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
+                torch.cuda.synchronize(device=device_obj)
+                policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
+                transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+                rollout_profile["policy_cuda_ms"] = policy_cuda_ms
+                rollout_profile["transition_cuda_ms"] = transition_cuda_ms
+            if profile_rollout_timing:
+                rollout_profile["policy_wall_ms"] = float(policy_wall_s * 1000.0)
+                rollout_profile["transition_wall_ms"] = float(transition_wall_s * 1000.0)
+                rollout_profile["transition_y_wall_ms"] = float(transition_y_wall_s * 1000.0)
+                rollout_profile["transition_x_wall_ms"] = float(transition_x_wall_s * 1000.0)
         self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
@@ -3219,11 +3394,19 @@ class EnvironmentPrior:
                         rollout_profile_acc = {
                             "policy_cuda_ms": 0.0,
                             "transition_cuda_ms": 0.0,
+                            "policy_wall_ms": 0.0,
+                            "transition_wall_ms": 0.0,
+                            "transition_y_wall_ms": 0.0,
+                            "transition_x_wall_ms": 0.0,
                             "steps": int(n_samples),
                             "batch_size": int(batch_size),
                         }
                     rollout_profile_acc["policy_cuda_ms"] += float(group_profile.get("policy_cuda_ms", 0.0))
                     rollout_profile_acc["transition_cuda_ms"] += float(group_profile.get("transition_cuda_ms", 0.0))
+                    rollout_profile_acc["policy_wall_ms"] += float(group_profile.get("policy_wall_ms", 0.0))
+                    rollout_profile_acc["transition_wall_ms"] += float(group_profile.get("transition_wall_ms", 0.0))
+                    rollout_profile_acc["transition_y_wall_ms"] += float(group_profile.get("transition_y_wall_ms", 0.0))
+                    rollout_profile_acc["transition_x_wall_ms"] += float(group_profile.get("transition_x_wall_ms", 0.0))
             self.last_rollout_profile = rollout_profile_acc
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
@@ -3374,6 +3557,10 @@ class EnvironmentPrior:
             if isinstance(rollout_profile, dict):
                 stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
                 stats["rollout_transition_cuda_ms"] = float(rollout_profile.get("transition_cuda_ms", 0.0))
+                stats["rollout_policy_wall_ms"] = float(rollout_profile.get("policy_wall_ms", 0.0))
+                stats["rollout_transition_wall_ms"] = float(rollout_profile.get("transition_wall_ms", 0.0))
+                stats["rollout_transition_y_wall_ms"] = float(rollout_profile.get("transition_y_wall_ms", 0.0))
+                stats["rollout_transition_x_wall_ms"] = float(rollout_profile.get("transition_x_wall_ms", 0.0))
             return loss, rollout, stats
 
         reward_sum = None
@@ -3468,6 +3655,10 @@ class EnvironmentPrior:
         if isinstance(rollout_profile, dict):
             stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
             stats["rollout_transition_cuda_ms"] = float(rollout_profile.get("transition_cuda_ms", 0.0))
+            stats["rollout_policy_wall_ms"] = float(rollout_profile.get("policy_wall_ms", 0.0))
+            stats["rollout_transition_wall_ms"] = float(rollout_profile.get("transition_wall_ms", 0.0))
+            stats["rollout_transition_y_wall_ms"] = float(rollout_profile.get("transition_y_wall_ms", 0.0))
+            stats["rollout_transition_x_wall_ms"] = float(rollout_profile.get("transition_x_wall_ms", 0.0))
         return loss, rollout, stats
 
     def get_last_coverage(self):
