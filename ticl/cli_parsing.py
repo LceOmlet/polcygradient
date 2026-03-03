@@ -330,6 +330,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-scale', type=float, help='Scale multiplier for sampled rewards.')
     environment_prior.add_argument('--reward-clip', type=float, help='Absolute clip bound applied to sampled rewards.')
     environment_prior.add_argument('--state-clip', type=float, help='Clamp bound for latent state before tanh.')
+    environment_prior.add_argument('--policy-gradient-normalize-rewards', type=str2bool,
+                                   help='If true, optimize normalized rewards; if false, optimize raw discounted reward mean.')
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
     environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')

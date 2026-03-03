@@ -2419,6 +2419,13 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 env_backend,
                 f"(grouping={env_grouping}, strict_rng_match={env_strict})",
             )
+            pg_normalize_rewards = bool(getattr(env_prior, "config", {}).get("policy_gradient_normalize_rewards", False))
+            pg_discount = float(getattr(env_prior, "config", {}).get("discount", 1.0))
+            print(
+                "Policy objective:",
+                ("normalized_reward_mean" if pg_normalize_rewards else "raw_discounted_reward_mean"),
+                f"(discount={pg_discount:.6g})",
+            )
             if policy_rollout_chunk_size is None:
                 print("Policy rollout chunk size: auto(batch_size)")
             else:

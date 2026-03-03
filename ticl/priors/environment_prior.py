@@ -67,6 +67,8 @@ class EnvironmentPrior:
         cfg.setdefault("state_clip", 8.0)
 
         # Reward normalization / policy-gradient stability.
+        # When False, PG optimizes raw discounted reward mean directly.
+        cfg.setdefault("policy_gradient_normalize_rewards", False)
         cfg.setdefault("reward_norm_eps", 1e-6)
         cfg.setdefault("reward_norm_clip", 10.0)
         cfg.setdefault("discount", 1.0)
@@ -3616,7 +3618,7 @@ class EnvironmentPrior:
         device=default_device,
         epoch=None,
         single_eval_pos=None,
-        normalize=True,
+        normalize=None,
         discount=None,
         detach_stats=True,
         eps=None,
@@ -3627,6 +3629,8 @@ class EnvironmentPrior:
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
+        if normalize is None:
+            normalize = bool(self.config.get("policy_gradient_normalize_rewards", False))
         tbptt_window_active = False
         tbptt_window_size = n_samples
         if tbptt_window is not None:

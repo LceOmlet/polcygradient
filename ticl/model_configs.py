@@ -219,8 +219,11 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reward_clip": 10.0,
         "state_clip": 8.0,
         # Policy-gradient stability knobs for differentiable rollout.
+        # Train objective default: maximize raw discounted reward mean directly.
+        "policy_gradient_normalize_rewards": False,
         "reward_norm_eps": 1e-6,
         "reward_norm_clip": 10.0,
+        # Keep Bellman-style undiscounted default unless overridden.
         "discount": 1.0,
         # Lipschitz safeguards: project sampled generator matrices by
         # Frobenius norm and cap GP outputscale for bounded transition Jacobians.
