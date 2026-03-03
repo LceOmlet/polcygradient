@@ -30,6 +30,26 @@ def _has_nonfinite_gradients(model, device):
     return bool(has_nonfinite.item())
 
 
+def _extract_optimizer_step(optimizer):
+    # Return a representative optimizer step counter from the first populated
+    # parameter state. Useful for observability in low-loss PG runs.
+    try:
+        for group in optimizer.param_groups:
+            for p in group.get("params", []):
+                state = optimizer.state.get(p, None)
+                if not state:
+                    continue
+                step = state.get("step", None)
+                if step is None:
+                    continue
+                if torch.is_tensor(step):
+                    return float(step.detach().item())
+                return float(step)
+    except Exception:
+        return None
+    return None
+
+
 def _resolve_environment_prior(prior):
     seen = set()
     cur = prior
@@ -1080,6 +1100,9 @@ def train_epoch_policy_gradient(
                 batch_policy_step_transformer_layer_finalize_attn_outproj_ms = 0.0
                 batch_policy_step_transformer_layer_finalize_ffn_ms = 0.0
                 batch_policy_step_transformer_layer_total_ms = 0.0
+                batch_grad_norm_value = None
+                batch_optimizer_step_value = None
+                batch_optimizer_stepped = False
                 rollout_t_start_unix = None
                 rollout_t_end_unix = None
                 backward_t_start_unix = None
@@ -1829,6 +1852,13 @@ def train_epoch_policy_gradient(
                     if scaler is not None:
                         scaler.unscale_(optimizer)
                     grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
+                try:
+                    batch_grad_norm_value = float(grad_norm.detach().float().cpu())
+                except Exception:
+                    try:
+                        batch_grad_norm_value = float(grad_norm)
+                    except Exception:
+                        batch_grad_norm_value = None
                 if not torch.isfinite(grad_norm):
                     batch_step_wall += (time.perf_counter() - step_t0)
                     if step_cuda_start is not None:
@@ -1928,6 +1958,8 @@ def train_epoch_policy_gradient(
                     else:
                         scaler.step(optimizer)
                         scaler.update()
+                batch_optimizer_stepped = True
+                batch_optimizer_step_value = _extract_optimizer_step(optimizer)
                 optimizer.zero_grad(set_to_none=True)
                 grad_accum_steps = 0
                 batch_step_wall += (time.perf_counter() - step_t0)
@@ -1988,11 +2020,18 @@ def train_epoch_policy_gradient(
             total_loss += batch_loss.detach().mean()
             valid_steps += 1
             if verbose and (batch == 0 or ((batch + 1) % 50 == 0)):
+                grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
+                opt_step_info = "na" if batch_optimizer_step_value is None else f"{float(batch_optimizer_step_value):.0f}"
                 print(
                     f"[pg-phase] epoch={getattr(dl, 'epoch_count', -1)} batch={batch} "
                     f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                     f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
-                    f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok"
+                    f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
+                    f"objective={float(batch_objective.detach().cpu()):+.3e} "
+                    f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
+                    f"grad_norm={grad_norm_info} "
+                    f"stepped={int(bool(batch_optimizer_stepped))} "
+                    f"opt_step={opt_step_info}"
                     f"{rollout_breakdown_suffix}"
                 )
             if epoch_profiler is not None:
