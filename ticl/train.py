@@ -1054,7 +1054,7 @@ def train_epoch_policy_gradient(
     pg_epoch_loss_signatures = set()
 
     base_steps_per_epoch = int(len(dl))
-    steps_per_epoch = int(base_steps_per_epoch * pg_env_replay_steps)
+    steps_per_epoch = int(base_steps_per_epoch)
     assert steps_per_epoch % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
     optimizer.zero_grad(set_to_none=True)
     batch_size_hint = int(dl.batch_size)
@@ -1181,18 +1181,7 @@ def train_epoch_policy_gradient(
         desc = f"Epoch {epoch_idx}" if epoch_idx is not None else "Epoch"
         iterator = tqdm(iterator, total=steps_per_epoch, desc=desc, unit="step")
 
-    replay_cache_base_batch = None
-    replay_cache_single_eval_pos = None
-    replay_cache_h_list = None
-    replay_cache_env_seeds = None
-
     for batch in iterator:
-        if pg_env_replay_steps > 1:
-            replay_base_batch = int(batch // pg_env_replay_steps)
-            replay_step_idx = int(batch % pg_env_replay_steps)
-        else:
-            replay_base_batch = int(batch)
-            replay_step_idx = 0
         if pg_mem_guard_enabled and device_obj.type == "cuda" and torch.cuda.is_available():
             try:
                 mem_alloc = int(torch.cuda.memory_allocated(device_obj))
@@ -1219,12 +1208,6 @@ def train_epoch_policy_gradient(
                 or (((batch + 1) % pg_phase_log_every) == 0)
             )
         )
-        replay_phase_suffix = ""
-        if pg_env_replay_steps > 1:
-            replay_phase_suffix = (
-                f" base_batch={replay_base_batch}"
-                f" replay_step={replay_step_idx + 1}/{pg_env_replay_steps}"
-            )
         if using_dist and not ((grad_accum_steps + 1) == aggregate_k_gradients):
             cm = model.no_sync()
         else:
@@ -1232,268 +1215,250 @@ def train_epoch_policy_gradient(
 
         with cm:
             if pg_env_replay_steps > 1:
-                if replay_cache_base_batch != replay_base_batch:
-                    replay_cache_base_batch = replay_base_batch
-                    replay_cache_single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
-                    replay_cache_h_list = _freeze_env_h_list_for_replay(
-                        env_prior,
-                        env_prior._sample_batch_hypers(batch_size),
-                    )
-                    replay_cache_env_seeds = env_prior._sample_seed_list(batch_size)
-                single_eval_pos = int(replay_cache_single_eval_pos)
-                batch_h_list_override = replay_cache_h_list
-                batch_env_seeds_override = replay_cache_env_seeds
+                fixed_single_eval_pos = int(env_prior._sample_single_eval_pos(n_samples, None))
+                fixed_batch_h_list_override = _freeze_env_h_list_for_replay(
+                    env_prior,
+                    env_prior._sample_batch_hypers(batch_size),
+                )
+                fixed_batch_env_seeds_override = env_prior._sample_seed_list(batch_size)
             else:
-                single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
-                batch_h_list_override = None
-                batch_env_seeds_override = None
-            batch_rng_state = _capture_rng_state(device)
-            max_batch_oom_retries = 8
-            batch_attempt = 0
-            same_cfg_oom_retries = 0
-            max_same_cfg_oom_retries = int(pg_same_cfg_oom_retries)
-            enable_same_cfg_oom_retry = (
-                max_same_cfg_oom_retries > 0
-                and device_obj.type == "cuda"
-                and torch.cuda.is_available()
-            )
-            gpu_observer_active = (
-                gpu_observer is not None
-                and hasattr(gpu_observer, "enabled")
-                and bool(gpu_observer.enabled())
-            )
-            while True:
-                _restore_rng_state(batch_rng_state)
-                batch_attempt += 1
+                fixed_single_eval_pos = None
+                fixed_batch_h_list_override = None
+                fixed_batch_env_seeds_override = None
 
-                batch_loss = torch.tensor(0.0, device=device)
-                batch_objective = torch.tensor(0.0, device=device)
-                batch_reward_mean = torch.tensor(0.0, device=device)
-                batch_reward_std = torch.tensor(0.0, device=device)
-                batch_reward_min_value = float("inf")
-                batch_reward_max_value = float("-inf")
-                batch_reward_absmax_value = 0.0
-                batch_reward_clip_hit_share = 0.0
-                batch_reward_norm_clip_hit_share = 0.0
-                batch_nonfinite = False
-                batch_rollout_wall = 0.0
-                batch_backward_wall = 0.0
-                batch_backward_calls = 0
-                batch_step_wall = 0.0
-                batch_rollout_policy_cuda_ms = 0.0
-                batch_rollout_transition_cuda_ms = 0.0
-                batch_rollout_policy_wall_ms = 0.0
-                batch_rollout_transition_wall_ms = 0.0
-                batch_rollout_transition_y_wall_ms = 0.0
-                batch_rollout_transition_x_wall_ms = 0.0
-                batch_rollout_transition_group_wall_ms = 0.0
-                batch_rollout_transition_env_pack_wall_ms = 0.0
-                batch_rollout_transition_state_update_wall_ms = 0.0
-                batch_rollout_transition_group_count = 0
-                batch_policy_step_calls = 0
-                batch_policy_step_encode_ms = 0.0
-                batch_policy_step_transformer_ms = 0.0
-                batch_policy_step_decoder_ms = 0.0
-                batch_policy_step_total_ms = 0.0
-                batch_policy_step_transformer_layer_calls = 0
-                batch_policy_step_transformer_layer_proj_ms = 0.0
-                batch_policy_step_transformer_layer_cache_ms = 0.0
-                batch_policy_step_transformer_layer_attnff_ms = 0.0
-                batch_policy_step_transformer_layer_attn_core_ms = 0.0
-                batch_policy_step_transformer_layer_finalize_ms = 0.0
-                batch_policy_step_transformer_layer_finalize_attn_outproj_ms = 0.0
-                batch_policy_step_transformer_layer_finalize_ffn_ms = 0.0
-                batch_policy_step_transformer_layer_total_ms = 0.0
-                batch_policy_step_layer_paged_single_page_calls = 0
-                batch_policy_step_layer_paged_flash_prefix_calls = 0
-                batch_policy_step_layer_paged_flash_merge_calls = 0
-                batch_policy_step_layer_paged_dense_calls = 0
-                batch_pg_loss_signature = None
-                try:
-                    sig_fn = getattr(env_prior, "policy_gradient_loss_signature", None)
-                    cfg = getattr(env_prior, "config", {})
-                    if callable(sig_fn):
-                        _resolve_scalar = getattr(env_prior, "_resolve_scalar", None)
-                        discount_cfg = cfg.get("discount", 1.0) if isinstance(cfg, dict) else 1.0
-                        eps_cfg = cfg.get("reward_norm_eps", 1e-6) if isinstance(cfg, dict) else 1e-6
-                        clip_cfg = cfg.get("reward_norm_clip", 10.0) if isinstance(cfg, dict) else 10.0
-                        if callable(_resolve_scalar):
-                            discount_v = _resolve_scalar(discount_cfg)
-                            eps_v = _resolve_scalar(eps_cfg)
-                            clip_v = _resolve_scalar(clip_cfg)
-                        else:
-                            discount_v = discount_cfg
-                            eps_v = eps_cfg
-                            clip_v = clip_cfg
-                        batch_pg_loss_signature = sig_fn(
-                            normalize=bool(cfg.get("policy_gradient_normalize_rewards", False)) if isinstance(cfg, dict) else False,
-                            discount=float(max(0.0, min(1.0, discount_v))),
-                            detach_stats=True,
-                            eps=eps_v,
-                            clip=clip_v,
-                        )
-                    else:
-                        batch_pg_loss_signature = "na"
-                except Exception:
-                    batch_pg_loss_signature = None
-                batch_grad_norm_value = None
-                batch_optimizer_step_value = None
-                batch_optimizer_stepped = False
-                rollout_t_start_unix = None
-                rollout_t_end_unix = None
-                backward_t_start_unix = None
-                backward_t_end_unix = None
-                step_t_start_unix = None
-                step_t_end_unix = None
-                rollout_cuda_pairs = []
-                backward_cuda_pairs = []
-                step_cuda_pairs = []
-
-                batch_oom = False
-                for chunk_start in range(0, batch_size, current_rollout_chunk_size):
-                    chunk_bs = min(current_rollout_chunk_size, batch_size - chunk_start)
-                    chunk_weight = float(chunk_bs) / float(batch_size)
-                    chunk_h_list_override = None
-                    chunk_env_seeds_override = None
-                    if batch_h_list_override is not None:
-                        chunk_h_list_override = batch_h_list_override[chunk_start: chunk_start + chunk_bs]
-                    if batch_env_seeds_override is not None:
-                        chunk_env_seeds_override = batch_env_seeds_override[chunk_start: chunk_start + chunk_bs]
-                    tbptt_stream_backward_active = (
-                        current_tbptt_window is not None and int(current_tbptt_window) > 0
+            for replay_step_idx in range(pg_env_replay_steps):
+                replay_phase_suffix = ""
+                if pg_env_replay_steps > 1:
+                    replay_phase_suffix = (
+                        f" base_batch={int(batch)} "
+                        f"replay_step={replay_step_idx + 1}/{pg_env_replay_steps}"
                     )
-                    tbptt_window_backward_called = False
-
-                    if tbptt_stream_backward_active:
-                        backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
-
-                        def _tbptt_chunk_loss_sink(weighted_window_loss):
-                            nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
-                            nonlocal backward_t_start_unix, backward_t_end_unix
-                            window_loss_scaled = weighted_window_loss * backward_scale
-                            backward_t0_unix = time.time()
-                            backward_t0 = time.perf_counter()
-                            backward_cuda_start = None
-                            if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
-                                backward_cuda_start = torch.cuda.Event(enable_timing=True)
-                                backward_cuda_start.record()
-                            with (
-                                kernel_profiler.phase("pg.backward")
-                                if (kernel_profiler is not None and kernel_profiler.enabled())
-                                else nullcontext()
-                            ):
-                                if scaler is None:
-                                    window_loss_scaled.backward()
-                                else:
-                                    scaler.scale(window_loss_scaled).backward()
-                            if backward_cuda_start is not None:
-                                backward_cuda_end = torch.cuda.Event(enable_timing=True)
-                                backward_cuda_end.record()
-                                backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
-                            batch_backward_wall += (time.perf_counter() - backward_t0)
-                            batch_backward_calls += 1
-                            backward_t1_unix = time.time()
-                            if backward_t_start_unix is None:
-                                backward_t_start_unix = backward_t0_unix
-                            backward_t_end_unix = backward_t1_unix
-                            tbptt_window_backward_called = True
-                    else:
-                        _tbptt_chunk_loss_sink = None
-
+                if fixed_single_eval_pos is not None:
+                    single_eval_pos = fixed_single_eval_pos
+                    batch_h_list_override = fixed_batch_h_list_override
+                    batch_env_seeds_override = fixed_batch_env_seeds_override
+                else:
+                    single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
+                    batch_h_list_override = None
+                    batch_env_seeds_override = None
+                batch_rng_state = _capture_rng_state(device)
+                max_batch_oom_retries = 8
+                batch_attempt = 0
+                same_cfg_oom_retries = 0
+                max_same_cfg_oom_retries = int(pg_same_cfg_oom_retries)
+                enable_same_cfg_oom_retry = (
+                    max_same_cfg_oom_retries > 0
+                    and device_obj.type == "cuda"
+                    and torch.cuda.is_available()
+                )
+                gpu_observer_active = (
+                    gpu_observer is not None
+                    and hasattr(gpu_observer, "enabled")
+                    and bool(gpu_observer.enabled())
+                )
+                while True:
+                    _restore_rng_state(batch_rng_state)
+                    batch_attempt += 1
+    
+                    batch_loss = torch.tensor(0.0, device=device)
+                    batch_objective = torch.tensor(0.0, device=device)
+                    batch_reward_mean = torch.tensor(0.0, device=device)
+                    batch_reward_std = torch.tensor(0.0, device=device)
+                    batch_reward_min_value = float("inf")
+                    batch_reward_max_value = float("-inf")
+                    batch_reward_absmax_value = 0.0
+                    batch_reward_clip_hit_share = 0.0
+                    batch_reward_norm_clip_hit_share = 0.0
+                    batch_nonfinite = False
+                    batch_rollout_wall = 0.0
+                    batch_backward_wall = 0.0
+                    batch_backward_calls = 0
+                    batch_step_wall = 0.0
+                    batch_rollout_policy_cuda_ms = 0.0
+                    batch_rollout_transition_cuda_ms = 0.0
+                    batch_rollout_policy_wall_ms = 0.0
+                    batch_rollout_transition_wall_ms = 0.0
+                    batch_rollout_transition_y_wall_ms = 0.0
+                    batch_rollout_transition_x_wall_ms = 0.0
+                    batch_rollout_transition_group_wall_ms = 0.0
+                    batch_rollout_transition_env_pack_wall_ms = 0.0
+                    batch_rollout_transition_state_update_wall_ms = 0.0
+                    batch_rollout_transition_group_count = 0
+                    batch_policy_step_calls = 0
+                    batch_policy_step_encode_ms = 0.0
+                    batch_policy_step_transformer_ms = 0.0
+                    batch_policy_step_decoder_ms = 0.0
+                    batch_policy_step_total_ms = 0.0
+                    batch_policy_step_transformer_layer_calls = 0
+                    batch_policy_step_transformer_layer_proj_ms = 0.0
+                    batch_policy_step_transformer_layer_cache_ms = 0.0
+                    batch_policy_step_transformer_layer_attnff_ms = 0.0
+                    batch_policy_step_transformer_layer_attn_core_ms = 0.0
+                    batch_policy_step_transformer_layer_finalize_ms = 0.0
+                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms = 0.0
+                    batch_policy_step_transformer_layer_finalize_ffn_ms = 0.0
+                    batch_policy_step_transformer_layer_total_ms = 0.0
+                    batch_policy_step_layer_paged_single_page_calls = 0
+                    batch_policy_step_layer_paged_flash_prefix_calls = 0
+                    batch_policy_step_layer_paged_flash_merge_calls = 0
+                    batch_policy_step_layer_paged_dense_calls = 0
+                    batch_pg_loss_signature = None
                     try:
-                        rollout_t0_unix = time.time()
-                        rollout_t0 = time.perf_counter()
-                        rollout_cuda_start = None
-                        if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
-                            rollout_cuda_start = torch.cuda.Event(enable_timing=True)
-                            rollout_cuda_start.record()
-                        with (
-                            kernel_profiler.phase("pg.rollout")
-                            if (kernel_profiler is not None and kernel_profiler.enabled())
-                            else nullcontext()
-                        ):
-                            with _amp_autocast_context(
-                                scaler,
-                                device=device,
-                                dtype=policy_autocast_dtype,
-                            ):
-                                rollout_override_kwargs = {}
-                                if chunk_h_list_override is not None:
-                                    rollout_override_kwargs["h_list_override"] = chunk_h_list_override
-                                if chunk_env_seeds_override is not None:
-                                    rollout_override_kwargs["env_seeds_override"] = chunk_env_seeds_override
-                                pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
-                                    env_prior=env_prior,
-                                    policy_step_fn=policy_step_fn,
-                                    batch_size=chunk_bs,
-                                    n_samples=n_samples,
-                                    num_features=num_features,
-                                    device=device,
-                                    single_eval_pos=single_eval_pos,
-                                    collect_x=False,
-                                    policy_rollout_checkpoint=bool(policy_rollout_checkpoint) and (not tbptt_stream_backward_active),
-                                    policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
-                                    pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
-                                    pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
-                                    pg_tbptt_window=current_tbptt_window,
-                                    tbptt_loss_sink=_tbptt_chunk_loss_sink,
-                                    **rollout_override_kwargs,
-                                )
-                                weighted_pg_loss = pg_loss_chunk * chunk_weight
-                                loss = weighted_pg_loss / aggregate_k_gradients
-                                if tbptt_stream_backward_active and tbptt_window_backward_called:
-                                    loss = loss.detach()
-                                metric_loss = loss.detach().mean()
-                                if tbptt_stream_backward_active and tbptt_window_backward_called:
-                                    # In streaming-TBPTT mode gradients are consumed inside
-                                    # tbptt_loss_sink; expose a meaningful monitor loss.
-                                    metric_loss = (
-                                        -pg_stats_chunk["objective"].detach() * float(chunk_weight)
-                                    ) / float(aggregate_k_gradients)
-                        if rollout_cuda_start is not None:
-                            rollout_cuda_end = torch.cuda.Event(enable_timing=True)
-                            rollout_cuda_end.record()
-                            rollout_cuda_pairs.append((rollout_cuda_start, rollout_cuda_end))
-                        batch_rollout_wall += (time.perf_counter() - rollout_t0)
-                        rollout_t1_unix = time.time()
-                        if rollout_t_start_unix is None:
-                            rollout_t_start_unix = rollout_t0_unix
-                        rollout_t_end_unix = rollout_t1_unix
-                        if not torch.isfinite(loss).all():
-                            batch_nonfinite = True
-                            loss_val = float(loss.detach().float().mean().cpu())
-                            break
-
-                        if (not tbptt_stream_backward_active) and loss.requires_grad:
-                            backward_t0_unix = time.time()
-                            backward_t0 = time.perf_counter()
-                            backward_cuda_start = None
+                        sig_fn = getattr(env_prior, "policy_gradient_loss_signature", None)
+                        cfg = getattr(env_prior, "config", {})
+                        if callable(sig_fn):
+                            _resolve_scalar = getattr(env_prior, "_resolve_scalar", None)
+                            discount_cfg = cfg.get("discount", 1.0) if isinstance(cfg, dict) else 1.0
+                            eps_cfg = cfg.get("reward_norm_eps", 1e-6) if isinstance(cfg, dict) else 1e-6
+                            clip_cfg = cfg.get("reward_norm_clip", 10.0) if isinstance(cfg, dict) else 10.0
+                            if callable(_resolve_scalar):
+                                discount_v = _resolve_scalar(discount_cfg)
+                                eps_v = _resolve_scalar(eps_cfg)
+                                clip_v = _resolve_scalar(clip_cfg)
+                            else:
+                                discount_v = discount_cfg
+                                eps_v = eps_cfg
+                                clip_v = clip_cfg
+                            batch_pg_loss_signature = sig_fn(
+                                normalize=bool(cfg.get("policy_gradient_normalize_rewards", False)) if isinstance(cfg, dict) else False,
+                                discount=float(max(0.0, min(1.0, discount_v))),
+                                detach_stats=True,
+                                eps=eps_v,
+                                clip=clip_v,
+                            )
+                        else:
+                            batch_pg_loss_signature = "na"
+                    except Exception:
+                        batch_pg_loss_signature = None
+                    batch_grad_norm_value = None
+                    batch_optimizer_step_value = None
+                    batch_optimizer_stepped = False
+                    rollout_t_start_unix = None
+                    rollout_t_end_unix = None
+                    backward_t_start_unix = None
+                    backward_t_end_unix = None
+                    step_t_start_unix = None
+                    step_t_end_unix = None
+                    rollout_cuda_pairs = []
+                    backward_cuda_pairs = []
+                    step_cuda_pairs = []
+    
+                    batch_oom = False
+                    for chunk_start in range(0, batch_size, current_rollout_chunk_size):
+                        chunk_bs = min(current_rollout_chunk_size, batch_size - chunk_start)
+                        chunk_weight = float(chunk_bs) / float(batch_size)
+                        chunk_h_list_override = None
+                        chunk_env_seeds_override = None
+                        if batch_h_list_override is not None:
+                            chunk_h_list_override = batch_h_list_override[chunk_start: chunk_start + chunk_bs]
+                        if batch_env_seeds_override is not None:
+                            chunk_env_seeds_override = batch_env_seeds_override[chunk_start: chunk_start + chunk_bs]
+                        tbptt_stream_backward_active = (
+                            current_tbptt_window is not None and int(current_tbptt_window) > 0
+                        )
+                        tbptt_window_backward_called = False
+    
+                        if tbptt_stream_backward_active:
+                            backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
+    
+                            def _tbptt_chunk_loss_sink(weighted_window_loss):
+                                nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
+                                nonlocal backward_t_start_unix, backward_t_end_unix
+                                window_loss_scaled = weighted_window_loss * backward_scale
+                                backward_t0_unix = time.time()
+                                backward_t0 = time.perf_counter()
+                                backward_cuda_start = None
+                                if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                                    backward_cuda_start = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_start.record()
+                                with (
+                                    kernel_profiler.phase("pg.backward")
+                                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                                    else nullcontext()
+                                ):
+                                    if scaler is None:
+                                        window_loss_scaled.backward()
+                                    else:
+                                        scaler.scale(window_loss_scaled).backward()
+                                if backward_cuda_start is not None:
+                                    backward_cuda_end = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_end.record()
+                                    backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
+                                batch_backward_wall += (time.perf_counter() - backward_t0)
+                                batch_backward_calls += 1
+                                backward_t1_unix = time.time()
+                                if backward_t_start_unix is None:
+                                    backward_t_start_unix = backward_t0_unix
+                                backward_t_end_unix = backward_t1_unix
+                                tbptt_window_backward_called = True
+                        else:
+                            _tbptt_chunk_loss_sink = None
+    
+                        try:
+                            rollout_t0_unix = time.time()
+                            rollout_t0 = time.perf_counter()
+                            rollout_cuda_start = None
                             if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
-                                backward_cuda_start = torch.cuda.Event(enable_timing=True)
-                                backward_cuda_start.record()
+                                rollout_cuda_start = torch.cuda.Event(enable_timing=True)
+                                rollout_cuda_start.record()
                             with (
-                                kernel_profiler.phase("pg.backward")
+                                kernel_profiler.phase("pg.rollout")
                                 if (kernel_profiler is not None and kernel_profiler.enabled())
                                 else nullcontext()
                             ):
-                                if scaler is None:
-                                    loss.backward()
-                                else:
-                                    scaler.scale(loss).backward()
-                            if backward_cuda_start is not None:
-                                backward_cuda_end = torch.cuda.Event(enable_timing=True)
-                                backward_cuda_end.record()
-                                backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
-                            batch_backward_wall += (time.perf_counter() - backward_t0)
-                            batch_backward_calls += 1
-                            backward_t1_unix = time.time()
-                            if backward_t_start_unix is None:
-                                backward_t_start_unix = backward_t0_unix
-                            backward_t_end_unix = backward_t1_unix
-                        if tbptt_stream_backward_active and (not tbptt_window_backward_called):
-                            if loss.requires_grad:
-                                # Compatibility fallback for mocked/test rollout helpers that
-                                # do not invoke tbptt_loss_sink.
+                                with _amp_autocast_context(
+                                    scaler,
+                                    device=device,
+                                    dtype=policy_autocast_dtype,
+                                ):
+                                    rollout_override_kwargs = {}
+                                    if chunk_h_list_override is not None:
+                                        rollout_override_kwargs["h_list_override"] = chunk_h_list_override
+                                    if chunk_env_seeds_override is not None:
+                                        rollout_override_kwargs["env_seeds_override"] = chunk_env_seeds_override
+                                    pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
+                                        env_prior=env_prior,
+                                        policy_step_fn=policy_step_fn,
+                                        batch_size=chunk_bs,
+                                        n_samples=n_samples,
+                                        num_features=num_features,
+                                        device=device,
+                                        single_eval_pos=single_eval_pos,
+                                        collect_x=False,
+                                        policy_rollout_checkpoint=bool(policy_rollout_checkpoint) and (not tbptt_stream_backward_active),
+                                        policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
+                                        pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                                        pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                                        pg_tbptt_window=current_tbptt_window,
+                                        tbptt_loss_sink=_tbptt_chunk_loss_sink,
+                                        **rollout_override_kwargs,
+                                    )
+                                    weighted_pg_loss = pg_loss_chunk * chunk_weight
+                                    loss = weighted_pg_loss / aggregate_k_gradients
+                                    if tbptt_stream_backward_active and tbptt_window_backward_called:
+                                        loss = loss.detach()
+                                    metric_loss = loss.detach().mean()
+                                    if tbptt_stream_backward_active and tbptt_window_backward_called:
+                                        # In streaming-TBPTT mode gradients are consumed inside
+                                        # tbptt_loss_sink; expose a meaningful monitor loss.
+                                        metric_loss = (
+                                            -pg_stats_chunk["objective"].detach() * float(chunk_weight)
+                                        ) / float(aggregate_k_gradients)
+                            if rollout_cuda_start is not None:
+                                rollout_cuda_end = torch.cuda.Event(enable_timing=True)
+                                rollout_cuda_end.record()
+                                rollout_cuda_pairs.append((rollout_cuda_start, rollout_cuda_end))
+                            batch_rollout_wall += (time.perf_counter() - rollout_t0)
+                            rollout_t1_unix = time.time()
+                            if rollout_t_start_unix is None:
+                                rollout_t_start_unix = rollout_t0_unix
+                            rollout_t_end_unix = rollout_t1_unix
+                            if not torch.isfinite(loss).all():
+                                batch_nonfinite = True
+                                loss_val = float(loss.detach().float().mean().cpu())
+                                break
+    
+                            if (not tbptt_stream_backward_active) and loss.requires_grad:
                                 backward_t0_unix = time.time()
                                 backward_t0 = time.perf_counter()
                                 backward_cuda_start = None
@@ -1519,47 +1484,63 @@ def train_epoch_policy_gradient(
                                 if backward_t_start_unix is None:
                                     backward_t_start_unix = backward_t0_unix
                                 backward_t_end_unix = backward_t1_unix
-                            else:
-                                raise RuntimeError("TBPTT streaming backward did not receive any window losses.")
-                    except Exception as e:
-                        if not _is_oom_exception(e):
-                            raise
-                        if bool(pg_oom_debug_raise):
-                            print(
-                                "[pg-oom-debug] re-raising OOM for full traceback "
-                                "(set --pg-oom-debug-raise false to enable auto chunk fallback)."
-                            )
-                            raise
-                        # Some batches hit transient allocator pressure; retry once
-                        # with unchanged TBPTT/chunk before degrading configuration.
-                        if enable_same_cfg_oom_retry and same_cfg_oom_retries < max_same_cfg_oom_retries:
-                            same_cfg_oom_retries += 1
-                            batch_oom = True
-                            if "cuda" in str(device):
-                                torch.cuda.empty_cache()
-                            gc.collect()
-                            print(
-                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
-                                f"retrying same config once "
-                                f"(chunk={current_rollout_chunk_size}, tbptt={current_tbptt_window})"
-                            )
-                            break
-                        if bool(pg_oom_reduce_tbptt_first):
-                            if current_tbptt_window is None and n_samples > 1:
-                                current_tbptt_window = max(1, n_samples // 2)
+                            if tbptt_stream_backward_active and (not tbptt_window_backward_called):
+                                if loss.requires_grad:
+                                    # Compatibility fallback for mocked/test rollout helpers that
+                                    # do not invoke tbptt_loss_sink.
+                                    backward_t0_unix = time.time()
+                                    backward_t0 = time.perf_counter()
+                                    backward_cuda_start = None
+                                    if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                                        backward_cuda_start = torch.cuda.Event(enable_timing=True)
+                                        backward_cuda_start.record()
+                                    with (
+                                        kernel_profiler.phase("pg.backward")
+                                        if (kernel_profiler is not None and kernel_profiler.enabled())
+                                        else nullcontext()
+                                    ):
+                                        if scaler is None:
+                                            loss.backward()
+                                        else:
+                                            scaler.scale(loss).backward()
+                                    if backward_cuda_start is not None:
+                                        backward_cuda_end = torch.cuda.Event(enable_timing=True)
+                                        backward_cuda_end.record()
+                                        backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
+                                    batch_backward_wall += (time.perf_counter() - backward_t0)
+                                    batch_backward_calls += 1
+                                    backward_t1_unix = time.time()
+                                    if backward_t_start_unix is None:
+                                        backward_t_start_unix = backward_t0_unix
+                                    backward_t_end_unix = backward_t1_unix
+                                else:
+                                    raise RuntimeError("TBPTT streaming backward did not receive any window losses.")
+                        except Exception as e:
+                            if not _is_oom_exception(e):
+                                raise
+                            if bool(pg_oom_debug_raise):
+                                print(
+                                    "[pg-oom-debug] re-raising OOM for full traceback "
+                                    "(set --pg-oom-debug-raise false to enable auto chunk fallback)."
+                                )
+                                raise
+                            # Some batches hit transient allocator pressure; retry once
+                            # with unchanged TBPTT/chunk before degrading configuration.
+                            if enable_same_cfg_oom_retry and same_cfg_oom_retries < max_same_cfg_oom_retries:
+                                same_cfg_oom_retries += 1
                                 batch_oom = True
                                 if "cuda" in str(device):
                                     torch.cuda.empty_cache()
+                                gc.collect()
                                 print(
                                     f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
-                                    f"reducing TBPTT window to {current_tbptt_window} "
-                                    "(keeping policy rollout chunk size unchanged)"
+                                    f"retrying same config once "
+                                    f"(chunk={current_rollout_chunk_size}, tbptt={current_tbptt_window})"
                                 )
                                 break
-                            if current_tbptt_window is not None and current_tbptt_window > 1:
-                                new_tbptt = max(1, int(current_tbptt_window // 2))
-                                if new_tbptt < current_tbptt_window:
-                                    current_tbptt_window = new_tbptt
+                            if bool(pg_oom_reduce_tbptt_first):
+                                if current_tbptt_window is None and n_samples > 1:
+                                    current_tbptt_window = max(1, n_samples // 2)
                                     batch_oom = True
                                     if "cuda" in str(device):
                                         torch.cuda.empty_cache()
@@ -1569,725 +1550,840 @@ def train_epoch_policy_gradient(
                                         "(keeping policy rollout chunk size unchanged)"
                                     )
                                     break
-                        batch_oom = True
-                        if "cuda" in str(device):
-                            torch.cuda.empty_cache()
-                        new_chunk = max(1, int(current_rollout_chunk_size // 2))
-                        if new_chunk < current_rollout_chunk_size:
-                            current_rollout_chunk_size = new_chunk
+                                if current_tbptt_window is not None and current_tbptt_window > 1:
+                                    new_tbptt = max(1, int(current_tbptt_window // 2))
+                                    if new_tbptt < current_tbptt_window:
+                                        current_tbptt_window = new_tbptt
+                                        batch_oom = True
+                                        if "cuda" in str(device):
+                                            torch.cuda.empty_cache()
+                                        print(
+                                            f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
+                                            f"reducing TBPTT window to {current_tbptt_window} "
+                                            "(keeping policy rollout chunk size unchanged)"
+                                        )
+                                        break
+                            batch_oom = True
+                            if "cuda" in str(device):
+                                torch.cuda.empty_cache()
+                            new_chunk = max(1, int(current_rollout_chunk_size // 2))
+                            if new_chunk < current_rollout_chunk_size:
+                                current_rollout_chunk_size = new_chunk
+                                print(
+                                    f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
+                                    f"reducing policy rollout chunk size to {current_rollout_chunk_size}"
+                                )
+                            else:
+                                print(
+                                    f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
+                                    "OOM at minimum policy rollout chunk size=1. "
+                                    "Memory is sequence-length dominated; batch chunking cannot reduce further."
+                                )
+                            break
+                        batch_loss += metric_loss
+                        batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
+                        batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
+                        batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
+                        chunk_reward_min = pg_stats_chunk.get("reward_min", None)
+                        if chunk_reward_min is not None:
+                            try:
+                                batch_reward_min_value = min(batch_reward_min_value, float(chunk_reward_min.detach().cpu()))
+                            except Exception:
+                                pass
+                        chunk_reward_max = pg_stats_chunk.get("reward_max", None)
+                        if chunk_reward_max is not None:
+                            try:
+                                batch_reward_max_value = max(batch_reward_max_value, float(chunk_reward_max.detach().cpu()))
+                            except Exception:
+                                pass
+                        chunk_reward_absmax = pg_stats_chunk.get("reward_abs_max", None)
+                        if chunk_reward_absmax is not None:
+                            try:
+                                batch_reward_absmax_value = max(
+                                    batch_reward_absmax_value,
+                                    float(chunk_reward_absmax.detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reward_clip_hit = pg_stats_chunk.get("reward_clip_hit_share", None)
+                        if chunk_reward_clip_hit is not None:
+                            try:
+                                batch_reward_clip_hit_share += float(chunk_reward_clip_hit.detach().cpu()) * chunk_weight
+                            except Exception:
+                                pass
+                        chunk_reward_norm_clip_hit = pg_stats_chunk.get("reward_norm_clip_hit_share", None)
+                        if chunk_reward_norm_clip_hit is not None:
+                            try:
+                                batch_reward_norm_clip_hit_share += (
+                                    float(chunk_reward_norm_clip_hit.detach().cpu()) * chunk_weight
+                                )
+                            except Exception:
+                                pass
+                        policy_cuda_ms = pg_stats_chunk.get("rollout_policy_cuda_ms", None)
+                        if policy_cuda_ms is not None:
+                            try:
+                                batch_rollout_policy_cuda_ms += float(policy_cuda_ms)
+                            except Exception:
+                                pass
+                        transition_cuda_ms = pg_stats_chunk.get("rollout_transition_cuda_ms", None)
+                        if transition_cuda_ms is not None:
+                            try:
+                                batch_rollout_transition_cuda_ms += float(transition_cuda_ms)
+                            except Exception:
+                                pass
+                        policy_wall_ms = pg_stats_chunk.get("rollout_policy_wall_ms", None)
+                        if policy_wall_ms is not None:
+                            try:
+                                batch_rollout_policy_wall_ms += float(policy_wall_ms)
+                            except Exception:
+                                pass
+                        transition_wall_ms = pg_stats_chunk.get("rollout_transition_wall_ms", None)
+                        if transition_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_wall_ms += float(transition_wall_ms)
+                            except Exception:
+                                pass
+                        transition_y_wall_ms = pg_stats_chunk.get("rollout_transition_y_wall_ms", None)
+                        if transition_y_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_y_wall_ms += float(transition_y_wall_ms)
+                            except Exception:
+                                pass
+                        transition_x_wall_ms = pg_stats_chunk.get("rollout_transition_x_wall_ms", None)
+                        if transition_x_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_x_wall_ms += float(transition_x_wall_ms)
+                            except Exception:
+                                pass
+                        transition_group_wall_ms = pg_stats_chunk.get("rollout_transition_group_wall_ms", None)
+                        if transition_group_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_group_wall_ms += float(transition_group_wall_ms)
+                            except Exception:
+                                pass
+                        transition_env_pack_wall_ms = pg_stats_chunk.get("rollout_transition_env_pack_wall_ms", None)
+                        if transition_env_pack_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_env_pack_wall_ms += float(transition_env_pack_wall_ms)
+                            except Exception:
+                                pass
+                        transition_state_update_wall_ms = pg_stats_chunk.get("rollout_transition_state_update_wall_ms", None)
+                        if transition_state_update_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_state_update_wall_ms += float(transition_state_update_wall_ms)
+                            except Exception:
+                                pass
+                        transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
+                        if transition_group_count is not None:
+                            try:
+                                batch_rollout_transition_group_count += int(transition_group_count)
+                            except Exception:
+                                pass
+                        if callable(policy_step_profile_consumer):
+                            try:
+                                step_profile = policy_step_profile_consumer()
+                            except Exception:
+                                step_profile = None
+                            if isinstance(step_profile, dict):
+                                batch_policy_step_calls += int(step_profile.get("calls", 0) or 0)
+                                batch_policy_step_encode_ms += float(step_profile.get("encode_wall_s", 0.0) or 0.0) * 1000.0
+                                batch_policy_step_transformer_ms += float(
+                                    step_profile.get("transformer_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_decoder_ms += float(step_profile.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
+                                batch_policy_step_total_ms += float(step_profile.get("total_wall_s", 0.0) or 0.0) * 1000.0
+                                batch_policy_step_transformer_layer_calls += int(
+                                    step_profile.get("transformer_layer_calls", 0) or 0
+                                )
+                                batch_policy_step_transformer_layer_proj_ms += float(
+                                    step_profile.get("transformer_layer_proj_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_cache_ms += float(
+                                    step_profile.get("transformer_layer_cache_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_attnff_ms += float(
+                                    step_profile.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_attn_core_ms += float(
+                                    step_profile.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_finalize_ms += float(
+                                    step_profile.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
+                                    step_profile.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_finalize_ffn_ms += float(
+                                    step_profile.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_transformer_layer_total_ms += float(
+                                    step_profile.get("transformer_layer_total_wall_s", 0.0) or 0.0
+                                ) * 1000.0
+                                batch_policy_step_layer_paged_single_page_calls += int(
+                                    step_profile.get("transformer_layer_paged_path_single_page", 0) or 0
+                                )
+                                batch_policy_step_layer_paged_flash_prefix_calls += int(
+                                    step_profile.get("transformer_layer_paged_path_flash_prefix", 0) or 0
+                                )
+                                batch_policy_step_layer_paged_flash_merge_calls += int(
+                                    step_profile.get("transformer_layer_paged_path_flash_merge", 0) or 0
+                                )
+                                batch_policy_step_layer_paged_dense_calls += int(
+                                    step_profile.get("transformer_layer_paged_path_dense", 0) or 0
+                                )
+    
+                    if batch_oom and batch_attempt < max_batch_oom_retries:
+                        optimizer.zero_grad(set_to_none=True)
+                        grad_accum_steps = 0
+                        if verbose:
                             print(
-                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
-                                f"reducing policy rollout chunk size to {current_rollout_chunk_size}"
+                                f"[pg-oom-retry] epoch={batch_epoch_for_profile} batch={batch} "
+                                f"attempt={batch_attempt + 1}/{max_batch_oom_retries} "
+                                f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window}"
                             )
-                        else:
-                            print(
-                                f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
-                                "OOM at minimum policy rollout chunk size=1. "
-                                "Memory is sequence-length dominated; batch chunking cannot reduce further."
-                            )
-                        break
-                    batch_loss += metric_loss
-                    batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
-                    batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
-                    batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
-                    chunk_reward_min = pg_stats_chunk.get("reward_min", None)
-                    if chunk_reward_min is not None:
-                        try:
-                            batch_reward_min_value = min(batch_reward_min_value, float(chunk_reward_min.detach().cpu()))
-                        except Exception:
-                            pass
-                    chunk_reward_max = pg_stats_chunk.get("reward_max", None)
-                    if chunk_reward_max is not None:
-                        try:
-                            batch_reward_max_value = max(batch_reward_max_value, float(chunk_reward_max.detach().cpu()))
-                        except Exception:
-                            pass
-                    chunk_reward_absmax = pg_stats_chunk.get("reward_abs_max", None)
-                    if chunk_reward_absmax is not None:
-                        try:
-                            batch_reward_absmax_value = max(
-                                batch_reward_absmax_value,
-                                float(chunk_reward_absmax.detach().cpu()),
-                            )
-                        except Exception:
-                            pass
-                    chunk_reward_clip_hit = pg_stats_chunk.get("reward_clip_hit_share", None)
-                    if chunk_reward_clip_hit is not None:
-                        try:
-                            batch_reward_clip_hit_share += float(chunk_reward_clip_hit.detach().cpu()) * chunk_weight
-                        except Exception:
-                            pass
-                    chunk_reward_norm_clip_hit = pg_stats_chunk.get("reward_norm_clip_hit_share", None)
-                    if chunk_reward_norm_clip_hit is not None:
-                        try:
-                            batch_reward_norm_clip_hit_share += (
-                                float(chunk_reward_norm_clip_hit.detach().cpu()) * chunk_weight
-                            )
-                        except Exception:
-                            pass
-                    policy_cuda_ms = pg_stats_chunk.get("rollout_policy_cuda_ms", None)
-                    if policy_cuda_ms is not None:
-                        try:
-                            batch_rollout_policy_cuda_ms += float(policy_cuda_ms)
-                        except Exception:
-                            pass
-                    transition_cuda_ms = pg_stats_chunk.get("rollout_transition_cuda_ms", None)
-                    if transition_cuda_ms is not None:
-                        try:
-                            batch_rollout_transition_cuda_ms += float(transition_cuda_ms)
-                        except Exception:
-                            pass
-                    policy_wall_ms = pg_stats_chunk.get("rollout_policy_wall_ms", None)
-                    if policy_wall_ms is not None:
-                        try:
-                            batch_rollout_policy_wall_ms += float(policy_wall_ms)
-                        except Exception:
-                            pass
-                    transition_wall_ms = pg_stats_chunk.get("rollout_transition_wall_ms", None)
-                    if transition_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_wall_ms += float(transition_wall_ms)
-                        except Exception:
-                            pass
-                    transition_y_wall_ms = pg_stats_chunk.get("rollout_transition_y_wall_ms", None)
-                    if transition_y_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_y_wall_ms += float(transition_y_wall_ms)
-                        except Exception:
-                            pass
-                    transition_x_wall_ms = pg_stats_chunk.get("rollout_transition_x_wall_ms", None)
-                    if transition_x_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_x_wall_ms += float(transition_x_wall_ms)
-                        except Exception:
-                            pass
-                    transition_group_wall_ms = pg_stats_chunk.get("rollout_transition_group_wall_ms", None)
-                    if transition_group_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_group_wall_ms += float(transition_group_wall_ms)
-                        except Exception:
-                            pass
-                    transition_env_pack_wall_ms = pg_stats_chunk.get("rollout_transition_env_pack_wall_ms", None)
-                    if transition_env_pack_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_env_pack_wall_ms += float(transition_env_pack_wall_ms)
-                        except Exception:
-                            pass
-                    transition_state_update_wall_ms = pg_stats_chunk.get("rollout_transition_state_update_wall_ms", None)
-                    if transition_state_update_wall_ms is not None:
-                        try:
-                            batch_rollout_transition_state_update_wall_ms += float(transition_state_update_wall_ms)
-                        except Exception:
-                            pass
-                    transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
-                    if transition_group_count is not None:
-                        try:
-                            batch_rollout_transition_group_count += int(transition_group_count)
-                        except Exception:
-                            pass
-                    if callable(policy_step_profile_consumer):
-                        try:
-                            step_profile = policy_step_profile_consumer()
-                        except Exception:
-                            step_profile = None
-                        if isinstance(step_profile, dict):
-                            batch_policy_step_calls += int(step_profile.get("calls", 0) or 0)
-                            batch_policy_step_encode_ms += float(step_profile.get("encode_wall_s", 0.0) or 0.0) * 1000.0
-                            batch_policy_step_transformer_ms += float(
-                                step_profile.get("transformer_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_decoder_ms += float(step_profile.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
-                            batch_policy_step_total_ms += float(step_profile.get("total_wall_s", 0.0) or 0.0) * 1000.0
-                            batch_policy_step_transformer_layer_calls += int(
-                                step_profile.get("transformer_layer_calls", 0) or 0
-                            )
-                            batch_policy_step_transformer_layer_proj_ms += float(
-                                step_profile.get("transformer_layer_proj_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_cache_ms += float(
-                                step_profile.get("transformer_layer_cache_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_attnff_ms += float(
-                                step_profile.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_attn_core_ms += float(
-                                step_profile.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_finalize_ms += float(
-                                step_profile.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
-                                step_profile.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_finalize_ffn_ms += float(
-                                step_profile.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_transformer_layer_total_ms += float(
-                                step_profile.get("transformer_layer_total_wall_s", 0.0) or 0.0
-                            ) * 1000.0
-                            batch_policy_step_layer_paged_single_page_calls += int(
-                                step_profile.get("transformer_layer_paged_path_single_page", 0) or 0
-                            )
-                            batch_policy_step_layer_paged_flash_prefix_calls += int(
-                                step_profile.get("transformer_layer_paged_path_flash_prefix", 0) or 0
-                            )
-                            batch_policy_step_layer_paged_flash_merge_calls += int(
-                                step_profile.get("transformer_layer_paged_path_flash_merge", 0) or 0
-                            )
-                            batch_policy_step_layer_paged_dense_calls += int(
-                                step_profile.get("transformer_layer_paged_path_dense", 0) or 0
-                            )
-
-                if batch_oom and batch_attempt < max_batch_oom_retries:
-                    optimizer.zero_grad(set_to_none=True)
-                    grad_accum_steps = 0
-                    if verbose:
-                        print(
-                            f"[pg-oom-retry] epoch={batch_epoch_for_profile} batch={batch} "
-                            f"attempt={batch_attempt + 1}/{max_batch_oom_retries} "
-                            f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window}"
-                        )
-                    continue
-                break
-
-            if callable(policy_step_profile_consumer):
-                try:
-                    step_profile_tail = policy_step_profile_consumer()
-                except Exception:
-                    step_profile_tail = None
-                if isinstance(step_profile_tail, dict):
-                    batch_policy_step_calls += int(step_profile_tail.get("calls", 0) or 0)
-                    batch_policy_step_encode_ms += float(step_profile_tail.get("encode_wall_s", 0.0) or 0.0) * 1000.0
-                    batch_policy_step_transformer_ms += float(
-                        step_profile_tail.get("transformer_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_decoder_ms += float(step_profile_tail.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
-                    batch_policy_step_total_ms += float(step_profile_tail.get("total_wall_s", 0.0) or 0.0) * 1000.0
-                    batch_policy_step_transformer_layer_calls += int(
-                        step_profile_tail.get("transformer_layer_calls", 0) or 0
-                    )
-                    batch_policy_step_transformer_layer_proj_ms += float(
-                        step_profile_tail.get("transformer_layer_proj_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_cache_ms += float(
-                        step_profile_tail.get("transformer_layer_cache_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_attnff_ms += float(
-                        step_profile_tail.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_attn_core_ms += float(
-                        step_profile_tail.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_finalize_ms += float(
-                        step_profile_tail.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
-                        step_profile_tail.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_finalize_ffn_ms += float(
-                        step_profile_tail.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_transformer_layer_total_ms += float(
-                        step_profile_tail.get("transformer_layer_total_wall_s", 0.0) or 0.0
-                    ) * 1000.0
-                    batch_policy_step_layer_paged_single_page_calls += int(
-                        step_profile_tail.get("transformer_layer_paged_path_single_page", 0) or 0
-                    )
-                    batch_policy_step_layer_paged_flash_prefix_calls += int(
-                        step_profile_tail.get("transformer_layer_paged_path_flash_prefix", 0) or 0
-                    )
-                    batch_policy_step_layer_paged_flash_merge_calls += int(
-                        step_profile_tail.get("transformer_layer_paged_path_flash_merge", 0) or 0
-                    )
-                    batch_policy_step_layer_paged_dense_calls += int(
-                        step_profile_tail.get("transformer_layer_paged_path_dense", 0) or 0
-                    )
-
-            stage_cuda_ms = {"rollout": None, "backward": None}
-            if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
-                all_pairs = rollout_cuda_pairs + backward_cuda_pairs
-                if all_pairs:
-                    torch.cuda.synchronize(device)
-                if rollout_cuda_pairs:
-                    stage_cuda_ms["rollout"] = float(sum(s.elapsed_time(e) for s, e in rollout_cuda_pairs))
-                if backward_cuda_pairs:
-                    stage_cuda_ms["backward"] = float(sum(s.elapsed_time(e) for s, e in backward_cuda_pairs))
-            rollout_cuda_busy_ratio = None
-            backward_cuda_busy_ratio = None
-            if stage_cuda_ms["rollout"] is not None and batch_rollout_wall > 0.0:
-                rollout_cuda_busy_ratio = float((stage_cuda_ms["rollout"] / 1000.0) / max(1e-9, batch_rollout_wall))
-            if stage_cuda_ms["backward"] is not None and batch_backward_wall > 0.0:
-                backward_cuda_busy_ratio = float((stage_cuda_ms["backward"] / 1000.0) / max(1e-9, batch_backward_wall))
-
-            rollout_breakdown_suffix = ""
-            rollout_breakdown_total_ms = batch_rollout_policy_cuda_ms + batch_rollout_transition_cuda_ms
-            if rollout_breakdown_total_ms > 0.0:
-                rollout_policy_share = float(batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms))
-                rollout_breakdown_suffix = (
-                    f" rollout_policy_cuda_ms={batch_rollout_policy_cuda_ms:.2f}"
-                    f" rollout_transition_cuda_ms={batch_rollout_transition_cuda_ms:.2f}"
-                    f" rollout_policy_share={rollout_policy_share:.3f}"
-                )
-            rollout_wall_total_ms = batch_rollout_policy_wall_ms + batch_rollout_transition_wall_ms
-            if rollout_wall_total_ms > 0.0:
-                rollout_policy_wall_share = float(batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms))
-                transition_y_share = float(
-                    batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                )
-                transition_x_share = float(
-                    batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                )
-                transition_group_share = float(
-                    batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                )
-                transition_env_pack_share = float(
-                    batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                )
-                transition_state_update_share = float(
-                    batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                )
-                rollout_breakdown_suffix += (
-                    f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
-                    f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
-                    f" rollout_policy_wall_share={rollout_policy_wall_share:.3f}"
-                    f" rollout_transition_y_share={transition_y_share:.3f}"
-                    f" rollout_transition_x_share={transition_x_share:.3f}"
-                    f" rollout_transition_group_share={transition_group_share:.3f}"
-                    f" rollout_transition_env_pack_share={transition_env_pack_share:.3f}"
-                    f" rollout_transition_state_update_share={transition_state_update_share:.3f}"
-                    f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
-                )
-            if batch_policy_step_total_ms > 0.0:
-                policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
-                policy_step_transformer_share = float(
-                    batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
-                )
-                policy_step_decoder_share = float(batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms))
-                rollout_breakdown_suffix += (
-                    f" policy_step_calls={int(batch_policy_step_calls)}"
-                    f" policy_step_total_ms={batch_policy_step_total_ms:.2f}"
-                    f" policy_step_encode_share={policy_step_encode_share:.3f}"
-                    f" policy_step_transformer_share={policy_step_transformer_share:.3f}"
-                    f" policy_step_decoder_share={policy_step_decoder_share:.3f}"
-                )
-            if batch_policy_step_transformer_layer_total_ms > 0.0:
-                policy_step_layer_proj_share = float(
-                    batch_policy_step_transformer_layer_proj_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_cache_share = float(
-                    batch_policy_step_transformer_layer_cache_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_attnff_share = float(
-                    batch_policy_step_transformer_layer_attnff_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_attn_core_share = float(
-                    batch_policy_step_transformer_layer_attn_core_ms
-                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_finalize_share = float(
-                    batch_policy_step_transformer_layer_finalize_ms
-                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_finalize_attn_outproj_share = float(
-                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms
-                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                policy_step_layer_finalize_ffn_share = float(
-                    batch_policy_step_transformer_layer_finalize_ffn_ms
-                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                )
-                rollout_breakdown_suffix += (
-                    f" policy_step_tf_layer_calls={int(batch_policy_step_transformer_layer_calls)}"
-                    f" policy_step_tf_layer_total_ms={batch_policy_step_transformer_layer_total_ms:.2f}"
-                    f" policy_step_tf_layer_proj_share={policy_step_layer_proj_share:.3f}"
-                    f" policy_step_tf_layer_cache_share={policy_step_layer_cache_share:.3f}"
-                    f" policy_step_tf_layer_attnff_share={policy_step_layer_attnff_share:.3f}"
-                    f" policy_step_tf_layer_attn_core_share={policy_step_layer_attn_core_share:.3f}"
-                    f" policy_step_tf_layer_finalize_share={policy_step_layer_finalize_share:.3f}"
-                    f" policy_step_tf_layer_finalize_attn_outproj_share={policy_step_layer_finalize_attn_outproj_share:.3f}"
-                    f" policy_step_tf_layer_finalize_ffn_share={policy_step_layer_finalize_ffn_share:.3f}"
-                )
-                paged_dispatch_total = int(
-                    batch_policy_step_layer_paged_single_page_calls
-                    + batch_policy_step_layer_paged_flash_prefix_calls
-                    + batch_policy_step_layer_paged_flash_merge_calls
-                    + batch_policy_step_layer_paged_dense_calls
-                )
-                if paged_dispatch_total > 0:
-                    rollout_breakdown_suffix += (
-                        f" policy_step_paged_dispatch(single/flashp/flashm/dense)="
-                        f"{batch_policy_step_layer_paged_single_page_calls}/"
-                        f"{batch_policy_step_layer_paged_flash_prefix_calls}/"
-                        f"{batch_policy_step_layer_paged_flash_merge_calls}/"
-                        f"{batch_policy_step_layer_paged_dense_calls}"
-                    )
-            if rollout_cuda_busy_ratio is not None:
-                rollout_breakdown_suffix += f" rollout_cuda_busy_ratio={rollout_cuda_busy_ratio:.3f}"
-            if backward_cuda_busy_ratio is not None:
-                rollout_breakdown_suffix += f" backward_cuda_busy_ratio={backward_cuda_busy_ratio:.3f}"
-            if batch_pg_loss_signature is not None:
-                rollout_breakdown_suffix += f" pg_loss_sig={batch_pg_loss_signature}"
-
-            if gpu_observer_active:
-                epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
-                stage_windows = {
-                    "rollout": (rollout_t_start_unix, rollout_t_end_unix),
-                    "backward": (backward_t_start_unix, backward_t_end_unix),
-                }
-                batch_status = "oom" if batch_oom else ("loss_nonfinite" if batch_nonfinite else "ok")
-                for stage_name, (stage_t0, stage_t1) in stage_windows.items():
-                    if stage_t0 is None or stage_t1 is None:
                         continue
-                    duration_sec = float(max(1e-9, stage_t1 - stage_t0))
-                    cuda_ms = stage_cuda_ms.get(stage_name, None)
-                    cuda_busy_ratio = None
-                    if cuda_ms is not None:
-                        cuda_busy_ratio = float((cuda_ms / 1000.0) / duration_sec)
-                    stage_extra = {
-                        "status": batch_status,
-                        "chunk_size": int(current_rollout_chunk_size),
-                        "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
-                        "cuda_elapsed_ms": cuda_ms,
-                        "cuda_busy_ratio": cuda_busy_ratio,
-                    }
-                    if stage_name == "rollout" and rollout_breakdown_total_ms > 0.0:
-                        stage_extra["rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
-                        stage_extra["rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
-                        stage_extra["rollout_policy_share"] = float(
-                            batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                    break
+    
+                if callable(policy_step_profile_consumer):
+                    try:
+                        step_profile_tail = policy_step_profile_consumer()
+                    except Exception:
+                        step_profile_tail = None
+                    if isinstance(step_profile_tail, dict):
+                        batch_policy_step_calls += int(step_profile_tail.get("calls", 0) or 0)
+                        batch_policy_step_encode_ms += float(step_profile_tail.get("encode_wall_s", 0.0) or 0.0) * 1000.0
+                        batch_policy_step_transformer_ms += float(
+                            step_profile_tail.get("transformer_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_decoder_ms += float(step_profile_tail.get("decoder_wall_s", 0.0) or 0.0) * 1000.0
+                        batch_policy_step_total_ms += float(step_profile_tail.get("total_wall_s", 0.0) or 0.0) * 1000.0
+                        batch_policy_step_transformer_layer_calls += int(
+                            step_profile_tail.get("transformer_layer_calls", 0) or 0
                         )
-                    if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
-                        stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
-                        stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
-                        stage_extra["rollout_policy_wall_share"] = float(
-                            batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
+                        batch_policy_step_transformer_layer_proj_ms += float(
+                            step_profile_tail.get("transformer_layer_proj_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_cache_ms += float(
+                            step_profile_tail.get("transformer_layer_cache_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_attnff_ms += float(
+                            step_profile_tail.get("transformer_layer_attnff_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_attn_core_ms += float(
+                            step_profile_tail.get("transformer_layer_attn_core_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_finalize_ms += float(
+                            step_profile_tail.get("transformer_layer_finalize_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_finalize_attn_outproj_ms += float(
+                            step_profile_tail.get("transformer_layer_finalize_attn_outproj_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_finalize_ffn_ms += float(
+                            step_profile_tail.get("transformer_layer_finalize_ffn_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_transformer_layer_total_ms += float(
+                            step_profile_tail.get("transformer_layer_total_wall_s", 0.0) or 0.0
+                        ) * 1000.0
+                        batch_policy_step_layer_paged_single_page_calls += int(
+                            step_profile_tail.get("transformer_layer_paged_path_single_page", 0) or 0
                         )
-                        stage_extra["rollout_transition_y_share"] = float(
-                            batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        batch_policy_step_layer_paged_flash_prefix_calls += int(
+                            step_profile_tail.get("transformer_layer_paged_path_flash_prefix", 0) or 0
                         )
-                        stage_extra["rollout_transition_x_share"] = float(
-                            batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        batch_policy_step_layer_paged_flash_merge_calls += int(
+                            step_profile_tail.get("transformer_layer_paged_path_flash_merge", 0) or 0
                         )
-                        stage_extra["rollout_transition_group_share"] = float(
-                            batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        batch_policy_step_layer_paged_dense_calls += int(
+                            step_profile_tail.get("transformer_layer_paged_path_dense", 0) or 0
                         )
-                        stage_extra["rollout_transition_env_pack_share"] = float(
-                            batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                        )
-                        stage_extra["rollout_transition_state_update_share"] = float(
-                            batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                        )
-                        stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
-                    if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
-                        stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
-                        stage_extra["policy_step_total_ms"] = float(batch_policy_step_total_ms)
-                        stage_extra["policy_step_encode_share"] = float(
-                            batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms)
-                        )
-                        stage_extra["policy_step_transformer_share"] = float(
-                            batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
-                        )
-                        stage_extra["policy_step_decoder_share"] = float(
-                            batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms)
-                        )
-                    if stage_name == "rollout" and batch_policy_step_transformer_layer_total_ms > 0.0:
-                        stage_extra["policy_step_tf_layer_calls"] = int(batch_policy_step_transformer_layer_calls)
-                        stage_extra["policy_step_tf_layer_total_ms"] = float(
-                            batch_policy_step_transformer_layer_total_ms
-                        )
-                        stage_extra["policy_step_tf_layer_proj_share"] = float(
-                            batch_policy_step_transformer_layer_proj_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_cache_share"] = float(
-                            batch_policy_step_transformer_layer_cache_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_attnff_share"] = float(
-                            batch_policy_step_transformer_layer_attnff_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_attn_core_share"] = float(
-                            batch_policy_step_transformer_layer_attn_core_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_finalize_share"] = float(
-                            batch_policy_step_transformer_layer_finalize_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_finalize_attn_outproj_share"] = float(
-                            batch_policy_step_transformer_layer_finalize_attn_outproj_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                        stage_extra["policy_step_tf_layer_finalize_ffn_share"] = float(
-                            batch_policy_step_transformer_layer_finalize_ffn_ms
-                            / max(1e-9, batch_policy_step_transformer_layer_total_ms)
-                        )
-                    if stage_name == "rollout" and batch_pg_loss_signature is not None:
-                        stage_extra["pg_loss_sig"] = str(batch_pg_loss_signature)
-                    stage_rec = gpu_observer.record_stage(
-                        epoch=epoch_obs,
-                        batch=int(batch),
-                        stage=stage_name,
-                        start_time_unix=float(stage_t0),
-                        end_time_unix=float(stage_t1),
-                        extra=stage_extra,
+    
+                stage_cuda_ms = {"rollout": None, "backward": None}
+                if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                    all_pairs = rollout_cuda_pairs + backward_cuda_pairs
+                    if all_pairs:
+                        torch.cuda.synchronize(device)
+                    if rollout_cuda_pairs:
+                        stage_cuda_ms["rollout"] = float(sum(s.elapsed_time(e) for s, e in rollout_cuda_pairs))
+                    if backward_cuda_pairs:
+                        stage_cuda_ms["backward"] = float(sum(s.elapsed_time(e) for s, e in backward_cuda_pairs))
+                rollout_cuda_busy_ratio = None
+                backward_cuda_busy_ratio = None
+                if stage_cuda_ms["rollout"] is not None and batch_rollout_wall > 0.0:
+                    rollout_cuda_busy_ratio = float((stage_cuda_ms["rollout"] / 1000.0) / max(1e-9, batch_rollout_wall))
+                if stage_cuda_ms["backward"] is not None and batch_backward_wall > 0.0:
+                    backward_cuda_busy_ratio = float((stage_cuda_ms["backward"] / 1000.0) / max(1e-9, batch_backward_wall))
+    
+                rollout_breakdown_suffix = ""
+                rollout_breakdown_total_ms = batch_rollout_policy_cuda_ms + batch_rollout_transition_cuda_ms
+                if rollout_breakdown_total_ms > 0.0:
+                    rollout_policy_share = float(batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms))
+                    rollout_breakdown_suffix = (
+                        f" rollout_policy_cuda_ms={batch_rollout_policy_cuda_ms:.2f}"
+                        f" rollout_transition_cuda_ms={batch_rollout_transition_cuda_ms:.2f}"
+                        f" rollout_policy_share={rollout_policy_share:.3f}"
                     )
-                    if should_log_phase:
-                        breakdown_info = ""
-                        if stage_name == "rollout":
-                            breakdown_info = rollout_breakdown_suffix
-                        print(
-                            f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage={stage_name} "
-                            f"{_format_gpu_stage_summary('', stage_rec)} "
-                            f"cuda_ms={'na' if cuda_ms is None else f'{cuda_ms:.2f}'} "
-                            f"cuda_busy_ratio={'na' if cuda_busy_ratio is None else f'{cuda_busy_ratio:.3f}'}"
-                            f"{breakdown_info}"
+                rollout_wall_total_ms = batch_rollout_policy_wall_ms + batch_rollout_transition_wall_ms
+                if rollout_wall_total_ms > 0.0:
+                    rollout_policy_wall_share = float(batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms))
+                    transition_y_share = float(
+                        batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
+                    transition_x_share = float(
+                        batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
+                    transition_group_share = float(
+                        batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
+                    transition_env_pack_share = float(
+                        batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
+                    transition_state_update_share = float(
+                        batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
+                    rollout_breakdown_suffix += (
+                        f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
+                        f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
+                        f" rollout_policy_wall_share={rollout_policy_wall_share:.3f}"
+                        f" rollout_transition_y_share={transition_y_share:.3f}"
+                        f" rollout_transition_x_share={transition_x_share:.3f}"
+                        f" rollout_transition_group_share={transition_group_share:.3f}"
+                        f" rollout_transition_env_pack_share={transition_env_pack_share:.3f}"
+                        f" rollout_transition_state_update_share={transition_state_update_share:.3f}"
+                        f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
+                    )
+                if batch_policy_step_total_ms > 0.0:
+                    policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
+                    policy_step_transformer_share = float(
+                        batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
+                    )
+                    policy_step_decoder_share = float(batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms))
+                    rollout_breakdown_suffix += (
+                        f" policy_step_calls={int(batch_policy_step_calls)}"
+                        f" policy_step_total_ms={batch_policy_step_total_ms:.2f}"
+                        f" policy_step_encode_share={policy_step_encode_share:.3f}"
+                        f" policy_step_transformer_share={policy_step_transformer_share:.3f}"
+                        f" policy_step_decoder_share={policy_step_decoder_share:.3f}"
+                    )
+                if batch_policy_step_transformer_layer_total_ms > 0.0:
+                    policy_step_layer_proj_share = float(
+                        batch_policy_step_transformer_layer_proj_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_cache_share = float(
+                        batch_policy_step_transformer_layer_cache_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_attnff_share = float(
+                        batch_policy_step_transformer_layer_attnff_ms / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_attn_core_share = float(
+                        batch_policy_step_transformer_layer_attn_core_ms
+                        / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_finalize_share = float(
+                        batch_policy_step_transformer_layer_finalize_ms
+                        / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_finalize_attn_outproj_share = float(
+                        batch_policy_step_transformer_layer_finalize_attn_outproj_ms
+                        / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    policy_step_layer_finalize_ffn_share = float(
+                        batch_policy_step_transformer_layer_finalize_ffn_ms
+                        / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                    )
+                    rollout_breakdown_suffix += (
+                        f" policy_step_tf_layer_calls={int(batch_policy_step_transformer_layer_calls)}"
+                        f" policy_step_tf_layer_total_ms={batch_policy_step_transformer_layer_total_ms:.2f}"
+                        f" policy_step_tf_layer_proj_share={policy_step_layer_proj_share:.3f}"
+                        f" policy_step_tf_layer_cache_share={policy_step_layer_cache_share:.3f}"
+                        f" policy_step_tf_layer_attnff_share={policy_step_layer_attnff_share:.3f}"
+                        f" policy_step_tf_layer_attn_core_share={policy_step_layer_attn_core_share:.3f}"
+                        f" policy_step_tf_layer_finalize_share={policy_step_layer_finalize_share:.3f}"
+                        f" policy_step_tf_layer_finalize_attn_outproj_share={policy_step_layer_finalize_attn_outproj_share:.3f}"
+                        f" policy_step_tf_layer_finalize_ffn_share={policy_step_layer_finalize_ffn_share:.3f}"
+                    )
+                    paged_dispatch_total = int(
+                        batch_policy_step_layer_paged_single_page_calls
+                        + batch_policy_step_layer_paged_flash_prefix_calls
+                        + batch_policy_step_layer_paged_flash_merge_calls
+                        + batch_policy_step_layer_paged_dense_calls
+                    )
+                    if paged_dispatch_total > 0:
+                        rollout_breakdown_suffix += (
+                            f" policy_step_paged_dispatch(single/flashp/flashm/dense)="
+                            f"{batch_policy_step_layer_paged_single_page_calls}/"
+                            f"{batch_policy_step_layer_paged_flash_prefix_calls}/"
+                            f"{batch_policy_step_layer_paged_flash_merge_calls}/"
+                            f"{batch_policy_step_layer_paged_dense_calls}"
                         )
-                    if wandb.run is not None:
-                        wandb_payload = {
-                            f"pg_gpu/{stage_name}_samples": int(stage_rec.get("samples", 0) or 0),
-                            f"pg_gpu/{stage_name}_gpu_util_avg": stage_rec.get("gpu_util_avg"),
-                            f"pg_gpu/{stage_name}_gpu_util_max": stage_rec.get("gpu_util_max"),
-                            f"pg_gpu/{stage_name}_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
-                            f"pg_gpu/{stage_name}_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
-                            f"pg_gpu/{stage_name}_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
-                            f"pg_gpu/{stage_name}_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
-                            f"pg_gpu/{stage_name}_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
-                        }
+                if rollout_cuda_busy_ratio is not None:
+                    rollout_breakdown_suffix += f" rollout_cuda_busy_ratio={rollout_cuda_busy_ratio:.3f}"
+                if backward_cuda_busy_ratio is not None:
+                    rollout_breakdown_suffix += f" backward_cuda_busy_ratio={backward_cuda_busy_ratio:.3f}"
+                if batch_pg_loss_signature is not None:
+                    rollout_breakdown_suffix += f" pg_loss_sig={batch_pg_loss_signature}"
+    
+                if gpu_observer_active:
+                    epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
+                    stage_windows = {
+                        "rollout": (rollout_t_start_unix, rollout_t_end_unix),
+                        "backward": (backward_t_start_unix, backward_t_end_unix),
+                    }
+                    batch_status = "oom" if batch_oom else ("loss_nonfinite" if batch_nonfinite else "ok")
+                    for stage_name, (stage_t0, stage_t1) in stage_windows.items():
+                        if stage_t0 is None or stage_t1 is None:
+                            continue
+                        duration_sec = float(max(1e-9, stage_t1 - stage_t0))
+                        cuda_ms = stage_cuda_ms.get(stage_name, None)
+                        cuda_busy_ratio = None
                         if cuda_ms is not None:
-                            wandb_payload[f"pg_gpu/{stage_name}_cuda_elapsed_ms"] = float(cuda_ms)
-                        if cuda_busy_ratio is not None:
-                            wandb_payload[f"pg_gpu/{stage_name}_cuda_busy_ratio"] = float(cuda_busy_ratio)
+                            cuda_busy_ratio = float((cuda_ms / 1000.0) / duration_sec)
+                        stage_extra = {
+                            "status": batch_status,
+                            "chunk_size": int(current_rollout_chunk_size),
+                            "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
+                            "cuda_elapsed_ms": cuda_ms,
+                            "cuda_busy_ratio": cuda_busy_ratio,
+                        }
                         if stage_name == "rollout" and rollout_breakdown_total_ms > 0.0:
-                            wandb_payload["pg_gpu/rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
-                            wandb_payload["pg_gpu/rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
-                            wandb_payload["pg_gpu/rollout_policy_share"] = float(
+                            stage_extra["rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
+                            stage_extra["rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
+                            stage_extra["rollout_policy_share"] = float(
                                 batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
                             )
                         if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
-                            wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
-                            wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
-                            wandb_payload["pg_gpu/rollout_policy_wall_share"] = float(
+                            stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
+                            stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
+                            stage_extra["rollout_policy_wall_share"] = float(
                                 batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_y_share"] = float(
+                            stage_extra["rollout_transition_y_share"] = float(
                                 batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
+                            stage_extra["rollout_transition_x_share"] = float(
                                 batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_group_share"] = float(
+                            stage_extra["rollout_transition_group_share"] = float(
                                 batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_env_pack_share"] = float(
+                            stage_extra["rollout_transition_env_pack_share"] = float(
                                 batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_state_update_share"] = float(
+                            stage_extra["rollout_transition_state_update_share"] = float(
                                 batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
-                            wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
-                                batch_rollout_transition_group_count
-                            )
+                            stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
                         if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
-                            wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
-                            wandb_payload["pg_gpu/policy_step_total_ms"] = float(batch_policy_step_total_ms)
-                            wandb_payload["pg_gpu/policy_step_encode_share"] = float(
+                            stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
+                            stage_extra["policy_step_total_ms"] = float(batch_policy_step_total_ms)
+                            stage_extra["policy_step_encode_share"] = float(
                                 batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_transformer_share"] = float(
+                            stage_extra["policy_step_transformer_share"] = float(
                                 batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_decoder_share"] = float(
+                            stage_extra["policy_step_decoder_share"] = float(
                                 batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms)
                             )
                         if stage_name == "rollout" and batch_policy_step_transformer_layer_total_ms > 0.0:
-                            wandb_payload["pg_gpu/policy_step_tf_layer_calls"] = int(
-                                batch_policy_step_transformer_layer_calls
-                            )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_total_ms"] = float(
+                            stage_extra["policy_step_tf_layer_calls"] = int(batch_policy_step_transformer_layer_calls)
+                            stage_extra["policy_step_tf_layer_total_ms"] = float(
                                 batch_policy_step_transformer_layer_total_ms
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_proj_share"] = float(
+                            stage_extra["policy_step_tf_layer_proj_share"] = float(
                                 batch_policy_step_transformer_layer_proj_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_cache_share"] = float(
+                            stage_extra["policy_step_tf_layer_cache_share"] = float(
                                 batch_policy_step_transformer_layer_cache_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_attnff_share"] = float(
+                            stage_extra["policy_step_tf_layer_attnff_share"] = float(
                                 batch_policy_step_transformer_layer_attnff_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_attn_core_share"] = float(
+                            stage_extra["policy_step_tf_layer_attn_core_share"] = float(
                                 batch_policy_step_transformer_layer_attn_core_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_share"] = float(
+                            stage_extra["policy_step_tf_layer_finalize_share"] = float(
                                 batch_policy_step_transformer_layer_finalize_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_attn_outproj_share"] = float(
+                            stage_extra["policy_step_tf_layer_finalize_attn_outproj_share"] = float(
                                 batch_policy_step_transformer_layer_finalize_attn_outproj_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
-                            wandb_payload["pg_gpu/policy_step_tf_layer_finalize_ffn_share"] = float(
+                            stage_extra["policy_step_tf_layer_finalize_ffn_share"] = float(
                                 batch_policy_step_transformer_layer_finalize_ffn_ms
                                 / max(1e-9, batch_policy_step_transformer_layer_total_ms)
                             )
                         if stage_name == "rollout" and batch_pg_loss_signature is not None:
-                            wandb_payload["pg_gpu/pg_loss_sig"] = str(batch_pg_loss_signature)
-                        wandb.log(wandb_payload)
-
-            if batch_oom:
-                skipped_steps += 1
-                stable_batches_for_chunk_growth = 0
-                optimizer.zero_grad(set_to_none=True)
-                grad_accum_steps = 0
-                if should_log_phase:
-                    print(
-                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
-                        f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
-                        f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
-                        f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
-                        f"{rollout_breakdown_suffix}"
-                    )
-                if epoch_profiler is not None:
-                    epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
-                    _maybe_emit_profile_interval(
-                        epoch_profiler,
-                        epoch_start_time=epoch_start_time,
-                        epoch_idx=epoch_idx,
+                            stage_extra["pg_loss_sig"] = str(batch_pg_loss_signature)
+                        stage_rec = gpu_observer.record_stage(
+                            epoch=epoch_obs,
+                            batch=int(batch),
+                            stage=stage_name,
+                            start_time_unix=float(stage_t0),
+                            end_time_unix=float(stage_t1),
+                            extra=stage_extra,
+                        )
+                        if should_log_phase:
+                            breakdown_info = ""
+                            if stage_name == "rollout":
+                                breakdown_info = rollout_breakdown_suffix
+                            print(
+                                f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage={stage_name} "
+                                f"{_format_gpu_stage_summary('', stage_rec)} "
+                                f"cuda_ms={'na' if cuda_ms is None else f'{cuda_ms:.2f}'} "
+                                f"cuda_busy_ratio={'na' if cuda_busy_ratio is None else f'{cuda_busy_ratio:.3f}'}"
+                                f"{breakdown_info}"
+                            )
+                        if wandb.run is not None:
+                            wandb_payload = {
+                                f"pg_gpu/{stage_name}_samples": int(stage_rec.get("samples", 0) or 0),
+                                f"pg_gpu/{stage_name}_gpu_util_avg": stage_rec.get("gpu_util_avg"),
+                                f"pg_gpu/{stage_name}_gpu_util_max": stage_rec.get("gpu_util_max"),
+                                f"pg_gpu/{stage_name}_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
+                                f"pg_gpu/{stage_name}_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
+                                f"pg_gpu/{stage_name}_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
+                                f"pg_gpu/{stage_name}_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
+                                f"pg_gpu/{stage_name}_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
+                            }
+                            if cuda_ms is not None:
+                                wandb_payload[f"pg_gpu/{stage_name}_cuda_elapsed_ms"] = float(cuda_ms)
+                            if cuda_busy_ratio is not None:
+                                wandb_payload[f"pg_gpu/{stage_name}_cuda_busy_ratio"] = float(cuda_busy_ratio)
+                            if stage_name == "rollout" and rollout_breakdown_total_ms > 0.0:
+                                wandb_payload["pg_gpu/rollout_policy_cuda_ms"] = float(batch_rollout_policy_cuda_ms)
+                                wandb_payload["pg_gpu/rollout_transition_cuda_ms"] = float(batch_rollout_transition_cuda_ms)
+                                wandb_payload["pg_gpu/rollout_policy_share"] = float(
+                                    batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
+                                )
+                            if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
+                                wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
+                                wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
+                                wandb_payload["pg_gpu/rollout_policy_wall_share"] = float(
+                                    batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_y_share"] = float(
+                                    batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
+                                    batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_group_share"] = float(
+                                    batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_env_pack_share"] = float(
+                                    batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_state_update_share"] = float(
+                                    batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
+                                    batch_rollout_transition_group_count
+                                )
+                            if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
+                                wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
+                                wandb_payload["pg_gpu/policy_step_total_ms"] = float(batch_policy_step_total_ms)
+                                wandb_payload["pg_gpu/policy_step_encode_share"] = float(
+                                    batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_transformer_share"] = float(
+                                    batch_policy_step_transformer_ms / max(1e-9, batch_policy_step_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_decoder_share"] = float(
+                                    batch_policy_step_decoder_ms / max(1e-9, batch_policy_step_total_ms)
+                                )
+                            if stage_name == "rollout" and batch_policy_step_transformer_layer_total_ms > 0.0:
+                                wandb_payload["pg_gpu/policy_step_tf_layer_calls"] = int(
+                                    batch_policy_step_transformer_layer_calls
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_total_ms"] = float(
+                                    batch_policy_step_transformer_layer_total_ms
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_proj_share"] = float(
+                                    batch_policy_step_transformer_layer_proj_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_cache_share"] = float(
+                                    batch_policy_step_transformer_layer_cache_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_attnff_share"] = float(
+                                    batch_policy_step_transformer_layer_attnff_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_attn_core_share"] = float(
+                                    batch_policy_step_transformer_layer_attn_core_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_finalize_share"] = float(
+                                    batch_policy_step_transformer_layer_finalize_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_finalize_attn_outproj_share"] = float(
+                                    batch_policy_step_transformer_layer_finalize_attn_outproj_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                                wandb_payload["pg_gpu/policy_step_tf_layer_finalize_ffn_share"] = float(
+                                    batch_policy_step_transformer_layer_finalize_ffn_ms
+                                    / max(1e-9, batch_policy_step_transformer_layer_total_ms)
+                                )
+                            if stage_name == "rollout" and batch_pg_loss_signature is not None:
+                                wandb_payload["pg_gpu/pg_loss_sig"] = str(batch_pg_loss_signature)
+                            wandb.log(wandb_payload)
+    
+                if batch_oom:
+                    skipped_steps += 1
+                    stable_batches_for_chunk_growth = 0
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_accum_steps = 0
+                    if should_log_phase:
+                        print(
+                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
+                            f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
+                            f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
+                            f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
+                            f"{rollout_breakdown_suffix}"
+                        )
+                    if epoch_profiler is not None:
+                        epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
+                        _maybe_emit_profile_interval(
+                            epoch_profiler,
+                            epoch_start_time=epoch_start_time,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch,
+                            train_profiler_log_every_batches=train_profiler_log_every_batches,
+                            verbose=verbose,
+                        )
+                    if wandb.run is not None:
+                        wandb.log(
+                            {
+                                'train_skip': 1,
+                                'train_skip_reason': 'policy_rollout_oom',
+                                'policy_rollout_chunk_size': current_rollout_chunk_size,
+                            }
+                        )
+                    _maybe_step_kernel_profiler(
+                        kernel_profiler,
+                        epoch_idx=batch_epoch_for_profile,
                         batch_idx=batch,
-                        train_profiler_log_every_batches=train_profiler_log_every_batches,
                         verbose=verbose,
                     )
-                if wandb.run is not None:
-                    wandb.log(
-                        {
-                            'train_skip': 1,
-                            'train_skip_reason': 'policy_rollout_oom',
-                            'policy_rollout_chunk_size': current_rollout_chunk_size,
-                        }
+                    continue
+    
+                if progress_bar and hasattr(iterator, "set_postfix"):
+                    step_eval_pos = int(single_eval_pos)
+                    iterator.set_postfix(
+                        step=f"{batch + 1}/{steps_per_epoch}",
+                        train_ctx=step_eval_pos,
+                        test_ctx=int(n_samples - step_eval_pos),
                     )
-                _maybe_step_kernel_profiler(
-                    kernel_profiler,
-                    epoch_idx=batch_epoch_for_profile,
-                    batch_idx=batch,
-                    verbose=verbose,
-                )
-                continue
-
-            if progress_bar and hasattr(iterator, "set_postfix"):
-                step_eval_pos = int(single_eval_pos)
-                iterator.set_postfix(
-                    step=f"{batch + 1}/{steps_per_epoch}",
-                    train_ctx=step_eval_pos,
-                    test_ctx=int(n_samples - step_eval_pos),
-                )
-
-            if batch_nonfinite:
-                skipped_steps += 1
-                stable_batches_for_chunk_growth = 0
-                optimizer.zero_grad(set_to_none=True)
-                grad_accum_steps = 0
-                if should_log_phase:
-                    print(
-                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
-                        f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
-                        f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
-                        f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
-                        f"{rollout_breakdown_suffix}"
-                    )
-                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=loss_nonfinite loss={loss_val}")
-                if epoch_profiler is not None:
-                    epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
-                    _maybe_emit_profile_interval(
-                        epoch_profiler,
-                        epoch_start_time=epoch_start_time,
-                        epoch_idx=epoch_idx,
+    
+                if batch_nonfinite:
+                    skipped_steps += 1
+                    stable_batches_for_chunk_growth = 0
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_accum_steps = 0
+                    if should_log_phase:
+                        print(
+                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
+                            f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
+                            f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
+                            f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
+                            f"{rollout_breakdown_suffix}"
+                        )
+                    print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=loss_nonfinite loss={loss_val}")
+                    if epoch_profiler is not None:
+                        epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
+                        _maybe_emit_profile_interval(
+                            epoch_profiler,
+                            epoch_start_time=epoch_start_time,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch,
+                            train_profiler_log_every_batches=train_profiler_log_every_batches,
+                            verbose=verbose,
+                        )
+                    if wandb.run is not None:
+                        wandb.log({'train_skip': 1, 'train_skip_reason': 'loss_nonfinite', 'train_skip_loss': loss_val})
+                    _maybe_step_kernel_profiler(
+                        kernel_profiler,
+                        epoch_idx=batch_epoch_for_profile,
                         batch_idx=batch,
-                        train_profiler_log_every_batches=train_profiler_log_every_batches,
                         verbose=verbose,
                     )
+                    continue
+    
                 if wandb.run is not None:
-                    wandb.log({'train_skip': 1, 'train_skip_reason': 'loss_nonfinite', 'train_skip_loss': loss_val})
-                _maybe_step_kernel_profiler(
-                    kernel_profiler,
-                    epoch_idx=batch_epoch_for_profile,
-                    batch_idx=batch,
-                    verbose=verbose,
-                )
-                continue
-
-            if wandb.run is not None:
-                wandb_payload = {
-                    'batch_loss': float(batch_loss.detach().mean().cpu()) * aggregate_k_gradients,
-                    'policy_objective': float(batch_objective.detach().cpu()),
-                    'policy_reward_mean': float(batch_reward_mean.detach().cpu()),
-                    'policy_reward_std': float(batch_reward_std.detach().cpu()),
-                    'policy_reward_clip_hit_share': float(batch_reward_clip_hit_share),
-                    'policy_reward_norm_clip_hit_share': float(batch_reward_norm_clip_hit_share),
-                }
-                if math.isfinite(batch_reward_min_value):
-                    wandb_payload['policy_reward_min'] = float(batch_reward_min_value)
-                if math.isfinite(batch_reward_max_value):
-                    wandb_payload['policy_reward_max'] = float(batch_reward_max_value)
-                if math.isfinite(batch_reward_absmax_value):
-                    wandb_payload['policy_reward_absmax'] = float(batch_reward_absmax_value)
-                wandb.log(wandb_payload)
-
-            if (scaler is None) and requires_midaccum_grad_finite_check and _has_nonfinite_gradients(model, device=device):
-                skipped_steps += 1
-                stable_batches_for_chunk_growth = 0
-                optimizer.zero_grad(set_to_none=True)
-                grad_accum_steps = 0
-                print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_nonfinite")
-                if epoch_profiler is not None:
-                    epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
-                    _maybe_emit_profile_interval(
-                        epoch_profiler,
-                        epoch_start_time=epoch_start_time,
-                        epoch_idx=epoch_idx,
+                    wandb_payload = {
+                        'batch_loss': float(batch_loss.detach().mean().cpu()) * aggregate_k_gradients,
+                        'policy_objective': float(batch_objective.detach().cpu()),
+                        'policy_reward_mean': float(batch_reward_mean.detach().cpu()),
+                        'policy_reward_std': float(batch_reward_std.detach().cpu()),
+                        'policy_reward_clip_hit_share': float(batch_reward_clip_hit_share),
+                        'policy_reward_norm_clip_hit_share': float(batch_reward_norm_clip_hit_share),
+                    }
+                    if math.isfinite(batch_reward_min_value):
+                        wandb_payload['policy_reward_min'] = float(batch_reward_min_value)
+                    if math.isfinite(batch_reward_max_value):
+                        wandb_payload['policy_reward_max'] = float(batch_reward_max_value)
+                    if math.isfinite(batch_reward_absmax_value):
+                        wandb_payload['policy_reward_absmax'] = float(batch_reward_absmax_value)
+                    wandb.log(wandb_payload)
+    
+                if (scaler is None) and requires_midaccum_grad_finite_check and _has_nonfinite_gradients(model, device=device):
+                    skipped_steps += 1
+                    stable_batches_for_chunk_growth = 0
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_accum_steps = 0
+                    print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_nonfinite")
+                    if epoch_profiler is not None:
+                        epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
+                        _maybe_emit_profile_interval(
+                            epoch_profiler,
+                            epoch_start_time=epoch_start_time,
+                            epoch_idx=epoch_idx,
+                            batch_idx=batch,
+                            train_profiler_log_every_batches=train_profiler_log_every_batches,
+                            verbose=verbose,
+                        )
+                    if wandb.run is not None:
+                        wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_nonfinite'})
+                    _maybe_step_kernel_profiler(
+                        kernel_profiler,
+                        epoch_idx=batch_epoch_for_profile,
                         batch_idx=batch,
-                        train_profiler_log_every_batches=train_profiler_log_every_batches,
                         verbose=verbose,
                     )
-                if wandb.run is not None:
-                    wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_nonfinite'})
-                _maybe_step_kernel_profiler(
-                    kernel_profiler,
-                    epoch_idx=batch_epoch_for_profile,
-                    batch_idx=batch,
-                    verbose=verbose,
-                )
-                continue
-
-            grad_accum_steps += 1
-            if grad_accum_steps == aggregate_k_gradients:
-                step_t0_unix = time.time()
-                step_t0 = time.perf_counter()
-                step_cuda_start = None
-                if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
-                    step_cuda_start = torch.cuda.Event(enable_timing=True)
-                    step_cuda_start.record()
-                with (
-                    kernel_profiler.phase("pg.step")
-                    if (kernel_profiler is not None and kernel_profiler.enabled())
-                    else nullcontext()
-                ):
-                    if scaler is not None:
-                        scaler.unscale_(optimizer)
-                    grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
-                try:
-                    batch_grad_norm_value = float(grad_norm.detach().float().cpu())
-                except Exception:
+                    continue
+    
+                grad_accum_steps += 1
+                if grad_accum_steps == aggregate_k_gradients:
+                    step_t0_unix = time.time()
+                    step_t0 = time.perf_counter()
+                    step_cuda_start = None
+                    if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                        step_cuda_start = torch.cuda.Event(enable_timing=True)
+                        step_cuda_start.record()
+                    with (
+                        kernel_profiler.phase("pg.step")
+                        if (kernel_profiler is not None and kernel_profiler.enabled())
+                        else nullcontext()
+                    ):
+                        if scaler is not None:
+                            scaler.unscale_(optimizer)
+                        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), 1., foreach=True)
                     try:
-                        batch_grad_norm_value = float(grad_norm)
+                        batch_grad_norm_value = float(grad_norm.detach().float().cpu())
                     except Exception:
-                        batch_grad_norm_value = None
-                if not torch.isfinite(grad_norm):
+                        try:
+                            batch_grad_norm_value = float(grad_norm)
+                        except Exception:
+                            batch_grad_norm_value = None
+                    if not torch.isfinite(grad_norm):
+                        batch_step_wall += (time.perf_counter() - step_t0)
+                        if step_cuda_start is not None:
+                            step_cuda_end = torch.cuda.Event(enable_timing=True)
+                            step_cuda_end.record()
+                            step_cuda_pairs.append((step_cuda_start, step_cuda_end))
+                        step_t1_unix = time.time()
+                        if step_t_start_unix is None:
+                            step_t_start_unix = step_t0_unix
+                        step_t_end_unix = step_t1_unix
+                        if gpu_observer_active and step_t_start_unix is not None and step_t_end_unix is not None:
+                            step_cuda_ms = None
+                            if step_cuda_pairs and ("cuda" in str(device)) and torch.cuda.is_available():
+                                torch.cuda.synchronize(device)
+                                step_cuda_ms = float(sum(s.elapsed_time(e) for s, e in step_cuda_pairs))
+                            step_dur = float(max(1e-9, step_t_end_unix - step_t_start_unix))
+                            step_busy_ratio = None if step_cuda_ms is None else float((step_cuda_ms / 1000.0) / step_dur)
+                            epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
+                            stage_rec = gpu_observer.record_stage(
+                                epoch=epoch_obs,
+                                batch=int(batch),
+                                stage="step",
+                                start_time_unix=float(step_t_start_unix),
+                                end_time_unix=float(step_t_end_unix),
+                                extra={
+                                    "status": "grad_norm_nonfinite",
+                                    "chunk_size": int(current_rollout_chunk_size),
+                                    "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
+                                    "cuda_elapsed_ms": step_cuda_ms,
+                                    "cuda_busy_ratio": step_busy_ratio,
+                                },
+                            )
+                            if should_log_phase:
+                                print(
+                                    f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage=step "
+                                    f"{_format_gpu_stage_summary('', stage_rec)} "
+                                    f"cuda_ms={'na' if step_cuda_ms is None else f'{step_cuda_ms:.2f}'} "
+                                    f"cuda_busy_ratio={'na' if step_busy_ratio is None else f'{step_busy_ratio:.3f}'}"
+                                )
+                            if wandb.run is not None:
+                                wandb_payload = {
+                                    "pg_gpu/step_samples": int(stage_rec.get("samples", 0) or 0),
+                                    "pg_gpu/step_gpu_util_avg": stage_rec.get("gpu_util_avg"),
+                                    "pg_gpu/step_gpu_util_max": stage_rec.get("gpu_util_max"),
+                                    "pg_gpu/step_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
+                                    "pg_gpu/step_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
+                                    "pg_gpu/step_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
+                                    "pg_gpu/step_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
+                                    "pg_gpu/step_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
+                                }
+                                if step_cuda_ms is not None:
+                                    wandb_payload["pg_gpu/step_cuda_elapsed_ms"] = float(step_cuda_ms)
+                                if step_busy_ratio is not None:
+                                    wandb_payload["pg_gpu/step_cuda_busy_ratio"] = float(step_busy_ratio)
+                                wandb.log(wandb_payload)
+                        skipped_steps += 1
+                        stable_batches_for_chunk_growth = 0
+                        optimizer.zero_grad(set_to_none=True)
+                        grad_accum_steps = 0
+                        if scaler is not None:
+                            scaler.update()
+                        if should_log_phase:
+                            print(
+                                f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
+                                f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
+                                f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
+                                f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
+                                f"{rollout_breakdown_suffix}"
+                            )
+                        print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_norm_nonfinite")
+                        if epoch_profiler is not None:
+                            epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
+                            _maybe_emit_profile_interval(
+                                epoch_profiler,
+                                epoch_start_time=epoch_start_time,
+                                epoch_idx=epoch_idx,
+                                batch_idx=batch,
+                                train_profiler_log_every_batches=train_profiler_log_every_batches,
+                                verbose=verbose,
+                            )
+                        if wandb.run is not None:
+                            wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_norm_nonfinite'})
+                        _maybe_step_kernel_profiler(
+                            kernel_profiler,
+                            epoch_idx=batch_epoch_for_profile,
+                            batch_idx=batch,
+                            verbose=verbose,
+                        )
+                        continue
+                    with (
+                        kernel_profiler.phase("pg.step")
+                        if (kernel_profiler is not None and kernel_profiler.enabled())
+                        else nullcontext()
+                    ):
+                        if scaler is None:
+                            optimizer.step()
+                        else:
+                            scaler.step(optimizer)
+                            scaler.update()
+                    batch_optimizer_stepped = True
+                    batch_optimizer_step_value = _extract_optimizer_step(optimizer)
+                    optimizer.zero_grad(set_to_none=True)
+                    grad_accum_steps = 0
                     batch_step_wall += (time.perf_counter() - step_t0)
                     if step_cuda_start is not None:
                         step_cuda_end = torch.cuda.Event(enable_timing=True)
@@ -2312,7 +2408,7 @@ def train_epoch_policy_gradient(
                             start_time_unix=float(step_t_start_unix),
                             end_time_unix=float(step_t_end_unix),
                             extra={
-                                "status": "grad_norm_nonfinite",
+                                "status": "ok",
                                 "chunk_size": int(current_rollout_chunk_size),
                                 "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
                                 "cuda_elapsed_ms": step_cuda_ms,
@@ -2342,213 +2438,111 @@ def train_epoch_policy_gradient(
                             if step_busy_ratio is not None:
                                 wandb_payload["pg_gpu/step_cuda_busy_ratio"] = float(step_busy_ratio)
                             wandb.log(wandb_payload)
-                    skipped_steps += 1
-                    stable_batches_for_chunk_growth = 0
-                    optimizer.zero_grad(set_to_none=True)
-                    grad_accum_steps = 0
-                    if scaler is not None:
-                        scaler.update()
-                    if should_log_phase:
-                        print(
-                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
-                            f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
-                            f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
-                            f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
-                            f"{rollout_breakdown_suffix}"
-                        )
-                    print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=grad_norm_nonfinite")
-                    if epoch_profiler is not None:
-                        epoch_profiler.record_batch(valid=False, batch_size=batch_size, n_samples=n_samples)
-                        _maybe_emit_profile_interval(
-                            epoch_profiler,
-                            epoch_start_time=epoch_start_time,
-                            epoch_idx=epoch_idx,
-                            batch_idx=batch,
-                            train_profiler_log_every_batches=train_profiler_log_every_batches,
-                            verbose=verbose,
-                        )
-                    if wandb.run is not None:
-                        wandb.log({'train_skip': 1, 'train_skip_reason': 'grad_norm_nonfinite'})
-                    _maybe_step_kernel_profiler(
-                        kernel_profiler,
-                        epoch_idx=batch_epoch_for_profile,
+    
+                total_loss += batch_loss.detach().mean()
+                valid_steps += 1
+                try:
+                    batch_objective_value = float(batch_objective.detach().cpu())
+                    if math.isfinite(batch_objective_value):
+                        pg_epoch_objective_values.append(batch_objective_value)
+                except Exception:
+                    pass
+                try:
+                    batch_reward_mean_value = float(batch_reward_mean.detach().cpu())
+                    if math.isfinite(batch_reward_mean_value):
+                        pg_epoch_reward_mean_values.append(batch_reward_mean_value)
+                except Exception:
+                    pass
+                try:
+                    batch_reward_std_value = float(batch_reward_std.detach().cpu())
+                    if math.isfinite(batch_reward_std_value):
+                        pg_epoch_reward_std_values.append(batch_reward_std_value)
+                except Exception:
+                    pass
+                if math.isfinite(batch_reward_absmax_value):
+                    pg_epoch_reward_absmax_values.append(float(batch_reward_absmax_value))
+                if math.isfinite(batch_reward_clip_hit_share):
+                    pg_epoch_clip_hit_values.append(float(batch_reward_clip_hit_share))
+                if math.isfinite(batch_reward_norm_clip_hit_share):
+                    pg_epoch_norm_clip_hit_values.append(float(batch_reward_norm_clip_hit_share))
+                if batch_grad_norm_value is not None and math.isfinite(float(batch_grad_norm_value)):
+                    grad_norm_float = float(batch_grad_norm_value)
+                    pg_epoch_grad_norm_values.append(grad_norm_float)
+                    try:
+                        lr_now = float(optimizer.param_groups[0].get("lr", float("nan")))
+                    except Exception:
+                        lr_now = float("nan")
+                    if math.isfinite(lr_now):
+                        pg_epoch_lr_step_proxy_values.append(abs(lr_now * grad_norm_float))
+                if math.isfinite(batch_rollout_wall):
+                    pg_epoch_rollout_wall_values.append(float(batch_rollout_wall))
+                if math.isfinite(batch_backward_wall):
+                    pg_epoch_backward_wall_values.append(float(batch_backward_wall))
+                if math.isfinite(batch_step_wall):
+                    pg_epoch_step_wall_values.append(float(batch_step_wall))
+                if batch_pg_loss_signature is not None:
+                    pg_epoch_loss_signatures.add(str(batch_pg_loss_signature))
+                if should_log_phase:
+                    grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
+                    opt_step_info = "na" if batch_optimizer_step_value is None else f"{float(batch_optimizer_step_value):.0f}"
+                    reward_min_info = "na" if not math.isfinite(batch_reward_min_value) else f"{batch_reward_min_value:+.3e}"
+                    reward_max_info = "na" if not math.isfinite(batch_reward_max_value) else f"{batch_reward_max_value:+.3e}"
+                    reward_absmax_info = (
+                        "na" if not math.isfinite(batch_reward_absmax_value) else f"{batch_reward_absmax_value:.3e}"
+                    )
+                    print(
+                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
+                        f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
+                        f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
+                        f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
+                        f"objective={float(batch_objective.detach().cpu()):+.3e} "
+                        f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
+                        f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
+                        f"reward_min={reward_min_info} reward_max={reward_max_info} "
+                        f"reward_absmax={reward_absmax_info} "
+                        f"clip_hit={float(batch_reward_clip_hit_share):.3f} "
+                        f"norm_clip_hit={float(batch_reward_norm_clip_hit_share):.3f} "
+                        f"grad_norm={grad_norm_info} "
+                        f"stepped={int(bool(batch_optimizer_stepped))} "
+                        f"opt_step={opt_step_info}"
+                        f"{rollout_breakdown_suffix}"
+                    )
+                if epoch_profiler is not None:
+                    epoch_profiler.record_batch(valid=True, batch_size=batch_size, n_samples=n_samples)
+                    _maybe_emit_profile_interval(
+                        epoch_profiler,
+                        epoch_start_time=epoch_start_time,
+                        epoch_idx=epoch_idx,
                         batch_idx=batch,
+                        train_profiler_log_every_batches=train_profiler_log_every_batches,
                         verbose=verbose,
                     )
-                    continue
-                with (
-                    kernel_profiler.phase("pg.step")
-                    if (kernel_profiler is not None and kernel_profiler.enabled())
-                    else nullcontext()
-                ):
-                    if scaler is None:
-                        optimizer.step()
-                    else:
-                        scaler.step(optimizer)
-                        scaler.update()
-                batch_optimizer_stepped = True
-                batch_optimizer_step_value = _extract_optimizer_step(optimizer)
-                optimizer.zero_grad(set_to_none=True)
-                grad_accum_steps = 0
-                batch_step_wall += (time.perf_counter() - step_t0)
-                if step_cuda_start is not None:
-                    step_cuda_end = torch.cuda.Event(enable_timing=True)
-                    step_cuda_end.record()
-                    step_cuda_pairs.append((step_cuda_start, step_cuda_end))
-                step_t1_unix = time.time()
-                if step_t_start_unix is None:
-                    step_t_start_unix = step_t0_unix
-                step_t_end_unix = step_t1_unix
-                if gpu_observer_active and step_t_start_unix is not None and step_t_end_unix is not None:
-                    step_cuda_ms = None
-                    if step_cuda_pairs and ("cuda" in str(device)) and torch.cuda.is_available():
-                        torch.cuda.synchronize(device)
-                        step_cuda_ms = float(sum(s.elapsed_time(e) for s, e in step_cuda_pairs))
-                    step_dur = float(max(1e-9, step_t_end_unix - step_t_start_unix))
-                    step_busy_ratio = None if step_cuda_ms is None else float((step_cuda_ms / 1000.0) / step_dur)
-                    epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
-                    stage_rec = gpu_observer.record_stage(
-                        epoch=epoch_obs,
-                        batch=int(batch),
-                        stage="step",
-                        start_time_unix=float(step_t_start_unix),
-                        end_time_unix=float(step_t_end_unix),
-                        extra={
-                            "status": "ok",
-                            "chunk_size": int(current_rollout_chunk_size),
-                            "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
-                            "cuda_elapsed_ms": step_cuda_ms,
-                            "cuda_busy_ratio": step_busy_ratio,
-                        },
-                    )
-                    if should_log_phase:
-                        print(
-                            f"[pg-gpu-stage] epoch={epoch_obs} batch={batch} stage=step "
-                            f"{_format_gpu_stage_summary('', stage_rec)} "
-                            f"cuda_ms={'na' if step_cuda_ms is None else f'{step_cuda_ms:.2f}'} "
-                            f"cuda_busy_ratio={'na' if step_busy_ratio is None else f'{step_busy_ratio:.3f}'}"
+                if rollout_chunk_autotune_active and current_rollout_chunk_size < rollout_chunk_cap:
+                    stable_batches_for_chunk_growth += 1
+                    if stable_batches_for_chunk_growth >= rollout_chunk_grow_every:
+                        grown = int(
+                            min(
+                                rollout_chunk_cap,
+                                max(
+                                    current_rollout_chunk_size + 1,
+                                    int(math.ceil(current_rollout_chunk_size * rollout_chunk_grow_factor)),
+                                ),
+                            )
                         )
-                    if wandb.run is not None:
-                        wandb_payload = {
-                            "pg_gpu/step_samples": int(stage_rec.get("samples", 0) or 0),
-                            "pg_gpu/step_gpu_util_avg": stage_rec.get("gpu_util_avg"),
-                            "pg_gpu/step_gpu_util_max": stage_rec.get("gpu_util_max"),
-                            "pg_gpu/step_proc_mem_avg_mib": stage_rec.get("process_mem_avg_mib"),
-                            "pg_gpu/step_proc_mem_max_mib": stage_rec.get("process_mem_max_mib"),
-                            "pg_gpu/step_proc_mem_share_avg": stage_rec.get("process_mem_share_avg"),
-                            "pg_gpu/step_proc_sm_util_avg": stage_rec.get("process_sm_util_avg"),
-                            "pg_gpu/step_proc_mem_util_avg": stage_rec.get("process_mem_util_avg"),
-                        }
-                        if step_cuda_ms is not None:
-                            wandb_payload["pg_gpu/step_cuda_elapsed_ms"] = float(step_cuda_ms)
-                        if step_busy_ratio is not None:
-                            wandb_payload["pg_gpu/step_cuda_busy_ratio"] = float(step_busy_ratio)
-                        wandb.log(wandb_payload)
-
-            total_loss += batch_loss.detach().mean()
-            valid_steps += 1
-            try:
-                batch_objective_value = float(batch_objective.detach().cpu())
-                if math.isfinite(batch_objective_value):
-                    pg_epoch_objective_values.append(batch_objective_value)
-            except Exception:
-                pass
-            try:
-                batch_reward_mean_value = float(batch_reward_mean.detach().cpu())
-                if math.isfinite(batch_reward_mean_value):
-                    pg_epoch_reward_mean_values.append(batch_reward_mean_value)
-            except Exception:
-                pass
-            try:
-                batch_reward_std_value = float(batch_reward_std.detach().cpu())
-                if math.isfinite(batch_reward_std_value):
-                    pg_epoch_reward_std_values.append(batch_reward_std_value)
-            except Exception:
-                pass
-            if math.isfinite(batch_reward_absmax_value):
-                pg_epoch_reward_absmax_values.append(float(batch_reward_absmax_value))
-            if math.isfinite(batch_reward_clip_hit_share):
-                pg_epoch_clip_hit_values.append(float(batch_reward_clip_hit_share))
-            if math.isfinite(batch_reward_norm_clip_hit_share):
-                pg_epoch_norm_clip_hit_values.append(float(batch_reward_norm_clip_hit_share))
-            if batch_grad_norm_value is not None and math.isfinite(float(batch_grad_norm_value)):
-                grad_norm_float = float(batch_grad_norm_value)
-                pg_epoch_grad_norm_values.append(grad_norm_float)
-                try:
-                    lr_now = float(optimizer.param_groups[0].get("lr", float("nan")))
-                except Exception:
-                    lr_now = float("nan")
-                if math.isfinite(lr_now):
-                    pg_epoch_lr_step_proxy_values.append(abs(lr_now * grad_norm_float))
-            if math.isfinite(batch_rollout_wall):
-                pg_epoch_rollout_wall_values.append(float(batch_rollout_wall))
-            if math.isfinite(batch_backward_wall):
-                pg_epoch_backward_wall_values.append(float(batch_backward_wall))
-            if math.isfinite(batch_step_wall):
-                pg_epoch_step_wall_values.append(float(batch_step_wall))
-            if batch_pg_loss_signature is not None:
-                pg_epoch_loss_signatures.add(str(batch_pg_loss_signature))
-            if should_log_phase:
-                grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
-                opt_step_info = "na" if batch_optimizer_step_value is None else f"{float(batch_optimizer_step_value):.0f}"
-                reward_min_info = "na" if not math.isfinite(batch_reward_min_value) else f"{batch_reward_min_value:+.3e}"
-                reward_max_info = "na" if not math.isfinite(batch_reward_max_value) else f"{batch_reward_max_value:+.3e}"
-                reward_absmax_info = (
-                    "na" if not math.isfinite(batch_reward_absmax_value) else f"{batch_reward_absmax_value:.3e}"
-                )
-                print(
-                    f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
-                    f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
-                    f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
-                    f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
-                    f"objective={float(batch_objective.detach().cpu()):+.3e} "
-                    f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
-                    f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
-                    f"reward_min={reward_min_info} reward_max={reward_max_info} "
-                    f"reward_absmax={reward_absmax_info} "
-                    f"clip_hit={float(batch_reward_clip_hit_share):.3f} "
-                    f"norm_clip_hit={float(batch_reward_norm_clip_hit_share):.3f} "
-                    f"grad_norm={grad_norm_info} "
-                    f"stepped={int(bool(batch_optimizer_stepped))} "
-                    f"opt_step={opt_step_info}"
-                    f"{rollout_breakdown_suffix}"
-                )
-            if epoch_profiler is not None:
-                epoch_profiler.record_batch(valid=True, batch_size=batch_size, n_samples=n_samples)
-                _maybe_emit_profile_interval(
-                    epoch_profiler,
-                    epoch_start_time=epoch_start_time,
-                    epoch_idx=epoch_idx,
+                        if grown > current_rollout_chunk_size:
+                            current_rollout_chunk_size = grown
+                            print(
+                                f"[pg-autotune] epoch={batch_epoch_for_profile} batch={batch} "
+                                f"increasing policy rollout chunk size to {current_rollout_chunk_size}"
+                            )
+                        stable_batches_for_chunk_growth = 0
+                _maybe_step_kernel_profiler(
+                    kernel_profiler,
+                    epoch_idx=batch_epoch_for_profile,
                     batch_idx=batch,
-                    train_profiler_log_every_batches=train_profiler_log_every_batches,
                     verbose=verbose,
                 )
-            if rollout_chunk_autotune_active and current_rollout_chunk_size < rollout_chunk_cap:
-                stable_batches_for_chunk_growth += 1
-                if stable_batches_for_chunk_growth >= rollout_chunk_grow_every:
-                    grown = int(
-                        min(
-                            rollout_chunk_cap,
-                            max(
-                                current_rollout_chunk_size + 1,
-                                int(math.ceil(current_rollout_chunk_size * rollout_chunk_grow_factor)),
-                            ),
-                        )
-                    )
-                    if grown > current_rollout_chunk_size:
-                        current_rollout_chunk_size = grown
-                        print(
-                            f"[pg-autotune] epoch={batch_epoch_for_profile} batch={batch} "
-                            f"increasing policy rollout chunk size to {current_rollout_chunk_size}"
-                        )
-                    stable_batches_for_chunk_growth = 0
-            _maybe_step_kernel_profiler(
-                kernel_profiler,
-                epoch_idx=batch_epoch_for_profile,
-                batch_idx=batch,
-                verbose=verbose,
-            )
-
+    
     if grad_accum_steps > 0:
         optimizer.zero_grad(set_to_none=True)
 

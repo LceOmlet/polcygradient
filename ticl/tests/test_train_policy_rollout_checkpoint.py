@@ -581,7 +581,7 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
     assert calls == [1, 1, 1, 1, 1]
 
 
-def test_policy_env_replay_steps_reuses_same_environment_config_across_updates():
+def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch():
     _seed_everything(20260315)
     model = _build_tiny_policy_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -683,6 +683,7 @@ def test_policy_env_replay_steps_reuses_same_environment_config_across_updates()
     assert env_prior.eval_calls == 1
     assert env_prior.hyper_calls == 1
     assert env_prior.seed_calls == 1
+    # One outer batch step, with 3 inner rollout->update cycles.
     assert step_count["n"] == 3
     assert len(calls) == 3
     assert all(call["batch_size"] == 2 for call in calls)
