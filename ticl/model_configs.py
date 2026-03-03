@@ -19,7 +19,8 @@ def get_optimizer_config():
         "pg_oom_debug_raise": False,
         "pg_kv_cache_mode": "auto",
         "pg_kv_cache_page_size": None,
-        "pg_tbptt_window": None,
+        "pg_tbptt_window": 64,
+        "pg_env_replay_steps": 1,
         "pg_oom_reduce_tbptt_first": False,
         "pg_torch_compile": False,
         "pg_torch_compile_backend": "inductor",
@@ -467,7 +468,10 @@ def get_rlpfn_default_config():
     # not needed by default and can otherwise shift pressure to host RAM.
     config['optimizer']['pg_saved_tensors_cpu_offload'] = False
     # Enable TBPTT by default for memory/throughput tradeoff.
-    config['optimizer']['pg_tbptt_window'] = 128
+    config['optimizer']['pg_tbptt_window'] = 64
+    # Reuse each sampled environment for multiple sequential
+    # rollout->update cycles to improve signal under fixed task dynamics.
+    config['optimizer']['pg_env_replay_steps'] = 8
     # Keep rollout batch parallel width as large as possible under OOM:
     # shrink TBPTT window first before shrinking rollout chunk.
     config['optimizer']['pg_oom_reduce_tbptt_first'] = True

@@ -58,6 +58,10 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         if "optimizer" not in config:
             config["optimizer"] = {}
         config["optimizer"]["pg_tbptt_window"] = args.optimizer.pg_tbptt_window
+    if _cli_flag_is_set(argv, "--pg-env-replay-steps"):
+        if "optimizer" not in config:
+            config["optimizer"] = {}
+        config["optimizer"]["pg_env_replay_steps"] = args.optimizer.pg_env_replay_steps
     profiler_flags = (
         ("--train-profiler-enabled", "train_profiler_enabled"),
         ("--train-profiler-output-path", "train_profiler_output_path"),
@@ -195,6 +199,11 @@ def main(argv, extra_config=None):
                 print(
                     "[continue-run-override] pg_tbptt_window set from CLI to",
                     config["optimizer"]["pg_tbptt_window"],
+                )
+            if _cli_flag_is_set(argv, "--pg-env-replay-steps"):
+                print(
+                    "[continue-run-override] pg_env_replay_steps set from CLI to",
+                    config["optimizer"]["pg_env_replay_steps"],
                 )
         else:
             print("WARNING warm starting with new settings")

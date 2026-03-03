@@ -73,7 +73,8 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_kernel_profiler_with_stack is False
     assert args.optimizer.train_kernel_profiler_with_flops is False
     assert args.optimizer.train_kernel_profiler_log_every_batches == 0
-    assert args.optimizer.pg_tbptt_window == 128
+    assert args.optimizer.pg_tbptt_window == 64
+    assert args.optimizer.pg_env_replay_steps == 8
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
     assert args.optimizer.pg_saved_tensors_cpu_offload is False
@@ -127,6 +128,17 @@ def test_rlpfn_parser_accepts_pg_tbptt_window_flag():
         ]
     )
     assert args.optimizer.pg_tbptt_window == 128
+
+
+def test_rlpfn_parser_accepts_pg_env_replay_steps_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-env-replay-steps", "4",
+        ]
+    )
+    assert args.optimizer.pg_env_replay_steps == 4
 
 
 def test_rlpfn_parser_accepts_pg_oom_reduce_tbptt_first_flag():
@@ -308,6 +320,14 @@ def test_continue_run_cli_override_applies_pg_tbptt_window():
     argv = ["rlpfn", "--pg-tbptt-window", "128"]
     out = _apply_continue_run_cli_overrides(config, args, argv)
     assert out["optimizer"]["pg_tbptt_window"] == 128
+
+
+def test_continue_run_cli_override_applies_pg_env_replay_steps():
+    config = {"optimizer": {"pg_env_replay_steps": 8}}
+    args = Namespace(optimizer=Namespace(pg_env_replay_steps=3))
+    argv = ["rlpfn", "--pg-env-replay-steps", "3"]
+    out = _apply_continue_run_cli_overrides(config, args, argv)
+    assert out["optimizer"]["pg_env_replay_steps"] == 3
 
 
 def test_continue_run_cli_override_applies_train_profiler_flags():

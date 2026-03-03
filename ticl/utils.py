@@ -459,6 +459,25 @@ def make_training_callback(
             with open(log_file, 'a') as f:
                 if config.get("model_type") == "rlpfn":
                     f.write(f'Epoch {epoch} train_loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
+                    pg_diag = getattr(model, "last_pg_epoch_metrics", None)
+                    if isinstance(pg_diag, dict) and len(pg_diag) > 0:
+                        diag_fields = []
+                        for k in sorted(pg_diag.keys()):
+                            v = pg_diag.get(k, None)
+                            if v is None:
+                                continue
+                            if isinstance(v, (bool, np.bool_)):
+                                diag_fields.append(f"{k}={int(v)}")
+                            elif isinstance(v, (int, np.integer)):
+                                diag_fields.append(f"{k}={int(v)}")
+                            elif isinstance(v, (float, np.floating)):
+                                fv = float(v)
+                                if np.isfinite(fv):
+                                    diag_fields.append(f"{k}={fv:.6g}")
+                            else:
+                                diag_fields.append(f"{k}={str(v)}")
+                        if diag_fields:
+                            f.write(f"Epoch {epoch} pg_diag {' '.join(diag_fields)}\n")
                 else:
                     f.write(f'Epoch {epoch} loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
         except Exception as e:

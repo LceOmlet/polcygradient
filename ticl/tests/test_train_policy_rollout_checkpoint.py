@@ -581,6 +581,150 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
     assert calls == [1, 1, 1, 1, 1]
 
 
+def test_policy_env_replay_steps_reuses_same_environment_config_across_updates():
+    _seed_everything(20260315)
+    model = _build_tiny_policy_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dl = _ChunkDebugDL(batch_size=2, n_samples=12, num_features=16, steps=1)
+
+    class _ReplayDebugEnvPrior:
+        def __init__(self):
+            self.eval_calls = 0
+            self.hyper_calls = 0
+            self.seed_calls = 0
+
+        def _sample_single_eval_pos(self, n_samples, single_eval_pos):
+            del single_eval_pos
+            self.eval_calls += 1
+            return max(1, int(n_samples) // 2)
+
+        def _sample_batch_hypers(self, batch_size):
+            self.hyper_calls += 1
+            return [
+                {
+                    "reward_dropout_enabled": False,
+                    "reward_dropout_randomize": False,
+                    "reward_dropout_ratio": 0.0,
+                    "obs_slot_dim": 12,
+                    "action_slot_dim": 2,
+                }
+                for _ in range(int(batch_size))
+            ]
+
+        def _sample_seed_list(self, batch_size):
+            self.seed_calls += 1
+            start = 1000 + (self.seed_calls * 10)
+            return [start + i for i in range(int(batch_size))]
+
+    env_prior = _ReplayDebugEnvPrior()
+
+    import ticl.train as train_mod
+    calls = []
+    step_count = {"n": 0}
+    orig_compute = train_mod._compute_policy_rollout_chunk_loss
+    orig_step = optimizer.step
+
+    def _count_step(*args, **kwargs):
+        step_count["n"] += 1
+        return orig_step(*args, **kwargs)
+
+    def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
+                      single_eval_pos, collect_x, policy_rollout_checkpoint,
+                      policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None,
+                      h_list_override=None, env_seeds_override=None, rollout_seeds_override=None):
+        del env_prior, policy_step_fn, n_samples, num_features, collect_x
+        del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory
+        del pg_tbptt_window, tbptt_loss_sink, rollout_seeds_override
+        calls.append(
+            {
+                "batch_size": int(batch_size),
+                "single_eval_pos": int(single_eval_pos),
+                "h_list_override": h_list_override,
+                "env_seeds_override": env_seeds_override,
+            }
+        )
+        anchor = next(model.parameters()).sum() * 0.0
+        stats = {
+            "objective": torch.zeros((), device=device),
+            "reward_mean": torch.zeros((), device=device),
+            "reward_std": torch.zeros((), device=device),
+        }
+        return anchor, None, stats
+
+    optimizer.step = _count_step
+    train_mod._compute_policy_rollout_chunk_loss = _fake_compute
+    try:
+        loss, _, _ = train_epoch_policy_gradient(
+            model=model,
+            aggregate_k_gradients=1,
+            using_dist=False,
+            scaler=None,
+            dl=dl,
+            device="cpu",
+            optimizer=optimizer,
+            env_prior=env_prior,
+            policy_rollout_chunk_size=2,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=False,
+            pg_grad_mutable_kv_cache=False,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=False,
+            pg_torch_compile=False,
+            pg_env_replay_steps=3,
+            progress_bar=False,
+        )
+    finally:
+        optimizer.step = orig_step
+        train_mod._compute_policy_rollout_chunk_loss = orig_compute
+
+    assert torch.isfinite(torch.tensor(loss))
+    assert env_prior.eval_calls == 1
+    assert env_prior.hyper_calls == 1
+    assert env_prior.seed_calls == 1
+    assert step_count["n"] == 3
+    assert len(calls) == 3
+    assert all(call["batch_size"] == 2 for call in calls)
+    assert all(call["single_eval_pos"] == calls[0]["single_eval_pos"] for call in calls)
+    assert all(call["h_list_override"] == calls[0]["h_list_override"] for call in calls)
+    assert all(call["env_seeds_override"] == calls[0]["env_seeds_override"] for call in calls)
+
+
+def test_policy_env_replay_steps_requires_no_grad_accumulation():
+    _seed_everything(20260316)
+    model = _build_tiny_policy_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dl = _ChunkDebugDL(batch_size=2, n_samples=12, num_features=16, steps=1)
+    env_prior = _ChunkDebugEnvPrior()
+
+    raised = False
+    try:
+        train_epoch_policy_gradient(
+            model=model,
+            aggregate_k_gradients=2,
+            using_dist=False,
+            scaler=None,
+            dl=dl,
+            device="cpu",
+            optimizer=optimizer,
+            env_prior=env_prior,
+            policy_rollout_chunk_size=2,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=False,
+            pg_grad_mutable_kv_cache=False,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=False,
+            pg_torch_compile=False,
+            pg_env_replay_steps=3,
+            progress_bar=False,
+        )
+    except ValueError as e:
+        raised = True
+        assert "aggregate_k_gradients == 1" in str(e)
+    assert raised
+
+
 def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
     _seed_everything(20260313)
     model = _build_tiny_policy_model()

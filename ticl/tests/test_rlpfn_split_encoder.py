@@ -50,7 +50,8 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["train_kernel_profiler_with_stack"] is False
     assert cfg["optimizer"]["train_kernel_profiler_with_flops"] is False
     assert cfg["optimizer"]["train_kernel_profiler_log_every_batches"] == 0
-    assert cfg["optimizer"]["pg_tbptt_window"] == 128
+    assert cfg["optimizer"]["pg_tbptt_window"] == 64
+    assert cfg["optimizer"]["pg_env_replay_steps"] == 8
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["prior"]["environment"]["lipschitz_enforce"] is True

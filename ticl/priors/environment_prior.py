@@ -3350,6 +3350,9 @@ class EnvironmentPrior:
         collect_runtime_info=True,
         tbptt_window=None,
         tbptt_reward_sink=None,
+        h_list_override=None,
+        env_seeds_override=None,
+        rollout_seeds_override=None,
     ):
         """
         Differentiable rollout for policy optimization.
@@ -3374,9 +3377,24 @@ class EnvironmentPrior:
         backend = self._resolve_batch_parallel_backend()
         strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
         grouping_mode = self._resolve_batch_vectorized_grouping()
-        h_list = self._sample_batch_hypers(batch_size)
-        env_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
-        rollout_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
+        if h_list_override is not None:
+            if len(h_list_override) != batch_size:
+                raise ValueError("h_list_override length must match batch_size")
+            h_list = list(h_list_override)
+        else:
+            h_list = self._sample_batch_hypers(batch_size)
+        if env_seeds_override is not None:
+            if len(env_seeds_override) != batch_size:
+                raise ValueError("env_seeds_override length must match batch_size")
+            env_seeds = [int(s) for s in env_seeds_override]
+        else:
+            env_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
+        if rollout_seeds_override is not None:
+            if len(rollout_seeds_override) != batch_size:
+                raise ValueError("rollout_seeds_override length must match batch_size")
+            rollout_seeds = [int(s) for s in rollout_seeds_override]
+        else:
+            rollout_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
 
         if backend == "torch_vectorized":
             effective_grouping_mode = str(grouping_mode)
@@ -3664,6 +3682,9 @@ class EnvironmentPrior:
         collect_x=False,
         tbptt_window=None,
         tbptt_loss_sink=None,
+        h_list_override=None,
+        env_seeds_override=None,
+        rollout_seeds_override=None,
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
@@ -3688,6 +3709,9 @@ class EnvironmentPrior:
                 single_eval_pos=single_eval_pos,
                 collect_x=collect_x,
                 collect_runtime_info=False,
+                h_list_override=h_list_override,
+                env_seeds_override=env_seeds_override,
+                rollout_seeds_override=rollout_seeds_override,
             )
             loss, stats = self.policy_gradient_loss_from_rewards(
                 rewards=rollout["rewards"],
@@ -3774,6 +3798,9 @@ class EnvironmentPrior:
             collect_runtime_info=False,
             tbptt_window=tbptt_window_size,
             tbptt_reward_sink=_tbptt_reward_sink,
+            h_list_override=h_list_override,
+            env_seeds_override=env_seeds_override,
+            rollout_seeds_override=rollout_seeds_override,
         )
 
         if tbptt_loss_sink is None:

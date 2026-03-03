@@ -115,6 +115,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Paged KV-cache page size for policy-gradient rollout when pg-kv-cache-mode=paged.')
     optimizer.add_argument('--pg-tbptt-window', type=int,
                            help='Truncated-BPTT window length over rollout time steps; None/<=0 keeps full-horizon policy-gradient semantics.')
+    optimizer.add_argument('--pg-env-replay-steps', type=int,
+                           help='For policy-gradient objective, number of sequential rollout->optimize updates to run on the same sampled batch environment before sampling the next batch environment.')
     optimizer.add_argument('--pg-oom-reduce-tbptt-first', type=str2bool,
                            help='When policy-gradient OOM fallback is enabled, reduce TBPTT window before shrinking rollout chunk size.')
     optimizer.add_argument('--pg-torch-compile', type=str2bool,

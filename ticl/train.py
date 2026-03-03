@@ -586,6 +586,30 @@ def _restore_rng_state(state):
         torch.cuda.set_rng_state(state["torch_cuda"], device=state["cuda_device"])
 
 
+def _freeze_env_h_list_for_replay(env_prior, h_list):
+    if h_list is None:
+        return None
+    ratio_sampler = getattr(env_prior, "_sample_reward_dropout_ratio", None)
+    frozen = []
+    for h in h_list:
+        if isinstance(h, dict):
+            h_frozen = dict(h)
+        else:
+            h_frozen = h
+        if isinstance(h_frozen, dict):
+            reward_dropout_enabled = bool(h_frozen.get("reward_dropout_enabled", True))
+            reward_dropout_randomize = bool(h_frozen.get("reward_dropout_randomize", True))
+            if reward_dropout_enabled and reward_dropout_randomize:
+                if callable(ratio_sampler):
+                    ratio = float(ratio_sampler(h_frozen))
+                else:
+                    ratio = float(h_frozen.get("reward_dropout_ratio", 0.0))
+                h_frozen["reward_dropout_randomize"] = False
+                h_frozen["reward_dropout_ratio"] = float(max(0.0, min(1.0, ratio)))
+        frozen.append(h_frozen)
+    return frozen
+
+
 def _compute_policy_rollout_chunk_loss(
     env_prior,
     policy_step_fn,
@@ -602,7 +626,18 @@ def _compute_policy_rollout_chunk_loss(
     pg_saved_tensors_pin_memory=True,
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
+    h_list_override=None,
+    env_seeds_override=None,
+    rollout_seeds_override=None,
 ):
+    rollout_kwargs = {}
+    if h_list_override is not None:
+        rollout_kwargs["h_list_override"] = h_list_override
+    if env_seeds_override is not None:
+        rollout_kwargs["env_seeds_override"] = env_seeds_override
+    if rollout_seeds_override is not None:
+        rollout_kwargs["rollout_seeds_override"] = rollout_seeds_override
+
     if tbptt_loss_sink is not None:
         # True TBPTT mode: window loss is backpropagated as soon as the window ends.
         # This keeps memory bounded by one TBPTT window and is incompatible with
@@ -621,6 +656,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=tbptt_loss_sink,
+                **rollout_kwargs,
             )
 
     if not policy_rollout_checkpoint:
@@ -638,6 +674,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=None,
+                **rollout_kwargs,
             )
 
     rng_state = _capture_rng_state(device)
@@ -660,6 +697,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=None,
+                **rollout_kwargs,
             )
         return (
             pg_loss_inner,
@@ -968,6 +1006,7 @@ def train_epoch_policy_gradient(
     pg_kv_cache_mode="auto",
     pg_kv_cache_page_size=None,
     pg_tbptt_window=None,
+    pg_env_replay_steps=1,
     pg_oom_reduce_tbptt_first=False,
     pg_torch_compile=False,
     pg_torch_compile_backend="inductor",
@@ -990,9 +1029,32 @@ def train_epoch_policy_gradient(
     valid_steps = torch.tensor(0.0, device=device)
     skipped_steps = 0
     grad_accum_steps = 0
+    try:
+        pg_env_replay_steps = int(pg_env_replay_steps)
+    except Exception:
+        pg_env_replay_steps = 1
+    pg_env_replay_steps = max(1, pg_env_replay_steps)
+    if pg_env_replay_steps > 1 and int(aggregate_k_gradients) != 1:
+        raise ValueError(
+            "pg_env_replay_steps > 1 requires aggregate_k_gradients == 1 "
+            "so each replay rollout is followed by exactly one optimizer step."
+        )
     requires_midaccum_grad_finite_check = aggregate_k_gradients > 1
+    pg_epoch_objective_values = []
+    pg_epoch_reward_mean_values = []
+    pg_epoch_reward_std_values = []
+    pg_epoch_reward_absmax_values = []
+    pg_epoch_clip_hit_values = []
+    pg_epoch_norm_clip_hit_values = []
+    pg_epoch_grad_norm_values = []
+    pg_epoch_lr_step_proxy_values = []
+    pg_epoch_rollout_wall_values = []
+    pg_epoch_backward_wall_values = []
+    pg_epoch_step_wall_values = []
+    pg_epoch_loss_signatures = set()
 
-    steps_per_epoch = len(dl)
+    base_steps_per_epoch = int(len(dl))
+    steps_per_epoch = int(base_steps_per_epoch * pg_env_replay_steps)
     assert steps_per_epoch % aggregate_k_gradients == 0, 'Please set the number of steps per epoch s.t. `aggregate_k_gradients` divides it.'
     optimizer.zero_grad(set_to_none=True)
     batch_size_hint = int(dl.batch_size)
@@ -1119,7 +1181,18 @@ def train_epoch_policy_gradient(
         desc = f"Epoch {epoch_idx}" if epoch_idx is not None else "Epoch"
         iterator = tqdm(iterator, total=steps_per_epoch, desc=desc, unit="step")
 
+    replay_cache_base_batch = None
+    replay_cache_single_eval_pos = None
+    replay_cache_h_list = None
+    replay_cache_env_seeds = None
+
     for batch in iterator:
+        if pg_env_replay_steps > 1:
+            replay_base_batch = int(batch // pg_env_replay_steps)
+            replay_step_idx = int(batch % pg_env_replay_steps)
+        else:
+            replay_base_batch = int(batch)
+            replay_step_idx = 0
         if pg_mem_guard_enabled and device_obj.type == "cuda" and torch.cuda.is_available():
             try:
                 mem_alloc = int(torch.cuda.memory_allocated(device_obj))
@@ -1146,13 +1219,34 @@ def train_epoch_policy_gradient(
                 or (((batch + 1) % pg_phase_log_every) == 0)
             )
         )
+        replay_phase_suffix = ""
+        if pg_env_replay_steps > 1:
+            replay_phase_suffix = (
+                f" base_batch={replay_base_batch}"
+                f" replay_step={replay_step_idx + 1}/{pg_env_replay_steps}"
+            )
         if using_dist and not ((grad_accum_steps + 1) == aggregate_k_gradients):
             cm = model.no_sync()
         else:
             cm = nullcontext()
 
         with cm:
-            single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
+            if pg_env_replay_steps > 1:
+                if replay_cache_base_batch != replay_base_batch:
+                    replay_cache_base_batch = replay_base_batch
+                    replay_cache_single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
+                    replay_cache_h_list = _freeze_env_h_list_for_replay(
+                        env_prior,
+                        env_prior._sample_batch_hypers(batch_size),
+                    )
+                    replay_cache_env_seeds = env_prior._sample_seed_list(batch_size)
+                single_eval_pos = int(replay_cache_single_eval_pos)
+                batch_h_list_override = replay_cache_h_list
+                batch_env_seeds_override = replay_cache_env_seeds
+            else:
+                single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
+                batch_h_list_override = None
+                batch_env_seeds_override = None
             batch_rng_state = _capture_rng_state(device)
             max_batch_oom_retries = 8
             batch_attempt = 0
@@ -1259,6 +1353,12 @@ def train_epoch_policy_gradient(
                 for chunk_start in range(0, batch_size, current_rollout_chunk_size):
                     chunk_bs = min(current_rollout_chunk_size, batch_size - chunk_start)
                     chunk_weight = float(chunk_bs) / float(batch_size)
+                    chunk_h_list_override = None
+                    chunk_env_seeds_override = None
+                    if batch_h_list_override is not None:
+                        chunk_h_list_override = batch_h_list_override[chunk_start: chunk_start + chunk_bs]
+                    if batch_env_seeds_override is not None:
+                        chunk_env_seeds_override = batch_env_seeds_override[chunk_start: chunk_start + chunk_bs]
                     tbptt_stream_backward_active = (
                         current_tbptt_window is not None and int(current_tbptt_window) > 0
                     )
@@ -1317,6 +1417,11 @@ def train_epoch_policy_gradient(
                                 device=device,
                                 dtype=policy_autocast_dtype,
                             ):
+                                rollout_override_kwargs = {}
+                                if chunk_h_list_override is not None:
+                                    rollout_override_kwargs["h_list_override"] = chunk_h_list_override
+                                if chunk_env_seeds_override is not None:
+                                    rollout_override_kwargs["env_seeds_override"] = chunk_env_seeds_override
                                 pg_loss_chunk, rollout_chunk, pg_stats_chunk = _compute_policy_rollout_chunk_loss(
                                     env_prior=env_prior,
                                     policy_step_fn=policy_step_fn,
@@ -1332,6 +1437,7 @@ def train_epoch_policy_gradient(
                                     pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
                                     pg_tbptt_window=current_tbptt_window,
                                     tbptt_loss_sink=_tbptt_chunk_loss_sink,
+                                    **rollout_override_kwargs,
                                 )
                                 weighted_pg_loss = pg_loss_chunk * chunk_weight
                                 loss = weighted_pg_loss / aggregate_k_gradients
@@ -2041,7 +2147,7 @@ def train_epoch_policy_gradient(
                 grad_accum_steps = 0
                 if should_log_phase:
                     print(
-                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
+                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
@@ -2088,7 +2194,7 @@ def train_epoch_policy_gradient(
                 grad_accum_steps = 0
                 if should_log_phase:
                     print(
-                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
+                        f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
@@ -2244,7 +2350,7 @@ def train_epoch_policy_gradient(
                         scaler.update()
                     if should_log_phase:
                         print(
-                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
+                            f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
@@ -2341,6 +2447,47 @@ def train_epoch_policy_gradient(
 
             total_loss += batch_loss.detach().mean()
             valid_steps += 1
+            try:
+                batch_objective_value = float(batch_objective.detach().cpu())
+                if math.isfinite(batch_objective_value):
+                    pg_epoch_objective_values.append(batch_objective_value)
+            except Exception:
+                pass
+            try:
+                batch_reward_mean_value = float(batch_reward_mean.detach().cpu())
+                if math.isfinite(batch_reward_mean_value):
+                    pg_epoch_reward_mean_values.append(batch_reward_mean_value)
+            except Exception:
+                pass
+            try:
+                batch_reward_std_value = float(batch_reward_std.detach().cpu())
+                if math.isfinite(batch_reward_std_value):
+                    pg_epoch_reward_std_values.append(batch_reward_std_value)
+            except Exception:
+                pass
+            if math.isfinite(batch_reward_absmax_value):
+                pg_epoch_reward_absmax_values.append(float(batch_reward_absmax_value))
+            if math.isfinite(batch_reward_clip_hit_share):
+                pg_epoch_clip_hit_values.append(float(batch_reward_clip_hit_share))
+            if math.isfinite(batch_reward_norm_clip_hit_share):
+                pg_epoch_norm_clip_hit_values.append(float(batch_reward_norm_clip_hit_share))
+            if batch_grad_norm_value is not None and math.isfinite(float(batch_grad_norm_value)):
+                grad_norm_float = float(batch_grad_norm_value)
+                pg_epoch_grad_norm_values.append(grad_norm_float)
+                try:
+                    lr_now = float(optimizer.param_groups[0].get("lr", float("nan")))
+                except Exception:
+                    lr_now = float("nan")
+                if math.isfinite(lr_now):
+                    pg_epoch_lr_step_proxy_values.append(abs(lr_now * grad_norm_float))
+            if math.isfinite(batch_rollout_wall):
+                pg_epoch_rollout_wall_values.append(float(batch_rollout_wall))
+            if math.isfinite(batch_backward_wall):
+                pg_epoch_backward_wall_values.append(float(batch_backward_wall))
+            if math.isfinite(batch_step_wall):
+                pg_epoch_step_wall_values.append(float(batch_step_wall))
+            if batch_pg_loss_signature is not None:
+                pg_epoch_loss_signatures.add(str(batch_pg_loss_signature))
             if should_log_phase:
                 grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
                 opt_step_info = "na" if batch_optimizer_step_value is None else f"{float(batch_optimizer_step_value):.0f}"
@@ -2350,7 +2497,7 @@ def train_epoch_policy_gradient(
                     "na" if not math.isfinite(batch_reward_absmax_value) else f"{batch_reward_absmax_value:.3e}"
                 )
                 print(
-                    f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch} "
+                    f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
                     f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                     f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                     f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
@@ -2412,6 +2559,90 @@ def train_epoch_policy_gradient(
 
     if skipped_steps > 0:
         print(f"[train-skip-summary] skipped={skipped_steps} valid={int(valid_steps.item())} total={steps_per_epoch}")
+
+    def _mean_std(values):
+        if not values:
+            return None, None
+        arr = np.asarray(values, dtype=np.float64)
+        return float(arr.mean()), float(arr.std(ddof=0))
+
+    objective_mean, objective_std = _mean_std(pg_epoch_objective_values)
+    reward_mean_mean, reward_mean_std = _mean_std(pg_epoch_reward_mean_values)
+    reward_std_mean, reward_std_std = _mean_std(pg_epoch_reward_std_values)
+    reward_absmax_mean, reward_absmax_std = _mean_std(pg_epoch_reward_absmax_values)
+    grad_norm_mean, grad_norm_std = _mean_std(pg_epoch_grad_norm_values)
+    step_proxy_mean, step_proxy_std = _mean_std(pg_epoch_lr_step_proxy_values)
+    rollout_wall_mean, _ = _mean_std(pg_epoch_rollout_wall_values)
+    backward_wall_mean, _ = _mean_std(pg_epoch_backward_wall_values)
+    step_wall_mean, _ = _mean_std(pg_epoch_step_wall_values)
+    clip_hit_mean, _ = _mean_std(pg_epoch_clip_hit_values)
+    norm_clip_hit_mean, _ = _mean_std(pg_epoch_norm_clip_hit_values)
+    objective_sign_flips = 0
+    if len(pg_epoch_objective_values) >= 2:
+        objective_sign_flips = sum(
+            1
+            for prev, cur in zip(pg_epoch_objective_values[:-1], pg_epoch_objective_values[1:])
+            if (prev > 0.0 and cur < 0.0) or (prev < 0.0 and cur > 0.0)
+        )
+    objective_flip_rate = (
+        float(objective_sign_flips) / float(max(1, len(pg_epoch_objective_values) - 1))
+        if pg_epoch_objective_values
+        else None
+    )
+    objective_jitter_mean_abs_delta = None
+    if len(pg_epoch_objective_values) >= 2:
+        objective_jitter_mean_abs_delta = float(
+            np.mean(np.abs(np.diff(np.asarray(pg_epoch_objective_values, dtype=np.float64))))
+        )
+    eps_snr = 1e-12
+    objective_snr = None
+    if objective_mean is not None and objective_std is not None:
+        objective_snr = float(abs(objective_mean) / max(eps_snr, objective_std))
+    grad_norm_snr = None
+    if grad_norm_mean is not None and grad_norm_std is not None:
+        grad_norm_snr = float(abs(grad_norm_mean) / max(eps_snr, grad_norm_std))
+    if hasattr(model, "module"):
+        target_model = model.module
+    else:
+        target_model = model
+    target_model.last_pg_epoch_metrics = {
+        "valid_steps": int(valid_steps.item()),
+        "skipped_steps": int(skipped_steps),
+        "env_replay_steps": int(pg_env_replay_steps),
+        "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
+        "objective_mean": objective_mean,
+        "objective_std": objective_std,
+        "objective_snr": objective_snr,
+        "objective_sign_flip_rate": objective_flip_rate,
+        "objective_jitter_mean_abs_delta": objective_jitter_mean_abs_delta,
+        "reward_mean_mean": reward_mean_mean,
+        "reward_mean_std": reward_mean_std,
+        "reward_std_mean": reward_std_mean,
+        "reward_std_std": reward_std_std,
+        "reward_absmax_mean": reward_absmax_mean,
+        "reward_absmax_std": reward_absmax_std,
+        "clip_hit_mean": clip_hit_mean,
+        "norm_clip_hit_mean": norm_clip_hit_mean,
+        "grad_norm_mean": grad_norm_mean,
+        "grad_norm_std": grad_norm_std,
+        "grad_norm_snr": grad_norm_snr,
+        "lr_grad_step_proxy_mean": step_proxy_mean,
+        "lr_grad_step_proxy_std": step_proxy_std,
+        "rollout_wall_mean": rollout_wall_mean,
+        "backward_wall_mean": backward_wall_mean,
+        "step_wall_mean": step_wall_mean,
+        "pg_loss_signature": ",".join(sorted(pg_epoch_loss_signatures)) if pg_epoch_loss_signatures else None,
+    }
+    if verbose and target_model.last_pg_epoch_metrics.get("objective_snr") is not None:
+        print(
+            "[pg-epoch] "
+            f"obj_mean={target_model.last_pg_epoch_metrics['objective_mean']:+.3e} "
+            f"obj_std={target_model.last_pg_epoch_metrics['objective_std']:.3e} "
+            f"obj_snr={target_model.last_pg_epoch_metrics['objective_snr']:.3e} "
+            f"grad_snr={target_model.last_pg_epoch_metrics['grad_norm_snr'] if target_model.last_pg_epoch_metrics['grad_norm_snr'] is not None else 'na'} "
+            f"flip_rate={target_model.last_pg_epoch_metrics['objective_sign_flip_rate'] if target_model.last_pg_epoch_metrics['objective_sign_flip_rate'] is not None else 'na'}"
+        )
+
     mean_loss = float((total_loss / valid_steps * aggregate_k_gradients).detach().cpu())
     _restore_policy_inner_recompute_attn(recompute_snapshot)
     return mean_loss, 0.0, 0.0
@@ -2461,6 +2692,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_kv_cache_mode="auto",
           pg_kv_cache_page_size=None,
           pg_tbptt_window=None,
+          pg_env_replay_steps=1,
           pg_oom_reduce_tbptt_first=False,
           pg_torch_compile=False,
           pg_torch_compile_backend="inductor",
@@ -2694,6 +2926,11 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print("Policy TBPTT window: disabled(full-horizon)")
             else:
                 print("Policy TBPTT window:", int(pg_tbptt_window))
+            try:
+                pg_env_replay_steps_print = int(max(1, int(pg_env_replay_steps)))
+            except Exception:
+                pg_env_replay_steps_print = 1
+            print("Policy env replay steps:", pg_env_replay_steps_print)
             print("Policy OOM reduce TBPTT first:", bool(pg_oom_reduce_tbptt_first))
             if bool(policy_rollout_checkpoint) and (not checkpoint_reentrant_active):
                 if bool(pg_saved_tensors_cpu_offload):
@@ -2863,6 +3100,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     pg_kv_cache_mode=pg_kv_cache_mode,
                     pg_kv_cache_page_size=pg_kv_cache_page_size,
                     pg_tbptt_window=pg_tbptt_window,
+                    pg_env_replay_steps=pg_env_replay_steps,
                     pg_oom_reduce_tbptt_first=pg_oom_reduce_tbptt_first,
                     pg_torch_compile=pg_torch_compile,
                     pg_torch_compile_backend=pg_torch_compile_backend,
