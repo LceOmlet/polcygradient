@@ -1514,7 +1514,12 @@ def train_epoch_policy_gradient(
                     batch_rollout_transition_fused_call_count = 0
                     batch_rollout_transition_fused_group_count = 0
                     batch_rollout_transition_fused_enabled = 0
+                    batch_rollout_transition_fused_oom_microbatch_enabled = 0
+                    batch_rollout_transition_fused_oom_microbatch_fallback_count = 0
+                    batch_rollout_transition_fused_oom_microbatch_calls = 0
+                    batch_rollout_transition_fused_oom_microbatch_min_size = 0
                     batch_rollout_transition_group_count = 0
+                    batch_rollout_transition_group_max_batch = 0
                     batch_rollout_transition_async_enabled = 0
                     batch_rollout_transition_lerp_fusion_enabled = 0
                     batch_rollout_noise_mode = None
@@ -1537,6 +1542,7 @@ def train_epoch_policy_gradient(
                     batch_policy_step_layer_paged_flash_prefix_calls = 0
                     batch_policy_step_layer_paged_flash_merge_calls = 0
                     batch_policy_step_layer_paged_dense_calls = 0
+                    batch_policy_step_layer_paged_recompute_calls = 0
                     batch_compile_warmup_wall = 0.0
                     batch_compile_warmup_ok = None
                     batch_compile_counter_delta_nonzero = 0
@@ -2194,10 +2200,76 @@ def train_epoch_policy_gradient(
                                 )
                             except Exception:
                                 pass
+                        transition_fused_oom_microbatch_enabled = pg_stats_chunk.get(
+                            "rollout_transition_fused_oom_microbatch_enabled",
+                            None,
+                        )
+                        if transition_fused_oom_microbatch_enabled is not None:
+                            try:
+                                batch_rollout_transition_fused_oom_microbatch_enabled = int(
+                                    max(
+                                        int(batch_rollout_transition_fused_oom_microbatch_enabled),
+                                        int(transition_fused_oom_microbatch_enabled),
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        transition_fused_oom_microbatch_fallback_count = pg_stats_chunk.get(
+                            "rollout_transition_fused_oom_microbatch_fallback_count",
+                            None,
+                        )
+                        if transition_fused_oom_microbatch_fallback_count is not None:
+                            try:
+                                batch_rollout_transition_fused_oom_microbatch_fallback_count += int(
+                                    transition_fused_oom_microbatch_fallback_count
+                                )
+                            except Exception:
+                                pass
+                        transition_fused_oom_microbatch_calls = pg_stats_chunk.get(
+                            "rollout_transition_fused_oom_microbatch_calls",
+                            None,
+                        )
+                        if transition_fused_oom_microbatch_calls is not None:
+                            try:
+                                batch_rollout_transition_fused_oom_microbatch_calls += int(
+                                    transition_fused_oom_microbatch_calls
+                                )
+                            except Exception:
+                                pass
+                        transition_fused_oom_microbatch_min_size = pg_stats_chunk.get(
+                            "rollout_transition_fused_oom_microbatch_min_size",
+                            None,
+                        )
+                        if transition_fused_oom_microbatch_min_size is not None:
+                            try:
+                                transition_fused_oom_microbatch_min_size = int(
+                                    transition_fused_oom_microbatch_min_size
+                                )
+                                if transition_fused_oom_microbatch_min_size > 0 and (
+                                    int(batch_rollout_transition_fused_oom_microbatch_min_size) <= 0
+                                    or transition_fused_oom_microbatch_min_size
+                                    < int(batch_rollout_transition_fused_oom_microbatch_min_size)
+                                ):
+                                    batch_rollout_transition_fused_oom_microbatch_min_size = int(
+                                        transition_fused_oom_microbatch_min_size
+                                    )
+                            except Exception:
+                                pass
                         transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
                         if transition_group_count is not None:
                             try:
                                 batch_rollout_transition_group_count += int(transition_group_count)
+                            except Exception:
+                                pass
+                        transition_group_max_batch = pg_stats_chunk.get("rollout_transition_group_max_batch", None)
+                        if transition_group_max_batch is not None:
+                            try:
+                                batch_rollout_transition_group_max_batch = int(
+                                    max(
+                                        int(batch_rollout_transition_group_max_batch),
+                                        int(transition_group_max_batch),
+                                    )
+                                )
                             except Exception:
                                 pass
                         transition_async_enabled = pg_stats_chunk.get("rollout_transition_async_enabled", None)
@@ -2286,6 +2358,9 @@ def train_epoch_policy_gradient(
                                 batch_policy_step_layer_paged_dense_calls += int(
                                     step_profile.get("transformer_layer_paged_path_dense", 0) or 0
                                 )
+                                batch_policy_step_layer_paged_recompute_calls += int(
+                                    step_profile.get("transformer_layer_paged_recompute_calls", 0) or 0
+                                )
     
                     if batch_oom and batch_attempt < max_batch_oom_retries:
                         optimizer.zero_grad(set_to_none=True)
@@ -2350,6 +2425,9 @@ def train_epoch_policy_gradient(
                         )
                         batch_policy_step_layer_paged_dense_calls += int(
                             step_profile_tail.get("transformer_layer_paged_path_dense", 0) or 0
+                        )
+                        batch_policy_step_layer_paged_recompute_calls += int(
+                            step_profile_tail.get("transformer_layer_paged_recompute_calls", 0) or 0
                         )
 
                 if compile_observe_enabled:
@@ -2490,6 +2568,11 @@ def train_epoch_policy_gradient(
                         f" rollout_transition_fused_groups={int(batch_rollout_transition_fused_group_count)}"
                         f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
                     )
+                    if int(batch_rollout_transition_group_max_batch) > 0:
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_group_max_batch="
+                            f"{int(batch_rollout_transition_group_max_batch)}"
+                        )
                     if (
                         int(batch_rollout_transition_fused_enabled) > 0
                         or batch_rollout_transition_fused_launch_wall_ms > 0.0
@@ -2502,6 +2585,23 @@ def train_epoch_policy_gradient(
                             f" rollout_transition_fused_enabled={int(batch_rollout_transition_fused_enabled)}"
                             f" rollout_transition_fused_launch_share={transition_fused_launch_share:.3f}"
                         )
+                    if int(batch_rollout_transition_fused_oom_microbatch_enabled) > 0:
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_fused_oom_microbatch_enabled="
+                            f"{int(batch_rollout_transition_fused_oom_microbatch_enabled)}"
+                        )
+                        if int(batch_rollout_transition_fused_oom_microbatch_fallback_count) > 0:
+                            rollout_breakdown_suffix += (
+                                f" rollout_transition_fused_oom_microbatch_fallbacks="
+                                f"{int(batch_rollout_transition_fused_oom_microbatch_fallback_count)}"
+                                f" rollout_transition_fused_oom_microbatch_calls="
+                                f"{int(batch_rollout_transition_fused_oom_microbatch_calls)}"
+                            )
+                            if int(batch_rollout_transition_fused_oom_microbatch_min_size) > 0:
+                                rollout_breakdown_suffix += (
+                                    f" rollout_transition_fused_oom_microbatch_min_size="
+                                    f"{int(batch_rollout_transition_fused_oom_microbatch_min_size)}"
+                                )
                     if not transition_async_mode:
                         transition_y_share = float(
                             batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
@@ -2624,6 +2724,11 @@ def train_epoch_policy_gradient(
                             f"{batch_policy_step_layer_paged_flash_merge_calls}/"
                             f"{batch_policy_step_layer_paged_dense_calls}"
                         )
+                        if int(batch_policy_step_layer_paged_recompute_calls) > 0:
+                            rollout_breakdown_suffix += (
+                                f" policy_step_paged_recompute_calls="
+                                f"{int(batch_policy_step_layer_paged_recompute_calls)}"
+                            )
                 if rollout_cuda_busy_ratio is not None:
                     rollout_breakdown_suffix += f" rollout_cuda_busy_ratio={rollout_cuda_busy_ratio:.3f}"
                 if backward_cuda_busy_ratio is not None:

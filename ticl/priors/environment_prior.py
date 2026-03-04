@@ -1657,6 +1657,23 @@ class EnvironmentPrior:
                     detached.get("v_pages", None), list
                 ):
                     detached["tail_frozen"] = True
+            # Paged cache can materialize dense prefix views (k_prefix/v_prefix)
+            # as an acceleration structure for flash-prefix routing. These
+            # tensors are derivable from k_pages/v_pages and become redundant
+            # after TBPTT detach, while still occupying substantial VRAM.
+            # Drop them at window boundaries to reduce peak memory; they will be
+            # rebuilt lazily on-demand in forward_step when needed.
+            drop_prefix_env = str(os.environ.get("TICL_POLICY_TBPTT_DETACH_DROP_PREFIX", "1")).strip().lower()
+            drop_prefix_enabled = drop_prefix_env not in {"0", "false", "no", "off"}
+            if (
+                drop_prefix_enabled
+                and detached.get("cache_mode", None) == "paged"
+                and isinstance(detached.get("k_pages", None), list)
+                and isinstance(detached.get("v_pages", None), list)
+            ):
+                detached["k_prefix"] = None
+                detached["v_prefix"] = None
+                detached["prefix_pages"] = 0
             return detached
         return cache
 
@@ -2261,6 +2278,20 @@ class EnvironmentPrior:
         )
         transition_lerp_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_LERP_FUSION", "0")).strip().lower()
         transition_lerp_fusion = bool(transition_lerp_fusion_flag in {"1", "true", "yes", "on"})
+        try:
+            transition_group_max_batch = int(os.environ.get("TICL_POLICY_TRANSITION_GROUP_MAX_BATCH", "0"))
+        except Exception:
+            transition_group_max_batch = 0
+        transition_group_max_batch = int(max(0, transition_group_max_batch))
+        if transition_group_max_batch <= 0:
+            try:
+                tbptt_hint = int(tbptt_window) if tbptt_window is not None else 0
+            except Exception:
+                tbptt_hint = 0
+            # Large TBPTT windows push transition kernels close to VRAM limits.
+            # Split oversized transition subgroups to cap baddbmm workspace peaks.
+            if tbptt_hint >= 128:
+                transition_group_max_batch = 32
         if transition_lerp_fusion:
             def _mix_state_fn(prev_state, next_state, alpha_state):
                 return torch.lerp(prev_state, next_state, alpha_state)
@@ -2283,6 +2314,136 @@ class EnvironmentPrior:
         transition_fused_launch_wall_s = 0.0
         transition_fused_call_count = 0
         transition_fused_group_count = 0
+        transition_oom_microbatch_flag = str(
+            os.environ.get("TICL_POLICY_TRANSITION_OOM_MICROBATCH", "0")
+        ).strip().lower()
+        transition_oom_microbatch_enabled = bool(
+            transition_oom_microbatch_flag in {"1", "true", "yes", "on"}
+            and device_obj.type == "cuda"
+            and torch.cuda.is_available()
+        )
+        try:
+            transition_oom_microbatch_size = int(
+                os.environ.get("TICL_POLICY_TRANSITION_OOM_MICROBATCH_SIZE", "0")
+            )
+        except Exception:
+            transition_oom_microbatch_size = 0
+        transition_oom_microbatch_size = int(max(0, transition_oom_microbatch_size))
+        transition_oom_microbatch_fallback_count = 0
+        transition_oom_microbatch_calls = 0
+        transition_oom_microbatch_min_size = 0
+
+        def _is_oom_exception_local(exc):
+            msg = str(exc).lower()
+            return (
+                ("out of memory" in msg)
+                or ("cuda out of memory" in msg)
+                or ("cuda error: out of memory" in msg)
+                or ("hip out of memory" in msg)
+                or ("xpu out of memory" in msg)
+                or ("mps backend out of memory" in msg)
+            )
+
+        def _call_fused_transition_with_oom_microbatch(
+            transition_generator_fn,
+            env_in_batch,
+            reward_scale_batch,
+            generators_for_noise_batch=None,
+            launch_stream=None,
+        ):
+            nonlocal transition_oom_microbatch_fallback_count
+            nonlocal transition_oom_microbatch_calls
+            nonlocal transition_oom_microbatch_min_size
+
+            def _call_once(inp, reward_scale_view, generators_view, stream_view):
+                if stream_view is not None:
+                    with torch.cuda.stream(stream_view):
+                        if generators_view is None:
+                            x_next_out, reward_raw_out = transition_generator_fn(inp)
+                        else:
+                            x_next_out, reward_raw_out = transition_generator_fn(
+                                inp,
+                                generators_for_noise=generators_view,
+                            )
+                        reward_raw_out = reward_scale_view * reward_raw_out.reshape(-1)
+                else:
+                    if generators_view is None:
+                        x_next_out, reward_raw_out = transition_generator_fn(inp)
+                    else:
+                        x_next_out, reward_raw_out = transition_generator_fn(
+                            inp,
+                            generators_for_noise=generators_view,
+                        )
+                    reward_raw_out = reward_scale_view * reward_raw_out.reshape(-1)
+                return x_next_out, reward_raw_out
+
+            try:
+                x_full, reward_full = _call_once(
+                    env_in_batch,
+                    reward_scale_batch,
+                    generators_for_noise_batch,
+                    launch_stream,
+                )
+                stream_tuple = (launch_stream,) if launch_stream is not None else tuple()
+                return x_full, reward_full, stream_tuple, 1, False
+            except Exception as e:
+                can_fallback = bool(
+                    transition_oom_microbatch_enabled
+                    and _is_oom_exception_local(e)
+                    and int(env_in_batch.shape[0]) > 1
+                )
+                if not can_fallback:
+                    raise
+                transition_oom_microbatch_fallback_count += 1
+                if device_obj.type == "cuda":
+                    torch.cuda.empty_cache()
+                micro_bs = int(max(1, transition_oom_microbatch_size))
+                if transition_oom_microbatch_size <= 0:
+                    micro_bs = int(max(1, int(env_in_batch.shape[0]) // 2))
+                micro_bs = int(min(micro_bs, int(env_in_batch.shape[0])))
+                last_exc = e
+                while True:
+                    x_chunks = []
+                    reward_chunks = []
+                    call_count = 0
+                    failed = False
+                    for start in range(0, int(env_in_batch.shape[0]), micro_bs):
+                        end = int(min(int(env_in_batch.shape[0]), start + micro_bs))
+                        gen_slice = None
+                        if generators_for_noise_batch is not None:
+                            gen_slice = generators_for_noise_batch[start:end]
+                        try:
+                            x_i, reward_i = _call_once(
+                                env_in_batch[start:end],
+                                reward_scale_batch[start:end],
+                                gen_slice,
+                                None,
+                            )
+                        except Exception as inner_e:
+                            if _is_oom_exception_local(inner_e) and micro_bs > 1:
+                                failed = True
+                                last_exc = inner_e
+                                break
+                            raise
+                        x_chunks.append(x_i)
+                        reward_chunks.append(reward_i)
+                        call_count += 1
+                    if not failed:
+                        transition_oom_microbatch_calls += int(call_count)
+                        if (transition_oom_microbatch_min_size <= 0) or (micro_bs < transition_oom_microbatch_min_size):
+                            transition_oom_microbatch_min_size = int(micro_bs)
+                        x_full = x_chunks[0] if len(x_chunks) == 1 else torch.cat(x_chunks, dim=0)
+                        reward_full = (
+                            reward_chunks[0]
+                            if len(reward_chunks) == 1
+                            else torch.cat(reward_chunks, dim=0)
+                        )
+                        return x_full, reward_full, tuple(), int(call_count), True
+                    if micro_bs <= 1:
+                        raise last_exc
+                    if device_obj.type == "cuda":
+                        torch.cuda.empty_cache()
+                    micro_bs = int(max(1, micro_bs // 2))
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -2308,113 +2469,121 @@ class EnvironmentPrior:
 
         transition_groups = []
         for group in structure_groups.values():
-            group_indices = [idx for idx, _ in group]
-            group_h_list = [h for _, h in group]
-            group_env_seeds = (
-                [env_rng_seeds[idx] for idx in group_indices]
-                if env_rng_seeds is not None
-                else None
-            )
-            env_batch = self._sample_environment_family_coarse_batch(
-                h_list=group_h_list,
-                device=device,
-                rng_seeds=group_env_seeds,
-            )
-            group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
-            group_bs = int(group_idx.numel())
+            if transition_group_max_batch > 0 and len(group) > transition_group_max_batch:
+                subgroup_list = [
+                    group[start: start + transition_group_max_batch]
+                    for start in range(0, len(group), transition_group_max_batch)
+                ]
+            else:
+                subgroup_list = [group]
+            for subgroup in subgroup_list:
+                group_indices = [idx for idx, _ in subgroup]
+                group_h_list = [h for _, h in subgroup]
+                group_env_seeds = (
+                    [env_rng_seeds[idx] for idx in group_indices]
+                    if env_rng_seeds is not None
+                    else None
+                )
+                env_batch = self._sample_environment_family_coarse_batch(
+                    h_list=group_h_list,
+                    device=device,
+                    rng_seeds=group_env_seeds,
+                )
+                group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
+                group_bs = int(group_idx.numel())
 
-            state_dims_group = env_batch.get("state_dim_per_sample", None)
-            obs_dims_group = env_batch.get("obs_dim_per_sample", None)
-            action_dims_group = env_batch.get("action_dim_per_sample", None)
-            noise_dims_group = env_batch.get("noise_dim_per_sample", None)
-            zero_pad_dims_group = env_batch.get("zero_pad_dim_per_sample", None)
-            obs_slot_dims_group = env_batch.get("obs_slot_dim_per_sample", None)
-            action_slot_dims_group = env_batch.get("action_slot_dim_per_sample", None)
-            if state_dims_group is None:
-                state_dims_group = torch.full((group_bs,), int(env_batch["state_dim"]), device=device, dtype=torch.long)
-            if obs_dims_group is None:
-                obs_dims_group = torch.full((group_bs,), int(env_batch["obs_dim"]), device=device, dtype=torch.long)
-            if action_dims_group is None:
-                action_dims_group = torch.full((group_bs,), int(env_batch["action_dim"]), device=device, dtype=torch.long)
-            if noise_dims_group is None:
-                noise_dims_group = torch.full((group_bs,), int(env_batch["noise_dim"]), device=device, dtype=torch.long)
-            if zero_pad_dims_group is None:
-                zero_pad_dims_group = torch.full((group_bs,), int(env_batch["zero_pad_dim"]), device=device, dtype=torch.long)
-            if obs_slot_dims_group is None:
-                obs_slot_dims_group = torch.full((group_bs,), int(env_batch["obs_slot_dim"]), device=device, dtype=torch.long)
-            if action_slot_dims_group is None:
-                action_slot_dims_group = torch.full((group_bs,), int(env_batch["action_slot_dim"]), device=device, dtype=torch.long)
+                state_dims_group = env_batch.get("state_dim_per_sample", None)
+                obs_dims_group = env_batch.get("obs_dim_per_sample", None)
+                action_dims_group = env_batch.get("action_dim_per_sample", None)
+                noise_dims_group = env_batch.get("noise_dim_per_sample", None)
+                zero_pad_dims_group = env_batch.get("zero_pad_dim_per_sample", None)
+                obs_slot_dims_group = env_batch.get("obs_slot_dim_per_sample", None)
+                action_slot_dims_group = env_batch.get("action_slot_dim_per_sample", None)
+                if state_dims_group is None:
+                    state_dims_group = torch.full((group_bs,), int(env_batch["state_dim"]), device=device, dtype=torch.long)
+                if obs_dims_group is None:
+                    obs_dims_group = torch.full((group_bs,), int(env_batch["obs_dim"]), device=device, dtype=torch.long)
+                if action_dims_group is None:
+                    action_dims_group = torch.full((group_bs,), int(env_batch["action_dim"]), device=device, dtype=torch.long)
+                if noise_dims_group is None:
+                    noise_dims_group = torch.full((group_bs,), int(env_batch["noise_dim"]), device=device, dtype=torch.long)
+                if zero_pad_dims_group is None:
+                    zero_pad_dims_group = torch.full((group_bs,), int(env_batch["zero_pad_dim"]), device=device, dtype=torch.long)
+                if obs_slot_dims_group is None:
+                    obs_slot_dims_group = torch.full((group_bs,), int(env_batch["obs_slot_dim"]), device=device, dtype=torch.long)
+                if action_slot_dims_group is None:
+                    action_slot_dims_group = torch.full((group_bs,), int(env_batch["action_slot_dim"]), device=device, dtype=torch.long)
 
-            state_dim_g = int(state_dims_group.max().item())
-            obs_dim_g = int(obs_dims_group.max().item())
-            action_dim_g = int(action_dims_group.max().item())
-            noise_dim_g = int(noise_dims_group.max().item())
-            zero_pad_dim_g = int(zero_pad_dims_group.max().item())
+                state_dim_g = int(state_dims_group.max().item())
+                obs_dim_g = int(obs_dims_group.max().item())
+                action_dim_g = int(action_dims_group.max().item())
+                noise_dim_g = int(noise_dims_group.max().item())
+                zero_pad_dim_g = int(zero_pad_dims_group.max().item())
 
-            state_dims[group_idx] = state_dims_group
-            obs_dims[group_idx] = obs_dims_group
-            action_dims[group_idx] = action_dims_group
-            noise_dims[group_idx] = noise_dims_group
-            zero_pad_dims[group_idx] = zero_pad_dims_group
-            obs_slot_dims[group_idx] = obs_slot_dims_group
-            action_slot_dims[group_idx] = action_slot_dims_group
+                state_dims[group_idx] = state_dims_group
+                obs_dims[group_idx] = obs_dims_group
+                action_dims[group_idx] = action_dims_group
+                noise_dims[group_idx] = noise_dims_group
+                zero_pad_dims[group_idx] = zero_pad_dims_group
+                obs_slot_dims[group_idx] = obs_slot_dims_group
+                action_slot_dims[group_idx] = action_slot_dims_group
 
-            init_state_std[group_idx] = env_batch["init_state_std"]
-            init_action_std[group_idx] = env_batch["init_action_std"]
-            state_noise_std[group_idx] = env_batch["state_noise_std"]
-            action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
-            action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
-            reward_scale[group_idx] = env_batch["reward_scale"]
-            reward_clip[group_idx] = env_batch["reward_clip"]
-            alpha[group_idx] = env_batch["alpha"]
-            state_clip[group_idx] = env_batch["state_clip"]
-            reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
-            reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
-            reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
-            for global_idx in group_indices:
-                family_list[global_idx] = str(env_batch["family"])
+                init_state_std[group_idx] = env_batch["init_state_std"]
+                init_action_std[group_idx] = env_batch["init_action_std"]
+                state_noise_std[group_idx] = env_batch["state_noise_std"]
+                action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
+                action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
+                reward_scale[group_idx] = env_batch["reward_scale"]
+                reward_clip[group_idx] = env_batch["reward_clip"]
+                alpha[group_idx] = env_batch["alpha"]
+                state_clip[group_idx] = env_batch["state_clip"]
+                reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
+                reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
+                reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
+                for global_idx in group_indices:
+                    family_list[global_idx] = str(env_batch["family"])
 
-            group_rollout_generators = None
-            if rollout_generators is not None:
-                group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
-            transition_generator = env_batch.get("transition_generator", None)
-            use_fused_transition = bool(callable(transition_generator))
-            if use_fused_transition:
-                transition_fused_group_count += 1
-            group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
-            transition_groups.append(
-                {
-                    "indices": group_idx,
-                    "env": env_batch,
-                    "state_dim": state_dim_g,
-                    "obs_dim": obs_dim_g,
-                    "action_dim": action_dim_g,
-                    "noise_dim": noise_dim_g,
-                    "env_obs_start": state_dim_g,
-                    "env_action_start": state_dim_g + obs_dim_g,
-                    "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
-                    "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
-                    "rollout_generators": group_rollout_generators,
-                    "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
-                    "transition_generator": transition_generator,
-                    "use_fused_transition": use_fused_transition,
-                    "stream_transition": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and use_fused_transition)
-                        else None
-                    ),
-                    "stream_y": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and (not use_fused_transition))
-                        else None
-                    ),
-                    "stream_x": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and (not use_fused_transition))
-                        else None
-                    ),
-                }
-            )
+                group_rollout_generators = None
+                if rollout_generators is not None:
+                    group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
+                transition_generator = env_batch.get("transition_generator", None)
+                use_fused_transition = bool(callable(transition_generator))
+                if use_fused_transition:
+                    transition_fused_group_count += 1
+                group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
+                transition_groups.append(
+                    {
+                        "indices": group_idx,
+                        "env": env_batch,
+                        "state_dim": state_dim_g,
+                        "obs_dim": obs_dim_g,
+                        "action_dim": action_dim_g,
+                        "noise_dim": noise_dim_g,
+                        "env_obs_start": state_dim_g,
+                        "env_action_start": state_dim_g + obs_dim_g,
+                        "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
+                        "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
+                        "rollout_generators": group_rollout_generators,
+                        "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
+                        "transition_generator": transition_generator,
+                        "use_fused_transition": use_fused_transition,
+                        "stream_transition": (
+                            torch.cuda.Stream(device=device_obj)
+                            if (transition_stream_fusion and use_fused_transition)
+                            else None
+                        ),
+                        "stream_y": (
+                            torch.cuda.Stream(device=device_obj)
+                            if (transition_stream_fusion and (not use_fused_transition))
+                            else None
+                        ),
+                        "stream_x": (
+                            torch.cuda.Stream(device=device_obj)
+                            if (transition_stream_fusion and (not use_fused_transition))
+                            else None
+                        ),
+                    }
+                )
 
         # Keep transition subgroups contiguous in memory to avoid per-step
         # index_select/scatter overhead in the rollout hot loop.
@@ -2841,48 +3010,38 @@ class EnvironmentPrior:
                 reward_next_raw_g = None
                 x_next_g = None
                 if use_fused_transition:
-                    if stream_transition is not None:
-                        launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                        with torch.cuda.stream(stream_transition):
-                            if has_rollout_generators:
-                                x_next_g, reward_next_raw_g = transition_generator_g(
-                                    env_in,
-                                    generators_for_noise=group["rollout_generators"],
-                                )
-                            else:
-                                x_next_g, reward_next_raw_g = transition_generator_g(env_in)
-                            reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
+                    fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                    generator_view = group["rollout_generators"] if has_rollout_generators else None
+                    x_next_g, reward_next_raw_g, stream_tuple, fused_call_count_g, _ = (
+                        _call_fused_transition_with_oom_microbatch(
+                            transition_generator_g,
+                            env_in,
+                            reward_scale_g,
+                            generators_for_noise_batch=generator_view,
+                            launch_stream=stream_transition,
+                        )
+                    )
+                    transition_fused_call_count += int(fused_call_count_g)
+                    if len(stream_tuple) > 0:
                         pending_async_group_ops[pending_async_group_count] = (
                             group_slice,
                             alpha_g,
                             state_dim_g,
                             x_next_g,
                             reward_next_raw_g,
-                            (stream_transition,),
+                            stream_tuple,
                         )
                         pending_async_group_count += 1
-                        transition_fused_call_count += 1
-                        if profile_rollout_timing and launch_wall_t0 is not None:
-                            launch_dt = time.perf_counter() - launch_wall_t0
-                            transition_group_launch_wall_s += float(launch_dt)
-                            transition_fused_wall_s += float(launch_dt)
-                            transition_fused_launch_wall_s += float(launch_dt)
                     else:
-                        fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                        if has_rollout_generators:
-                            x_next_g, reward_next_raw_g = transition_generator_g(
-                                env_in,
-                                generators_for_noise=group["rollout_generators"],
-                            )
-                        else:
-                            x_next_g, reward_next_raw_g = transition_generator_g(env_in)
-                        reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
-                        if profile_rollout_timing and fused_wall_t0 is not None:
-                            transition_fused_wall_s += (time.perf_counter() - fused_wall_t0)
-                        transition_fused_call_count += 1
                         state_next_g = _mix_state_fn(state_in, x_next_g, alpha_g)
                         reward_next_raw[group_slice] = reward_next_raw_g
                         state_next[group_slice, :state_dim_g] = state_next_g
+                    if profile_rollout_timing and fused_wall_t0 is not None:
+                        fused_dt = time.perf_counter() - fused_wall_t0
+                        transition_fused_wall_s += float(fused_dt)
+                        if len(stream_tuple) > 0:
+                            transition_group_launch_wall_s += float(fused_dt)
+                            transition_fused_launch_wall_s += float(fused_dt)
                 elif (stream_y is not None) and (stream_x is not None):
                     launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
@@ -3084,6 +3243,7 @@ class EnvironmentPrior:
                 "batch_size": int(batch_size),
                 "noise_mode": noise_mode,
                 "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
+                "transition_group_max_batch": int(transition_group_max_batch),
             }
             if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
                 torch.cuda.synchronize(device=device_obj)
@@ -3113,6 +3273,18 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_call_count"] = int(transition_fused_call_count)
                 rollout_profile["transition_fused_group_count"] = int(transition_fused_group_count)
                 rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
+                rollout_profile["transition_fused_oom_microbatch_enabled"] = int(
+                    bool(transition_oom_microbatch_enabled)
+                )
+                rollout_profile["transition_fused_oom_microbatch_fallback_count"] = int(
+                    transition_oom_microbatch_fallback_count
+                )
+                rollout_profile["transition_fused_oom_microbatch_calls"] = int(
+                    transition_oom_microbatch_calls
+                )
+                rollout_profile["transition_fused_oom_microbatch_min_size"] = int(
+                    transition_oom_microbatch_min_size
+                )
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
                 rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
                 rollout_profile["transition_lerp_fusion_enabled"] = int(bool(transition_lerp_fusion))
@@ -4036,11 +4208,16 @@ class EnvironmentPrior:
                             "transition_fused_call_count": 0,
                             "transition_fused_group_count": 0,
                             "transition_fused_enabled": 0,
+                            "transition_fused_oom_microbatch_enabled": 0,
+                            "transition_fused_oom_microbatch_fallback_count": 0,
+                            "transition_fused_oom_microbatch_calls": 0,
+                            "transition_fused_oom_microbatch_min_size": 0,
                             "transition_group_count": 0,
                             "transition_async_enabled": 0,
                             "transition_lerp_fusion_enabled": 0,
                             "noise_mode": None,
                             "noise_block_size": 0,
+                            "transition_group_max_batch": 0,
                             "steps": int(n_samples),
                             "batch_size": int(batch_size),
                         }
@@ -4086,6 +4263,31 @@ class EnvironmentPrior:
                             int(group_profile.get("transition_fused_enabled", 0) or 0),
                         )
                     )
+                    rollout_profile_acc["transition_fused_oom_microbatch_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_fused_oom_microbatch_enabled", 0) or 0),
+                            int(group_profile.get("transition_fused_oom_microbatch_enabled", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_fused_oom_microbatch_fallback_count"] += int(
+                        group_profile.get("transition_fused_oom_microbatch_fallback_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_fused_oom_microbatch_calls"] += int(
+                        group_profile.get("transition_fused_oom_microbatch_calls", 0) or 0
+                    )
+                    group_microbatch_min_size = int(
+                        group_profile.get("transition_fused_oom_microbatch_min_size", 0) or 0
+                    )
+                    current_microbatch_min_size = int(
+                        rollout_profile_acc.get("transition_fused_oom_microbatch_min_size", 0) or 0
+                    )
+                    if group_microbatch_min_size > 0 and (
+                        current_microbatch_min_size <= 0
+                        or group_microbatch_min_size < current_microbatch_min_size
+                    ):
+                        rollout_profile_acc["transition_fused_oom_microbatch_min_size"] = int(
+                            group_microbatch_min_size
+                        )
                     rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
                     rollout_profile_acc["transition_async_enabled"] = int(
                         max(
@@ -4113,6 +4315,16 @@ class EnvironmentPrior:
                         group_noise_block_size = 0
                     if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
                         rollout_profile_acc["noise_block_size"] = group_noise_block_size
+                    try:
+                        group_transition_group_max_batch = int(
+                            group_profile.get("transition_group_max_batch", 0) or 0
+                        )
+                    except Exception:
+                        group_transition_group_max_batch = 0
+                    if group_transition_group_max_batch > int(
+                        rollout_profile_acc.get("transition_group_max_batch", 0) or 0
+                    ):
+                        rollout_profile_acc["transition_group_max_batch"] = group_transition_group_max_batch
             self.last_rollout_profile = rollout_profile_acc
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
@@ -4381,6 +4593,18 @@ class EnvironmentPrior:
                 stats["rollout_transition_fused_enabled"] = int(
                     rollout_profile.get("transition_fused_enabled", 0) or 0
                 )
+                stats["rollout_transition_fused_oom_microbatch_enabled"] = int(
+                    rollout_profile.get("transition_fused_oom_microbatch_enabled", 0) or 0
+                )
+                stats["rollout_transition_fused_oom_microbatch_fallback_count"] = int(
+                    rollout_profile.get("transition_fused_oom_microbatch_fallback_count", 0) or 0
+                )
+                stats["rollout_transition_fused_oom_microbatch_calls"] = int(
+                    rollout_profile.get("transition_fused_oom_microbatch_calls", 0) or 0
+                )
+                stats["rollout_transition_fused_oom_microbatch_min_size"] = int(
+                    rollout_profile.get("transition_fused_oom_microbatch_min_size", 0) or 0
+                )
                 stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
                 stats["rollout_transition_async_enabled"] = int(
                     rollout_profile.get("transition_async_enabled", 0) or 0
@@ -4390,6 +4614,9 @@ class EnvironmentPrior:
                 )
                 stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
                 stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
+                stats["rollout_transition_group_max_batch"] = int(
+                    rollout_profile.get("transition_group_max_batch", 0) or 0
+                )
             return loss, rollout, stats
 
         reward_sum = None
@@ -4524,6 +4751,18 @@ class EnvironmentPrior:
             stats["rollout_transition_fused_enabled"] = int(
                 rollout_profile.get("transition_fused_enabled", 0) or 0
             )
+            stats["rollout_transition_fused_oom_microbatch_enabled"] = int(
+                rollout_profile.get("transition_fused_oom_microbatch_enabled", 0) or 0
+            )
+            stats["rollout_transition_fused_oom_microbatch_fallback_count"] = int(
+                rollout_profile.get("transition_fused_oom_microbatch_fallback_count", 0) or 0
+            )
+            stats["rollout_transition_fused_oom_microbatch_calls"] = int(
+                rollout_profile.get("transition_fused_oom_microbatch_calls", 0) or 0
+            )
+            stats["rollout_transition_fused_oom_microbatch_min_size"] = int(
+                rollout_profile.get("transition_fused_oom_microbatch_min_size", 0) or 0
+            )
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             stats["rollout_transition_async_enabled"] = int(
                 rollout_profile.get("transition_async_enabled", 0) or 0
@@ -4533,6 +4772,9 @@ class EnvironmentPrior:
             )
             stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
             stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
+            stats["rollout_transition_group_max_batch"] = int(
+                rollout_profile.get("transition_group_max_batch", 0) or 0
+            )
         return loss, rollout, stats
 
     def get_last_coverage(self):

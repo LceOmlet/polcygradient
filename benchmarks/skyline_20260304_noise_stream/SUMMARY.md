@@ -933,3 +933,96 @@ Conclusion:
 
 - `TBPTT=128` is feasible only when reducing rollout chunk, but this causes a major wall-time regression versus current skyline (`~85-90s` class -> `160s`).
 - therefore this pass records feasibility boundary, but does not promote `tbptt=128` as throughput skyline winner under current constraints.
+
+## Continuation pass (2026-03-04 evening): paged-prefix hard probes (fixed-seed)
+
+### Scope
+
+- continue attacking dominant policy-step hotspot without changing `chunk` (`64`) and with fixed workload.
+- target: keep `tbptt=128` stable and reduce memory pressure while preserving `batch_wall_excl_compile_s`.
+- avoid pseudo gains: every probe is fixed-seed and compared by `batch_wall_excl_compile_s` first.
+
+### Code changes in this pass
+
+- `ticl/models/layer.py`
+  - added paged-prefix compact representation toggle:
+    - `TICL_POLICY_PAGED_PREFIX_COMPACT_PAGES` (default `1`).
+  - added gated strict auto-route toggle for prefix maintenance:
+    - `TICL_POLICY_PAGED_PREFIX_AUTO_ROUTE` (default `0`).
+  - rationale:
+    - keep current skyline-safe behavior by default;
+    - enable strict route as an explicit probe path to avoid silent regressions.
+
+### Fixed-seed A/B: compact-pages only (same command/workload)
+
+Logs:
+
+- `compact=0`:
+  `20260304_tbptt128_chunk64_prefixcompact0_ab_seeded.log`
+- `compact=1`:
+  `20260304_tbptt128_chunk64_prefixcompact1_ab_seeded.log`
+
+Observed:
+
+- both runs stay on `tbptt=128`.
+- KPI:
+  - `batch_wall_excl_compile_s`: `99.935 -> 102.938` (`+3.0%`, worse).
+- memory:
+  - peak unchanged at `42.27/43.38 GiB`.
+
+Decision:
+
+- compact-pages alone did not show monotonic gain on the current default route.
+- keep as probe capability; do not claim skyline promotion from this A/B.
+
+### Strict auto-route probes (regression detection)
+
+Logs:
+
+- strict route + compact off:
+  `20260304_tbptt128_chunk64_prefixcompact0_ab_seeded_v2.log`
+- strict route + compact on:
+  `20260304_tbptt128_chunk64_prefixcompact1_ab_seeded_v2.log`
+- strict route + compact on + page16 probe:
+  `20260304_tbptt128_chunk64_prefixcompact1_page16_probe_v2.log`
+- strict route + compact on + recompute:
+  `20260304_tbptt128_chunk64_prefixcompact1_recompute1_probe_v2.log`
+- strict route OOM traceback:
+  `20260304_tbptt128_prefixcompact1_oomtrace_v2.log`
+
+Observed:
+
+- strict route immediately triggers OOM fallback:
+  - `[pg-oom] ... reducing TBPTT window to 64 ...`
+- effective run becomes `tbptt=64`, violating target skyline constraint.
+- OOM traceback pinpoints failure in TBPTT backward stage (small allocation failure near full VRAM):
+  - `CUDA out of memory ... Tried to allocate 46.00 MiB ...`
+- additional mitigations in this pass did not recover `tbptt=128`:
+  - `PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True`
+  - smaller flash-prefix page (`16`)
+  - `TICL_POLICY_PAGED_RECOMPUTE_ATTN=1`
+- recompute probe massively regressed wall:
+  - `batch_wall_excl_compile_s=167.286` (and still fallback to `tbptt=64`).
+
+Decision:
+
+- strict auto-route remains probe-only (gated), not mainline default.
+- recompute path remains non-mainline for this workload.
+
+### Skyline-safe verification after gating
+
+Log:
+
+- `20260304_tbptt128_chunk64_default_after_prefixgate.log`
+
+Observed (default gate off):
+
+- stable: `chunk=64`, `tbptt=128`, `status=ok`.
+- `batch_wall_excl_compile_s=101.060`.
+- peak memory `42.27/43.38 GiB`.
+
+Conclusion:
+
+- this pass improved observability and isolated a strict-route regression class.
+- no new throughput skyline promotion yet.
+- retained default behavior avoids regression while keeping strict probe path available for next hard-kernel pass.

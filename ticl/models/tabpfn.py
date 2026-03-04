@@ -102,6 +102,7 @@ class TabPFN(nn.Module):
             "transformer_layer_paged_path_flash_prefix": 0,
             "transformer_layer_paged_path_flash_merge": 0,
             "transformer_layer_paged_path_dense": 0,
+            "transformer_layer_paged_recompute_calls": 0,
             "transformer_layer_total_wall_s": 0.0,
         }
         self.init_weights()
@@ -128,6 +129,7 @@ class TabPFN(nn.Module):
             "transformer_layer_paged_path_flash_prefix": 0,
             "transformer_layer_paged_path_flash_merge": 0,
             "transformer_layer_paged_path_dense": 0,
+            "transformer_layer_paged_recompute_calls": 0,
             "transformer_layer_total_wall_s": 0.0,
         }
         return stats
@@ -336,6 +338,9 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_paged_path_dense"] += int(
                     transformer_layer_profile.get("paged_path_dense", 0) or 0
                 )
+                stats["transformer_layer_paged_recompute_calls"] += int(
+                    transformer_layer_profile.get("paged_recompute_calls", 0) or 0
+                )
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache
 
@@ -496,6 +501,9 @@ class TabPFN(nn.Module):
                 )
                 stats["transformer_layer_paged_path_dense"] += int(
                     transformer_layer_profile.get("paged_path_dense", 0) or 0
+                )
+                stats["transformer_layer_paged_recompute_calls"] += int(
+                    transformer_layer_profile.get("paged_recompute_calls", 0) or 0
                 )
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache
