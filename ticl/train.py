@@ -12,6 +12,10 @@ from tqdm import tqdm
 from torch.amp import GradScaler, autocast
 from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from torch.utils.checkpoint import checkpoint
+try:
+    import psutil
+except Exception:  # pragma: no cover - optional runtime dependency
+    psutil = None
 
 import ticl.utils as utils
 from ticl.utils import ExponentialLR, ReduceLROnSpike, init_dist
@@ -29,6 +33,18 @@ def _has_nonfinite_gradients(model, device):
         if g is not None:
             has_nonfinite = has_nonfinite | (~torch.isfinite(g).all())
     return bool(has_nonfinite.item())
+
+
+def _get_host_memory_snapshot():
+    if psutil is None:
+        return None
+    try:
+        proc = psutil.Process(os.getpid())
+        rss_gib = float(proc.memory_info().rss) / (1024.0 ** 3)
+        avail_gib = float(psutil.virtual_memory().available) / (1024.0 ** 3)
+        return {"rss_gib": rss_gib, "avail_gib": avail_gib}
+    except Exception:
+        return None
 
 
 def _extract_optimizer_step(optimizer):
@@ -1091,6 +1107,23 @@ def train_epoch_policy_gradient(
         allow_grad_inplace_paged_kv = False
     if (not allow_grad_mutable_kv) or (kv_cache_mode != "paged"):
         allow_grad_inplace_paged_kv = False
+    compile_mode_effective = str(pg_torch_compile_mode)
+    if bool(pg_torch_compile):
+        compile_no_cudagraph_env = str(
+            os.environ.get("TICL_POLICY_COMPILE_NO_CUDAGRAPHS", "auto")
+        ).strip().lower()
+        if compile_no_cudagraph_env in {"1", "true", "yes", "on"}:
+            force_no_cudagraphs = True
+        elif compile_no_cudagraph_env in {"0", "false", "no", "off"}:
+            force_no_cudagraphs = False
+        else:
+            # Mutable paged KV updates are incompatible with cudagraph replay
+            # under dynamic compilation in this rollout workload.
+            force_no_cudagraphs = bool(allow_grad_mutable_kv) and (str(kv_cache_mode) == "paged")
+        if force_no_cudagraphs and str(compile_mode_effective).strip().lower() == "reduce-overhead":
+            # Keep compile startup bounded: use default mode without cudagraph
+            # assumptions instead of max-autotune no-cudagraph mode.
+            compile_mode_effective = "default"
 
     # Reentrant checkpoint is unsafe with in-place-updated static KV cache.
     # Paged cache uses copy-on-write appends and is safe for reentrant.
@@ -1119,10 +1152,15 @@ def train_epoch_policy_gradient(
         allow_grad_inplace_paged_cache=allow_grad_inplace_paged_kv,
         pg_torch_compile=bool(pg_torch_compile),
         pg_torch_compile_backend=str(pg_torch_compile_backend),
-        pg_torch_compile_mode=str(pg_torch_compile_mode),
+        pg_torch_compile_mode=str(compile_mode_effective),
         pg_torch_compile_fullgraph=bool(pg_torch_compile_fullgraph),
         pg_torch_compile_dynamic=bool(pg_torch_compile_dynamic),
     )
+    if bool(pg_torch_compile) and str(compile_mode_effective) != str(pg_torch_compile_mode):
+        print(
+            "[pg-compile-note] adjusted compile mode for mutable paged KV cache: "
+            f"{pg_torch_compile_mode} -> {compile_mode_effective}"
+        )
     model_ref = model.module if hasattr(model, "module") else model
     policy_step_profile_consumer = getattr(model_ref, "consume_policy_step_profile", None)
     batch_size = int(dl.batch_size)
@@ -1133,6 +1171,16 @@ def train_epoch_policy_gradient(
     else:
         tbptt_value = int(pg_tbptt_window)
         current_tbptt_window = tbptt_value if tbptt_value > 0 else None
+    if current_tbptt_window is None:
+        current_tbptt_stream_merge_windows = 1
+    else:
+        try:
+            current_tbptt_stream_merge_windows = int(
+                os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS", "1")
+            )
+        except Exception:
+            current_tbptt_stream_merge_windows = 1
+        current_tbptt_stream_merge_windows = int(max(1, current_tbptt_stream_merge_windows))
     if policy_rollout_chunk_size is None:
         # Default: run rollout chunks at full batch width.
         rollout_chunk_cap = batch_size
@@ -1175,6 +1223,30 @@ def train_epoch_policy_gradient(
     if (not math.isfinite(pg_mem_guard_slack_gb)) or pg_mem_guard_slack_gb < 0.0:
         pg_mem_guard_slack_gb = 3.0
     pg_mem_guard_slack_bytes = int(pg_mem_guard_slack_gb * (1024.0 ** 3))
+    compile_warmup_flag = str(os.environ.get("TICL_POLICY_COMPILE_WARMUP", "1")).strip().lower()
+    compile_warmup_enabled = bool(pg_torch_compile) and (
+        compile_warmup_flag not in {"0", "false", "no", "off"}
+    )
+    try:
+        compile_warmup_steps = int(os.environ.get("TICL_POLICY_COMPILE_WARMUP_STEPS", "1"))
+    except Exception:
+        compile_warmup_steps = 1
+    compile_warmup_steps = int(max(1, compile_warmup_steps))
+    try:
+        compile_warmup_n_samples_cap = int(
+            os.environ.get("TICL_POLICY_COMPILE_WARMUP_SAMPLES", "2")
+        )
+    except Exception:
+        compile_warmup_n_samples_cap = 2
+    compile_warmup_n_samples_cap = int(max(2, compile_warmup_n_samples_cap))
+    try:
+        compile_warmup_chunk_cap = int(
+            os.environ.get("TICL_POLICY_COMPILE_WARMUP_CHUNK", str(batch_size))
+        )
+    except Exception:
+        compile_warmup_chunk_cap = int(batch_size)
+    compile_warmup_chunk_cap = int(max(1, min(int(batch_size), compile_warmup_chunk_cap)))
+    compile_warmup_done = not bool(compile_warmup_enabled)
 
     iterator = range(steps_per_epoch)
     if progress_bar:
@@ -1273,6 +1345,10 @@ def train_epoch_policy_gradient(
                     batch_rollout_wall = 0.0
                     batch_backward_wall = 0.0
                     batch_backward_calls = 0
+                    batch_tbptt_stream_backward_active = False
+                    batch_tbptt_stream_merge_windows = 1
+                    batch_tbptt_stream_backward_launches = 0
+                    batch_tbptt_stream_backward_roots = 0
                     batch_step_wall = 0.0
                     batch_rollout_policy_cuda_ms = 0.0
                     batch_rollout_transition_cuda_ms = 0.0
@@ -1281,9 +1357,15 @@ def train_epoch_policy_gradient(
                     batch_rollout_transition_y_wall_ms = 0.0
                     batch_rollout_transition_x_wall_ms = 0.0
                     batch_rollout_transition_group_wall_ms = 0.0
+                    batch_rollout_transition_group_launch_wall_ms = 0.0
+                    batch_rollout_transition_group_sync_wall_ms = 0.0
                     batch_rollout_transition_env_pack_wall_ms = 0.0
                     batch_rollout_transition_state_update_wall_ms = 0.0
+                    batch_rollout_transition_noise_wall_ms = 0.0
                     batch_rollout_transition_group_count = 0
+                    batch_rollout_transition_async_enabled = 0
+                    batch_rollout_noise_mode = None
+                    batch_rollout_noise_block_size = None
                     batch_policy_step_calls = 0
                     batch_policy_step_encode_ms = 0.0
                     batch_policy_step_transformer_ms = 0.0
@@ -1302,6 +1384,8 @@ def train_epoch_policy_gradient(
                     batch_policy_step_layer_paged_flash_prefix_calls = 0
                     batch_policy_step_layer_paged_flash_merge_calls = 0
                     batch_policy_step_layer_paged_dense_calls = 0
+                    batch_compile_warmup_wall = 0.0
+                    batch_compile_warmup_ok = None
                     batch_pg_loss_signature = None
                     try:
                         sig_fn = getattr(env_prior, "policy_gradient_loss_signature", None)
@@ -1342,6 +1426,77 @@ def train_epoch_policy_gradient(
                     rollout_cuda_pairs = []
                     backward_cuda_pairs = []
                     step_cuda_pairs = []
+
+                    if (not compile_warmup_done) and bool(compile_warmup_enabled):
+                        warmup_chunk_bs = int(
+                            max(1, min(int(current_rollout_chunk_size), int(compile_warmup_chunk_cap)))
+                        )
+                        warmup_n_samples = int(max(2, min(int(n_samples), int(compile_warmup_n_samples_cap))))
+                        if warmup_n_samples < int(n_samples):
+                            warmup_single_eval_pos = int(max(1, min(int(single_eval_pos), warmup_n_samples - 1)))
+                        else:
+                            warmup_single_eval_pos = int(single_eval_pos)
+                        warmup_h_list_override = None
+                        warmup_env_seeds_override = None
+                        if batch_h_list_override is not None:
+                            warmup_h_list_override = batch_h_list_override[:warmup_chunk_bs]
+                        if batch_env_seeds_override is not None:
+                            warmup_env_seeds_override = batch_env_seeds_override[:warmup_chunk_bs]
+                        warmup_rng_state = _capture_rng_state(device)
+                        warmup_t0 = time.perf_counter()
+                        warmup_ok = True
+                        try:
+                            for _ in range(int(compile_warmup_steps)):
+                                with _amp_autocast_context(
+                                    scaler,
+                                    device=device,
+                                    dtype=policy_autocast_dtype,
+                                ):
+                                    _warmup_loss, _, _ = _compute_policy_rollout_chunk_loss(
+                                        env_prior=env_prior,
+                                        policy_step_fn=policy_step_fn,
+                                        batch_size=warmup_chunk_bs,
+                                        n_samples=warmup_n_samples,
+                                        num_features=num_features,
+                                        device=device,
+                                        single_eval_pos=warmup_single_eval_pos,
+                                        collect_x=False,
+                                        policy_rollout_checkpoint=False,
+                                        policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
+                                        pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                                        pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                                        pg_tbptt_window=current_tbptt_window,
+                                        tbptt_loss_sink=None,
+                                        h_list_override=warmup_h_list_override,
+                                        env_seeds_override=warmup_env_seeds_override,
+                                    )
+                                    del _warmup_loss
+                            if device_obj.type == "cuda" and torch.cuda.is_available():
+                                torch.cuda.synchronize(device_obj)
+                        except Exception as warmup_err:
+                            warmup_ok = False
+                            print(
+                                "[pg-compile-warn] compile warmup skipped due to runtime error: "
+                                f"{warmup_err}"
+                            )
+                        finally:
+                            _restore_rng_state(warmup_rng_state)
+                            optimizer.zero_grad(set_to_none=True)
+                            if callable(policy_step_profile_consumer):
+                                try:
+                                    policy_step_profile_consumer()
+                                except Exception:
+                                    pass
+                        compile_warmup_done = True
+                        warmup_dt = float(time.perf_counter() - warmup_t0)
+                        batch_compile_warmup_wall = float(warmup_dt)
+                        batch_compile_warmup_ok = bool(warmup_ok)
+                        print(
+                            "[pg-compile-warmup] "
+                            f"ok={int(bool(warmup_ok))} steps={int(compile_warmup_steps)} "
+                            f"chunk={int(warmup_chunk_bs)} n_samples={int(warmup_n_samples)} "
+                            f"wall_s={warmup_dt:.3f}"
+                        )
     
                     batch_oom = False
                     for chunk_start in range(0, batch_size, current_rollout_chunk_size):
@@ -1356,15 +1511,33 @@ def train_epoch_policy_gradient(
                         tbptt_stream_backward_active = (
                             current_tbptt_window is not None and int(current_tbptt_window) > 0
                         )
+                        tbptt_stream_merge_windows = 1
+                        if tbptt_stream_backward_active:
+                            batch_tbptt_stream_backward_active = True
+                            tbptt_stream_merge_windows = int(max(1, current_tbptt_stream_merge_windows))
+                            batch_tbptt_stream_merge_windows = max(
+                                int(batch_tbptt_stream_merge_windows),
+                                int(tbptt_stream_merge_windows),
+                            )
                         tbptt_window_backward_called = False
+                        tbptt_pending_window_losses = (
+                            []
+                            if tbptt_stream_backward_active and int(tbptt_stream_merge_windows) > 1
+                            else None
+                        )
     
                         if tbptt_stream_backward_active:
                             backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
-    
-                            def _tbptt_chunk_loss_sink(weighted_window_loss):
+
+                            def _tbptt_backward_from_losses(window_losses_scaled):
                                 nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
                                 nonlocal backward_t_start_unix, backward_t_end_unix
-                                window_loss_scaled = weighted_window_loss * backward_scale
+                                nonlocal batch_tbptt_stream_backward_launches, batch_tbptt_stream_backward_roots
+                                if window_losses_scaled is None:
+                                    return
+                                num_roots = int(len(window_losses_scaled))
+                                if num_roots <= 0:
+                                    return
                                 backward_t0_unix = time.time()
                                 backward_t0 = time.perf_counter()
                                 backward_cuda_start = None
@@ -1377,22 +1550,49 @@ def train_epoch_policy_gradient(
                                     else nullcontext()
                                 ):
                                     if scaler is None:
-                                        window_loss_scaled.backward()
+                                        if num_roots == 1:
+                                            window_losses_scaled[0].backward()
+                                        else:
+                                            torch.autograd.backward(window_losses_scaled)
                                     else:
-                                        scaler.scale(window_loss_scaled).backward()
+                                        scaled_losses = [scaler.scale(loss_root) for loss_root in window_losses_scaled]
+                                        if num_roots == 1:
+                                            scaled_losses[0].backward()
+                                        else:
+                                            torch.autograd.backward(scaled_losses)
                                 if backward_cuda_start is not None:
                                     backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_end.record()
                                     backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
                                 batch_backward_wall += (time.perf_counter() - backward_t0)
                                 batch_backward_calls += 1
+                                batch_tbptt_stream_backward_launches += 1
+                                batch_tbptt_stream_backward_roots += int(num_roots)
                                 backward_t1_unix = time.time()
                                 if backward_t_start_unix is None:
                                     backward_t_start_unix = backward_t0_unix
                                 backward_t_end_unix = backward_t1_unix
                                 tbptt_window_backward_called = True
+
+                            def _tbptt_flush_pending_windows():
+                                if tbptt_pending_window_losses is None or (len(tbptt_pending_window_losses) == 0):
+                                    return
+                                merged_losses = list(tbptt_pending_window_losses)
+                                tbptt_pending_window_losses.clear()
+                                _tbptt_backward_from_losses(merged_losses)
+
+                            def _tbptt_chunk_loss_sink(weighted_window_loss):
+                                window_loss_scaled = weighted_window_loss * backward_scale
+                                if tbptt_pending_window_losses is not None:
+                                    tbptt_pending_window_losses.append(window_loss_scaled)
+                                    if len(tbptt_pending_window_losses) < int(tbptt_stream_merge_windows):
+                                        return
+                                    _tbptt_flush_pending_windows()
+                                    return
+                                _tbptt_backward_from_losses([window_loss_scaled])
                         else:
                             _tbptt_chunk_loss_sink = None
+                            _tbptt_flush_pending_windows = None
     
                         try:
                             rollout_t0_unix = time.time()
@@ -1457,6 +1657,8 @@ def train_epoch_policy_gradient(
                                 batch_nonfinite = True
                                 loss_val = float(loss.detach().float().mean().cpu())
                                 break
+                            if tbptt_stream_backward_active and callable(_tbptt_flush_pending_windows):
+                                _tbptt_flush_pending_windows()
     
                             if (not tbptt_stream_backward_active) and loss.requires_grad:
                                 backward_t0_unix = time.time()
@@ -1524,6 +1726,20 @@ def train_epoch_policy_gradient(
                                     "(set --pg-oom-debug-raise false to enable auto chunk fallback)."
                                 )
                                 raise
+                            if tbptt_stream_backward_active and int(current_tbptt_stream_merge_windows) > 1:
+                                current_tbptt_stream_merge_windows = int(
+                                    max(1, int(current_tbptt_stream_merge_windows) // 2)
+                                )
+                                batch_oom = True
+                                if "cuda" in str(device):
+                                    torch.cuda.empty_cache()
+                                gc.collect()
+                                print(
+                                    f"[pg-oom] epoch={batch_epoch_for_profile} batch={batch} "
+                                    f"reducing TBPTT stream merge windows to {int(current_tbptt_stream_merge_windows)} "
+                                    f"(chunk={current_rollout_chunk_size}, tbptt={current_tbptt_window})"
+                                )
+                                break
                             # Some batches hit transient allocator pressure; retry once
                             # with unchanged TBPTT/chunk before degrading configuration.
                             if enable_same_cfg_oom_retry and same_cfg_oom_retries < max_same_cfg_oom_retries:
@@ -1661,6 +1877,22 @@ def train_epoch_policy_gradient(
                                 batch_rollout_transition_group_wall_ms += float(transition_group_wall_ms)
                             except Exception:
                                 pass
+                        transition_group_launch_wall_ms = pg_stats_chunk.get(
+                            "rollout_transition_group_launch_wall_ms", None
+                        )
+                        if transition_group_launch_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_group_launch_wall_ms += float(transition_group_launch_wall_ms)
+                            except Exception:
+                                pass
+                        transition_group_sync_wall_ms = pg_stats_chunk.get(
+                            "rollout_transition_group_sync_wall_ms", None
+                        )
+                        if transition_group_sync_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_group_sync_wall_ms += float(transition_group_sync_wall_ms)
+                            except Exception:
+                                pass
                         transition_env_pack_wall_ms = pg_stats_chunk.get("rollout_transition_env_pack_wall_ms", None)
                         if transition_env_pack_wall_ms is not None:
                             try:
@@ -1673,10 +1905,36 @@ def train_epoch_policy_gradient(
                                 batch_rollout_transition_state_update_wall_ms += float(transition_state_update_wall_ms)
                             except Exception:
                                 pass
+                        transition_noise_wall_ms = pg_stats_chunk.get("rollout_transition_noise_wall_ms", None)
+                        if transition_noise_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_noise_wall_ms += float(transition_noise_wall_ms)
+                            except Exception:
+                                pass
                         transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
                         if transition_group_count is not None:
                             try:
                                 batch_rollout_transition_group_count += int(transition_group_count)
+                            except Exception:
+                                pass
+                        transition_async_enabled = pg_stats_chunk.get("rollout_transition_async_enabled", None)
+                        if transition_async_enabled is not None:
+                            try:
+                                batch_rollout_transition_async_enabled = int(
+                                    max(
+                                        int(batch_rollout_transition_async_enabled),
+                                        int(transition_async_enabled),
+                                    )
+                                )
+                            except Exception:
+                                pass
+                        rollout_noise_mode = pg_stats_chunk.get("rollout_noise_mode", None)
+                        if rollout_noise_mode is not None:
+                            batch_rollout_noise_mode = str(rollout_noise_mode)
+                        rollout_noise_block_size = pg_stats_chunk.get("rollout_noise_block_size", None)
+                        if rollout_noise_block_size is not None:
+                            try:
+                                batch_rollout_noise_block_size = int(rollout_noise_block_size)
                             except Exception:
                                 pass
                         if callable(policy_step_profile_consumer):
@@ -1812,7 +2070,14 @@ def train_epoch_policy_gradient(
                     rollout_cuda_busy_ratio = float((stage_cuda_ms["rollout"] / 1000.0) / max(1e-9, batch_rollout_wall))
                 if stage_cuda_ms["backward"] is not None and batch_backward_wall > 0.0:
                     backward_cuda_busy_ratio = float((stage_cuda_ms["backward"] / 1000.0) / max(1e-9, batch_backward_wall))
-    
+                batch_rollout_backward_overlap_wall = 0.0
+                batch_rollout_forward_est_wall = float(batch_rollout_wall)
+                if batch_tbptt_stream_backward_active and batch_backward_wall > 0.0:
+                    batch_rollout_backward_overlap_wall = float(min(batch_rollout_wall, batch_backward_wall))
+                    batch_rollout_forward_est_wall = float(
+                        max(0.0, batch_rollout_wall - batch_rollout_backward_overlap_wall)
+                    )
+
                 rollout_breakdown_suffix = ""
                 rollout_breakdown_total_ms = batch_rollout_policy_cuda_ms + batch_rollout_transition_cuda_ms
                 if rollout_breakdown_total_ms > 0.0:
@@ -1825,12 +2090,7 @@ def train_epoch_policy_gradient(
                 rollout_wall_total_ms = batch_rollout_policy_wall_ms + batch_rollout_transition_wall_ms
                 if rollout_wall_total_ms > 0.0:
                     rollout_policy_wall_share = float(batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms))
-                    transition_y_share = float(
-                        batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                    )
-                    transition_x_share = float(
-                        batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                    )
+                    transition_async_mode = bool(int(batch_rollout_transition_async_enabled) > 0)
                     transition_group_share = float(
                         batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                     )
@@ -1840,17 +2100,64 @@ def train_epoch_policy_gradient(
                     transition_state_update_share = float(
                         batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                     )
+                    transition_noise_share = float(
+                        batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
                     rollout_breakdown_suffix += (
                         f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
                         f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
                         f" rollout_policy_wall_share={rollout_policy_wall_share:.3f}"
-                        f" rollout_transition_y_share={transition_y_share:.3f}"
-                        f" rollout_transition_x_share={transition_x_share:.3f}"
                         f" rollout_transition_group_share={transition_group_share:.3f}"
                         f" rollout_transition_env_pack_share={transition_env_pack_share:.3f}"
                         f" rollout_transition_state_update_share={transition_state_update_share:.3f}"
+                        f" rollout_transition_noise_share={transition_noise_share:.3f}"
                         f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
                     )
+                    if not transition_async_mode:
+                        transition_y_share = float(
+                            batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        transition_x_share = float(
+                            batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_y_share={transition_y_share:.3f}"
+                            f" rollout_transition_x_share={transition_x_share:.3f}"
+                        )
+                    if (
+                        int(batch_rollout_transition_async_enabled) > 0
+                        or batch_rollout_transition_group_launch_wall_ms > 0.0
+                        or batch_rollout_transition_group_sync_wall_ms > 0.0
+                    ):
+                        transition_group_launch_share = float(
+                            batch_rollout_transition_group_launch_wall_ms
+                            / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        transition_group_sync_share = float(
+                            batch_rollout_transition_group_sync_wall_ms
+                            / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_async_enabled={int(batch_rollout_transition_async_enabled)}"
+                            f" rollout_transition_group_launch_share={transition_group_launch_share:.3f}"
+                            f" rollout_transition_group_sync_share={transition_group_sync_share:.3f}"
+                        )
+                if batch_rollout_noise_mode is not None:
+                    rollout_breakdown_suffix += f" rollout_noise_mode={batch_rollout_noise_mode}"
+                if batch_rollout_noise_block_size is not None:
+                    rollout_breakdown_suffix += (
+                        f" rollout_noise_block_size={int(batch_rollout_noise_block_size)}"
+                    )
+                if batch_compile_warmup_wall > 0.0:
+                    batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
+                    batch_wall_incl_compile = float(batch_wall_excl_compile + batch_compile_warmup_wall)
+                    rollout_breakdown_suffix += (
+                        f" compile_warmup_s={batch_compile_warmup_wall:.3f}"
+                        f" batch_wall_excl_compile_s={batch_wall_excl_compile:.3f}"
+                        f" batch_wall_incl_compile_s={batch_wall_incl_compile:.3f}"
+                    )
+                    if batch_compile_warmup_ok is not None:
+                        rollout_breakdown_suffix += f" compile_warmup_ok={int(bool(batch_compile_warmup_ok))}"
                 if batch_policy_step_total_ms > 0.0:
                     policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
                     policy_step_transformer_share = float(
@@ -1919,8 +2226,30 @@ def train_epoch_policy_gradient(
                     rollout_breakdown_suffix += f" rollout_cuda_busy_ratio={rollout_cuda_busy_ratio:.3f}"
                 if backward_cuda_busy_ratio is not None:
                     rollout_breakdown_suffix += f" backward_cuda_busy_ratio={backward_cuda_busy_ratio:.3f}"
+                if batch_tbptt_stream_backward_active:
+                    rollout_instage_backward_share = float(
+                        batch_rollout_backward_overlap_wall / max(1e-9, batch_rollout_wall)
+                    )
+                    tbptt_stream_merge_eff = float(
+                        batch_tbptt_stream_backward_roots / max(1, batch_tbptt_stream_backward_launches)
+                    )
+                    rollout_breakdown_suffix += (
+                        f" tbptt_stream_merge_windows={int(batch_tbptt_stream_merge_windows)}"
+                        f" tbptt_stream_backward_calls={int(batch_tbptt_stream_backward_launches)}"
+                        f" tbptt_stream_backward_roots={int(batch_tbptt_stream_backward_roots)}"
+                        f" tbptt_stream_merge_effective={tbptt_stream_merge_eff:.2f}"
+                        f" rollout_forward_est_s={batch_rollout_forward_est_wall:.3f}"
+                        f" rollout_instage_backward_s={batch_rollout_backward_overlap_wall:.3f}"
+                        f" rollout_instage_backward_share={rollout_instage_backward_share:.3f}"
+                    )
                 if batch_pg_loss_signature is not None:
                     rollout_breakdown_suffix += f" pg_loss_sig={batch_pg_loss_signature}"
+                host_mem_snapshot = _get_host_memory_snapshot()
+                if isinstance(host_mem_snapshot, dict):
+                    rollout_breakdown_suffix += (
+                        f" host_rss_gib={host_mem_snapshot['rss_gib']:.2f}"
+                        f" host_avail_gib={host_mem_snapshot['avail_gib']:.2f}"
+                    )
     
                 if gpu_observer_active:
                     epoch_obs = int(epoch_idx if epoch_idx is not None else getattr(dl, "epoch_count", -1))
@@ -1941,6 +2270,8 @@ def train_epoch_policy_gradient(
                             "status": batch_status,
                             "chunk_size": int(current_rollout_chunk_size),
                             "tbptt_window": (None if current_tbptt_window is None else int(current_tbptt_window)),
+                            "tbptt_stream_backward": bool(batch_tbptt_stream_backward_active),
+                            "tbptt_stream_merge_windows": int(batch_tbptt_stream_merge_windows),
                             "cuda_elapsed_ms": cuda_ms,
                             "cuda_busy_ratio": cuda_busy_ratio,
                         }
@@ -1950,28 +2281,77 @@ def train_epoch_policy_gradient(
                             stage_extra["rollout_policy_share"] = float(
                                 batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
                             )
+                        if stage_name == "rollout" and batch_compile_warmup_wall > 0.0:
+                            batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
+                            stage_extra["compile_warmup_s"] = float(batch_compile_warmup_wall)
+                            stage_extra["batch_wall_excl_compile_s"] = float(batch_wall_excl_compile)
+                            stage_extra["batch_wall_incl_compile_s"] = float(
+                                batch_wall_excl_compile + batch_compile_warmup_wall
+                            )
+                            if batch_compile_warmup_ok is not None:
+                                stage_extra["compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
                         if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                             stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                             stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
                             stage_extra["rollout_policy_wall_share"] = float(
                                 batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
                             )
-                            stage_extra["rollout_transition_y_share"] = float(
-                                batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                            )
-                            stage_extra["rollout_transition_x_share"] = float(
-                                batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                            )
+                            if int(batch_rollout_transition_async_enabled) <= 0:
+                                stage_extra["rollout_transition_y_share"] = float(
+                                    batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                stage_extra["rollout_transition_x_share"] = float(
+                                    batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
                             stage_extra["rollout_transition_group_share"] = float(
                                 batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
+                            if (
+                                int(batch_rollout_transition_async_enabled) > 0
+                                or batch_rollout_transition_group_launch_wall_ms > 0.0
+                                or batch_rollout_transition_group_sync_wall_ms > 0.0
+                            ):
+                                stage_extra["rollout_transition_async_enabled"] = int(
+                                    batch_rollout_transition_async_enabled
+                                )
+                                stage_extra["rollout_transition_group_launch_share"] = float(
+                                    batch_rollout_transition_group_launch_wall_ms
+                                    / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                stage_extra["rollout_transition_group_sync_share"] = float(
+                                    batch_rollout_transition_group_sync_wall_ms
+                                    / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
                             stage_extra["rollout_transition_env_pack_share"] = float(
                                 batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
                             stage_extra["rollout_transition_state_update_share"] = float(
                                 batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
+                            stage_extra["rollout_transition_noise_share"] = float(
+                                batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
                             stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
+                            if batch_rollout_noise_mode is not None:
+                                stage_extra["rollout_noise_mode"] = str(batch_rollout_noise_mode)
+                            if batch_rollout_noise_block_size is not None:
+                                stage_extra["rollout_noise_block_size"] = int(batch_rollout_noise_block_size)
+                            if batch_tbptt_stream_backward_active:
+                                stage_extra["tbptt_stream_backward_calls"] = int(
+                                    batch_tbptt_stream_backward_launches
+                                )
+                                stage_extra["tbptt_stream_backward_roots"] = int(
+                                    batch_tbptt_stream_backward_roots
+                                )
+                                stage_extra["tbptt_stream_merge_effective"] = float(
+                                    batch_tbptt_stream_backward_roots
+                                    / max(1, batch_tbptt_stream_backward_launches)
+                                )
+                                stage_extra["rollout_forward_est_s"] = float(batch_rollout_forward_est_wall)
+                                stage_extra["rollout_instage_backward_s"] = float(batch_rollout_backward_overlap_wall)
+                                stage_extra["rollout_instage_backward_share"] = float(
+                                    batch_rollout_backward_overlap_wall / max(1e-9, batch_rollout_wall)
+                                )
                         if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                             stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
                             stage_extra["policy_step_total_ms"] = float(batch_policy_step_total_ms)
@@ -2059,30 +2439,84 @@ def train_epoch_policy_gradient(
                                 wandb_payload["pg_gpu/rollout_policy_share"] = float(
                                     batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
                                 )
+                            if stage_name == "rollout" and batch_compile_warmup_wall > 0.0:
+                                batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
+                                wandb_payload["pg_gpu/compile_warmup_s"] = float(batch_compile_warmup_wall)
+                                wandb_payload["pg_gpu/batch_wall_excl_compile_s"] = float(batch_wall_excl_compile)
+                                wandb_payload["pg_gpu/batch_wall_incl_compile_s"] = float(
+                                    batch_wall_excl_compile + batch_compile_warmup_wall
+                                )
+                                if batch_compile_warmup_ok is not None:
+                                    wandb_payload["pg_gpu/compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
                             if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                                 wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                                 wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
                                 wandb_payload["pg_gpu/rollout_policy_wall_share"] = float(
                                     batch_rollout_policy_wall_ms / max(1e-9, rollout_wall_total_ms)
                                 )
-                                wandb_payload["pg_gpu/rollout_transition_y_share"] = float(
-                                    batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                                )
-                                wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
-                                    batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
-                                )
+                                if int(batch_rollout_transition_async_enabled) <= 0:
+                                    wandb_payload["pg_gpu/rollout_transition_y_share"] = float(
+                                        batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                    )
+                                    wandb_payload["pg_gpu/rollout_transition_x_share"] = float(
+                                        batch_rollout_transition_x_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                    )
                                 wandb_payload["pg_gpu/rollout_transition_group_share"] = float(
                                     batch_rollout_transition_group_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                                 )
+                                if (
+                                    int(batch_rollout_transition_async_enabled) > 0
+                                    or batch_rollout_transition_group_launch_wall_ms > 0.0
+                                    or batch_rollout_transition_group_sync_wall_ms > 0.0
+                                ):
+                                    wandb_payload["pg_gpu/rollout_transition_async_enabled"] = int(
+                                        batch_rollout_transition_async_enabled
+                                    )
+                                    wandb_payload["pg_gpu/rollout_transition_group_launch_share"] = float(
+                                        batch_rollout_transition_group_launch_wall_ms
+                                        / max(1e-9, batch_rollout_transition_wall_ms)
+                                    )
+                                    wandb_payload["pg_gpu/rollout_transition_group_sync_share"] = float(
+                                        batch_rollout_transition_group_sync_wall_ms
+                                        / max(1e-9, batch_rollout_transition_wall_ms)
+                                    )
                                 wandb_payload["pg_gpu/rollout_transition_env_pack_share"] = float(
                                     batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                                 )
                                 wandb_payload["pg_gpu/rollout_transition_state_update_share"] = float(
                                     batch_rollout_transition_state_update_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                                 )
+                                wandb_payload["pg_gpu/rollout_transition_noise_share"] = float(
+                                    batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
                                 wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
                                     batch_rollout_transition_group_count
                                 )
+                                if batch_rollout_noise_mode is not None:
+                                    wandb_payload["pg_gpu/rollout_noise_mode"] = str(batch_rollout_noise_mode)
+                                if batch_rollout_noise_block_size is not None:
+                                    wandb_payload["pg_gpu/rollout_noise_block_size"] = int(batch_rollout_noise_block_size)
+                                if batch_tbptt_stream_backward_active:
+                                    wandb_payload["pg_gpu/tbptt_stream_merge_windows"] = int(
+                                        batch_tbptt_stream_merge_windows
+                                    )
+                                    wandb_payload["pg_gpu/tbptt_stream_backward_calls"] = int(
+                                        batch_tbptt_stream_backward_launches
+                                    )
+                                    wandb_payload["pg_gpu/tbptt_stream_backward_roots"] = int(
+                                        batch_tbptt_stream_backward_roots
+                                    )
+                                    wandb_payload["pg_gpu/tbptt_stream_merge_effective"] = float(
+                                        batch_tbptt_stream_backward_roots
+                                        / max(1, batch_tbptt_stream_backward_launches)
+                                    )
+                                    wandb_payload["pg_gpu/rollout_forward_est_s"] = float(batch_rollout_forward_est_wall)
+                                    wandb_payload["pg_gpu/rollout_instage_backward_s"] = float(
+                                        batch_rollout_backward_overlap_wall
+                                    )
+                                    wandb_payload["pg_gpu/rollout_instage_backward_share"] = float(
+                                        batch_rollout_backward_overlap_wall / max(1e-9, batch_rollout_wall)
+                                    )
                             if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                                 wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
                                 wandb_payload["pg_gpu/policy_step_total_ms"] = float(batch_policy_step_total_ms)
@@ -2903,11 +3337,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 if paged_train_mode not in {"auto", "dense", "flash_merge", "flash_prefix"}:
                     paged_train_mode = "auto"
                 print("Policy paged-attn train mode:", paged_train_mode)
+                flash_prefix_async_env = str(os.environ.get("TICL_POLICY_FLASH_PREFIX_ASYNC", "1")).strip().lower()
+                flash_prefix_async_on = flash_prefix_async_env in {"1", "true", "yes", "on"}
+                print("Policy flash-prefix async:", bool(flash_prefix_async_on))
                 try:
                     dense_page_cap = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
                 except Exception:
                     dense_page_cap = 128
                 print("Policy paged-attn dense page cap:", int(max(1, dense_page_cap)))
+                tail_freeze_env = str(os.environ.get("TICL_POLICY_TAIL_FREEZE", "1")).strip().lower()
+                tail_freeze_on = tail_freeze_env not in {"0", "false", "no", "off"}
+                print("Policy paged tail freeze:", bool(tail_freeze_on))
                 print("Policy KV cache in-place append:", bool(inplace_kv_print))
             if bool(policy_rollout_checkpoint_reentrant) and not checkpoint_reentrant_active:
                 print(
@@ -2920,6 +3360,13 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print("Policy TBPTT window: disabled(full-horizon)")
             else:
                 print("Policy TBPTT window:", int(pg_tbptt_window))
+                try:
+                    tbptt_merge_windows_print = int(
+                        max(1, int(os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS", "1")))
+                    )
+                except Exception:
+                    tbptt_merge_windows_print = 1
+                print("Policy TBPTT stream merge windows:", int(tbptt_merge_windows_print))
             try:
                 pg_env_replay_steps_print = int(max(1, int(pg_env_replay_steps)))
             except Exception:
@@ -2940,6 +3387,34 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         "long-horizon rollout memory high."
                     )
             print("Policy torch.compile:", bool(pg_torch_compile))
+            if bool(pg_torch_compile):
+                compile_warmup_env = str(os.environ.get("TICL_POLICY_COMPILE_WARMUP", "1")).strip().lower()
+                compile_warmup_on = compile_warmup_env not in {"0", "false", "no", "off"}
+                try:
+                    compile_warmup_steps_print = int(
+                        max(1, int(os.environ.get("TICL_POLICY_COMPILE_WARMUP_STEPS", "1")))
+                    )
+                except Exception:
+                    compile_warmup_steps_print = 1
+                try:
+                    compile_warmup_samples_print = int(
+                        max(2, int(os.environ.get("TICL_POLICY_COMPILE_WARMUP_SAMPLES", "2")))
+                    )
+                except Exception:
+                    compile_warmup_samples_print = 2
+                try:
+                    compile_warmup_chunk_print = int(
+                        max(1, int(os.environ.get("TICL_POLICY_COMPILE_WARMUP_CHUNK", str(int(dl.batch_size)))))
+                    )
+                except Exception:
+                    compile_warmup_chunk_print = int(dl.batch_size)
+                print(
+                    "Policy compile warmup:",
+                    bool(compile_warmup_on),
+                    f"(steps={int(compile_warmup_steps_print)}, "
+                    f"samples={int(compile_warmup_samples_print)}, "
+                    f"chunk={int(max(1, min(int(dl.batch_size), compile_warmup_chunk_print)))})",
+                )
             try:
                 from torch.nn.attention import sdpa_kernel as _sdpa_kernel_probe  # noqa: F401
                 sdpa_api_available = True

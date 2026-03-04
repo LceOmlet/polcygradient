@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from ticl.distributions import parse_distributions, sample_distributions
 from ticl.utils import default_device
@@ -284,6 +285,23 @@ class EnvironmentPrior:
         if single_eval_pos is None:
             single_eval_pos = np.random.randint(1, n_samples)
         return int(max(1, min(int(n_samples) - 1, int(single_eval_pos))))
+
+    @staticmethod
+    def _resolve_rollout_noise_block_size(n_samples):
+        stream_flag = str(os.environ.get("TICL_POLICY_ROLLOUT_NOISE_STREAM", "1")).strip().lower()
+        if stream_flag in {"0", "false", "no", "off"}:
+            return 0
+        try:
+            block_size = int(os.environ.get("TICL_POLICY_ROLLOUT_NOISE_BLOCK_SIZE", "64"))
+        except Exception:
+            block_size = 64
+        if block_size <= 0:
+            return 0
+        n_samples = int(max(1, n_samples))
+        block_size = int(min(n_samples, block_size))
+        if block_size >= n_samples:
+            return 0
+        return block_size
 
     def _sample_dims(self, h):
         action_dim = self._clamp_int(h["action_dim"], 1, 30)
@@ -1467,7 +1485,21 @@ class EnvironmentPrior:
         if isinstance(cache, tuple):
             return tuple(EnvironmentPrior._detach_policy_cache(v, clone_tensors=clone_tensors) for v in cache)
         if isinstance(cache, dict):
-            return {k: EnvironmentPrior._detach_policy_cache(v, clone_tensors=clone_tensors) for k, v in cache.items()}
+            detached = {
+                k: EnvironmentPrior._detach_policy_cache(v, clone_tensors=clone_tensors)
+                for k, v in cache.items()
+            }
+            # After TBPTT detach, keep old paged tail immutable and let the next
+            # window start from a fresh mutable page to avoid COW-copying long
+            # detached history on every append.
+            tail_freeze_env = str(os.environ.get("TICL_POLICY_TAIL_FREEZE", "1")).strip().lower()
+            tail_freeze_enabled = tail_freeze_env not in {"0", "false", "no", "off"}
+            if tail_freeze_enabled and detached.get("cache_mode", None) == "paged":
+                if isinstance(detached.get("k_pages", None), list) and isinstance(
+                    detached.get("v_pages", None), list
+                ):
+                    detached["tail_frozen"] = True
+            return detached
         return cache
 
     def _rollout_distinct_envs_vectorized_with_policy(
@@ -1520,6 +1552,7 @@ class EnvironmentPrior:
         transition_group_wall_s = 0.0
         transition_env_pack_wall_s = 0.0
         transition_state_update_wall_s = 0.0
+        transition_noise_wall_s = 0.0
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
@@ -1573,6 +1606,15 @@ class EnvironmentPrior:
         action_noise_eval = None
         state_noise = None
         dropout_draws = None
+        noise_block_size = 0
+        noise_streaming_mode = False
+        noise_block_start = 0
+        noise_block_end = 0
+        transition_noise_block = None
+        action_noise_train_block = None
+        action_noise_eval_block = None
+        state_noise_block = None
+        dropout_draws_block = None
 
         transition_noise_generators = None
         action_noise_train_generators = None
@@ -1656,40 +1698,97 @@ class EnvironmentPrior:
                         _advance_generator_rand(g, n_samples)
             env_noise_generators = rollout_generators
         else:
-            transition_noise = self._stack_randn_with_generators(
-                rollout_generators,
-                (batch_size, n_samples, noise_dim),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(0, 1)
-            if torch.any(env["action_noise_train_std"] > 0):
-                action_noise_train = self._stack_randn_with_generators(
+            noise_block_size = self._resolve_rollout_noise_block_size(n_samples)
+            noise_streaming_mode = bool(noise_block_size > 0)
+
+            def _refresh_noise_block(block_start_idx):
+                nonlocal noise_block_start, noise_block_end
+                nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
+                nonlocal state_noise_block, dropout_draws_block
+                block_start_idx = int(block_start_idx)
+                block_len = int(min(noise_block_size, n_samples - block_start_idx))
+                noise_block_start = block_start_idx
+                noise_block_end = block_start_idx + block_len
+                transition_noise_block = self._stack_randn_with_generators(
                     rollout_generators,
-                    (batch_size, n_samples, action_dim),
+                    (batch_size, block_len, noise_dim),
                     device=device,
                     dtype=torch.float32,
                 ).transpose(0, 1)
-            if torch.any(env["action_noise_eval_std"] > 0):
-                action_noise_eval = self._stack_randn_with_generators(
+                if torch.any(env["action_noise_train_std"] > 0):
+                    action_noise_train_block = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, block_len, action_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                else:
+                    action_noise_train_block = None
+                if torch.any(env["action_noise_eval_std"] > 0):
+                    action_noise_eval_block = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, block_len, action_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                else:
+                    action_noise_eval_block = None
+                if torch.any(env["state_noise_std"] > 0):
+                    state_noise_block = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, block_len, state_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                else:
+                    state_noise_block = None
+                if torch.any(dropout_active):
+                    dropout_draws_block = self._stack_rand_with_generators(
+                        rollout_generators,
+                        (batch_size, block_len),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                else:
+                    dropout_draws_block = None
+
+            if noise_streaming_mode:
+                _refresh_noise_block(0)
+            else:
+                transition_noise = self._stack_randn_with_generators(
                     rollout_generators,
-                    (batch_size, n_samples, action_dim),
+                    (batch_size, n_samples, noise_dim),
                     device=device,
                     dtype=torch.float32,
                 ).transpose(0, 1)
-            if torch.any(env["state_noise_std"] > 0):
-                state_noise = self._stack_randn_with_generators(
-                    rollout_generators,
-                    (batch_size, n_samples, state_dim),
-                    device=device,
-                    dtype=torch.float32,
-                ).transpose(0, 1)
-            if torch.any(dropout_active):
-                dropout_draws = self._stack_rand_with_generators(
-                    rollout_generators,
-                    (batch_size, n_samples),
-                    device=device,
-                    dtype=torch.float32,
-                ).transpose(0, 1)
+                if torch.any(env["action_noise_train_std"] > 0):
+                    action_noise_train = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, n_samples, action_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                if torch.any(env["action_noise_eval_std"] > 0):
+                    action_noise_eval = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, n_samples, action_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                if torch.any(env["state_noise_std"] > 0):
+                    state_noise = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, n_samples, state_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
+                if torch.any(dropout_active):
+                    dropout_draws = self._stack_rand_with_generators(
+                        rollout_generators,
+                        (batch_size, n_samples),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1)
 
         token_reward_idx = obs_slot_dim
         token_mask_idx = obs_slot_dim + 1
@@ -1765,6 +1864,13 @@ class EnvironmentPrior:
                 )
             action_next = torch.tanh(action_next)
 
+            noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+            noise_block_idx = None
+            if noise_streaming_mode:
+                if t >= noise_block_end:
+                    _refresh_noise_block(t)
+                noise_block_idx = int(t - noise_block_start)
+
             if t < single_eval_pos:
                 if strict_seed_mode and action_noise_train_generators is not None:
                     action_noise_train_t = _draw_step_randn_with_optional_generators(
@@ -1772,6 +1878,10 @@ class EnvironmentPrior:
                         action_dim,
                     )
                     action_next = torch.tanh(action_next + action_noise_train_t * env["action_noise_train_std"][:, None])
+                elif noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                    action_next = torch.tanh(
+                        action_next + action_noise_train_block[noise_block_idx] * env["action_noise_train_std"][:, None]
+                    )
                 elif action_noise_train is not None:
                     action_next = torch.tanh(action_next + action_noise_train[t] * env["action_noise_train_std"][:, None])
             else:
@@ -1781,6 +1891,10 @@ class EnvironmentPrior:
                         action_dim,
                     )
                     action_next = torch.tanh(action_next + action_noise_eval_t * env["action_noise_eval_std"][:, None])
+                elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                    action_next = torch.tanh(
+                        action_next + action_noise_eval_block[noise_block_idx] * env["action_noise_eval_std"][:, None]
+                    )
                 elif action_noise_eval is not None:
                     action_next = torch.tanh(action_next + action_noise_eval[t] * env["action_noise_eval_std"][:, None])
 
@@ -1793,8 +1907,12 @@ class EnvironmentPrior:
                     transition_noise_generators,
                     noise_dim,
                 )
+            elif noise_streaming_mode and noise_block_idx is not None:
+                noise_t = transition_noise_block[noise_block_idx]
             else:
                 noise_t = transition_noise[t]
+            if profile_rollout_timing and noise_timing_t0 is not None:
+                transition_noise_wall_s += (time.perf_counter() - noise_timing_t0)
             env_in[:, :state_dim] = state_t
             env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
             env_in[:, env_action_start: env_action_start + action_dim] = action_next
@@ -1810,7 +1928,10 @@ class EnvironmentPrior:
             )
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
+            dropout_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+            dropout_timed = False
             if strict_seed_mode and dropout_draw_generators is not None:
+                dropout_timed = True
                 drop_draw = _draw_step_rand_with_optional_generators(dropout_draw_generators)
                 drop_mask = dropout_active & (drop_draw < env["reward_dropout_ratio"])
                 if collect_runtime_info:
@@ -1818,24 +1939,44 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+            elif noise_streaming_mode and dropout_draws_block is not None and noise_block_idx is not None:
+                dropout_timed = True
+                drop_mask = dropout_active & (dropout_draws_block[noise_block_idx] < env["reward_dropout_ratio"])
+                if collect_runtime_info:
+                    reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
+                reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
+                impute_mask = drop_mask & env["reward_dropout_impute_zero"]
+                reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
             elif dropout_draws is not None:
+                dropout_timed = True
                 drop_mask = dropout_active & (dropout_draws[t] < env["reward_dropout_ratio"])
                 if collect_runtime_info:
                     reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+            if profile_rollout_timing and dropout_timed and dropout_timing_t0 is not None:
+                transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
 
             x_next = env["x_generator"](env_in, generators_for_noise=env_noise_generators)
             state_next = (1.0 - env["alpha"][:, None]) * state_t + env["alpha"][:, None] * x_next
+            state_noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+            state_noise_timed = False
             if strict_seed_mode and state_noise_generators is not None:
+                state_noise_timed = True
                 state_noise_t = _draw_step_randn_with_optional_generators(
                     state_noise_generators,
                     state_dim,
                 )
                 state_next = state_next + state_noise_t * env["state_noise_std"][:, None]
+            elif noise_streaming_mode and state_noise_block is not None and noise_block_idx is not None:
+                state_noise_timed = True
+                state_next = state_next + state_noise_block[noise_block_idx] * env["state_noise_std"][:, None]
             elif state_noise is not None:
+                state_noise_timed = True
                 state_next = state_next + state_noise[t] * env["state_noise_std"][:, None]
+            if profile_rollout_timing and state_noise_timed and state_noise_timing_t0 is not None:
+                transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
             state_clip = env["state_clip"][:, None]
             state_next = torch.maximum(torch.minimum(state_next, state_clip), -state_clip)
             state_next = torch.tanh(state_next)
@@ -1889,11 +2030,15 @@ class EnvironmentPrior:
             torch.cuda.synchronize(device=device_obj)
             policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
             transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+            noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
             rollout_profile = {
                 "policy_cuda_ms": policy_cuda_ms,
                 "transition_cuda_ms": transition_cuda_ms,
                 "steps": int(n_samples),
                 "batch_size": int(batch_size),
+                "noise_mode": noise_mode,
+                "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
+                "transition_noise_wall_ms": float(transition_noise_wall_s * 1000.0),
             }
         self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
@@ -1948,12 +2093,13 @@ class EnvironmentPrior:
             and device_obj.type == "cuda"
             and torch.cuda.is_available()
         )
-        transition_stream_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION", "0")).strip().lower()
+        transition_stream_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION", "1")).strip().lower()
         transition_stream_fusion = bool(
             transition_stream_fusion_flag in {"1", "true", "yes", "on"}
             and device_obj.type == "cuda"
             and torch.cuda.is_available()
             and rollout_generators is None
+            and len(structure_groups) > 1
         )
         policy_cuda_pairs = []
         transition_cuda_pairs = []
@@ -1962,8 +2108,11 @@ class EnvironmentPrior:
         transition_y_wall_s = 0.0
         transition_x_wall_s = 0.0
         transition_group_wall_s = 0.0
+        transition_group_launch_wall_s = 0.0
+        transition_group_sync_wall_s = 0.0
         transition_env_pack_wall_s = 0.0
         transition_state_update_wall_s = 0.0
+        transition_noise_wall_s = 0.0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -2130,6 +2279,14 @@ class EnvironmentPrior:
         max_action_dim = int(action_dims.max().item())
         max_noise_dim = int(noise_dims.max().item())
 
+        for group in transition_groups:
+            start = int(group["start"])
+            end = int(group["end"])
+            state_dim_g = int(group["state_dim"])
+            group["slice"] = slice(start, end)
+            group["reward_scale_view"] = reward_scale[start:end]
+            group["alpha_view"] = alpha[start:end].unsqueeze(1)
+
         state_idx = torch.arange(max_state_dim, device=device, dtype=torch.long)
         obs_idx = torch.arange(max_obs_dim, device=device, dtype=torch.long)
         action_idx = torch.arange(max_action_dim, device=device, dtype=torch.long)
@@ -2191,44 +2348,114 @@ class EnvironmentPrior:
                 tbptt_window_size = w
         tbptt_reward_buffer = [] if tbptt_window_active else None
 
-        transition_noise = self._stack_randn_with_generators(
-            rollout_generators,
-            (batch_size, n_samples, max_noise_dim),
-            device=device,
-            dtype=torch.float32,
-        ).transpose(0, 1) * noise_mask.unsqueeze(0)
+        strict_seed_mode = rollout_generators is not None
+        noise_block_size = 0
+        noise_streaming_mode = False
+        noise_block_start = 0
+        noise_block_end = 0
+        transition_noise_block = None
+        action_noise_train_block = None
+        action_noise_eval_block = None
+        state_noise_block = None
+        dropout_draws_block = None
+        if not strict_seed_mode:
+            noise_block_size = self._resolve_rollout_noise_block_size(n_samples)
+            noise_streaming_mode = bool(noise_block_size > 0)
+
+        transition_noise = None
         action_noise_train = None
         action_noise_eval = None
         state_noise = None
-        if torch.any(action_noise_train_std > 0):
-            action_noise_train = self._stack_randn_with_generators(
-                rollout_generators,
-                (batch_size, n_samples, max_action_dim),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(0, 1) * action_mask.unsqueeze(0)
-        if torch.any(action_noise_eval_std > 0):
-            action_noise_eval = self._stack_randn_with_generators(
-                rollout_generators,
-                (batch_size, n_samples, max_action_dim),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(0, 1) * action_mask.unsqueeze(0)
-        if torch.any(state_noise_std > 0):
-            state_noise = self._stack_randn_with_generators(
-                rollout_generators,
-                (batch_size, n_samples, max_state_dim),
-                device=device,
-                dtype=torch.float32,
-            ).transpose(0, 1) * state_mask.unsqueeze(0)
         dropout_draws = None
-        if torch.any(dropout_active):
-            dropout_draws = self._stack_rand_with_generators(
+
+        def _refresh_noise_block(block_start_idx):
+            nonlocal noise_block_start, noise_block_end
+            nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
+            nonlocal state_noise_block, dropout_draws_block
+            block_start_idx = int(block_start_idx)
+            block_len = int(min(noise_block_size, n_samples - block_start_idx))
+            noise_block_start = block_start_idx
+            noise_block_end = block_start_idx + block_len
+            transition_noise_block = self._stack_randn_with_generators(
                 rollout_generators,
-                (batch_size, n_samples),
+                (batch_size, block_len, max_noise_dim),
                 device=device,
                 dtype=torch.float32,
-            ).transpose(0, 1)
+            ).transpose(0, 1) * noise_mask.unsqueeze(0)
+            if torch.any(action_noise_train_std > 0):
+                action_noise_train_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            else:
+                action_noise_train_block = None
+            if torch.any(action_noise_eval_std > 0):
+                action_noise_eval_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            else:
+                action_noise_eval_block = None
+            if torch.any(state_noise_std > 0):
+                state_noise_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_state_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * state_mask.unsqueeze(0)
+            else:
+                state_noise_block = None
+            if torch.any(dropout_active):
+                dropout_draws_block = self._stack_rand_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1)
+            else:
+                dropout_draws_block = None
+
+        if noise_streaming_mode:
+            _refresh_noise_block(0)
+        else:
+            transition_noise = self._stack_randn_with_generators(
+                rollout_generators,
+                (batch_size, n_samples, max_noise_dim),
+                device=device,
+                dtype=torch.float32,
+            ).transpose(0, 1) * noise_mask.unsqueeze(0)
+            if torch.any(action_noise_train_std > 0):
+                action_noise_train = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            if torch.any(action_noise_eval_std > 0):
+                action_noise_eval = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            if torch.any(state_noise_std > 0):
+                state_noise = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_state_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * state_mask.unsqueeze(0)
+            if torch.any(dropout_active):
+                dropout_draws = self._stack_rand_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1)
 
         policy_accepts_reward_mask = self._policy_step_accepts_reward_mask(policy_step_fn)
         obs_slot_dim_max = int(obs_slot_dims.max().item())
@@ -2335,14 +2562,47 @@ class EnvironmentPrior:
                 )
             action_next = torch.tanh(action_next) * action_mask
 
+            noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+            noise_block_idx = None
+            if noise_streaming_mode:
+                if t >= noise_block_end:
+                    _refresh_noise_block(t)
+                noise_block_idx = int(t - noise_block_start)
+
             if t < single_eval_pos:
-                if action_noise_train is not None:
+                if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                    action_next = torch.tanh(
+                        action_next + action_noise_train_block[noise_block_idx] * action_noise_train_std[:, None]
+                    ) * action_mask
+                elif action_noise_train is not None:
                     action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_train_std[:, None]) * action_mask
+            elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                action_next = torch.tanh(
+                    action_next + action_noise_eval_block[noise_block_idx] * action_noise_eval_std[:, None]
+                ) * action_mask
             elif action_noise_eval is not None:
                 action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_eval_std[:, None]) * action_mask
 
-            noise_t = transition_noise[t]
-            reward_next = torch.empty((batch_size,), device=device, dtype=torch.float32)
+            if noise_streaming_mode and noise_block_idx is not None:
+                noise_t = transition_noise_block[noise_block_idx]
+                state_noise_t = (
+                    None
+                    if state_noise_block is None
+                    else state_noise_block[noise_block_idx]
+                )
+                dropout_draw_t = (
+                    None
+                    if dropout_draws_block is None
+                    else dropout_draws_block[noise_block_idx]
+                )
+            else:
+                noise_t = transition_noise[t]
+                state_noise_t = None if state_noise is None else state_noise[t]
+                dropout_draw_t = None if dropout_draws is None else dropout_draws[t]
+            if profile_rollout_timing and noise_timing_t0 is not None:
+                transition_noise_wall_s += (time.perf_counter() - noise_timing_t0)
+
+            reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
@@ -2351,21 +2611,21 @@ class EnvironmentPrior:
             if profile_rollout_breakdown_cuda:
                 transition_cuda_start = torch.cuda.Event(enable_timing=True)
                 transition_cuda_start.record()
+            pending_async_group_ops = ([None] * int(len(transition_groups))) if transition_stream_fusion else None
+            pending_async_group_count = 0
             for group in transition_groups:
                 group_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                start = int(group["start"])
-                end = int(group["end"])
+                group_slice = group["slice"]
                 env_g = group["env"]
                 state_dim_g = int(group["state_dim"])
                 obs_dim_g = int(group["obs_dim"])
                 action_dim_g = int(group["action_dim"])
                 noise_dim_g = int(group["noise_dim"])
-
                 pack_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                state_in = state_t[start:end, :state_dim_g]
-                obs_in = obs_t[start:end, :obs_dim_g]
-                action_in = action_next[start:end, :action_dim_g]
-                noise_in = noise_t[start:end, :noise_dim_g]
+                state_in = state_t[group_slice, :state_dim_g]
+                obs_in = obs_t[group_slice, :obs_dim_g]
+                action_in = action_next[group_slice, :action_dim_g]
+                noise_in = noise_t[group_slice, :noise_dim_g]
 
                 env_in = group["env_in"]
                 env_obs_start = int(group["env_obs_start"])
@@ -2378,15 +2638,16 @@ class EnvironmentPrior:
                 if profile_rollout_timing and pack_wall_t0 is not None:
                     transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
 
-                reward_scale_g = reward_scale[start:end]
-                reward_clip_g = reward_clip[start:end]
+                reward_scale_g = group["reward_scale_view"]
+                alpha_g = group["alpha_view"]
                 stream_y = group.get("stream_y", None)
                 stream_x = group.get("stream_x", None)
-                reward_next_raw = None
+                reward_next_raw_g = None
                 x_next_g = None
                 if (stream_y is not None) and (stream_x is not None):
+                    launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
-                        reward_next_raw = reward_scale_g * env_g["y_generator"](
+                        reward_next_raw_g = reward_scale_g * env_g["y_generator"](
                             env_in,
                             generators_for_noise=group["rollout_generators"],
                         ).reshape(-1)
@@ -2395,34 +2656,27 @@ class EnvironmentPrior:
                             env_in,
                             generators_for_noise=group["rollout_generators"],
                         )
-                    cur_stream = torch.cuda.current_stream(device=device_obj)
-                    cur_stream.wait_stream(stream_y)
-                    cur_stream.wait_stream(stream_x)
+                    pending_async_group_ops[pending_async_group_count] = (
+                        group_slice,
+                        alpha_g,
+                        state_dim_g,
+                        x_next_g,
+                        reward_next_raw_g,
+                        stream_y,
+                        stream_x,
+                    )
+                    pending_async_group_count += 1
+                    if profile_rollout_timing and launch_wall_t0 is not None:
+                        launch_dt = time.perf_counter() - launch_wall_t0
+                        transition_group_launch_wall_s += float(launch_dt)
                 else:
                     y_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                    reward_next_raw = reward_scale_g * env_g["y_generator"](
+                    reward_next_raw_g = reward_scale_g * env_g["y_generator"](
                         env_in,
                         generators_for_noise=group["rollout_generators"],
                     ).reshape(-1)
                     if profile_rollout_timing and y_wall_t0 is not None:
                         transition_y_wall_s += (time.perf_counter() - y_wall_t0)
-                reward_next_g = torch.maximum(
-                    torch.minimum(reward_next_raw, reward_clip_g),
-                    -reward_clip_g,
-                )
-                reward_mask_next_g = torch.ones_like(reward_next_g)
-
-                if dropout_draws is not None:
-                    dropout_active_g = dropout_active[start:end]
-                    ratio_g = reward_dropout_ratio[start:end]
-                    drop_mask = dropout_active_g & (dropout_draws[t, start:end] < ratio_g)
-                    if collect_runtime_info:
-                        reward_drop_count[start:end] = reward_drop_count[start:end] + drop_mask.to(dtype=torch.int64)
-                    reward_mask_next_g = torch.where(drop_mask, torch.zeros_like(reward_mask_next_g), reward_mask_next_g)
-                    impute_mask = drop_mask & reward_dropout_impute_zero[start:end]
-                    reward_next_g = torch.where(impute_mask, torch.zeros_like(reward_next_g), reward_next_g)
-
-                if x_next_g is None:
                     x_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     x_next_g = env_g["x_generator"](
                         env_in,
@@ -2430,23 +2684,54 @@ class EnvironmentPrior:
                     )
                     if profile_rollout_timing and x_wall_t0 is not None:
                         transition_x_wall_s += (time.perf_counter() - x_wall_t0)
-                state_update_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                alpha_g = alpha[start:end].unsqueeze(1)
-                state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
-                if (state_noise is not None) and bool(group.get("state_noise_active", False)):
-                    state_noise_std_g = state_noise_std[start:end]
-                    state_next_g = state_next_g + state_noise[t, start:end, :state_dim_g] * state_noise_std_g[:, None]
-                clip_g = state_clip[start:end].unsqueeze(1)
-                state_next_g = torch.maximum(torch.minimum(state_next_g, clip_g), -clip_g)
-                state_next_g = torch.tanh(state_next_g)
-
-                state_next[start:end, :state_dim_g] = state_next_g
-                reward_next[start:end] = reward_next_g
-                reward_mask_next[start:end] = reward_mask_next_g
-                if profile_rollout_timing and state_update_wall_t0 is not None:
-                    transition_state_update_wall_s += (time.perf_counter() - state_update_wall_t0)
+                    state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                    reward_next_raw[group_slice] = reward_next_raw_g
+                    state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and group_wall_t0 is not None:
                     transition_group_wall_s += (time.perf_counter() - group_wall_t0)
+
+            if pending_async_group_count > 0:
+                sync_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                cur_stream = torch.cuda.current_stream(device=device_obj)
+                for op_idx in range(pending_async_group_count):
+                    _, _, _, _, _, stream_y, stream_x = pending_async_group_ops[op_idx]
+                    cur_stream.wait_stream(stream_y)
+                    cur_stream.wait_stream(stream_x)
+                state_update_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                for op_idx in range(pending_async_group_count):
+                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, _, _ = pending_async_group_ops[op_idx]
+                    state_in = state_t[group_slice, :state_dim_g]
+                    state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                    reward_next_raw[group_slice] = reward_next_raw_g
+                    state_next[group_slice, :state_dim_g] = state_next_g
+                if profile_rollout_timing and state_update_wall_t0 is not None:
+                    transition_state_update_wall_s += (time.perf_counter() - state_update_wall_t0)
+                if profile_rollout_timing and sync_wall_t0 is not None:
+                    sync_dt = time.perf_counter() - sync_wall_t0
+                    transition_group_sync_wall_s += float(sync_dt)
+                    transition_group_wall_s += float(sync_dt)
+
+            reward_next = torch.maximum(
+                torch.minimum(reward_next_raw, reward_clip),
+                -reward_clip,
+            )
+            if dropout_draw_t is not None:
+                dropout_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+                drop_mask = dropout_active & (dropout_draw_t < reward_dropout_ratio)
+                if collect_runtime_info:
+                    reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
+                reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
+                impute_mask = drop_mask & reward_dropout_impute_zero
+                reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                if profile_rollout_timing and dropout_timing_t0 is not None:
+                    transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
+            if state_noise_t is not None:
+                state_noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
+                state_next = state_next + state_noise_t * state_noise_std[:, None]
+                if profile_rollout_timing and state_noise_timing_t0 is not None:
+                    transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
+            state_next = torch.maximum(torch.minimum(state_next, state_clip[:, None]), -state_clip[:, None])
+            state_next = torch.tanh(state_next)
             if transition_cuda_start is not None:
                 transition_cuda_end = torch.cuda.Event(enable_timing=True)
                 transition_cuda_end.record()
@@ -2543,9 +2828,12 @@ class EnvironmentPrior:
             infos = [None] * batch_size
         rollout_profile = None
         if (profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs)) or profile_rollout_timing:
+            noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
             rollout_profile = {
                 "steps": int(n_samples),
                 "batch_size": int(batch_size),
+                "noise_mode": noise_mode,
+                "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
             }
             if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
                 torch.cuda.synchronize(device=device_obj)
@@ -2559,9 +2847,17 @@ class EnvironmentPrior:
                 rollout_profile["transition_y_wall_ms"] = float(transition_y_wall_s * 1000.0)
                 rollout_profile["transition_x_wall_ms"] = float(transition_x_wall_s * 1000.0)
                 rollout_profile["transition_group_wall_ms"] = float(transition_group_wall_s * 1000.0)
+                rollout_profile["transition_group_launch_wall_ms"] = float(
+                    transition_group_launch_wall_s * 1000.0
+                )
+                rollout_profile["transition_group_sync_wall_ms"] = float(
+                    transition_group_sync_wall_s * 1000.0
+                )
                 rollout_profile["transition_env_pack_wall_ms"] = float(transition_env_pack_wall_s * 1000.0)
                 rollout_profile["transition_state_update_wall_ms"] = float(transition_state_update_wall_s * 1000.0)
+                rollout_profile["transition_noise_wall_ms"] = float(transition_noise_wall_s * 1000.0)
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
+                rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
         self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
@@ -3472,9 +3768,15 @@ class EnvironmentPrior:
                             "transition_y_wall_ms": 0.0,
                             "transition_x_wall_ms": 0.0,
                             "transition_group_wall_ms": 0.0,
+                            "transition_group_launch_wall_ms": 0.0,
+                            "transition_group_sync_wall_ms": 0.0,
                             "transition_env_pack_wall_ms": 0.0,
                             "transition_state_update_wall_ms": 0.0,
+                            "transition_noise_wall_ms": 0.0,
                             "transition_group_count": 0,
+                            "transition_async_enabled": 0,
+                            "noise_mode": None,
+                            "noise_block_size": 0,
                             "steps": int(n_samples),
                             "batch_size": int(batch_size),
                         }
@@ -3487,13 +3789,42 @@ class EnvironmentPrior:
                     rollout_profile_acc["transition_group_wall_ms"] += float(
                         group_profile.get("transition_group_wall_ms", 0.0)
                     )
+                    rollout_profile_acc["transition_group_launch_wall_ms"] += float(
+                        group_profile.get("transition_group_launch_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_group_sync_wall_ms"] += float(
+                        group_profile.get("transition_group_sync_wall_ms", 0.0)
+                    )
                     rollout_profile_acc["transition_env_pack_wall_ms"] += float(
                         group_profile.get("transition_env_pack_wall_ms", 0.0)
                     )
                     rollout_profile_acc["transition_state_update_wall_ms"] += float(
                         group_profile.get("transition_state_update_wall_ms", 0.0)
                     )
+                    rollout_profile_acc["transition_noise_wall_ms"] += float(
+                        group_profile.get("transition_noise_wall_ms", 0.0)
+                    )
                     rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
+                    rollout_profile_acc["transition_async_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_async_enabled", 0) or 0),
+                            int(group_profile.get("transition_async_enabled", 0) or 0),
+                        )
+                    )
+                    group_noise_mode = group_profile.get("noise_mode", None)
+                    if group_noise_mode is not None:
+                        group_noise_mode = str(group_noise_mode)
+                        current_noise_mode = rollout_profile_acc.get("noise_mode", None)
+                        if current_noise_mode is None:
+                            rollout_profile_acc["noise_mode"] = group_noise_mode
+                        elif str(current_noise_mode) != group_noise_mode:
+                            rollout_profile_acc["noise_mode"] = "mixed"
+                    try:
+                        group_noise_block_size = int(group_profile.get("noise_block_size", 0) or 0)
+                    except Exception:
+                        group_noise_block_size = 0
+                    if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
+                        rollout_profile_acc["noise_block_size"] = group_noise_block_size
             self.last_rollout_profile = rollout_profile_acc
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
@@ -3732,13 +4063,27 @@ class EnvironmentPrior:
                 stats["rollout_transition_group_wall_ms"] = float(
                     rollout_profile.get("transition_group_wall_ms", 0.0)
                 )
+                stats["rollout_transition_group_launch_wall_ms"] = float(
+                    rollout_profile.get("transition_group_launch_wall_ms", 0.0)
+                )
+                stats["rollout_transition_group_sync_wall_ms"] = float(
+                    rollout_profile.get("transition_group_sync_wall_ms", 0.0)
+                )
                 stats["rollout_transition_env_pack_wall_ms"] = float(
                     rollout_profile.get("transition_env_pack_wall_ms", 0.0)
                 )
                 stats["rollout_transition_state_update_wall_ms"] = float(
                     rollout_profile.get("transition_state_update_wall_ms", 0.0)
                 )
+                stats["rollout_transition_noise_wall_ms"] = float(
+                    rollout_profile.get("transition_noise_wall_ms", 0.0)
+                )
                 stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
+                stats["rollout_transition_async_enabled"] = int(
+                    rollout_profile.get("transition_async_enabled", 0) or 0
+                )
+                stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
+                stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
             return loss, rollout, stats
 
         reward_sum = None
@@ -3843,13 +4188,27 @@ class EnvironmentPrior:
             stats["rollout_transition_group_wall_ms"] = float(
                 rollout_profile.get("transition_group_wall_ms", 0.0)
             )
+            stats["rollout_transition_group_launch_wall_ms"] = float(
+                rollout_profile.get("transition_group_launch_wall_ms", 0.0)
+            )
+            stats["rollout_transition_group_sync_wall_ms"] = float(
+                rollout_profile.get("transition_group_sync_wall_ms", 0.0)
+            )
             stats["rollout_transition_env_pack_wall_ms"] = float(
                 rollout_profile.get("transition_env_pack_wall_ms", 0.0)
             )
             stats["rollout_transition_state_update_wall_ms"] = float(
                 rollout_profile.get("transition_state_update_wall_ms", 0.0)
             )
+            stats["rollout_transition_noise_wall_ms"] = float(
+                rollout_profile.get("transition_noise_wall_ms", 0.0)
+            )
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
+            stats["rollout_transition_async_enabled"] = int(
+                rollout_profile.get("transition_async_enabled", 0) or 0
+            )
+            stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
+            stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
         return loss, rollout, stats
 
     def get_last_coverage(self):

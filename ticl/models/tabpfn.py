@@ -10,6 +10,23 @@ from ticl.utils import SeqBN, get_init_method
 from ticl.models.encoders import Linear, SplitObsActionEncoder
 
 
+def _is_torch_compiling():
+    compiler_mod = getattr(torch, "compiler", None)
+    if compiler_mod is not None and hasattr(compiler_mod, "is_compiling"):
+        try:
+            if bool(compiler_mod.is_compiling()):
+                return True
+        except Exception:
+            pass
+    dynamo_mod = getattr(torch, "_dynamo", None)
+    if dynamo_mod is not None and hasattr(dynamo_mod, "is_compiling"):
+        try:
+            return bool(dynamo_mod.is_compiling())
+        except Exception:
+            return False
+    return False
+
+
 class TabPFN(nn.Module):
     def __init__(self, *, n_out, emsize, nhead, nhid_factor, nlayers, n_features, dropout=0.0,  y_encoder_layer=None,
                  decoder=None, input_normalization=False, init_method=None, pre_norm=False,
@@ -254,7 +271,7 @@ class TabPFN(nn.Module):
         if x_token.ndim != 3 or x_token.shape[0] != 1:
             raise ValueError(f"x_token must have shape (1, B, F), got {tuple(x_token.shape)}")
 
-        profile_enabled = bool(self._policy_step_profile_enabled)
+        profile_enabled = bool(self._policy_step_profile_enabled) and (not _is_torch_compiling())
         total_t0 = time.perf_counter() if profile_enabled else None
         encode_t0 = time.perf_counter() if profile_enabled else None
         x_enc = self.encoder(x_token)
@@ -348,7 +365,7 @@ class TabPFN(nn.Module):
                 f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
             )
 
-        profile_enabled = bool(self._policy_step_profile_enabled)
+        profile_enabled = bool(self._policy_step_profile_enabled) and (not _is_torch_compiling())
         total_t0 = time.perf_counter() if profile_enabled else None
         encode_t0 = time.perf_counter() if profile_enabled else None
         batch_size = int(obs_t.shape[0])

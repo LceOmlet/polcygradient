@@ -469,9 +469,9 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = False
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 64
-    # Reuse each sampled environment for multiple sequential
-    # rollout->update cycles to improve signal under fixed task dynamics.
-    config['optimizer']['pg_env_replay_steps'] = 8
+    # Keep one rollout->update cycle per batch by default for throughput-first
+    # benchmarking and simpler PG phase attribution.
+    config['optimizer']['pg_env_replay_steps'] = 1
     # Keep rollout batch parallel width as large as possible under OOM:
     # shrink TBPTT window first before shrinking rollout chunk.
     config['optimizer']['pg_oom_reduce_tbptt_first'] = True
