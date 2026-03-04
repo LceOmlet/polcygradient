@@ -1,0 +1,45 @@
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=None, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=785258, interval_sec=0.20, sample_output=None, stage_output=None)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy objective: raw_discounted_reward_mean (discount=1)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy paged-attn train mode: auto
+Policy flash-prefix async: True
+Policy paged-attn dense page cap: 128
+Policy paged tail freeze: True
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 64
+Policy TBPTT stream merge windows: 1
+Policy env replay steps: 1
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: True
+Policy compile warmup: True (steps=1, samples=2, chunk=64)
+Policy runtime torch: 2.10.0+cu128 (sdpa_kernel_api=True)
+Policy finalize 2D fastpath: True
+Policy autocast dtype: bf16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=None stages_jsonl=None
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_pgtorchcompileTrue_pgtorchcompiledynamicTrue_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_04_2026_10_02_01
+AdamW fused: enabled
+start of epoch 1
+[pg-compile] enabled forward_policy_step compile (backend=inductor, mode=max-autotune-no-cudagraphs, fullgraph=False, dynamic=True)
+[pg-compile] enabled forward_policy_step_split compile (backend=inductor, mode=max-autotune-no-cudagraphs, fullgraph=False, dynamic=True)
+[pg-compile-note] adjusted compile mode for mutable paged KV cache: reduce-overhead -> max-autotune-no-cudagraphs

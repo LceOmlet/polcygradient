@@ -1,0 +1,53 @@
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=None, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=724733, interval_sec=0.20, sample_output=None, stage_output=None)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy objective: raw_discounted_reward_mean (discount=1)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy paged-attn train mode: auto
+Policy paged-attn dense page cap: 128
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 64
+Policy env replay steps: 1
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+Policy runtime torch: 2.10.0+cu128 (sdpa_kernel_api=True)
+Policy finalize 2D fastpath: True
+Policy autocast dtype: bf16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=None stages_jsonl=None
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_04_2026_08_11_37
+AdamW fused: enabled
+start of epoch 1
+[pg-gpu-stage] epoch=1 batch=0 stage=rollout  samples=216 gpu_util_avg=27.33 gpu_util_max=31.00 proc_mem_avg_mib=23338.7 proc_mem_max_mib=25638.0 proc_mem_share_avg=47.49 proc_sm_util_avg=25.62 cuda_ms=63833.26 cuda_busy_ratio=1.000 rollout_policy_cuda_ms=15192.50 rollout_transition_cuda_ms=10342.88 rollout_policy_share=0.595 rollout_policy_wall_ms=15197.53 rollout_transition_wall_ms=10383.83 rollout_policy_wall_share=0.594 rollout_transition_y_share=0.417 rollout_transition_x_share=0.416 rollout_transition_group_share=0.991 rollout_transition_env_pack_share=0.033 rollout_transition_state_update_share=0.073 rollout_transition_noise_share=0.060 rollout_transition_group_count=2 rollout_noise_mode=block_stream rollout_noise_block_size=64 policy_step_calls=1024 policy_step_total_ms=14930.32 policy_step_encode_share=0.052 policy_step_transformer_share=0.929 policy_step_decoder_share=0.017 rollout_cuda_busy_ratio=1.000 backward_cuda_busy_ratio=1.000 pg_loss_sig=pg_v2|norm=0|disc=1|detach=1|eps=1e-06|clip=10|rclip=10
+[pg-gpu-stage] epoch=1 batch=0 stage=backward  samples=205 gpu_util_avg=27.66 gpu_util_max=31.00 proc_mem_avg_mib=24174.7 proc_mem_max_mib=25638.0 proc_mem_share_avg=49.20 proc_sm_util_avg=25.76 cuda_ms=36001.89 cuda_busy_ratio=0.592
+[pg-gpu-stage] epoch=1 batch=0 stage=step  samples=0 gpu_util_avg=na gpu_util_max=na proc_mem_avg_mib=na proc_mem_max_mib=na proc_mem_share_avg=na proc_sm_util_avg=na cuda_ms=45.94 cuda_busy_ratio=0.999
+[pg-phase] epoch=1 batch=0 rollout_s=63.836 backward_s=36.006 step_s=0.046 backward_calls=16 chunk=64 tbptt=64 status=ok objective=+1.321e-02 reward_mean=+1.321e-02 reward_std=7.693e-01 reward_min=na reward_max=na reward_absmax=0.000e+00 clip_hit=0.000 norm_clip_hit=0.000 grad_norm=1.478e-02 stepped=1 opt_step=1 rollout_policy_cuda_ms=15192.50 rollout_transition_cuda_ms=10342.88 rollout_policy_share=0.595 rollout_policy_wall_ms=15197.53 rollout_transition_wall_ms=10383.83 rollout_policy_wall_share=0.594 rollout_transition_y_share=0.417 rollout_transition_x_share=0.416 rollout_transition_group_share=0.991 rollout_transition_env_pack_share=0.033 rollout_transition_state_update_share=0.073 rollout_transition_noise_share=0.060 rollout_transition_group_count=2 rollout_noise_mode=block_stream rollout_noise_block_size=64 policy_step_calls=1024 policy_step_total_ms=14930.32 policy_step_encode_share=0.052 policy_step_transformer_share=0.929 policy_step_decoder_share=0.017 rollout_cuda_busy_ratio=1.000 backward_cuda_busy_ratio=1.000 pg_loss_sig=pg_v2|norm=0|disc=1|detach=1|eps=1e-06|clip=10|rclip=10
+ [profile-interval] epoch=1 batch=1 steps/s=0.02 samples/s=1.00 tokens/s=1025.78
+[pg-epoch] obj_mean=+1.321e-02 obj_std=0.000e+00 obj_snr=1.321e+10 grad_snr=14783694408.83398 flip_rate=0.0
+[pg-note] learning rate is still in warmup phase (epoch 1/20, lr=3.000e-15, base_lr=3.000e-05); early objective fluctuations are expected.
+-----------------------------------------------------------------------------------------
+ peak gpu mem alloc/reserved 21.92GiB/24.57GiB |
+| end of epoch   1 | Wallclock time: 63.89s | GPU time: 63.89s | mean loss -1.320624e-02 | 
+ profile steps/s 0.02 (ema 0.02) | samples/s 1.00 | tokens/s 1025.76 | valid/skipped 1/0
+ gpu-observer samples 216 | gpu_util_avg 27.333333333333332 | gpu_util_max 31.0 | proc_mem_avg_mib 23338.675925925927 | proc_mem_max_mib 25638.0 | proc_sm_util_avg 25.623115577889447 | proc_sm_util_max 30.0
+ lr 3.0000000000000002e-15 nan share  0.00 ignore share (for classification tasks) 0.0000
+-----------------------------------------------------------------------------------------
+Saving model to ./models_diff/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_04_2026_08_11_37_epoch_on_exit.cpkt
