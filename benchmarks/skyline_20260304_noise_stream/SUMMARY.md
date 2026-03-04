@@ -856,3 +856,80 @@ Decision:
 - do not mainline `transition_lerp_fusion` as default (kept as probe flag only).
 - keep `flash_prefix_async` default ON.
 - keep TBPTT stream merge auto default OFF for stable skyline (OOM-safe by default).
+
+## Continuation pass (2026-03-04): TBPTT window 128 feasibility skyline
+
+### Scope
+
+- raise default `pg_tbptt_window` to `128`.
+- verify whether `TBPTT=128` is memory-feasible under current skyline workload.
+- if feasible, maintain a new skyline record for this configuration.
+
+### Config changes
+
+- `ticl/model_configs.py`
+  - optimizer default `pg_tbptt_window`: `64 -> 128`.
+  - rlpfn default `pg_tbptt_window`: `64 -> 128`.
+
+### Fixed-seed probes
+
+Common command base:
+
+```bash
+CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
+  python -u -m ticl.fit_model rlpfn \
+  --seed-everything True \
+  --epochs 1 --num-steps 1 \
+  --validate False --rl-validate-enabled False --progress-bar False \
+  --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 \
+  --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2
+```
+
+#### Probe A: keep rollout chunk=64 (default)
+
+Logs:
+
+- `20260304_tbptt128_skyline_probe.log` (with detailed rollout profiling envs)
+- `20260304_tbptt128_lightprobe.log` (light probe, no extra env profiling flags)
+
+Observed in both runs:
+
+- startup shows `Policy TBPTT window: 128`.
+- batch immediately hits OOM and auto-reduces:
+  - `[pg-oom] ... reducing TBPTT window to 64 ...`
+- effective training config becomes `tbptt=64` (`[pg-phase] ... tbptt=64 ...`).
+
+Representative KPI from light probe:
+
+- `batch_wall_excl_compile_s=89.625` (post-fallback run with effective `tbptt=64`)
+- peak memory seen: `peak gpu mem alloc/reserved 44.91GiB/46.28GiB`
+
+Conclusion:
+
+- under current `chunk=64` skyline workload, `TBPTT=128` is not stably memory-feasible.
+
+#### Probe B: force smaller chunk to keep TBPTT=128
+
+Log:
+
+- `20260304_tbptt128_chunk32_probe.log`
+
+Command delta:
+
+- `--policy-rollout-chunk-size 32 --pg-oom-reduce-tbptt-first False`
+
+Observed:
+
+- run stays at `tbptt=128` (no TBPTT downshift).
+- KPI:
+  - `batch_wall_excl_compile_s=160.504`
+  - `rollout_s=101.497`
+  - `backward_s=59.007`
+  - `chunk=32 tbptt=128`
+- memory:
+  - peak `alloc/reserved = 31.22GiB/46.28GiB` (fits, but with large reserved pool).
+
+Conclusion:
+
+- `TBPTT=128` is feasible only when reducing rollout chunk, but this causes a major wall-time regression versus current skyline (`~85-90s` class -> `160s`).
+- therefore this pass records feasibility boundary, but does not promote `tbptt=128` as throughput skyline winner under current constraints.
