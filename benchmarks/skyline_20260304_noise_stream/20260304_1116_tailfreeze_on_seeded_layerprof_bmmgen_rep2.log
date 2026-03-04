@@ -1,0 +1,56 @@
+Setting regression parameters
+Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.
+Number of parameters in backbone:  25233408
+Using a Transformer with 25.98 M parameters
+Using cuda device
+Policy TF32 matmul: True (prev=False)
+Train profiler: enabled (output_path=None, ema_alpha=0.20, warmup_epochs=0, warmup_batches=0, log_every_batches=1, wandb=False)
+GPU observer: enabled (device_index=0, pid=820080, interval_sec=0.20, sample_output=None, stage_output=None)
+Using policy_gradient objective with differentiable EnvironmentPrior rollout.
+Environment rollout backend: torch_vectorized (grouping=family, strict_rng_match=False)
+Policy objective: raw_discounted_reward_mean (discount=1)
+Policy rollout chunk size: auto(batch_size)
+Policy rollout chunk autotune: False (grow_every=8, grow_factor=2.00)
+Policy rollout checkpoint: True
+Policy rollout checkpoint reentrant: True
+Policy inner forward_step recompute_attn: kept enabled (TBPTT streaming path does not use outer rollout checkpoint).
+Policy grad-mutable KV cache: True
+Policy KV cache mode: paged
+Policy KV cache page size: 128
+Policy paged-attn train mode: auto
+Policy flash-prefix async: True
+Policy paged-attn dense page cap: 128
+Policy paged tail freeze: True
+Policy KV cache in-place append: False
+Policy saved-tensors CPU offload: False
+Policy OOM debug re-raise: False
+Policy TBPTT window: 64
+Policy TBPTT stream merge windows: 1
+Policy env replay steps: 1
+Policy OOM reduce TBPTT first: True
+Policy torch.compile: False
+Policy runtime torch: 2.10.0+cu128 (sdpa_kernel_api=True)
+Policy finalize 2D fastpath: True
+Policy autocast dtype: bf16
+GPU observer enabled: True
+GPU observer sampling: interval_sec=0.20 samples_jsonl=None stages_jsonl=None
+Kernel profiler enabled: False
+Single GPU training on NVIDIA GeForce RTX 4090
+Starting training of model rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_04_2026_10_55_36
+AdamW fused: enabled
+start of epoch 1
+[pg-gpu-stage] epoch=1 batch=0 stage=rollout  samples=245 gpu_util_avg=25.53 gpu_util_max=29.00 proc_mem_avg_mib=25326.9 proc_mem_max_mib=26978.0 proc_mem_share_avg=51.54 proc_sm_util_avg=25.08 cuda_ms=72353.91 cuda_busy_ratio=1.000 rollout_policy_cuda_ms=15816.80 rollout_transition_cuda_ms=12473.46 rollout_policy_share=0.559 rollout_policy_wall_ms=15824.47 rollout_transition_wall_ms=12509.27 rollout_policy_wall_share=0.559 rollout_transition_group_share=0.961 rollout_transition_env_pack_share=0.033 rollout_transition_state_update_share=0.035 rollout_transition_noise_share=0.029 rollout_transition_group_count=2 rollout_transition_async_enabled=1 rollout_transition_group_launch_share=0.886 rollout_transition_group_sync_share=0.041 rollout_noise_mode=block_stream rollout_noise_block_size=64 policy_step_calls=1024 policy_step_total_ms=15543.18 policy_step_encode_share=0.052 policy_step_transformer_share=0.925 policy_step_decoder_share=0.018 policy_step_tf_layer_calls=12288 policy_step_tf_layer_total_ms=14186.41 policy_step_tf_layer_proj_share=0.156 policy_step_tf_layer_cache_share=0.175 policy_step_tf_layer_attnff_share=0.646 policy_step_tf_layer_attn_core_share=0.156 policy_step_tf_layer_finalize_share=0.469 policy_step_tf_layer_finalize_attn_outproj_share=0.178 policy_step_tf_layer_finalize_ffn_share=0.248 policy_step_paged_dispatch(single/flashp/flashm/dense)=768/11520/0/0 rollout_cuda_busy_ratio=1.000 backward_cuda_busy_ratio=1.000 tbptt_stream_merge_windows=1 tbptt_stream_backward_calls=16 tbptt_stream_backward_roots=16 tbptt_stream_merge_effective=1.00 rollout_forward_est_s=30.729 rollout_instage_backward_s=41.626 rollout_instage_backward_share=0.575 pg_loss_sig=pg_v2|norm=0|disc=1|detach=1|eps=1e-06|clip=10|rclip=10 host_rss_gib=1.87 host_avail_gib=54.29
+[pg-gpu-stage] epoch=1 batch=0 stage=backward  samples=233 gpu_util_avg=25.84 gpu_util_max=29.00 proc_mem_avg_mib=26198.6 proc_mem_max_mib=26978.0 proc_mem_share_avg=53.31 proc_sm_util_avg=25.18 cuda_ms=41624.24 cuda_busy_ratio=0.606
+[pg-gpu-stage] epoch=1 batch=0 stage=step  samples=0 gpu_util_avg=na gpu_util_max=na proc_mem_avg_mib=na proc_mem_max_mib=na proc_mem_share_avg=na proc_sm_util_avg=na cuda_ms=51.67 cuda_busy_ratio=0.997
+[pg-phase] epoch=1 batch=0 rollout_s=72.355 backward_s=41.626 step_s=0.052 backward_calls=16 chunk=64 tbptt=64 status=ok objective=+2.825e-03 reward_mean=+2.825e-03 reward_std=2.025e-01 reward_min=na reward_max=na reward_absmax=0.000e+00 clip_hit=0.000 norm_clip_hit=0.000 grad_norm=4.069e-03 stepped=1 opt_step=1 rollout_policy_cuda_ms=15816.80 rollout_transition_cuda_ms=12473.46 rollout_policy_share=0.559 rollout_policy_wall_ms=15824.47 rollout_transition_wall_ms=12509.27 rollout_policy_wall_share=0.559 rollout_transition_group_share=0.961 rollout_transition_env_pack_share=0.033 rollout_transition_state_update_share=0.035 rollout_transition_noise_share=0.029 rollout_transition_group_count=2 rollout_transition_async_enabled=1 rollout_transition_group_launch_share=0.886 rollout_transition_group_sync_share=0.041 rollout_noise_mode=block_stream rollout_noise_block_size=64 policy_step_calls=1024 policy_step_total_ms=15543.18 policy_step_encode_share=0.052 policy_step_transformer_share=0.925 policy_step_decoder_share=0.018 policy_step_tf_layer_calls=12288 policy_step_tf_layer_total_ms=14186.41 policy_step_tf_layer_proj_share=0.156 policy_step_tf_layer_cache_share=0.175 policy_step_tf_layer_attnff_share=0.646 policy_step_tf_layer_attn_core_share=0.156 policy_step_tf_layer_finalize_share=0.469 policy_step_tf_layer_finalize_attn_outproj_share=0.178 policy_step_tf_layer_finalize_ffn_share=0.248 policy_step_paged_dispatch(single/flashp/flashm/dense)=768/11520/0/0 rollout_cuda_busy_ratio=1.000 backward_cuda_busy_ratio=1.000 tbptt_stream_merge_windows=1 tbptt_stream_backward_calls=16 tbptt_stream_backward_roots=16 tbptt_stream_merge_effective=1.00 rollout_forward_est_s=30.729 rollout_instage_backward_s=41.626 rollout_instage_backward_share=0.575 pg_loss_sig=pg_v2|norm=0|disc=1|detach=1|eps=1e-06|clip=10|rclip=10 host_rss_gib=1.87 host_avail_gib=54.29
+ [profile-interval] epoch=1 batch=1 steps/s=0.01 samples/s=0.88 tokens/s=905.04
+[pg-epoch] obj_mean=+2.825e-03 obj_std=0.000e+00 obj_snr=2.825e+09 grad_snr=4068680573.2548237 flip_rate=0.0
+[pg-note] learning rate is still in warmup phase (epoch 1/20, lr=3.000e-15, base_lr=3.000e-05); early objective fluctuations are expected.
+-----------------------------------------------------------------------------------------
+ peak gpu mem alloc/reserved 24.22GiB/25.86GiB |
+| end of epoch   1 | Wallclock time: 72.41s | GPU time: 72.41s | mean loss -2.824605e-03 | 
+ profile steps/s 0.01 (ema 0.01) | samples/s 0.88 | tokens/s 905.02 | valid/skipped 1/0
+ gpu-observer samples 245 | gpu_util_avg 25.53469387755102 | gpu_util_max 29.0 | proc_mem_avg_mib 25326.906122448978 | proc_mem_max_mib 26978.0 | proc_sm_util_avg 25.07758620689655 | proc_sm_util_max 28.0
+ lr 3.0000000000000002e-15 nan share  0.00 ignore share (for classification tasks) 0.0000
+-----------------------------------------------------------------------------------------
+Saving model to ./models_diff/rlpfn_E1_n1_traingpuobserverenabledTrue_traingpuobserverintervalsec0.2_trainprofilerenabledTrue_trainprofilerlogeverybatches1_trainprofilerwandbFalse_03_04_2026_10_55_36_epoch_on_exit.cpkt

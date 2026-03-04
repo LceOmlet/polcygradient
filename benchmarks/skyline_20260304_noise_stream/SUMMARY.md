@@ -326,3 +326,77 @@ Decision:
   - blocked by runtime CUDA init failure on host (`cudaGetDeviceCount error 304`,
     `nvidia-smi: Failed to initialize NVML`), so no new authoritative skyline
     numbers were produced in this pass.
+
+## Continuation pass (2026-03-04, CUDA restored): non-compile hard-kernel optimization
+
+### Scope
+
+- target: keep `replay_step=1`, no compile dependency, reduce pseudo-serial
+  launch/copy overhead in:
+  - `policy_step_transformer_share` path (`forward_step` cache container churn),
+  - `transition_group_share` path (env generator kernels).
+
+### Code changes
+
+- `TransformerEncoderLayer` / `TransformerEncoderSimple`:
+  - added cache container reuse toggle: `TICL_POLICY_CACHE_CONTAINER_REUSE`
+    (default `1`), reusing per-layer cache dict and encoder cache list in
+    mutable rollout path to reduce per-step Python object churn.
+- `EnvironmentPrior` env generators:
+  - introduced `_batch_affine` and switched SCM/GP batch generator hot paths
+    from `einsum("bi,bij->bj")` to CUDA `bmm/baddbmm` kernels.
+  - strict CPU semantics retained (CPU path still uses original einsum) so
+    strict-RNG semantic tests remain unchanged.
+  - toggle: `TICL_POLICY_ENVGEN_BMM` (default `1`).
+
+### Fixed-seed measurements
+
+- pre-pass reference (same branch before envgen-bmm):
+  - `20260304_1047_tailfreeze_on_seeded_layerprof_afterpush.log`
+  - `rollout_s=71.777`, `backward_s=40.681`
+  - `rollout_transition_wall_ms=13170.34`
+- envgen-bmm on:
+  - `20260304_1110_tailfreeze_on_seeded_layerprof_bmmgen.log`
+    - `rollout_s=69.980`, `backward_s=39.919`
+    - `rollout_transition_wall_ms=12290.55`
+  - `20260304_1116_tailfreeze_on_seeded_layerprof_bmmgen_rep2.log`
+    - `rollout_s=72.355`, `backward_s=41.626`
+    - `rollout_transition_wall_ms=12509.27`
+- envgen-bmm off (A/B):
+  - `20260304_1123_tailfreeze_on_seeded_layerprof_bmmgen_off.log`
+  - `rollout_s=73.050`, `backward_s=42.408`
+  - `rollout_transition_wall_ms=13091.10`
+
+Interpretation:
+
+- `TICL_POLICY_ENVGEN_BMM=1` consistently lowers transition wall share in A/B
+  and improves end-to-end wall in fixed-seed probes.
+- `TICL_POLICY_CACHE_CONTAINER_REUSE` shows small/variable gains; retained as
+  default-on toggle but not treated as the primary win in this pass.
+
+### Mainline skyline probe (no layer-profile overhead)
+
+- `20260304_1130_tailfreeze_on_seeded_mainline_bmmgen.log`
+  - `rollout_s=68.847`
+  - `backward_s=39.623`
+  - `policy_step_total_ms=14490.08`
+  - `rollout_transition_wall_ms=12145.68`
+  - peak alloc/reserved: `24.22/25.86 GiB`
+
+Compared with prior authoritative on-run (`20260304_1220_tailfreeze_on_seeded_postcompilefix.log`):
+
+- `rollout_s`: `71.218 -> 68.847` (`-3.33%`)
+- `backward_s`: `40.581 -> 39.623` (`-2.36%`)
+- `policy_step_total_ms`: `15102.49 -> 14490.08` (`-4.06%`)
+
+### TBPTT merge-window recheck on new branch
+
+- `20260304_1140_tailfreeze_on_seeded_bmmgen_tbpttmerge2.log`
+- with `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=2`, run again hit OOM fallback:
+  - immediately reduced to merge=`1`
+  - peak alloc/reserved rose to `43.65/46.28 GiB`
+
+Decision:
+
+- keep `merge_windows=1` as skyline default (merge>1 still non-viable under
+  current horizon/model).

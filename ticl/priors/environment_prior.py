@@ -108,6 +108,8 @@ class EnvironmentPrior:
         self.last_rollout_profile = None
         self._rollout_executor = None
         self._rollout_executor_workers = 0
+        envgen_bmm_flag = str(os.environ.get("TICL_POLICY_ENVGEN_BMM", "1")).strip().lower()
+        self.envgen_bmm = envgen_bmm_flag not in {"0", "false", "no", "off"}
 
     def __del__(self):
         executor = getattr(self, "_rollout_executor", None)
@@ -608,7 +610,7 @@ class EnvironmentPrior:
             z = x
             for li, layer in enumerate(layers):
                 z_in = z[:, :layer["in_cap"]] * layer["in_mask"]
-                z = torch.einsum("bi,bij->bj", z_in, layer["w"]) + layer["b"]
+                z = self._batch_affine(z_in, layer["w"], layer["b"])
                 z = z * layer["out_mask"]
                 if li < (len(layers) - 1):
                     activation_mask = layer["activation_mask"].unsqueeze(1)
@@ -719,8 +721,8 @@ class EnvironmentPrior:
 
         def fn(x, generators_for_noise=None):
             x_in = x[:, :in_cap] * in_mask
-            phi = torch.cos(torch.einsum("bi,bij->bj", x_in, w) + b) * m_mask
-            y = outputscale[:, None] * torch.einsum("bi,bij->bj", phi, a)
+            phi = torch.cos(self._batch_affine(x_in, w, b)) * m_mask
+            y = outputscale[:, None] * self._batch_affine(phi, a, None)
             y = y * out_mask
             if torch.any(noise > 0):
                 if generators_for_noise is None:
@@ -995,7 +997,7 @@ class EnvironmentPrior:
         def fn(x, generators_for_noise=None):
             z = x
             for i, (w, b) in enumerate(zip(weights, biases)):
-                z = torch.einsum("bi,bij->bj", z, w) + b
+                z = self._batch_affine(z, w, b)
                 if i < len(weights) - 1:
                     z = activation(z)
             if torch.any(noise_std > 0):
@@ -1068,8 +1070,8 @@ class EnvironmentPrior:
                 a[bi] = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
 
         def fn(x, generators_for_noise=None):
-            phi = torch.cos(torch.einsum("bi,bij->bj", x, w) + b)
-            y = outputscale[:, None] * torch.einsum("bi,bij->bj", phi, a)
+            phi = torch.cos(self._batch_affine(x, w, b))
+            y = outputscale[:, None] * self._batch_affine(phi, a, None)
             if torch.any(noise > 0):
                 if generators_for_noise is None:
                     y = y + torch.randn_like(y) * noise[:, None]
@@ -1223,6 +1225,19 @@ class EnvironmentPrior:
             for g in generators
         ]
         return torch.stack(cols, dim=0)
+
+    def _batch_affine(self, x, w, b=None):
+        """
+        Batched affine map for per-sample weights.
+        x: (B, I), w: (B, I, O), b: (B, O) or None.
+        """
+        if (x.device.type != "cuda") or (not bool(self.envgen_bmm)):
+            out = torch.einsum("bi,bij->bj", x, w)
+            return out if b is None else (out + b)
+        x3 = x.unsqueeze(1)
+        if b is None:
+            return torch.bmm(x3, w).squeeze(1)
+        return torch.baddbmm(b.unsqueeze(1), x3, w).squeeze(1)
 
     @staticmethod
     def _sample_seed_list(batch_size):

@@ -177,6 +177,8 @@ class TransformerEncoderLayer(Module):
         self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
         finalize_2d_flag = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
         self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
+        cache_reuse_flag = str(os.environ.get("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")).strip().lower()
+        self.cache_container_reuse = cache_reuse_flag not in {"0", "false", "no", "off"}
         self._layer_step_profile_stats = {
             "calls": 0,
             "proj_wall_s": 0.0,
@@ -1396,25 +1398,53 @@ class TransformerEncoderLayer(Module):
             (cache_mode == "paged")
             and (k_pages is None or v_pages is None)
         )
-        new_cache = {
-            "k": (k_all if (cache_mode != "paged" or store_dense_paged_views) else None),
-            "v": (v_all if (cache_mode != "paged" or store_dense_paged_views) else None),
-            "cache_mode": cache_mode,
-            "max_cache_len": int(max_cache_len) if max_cache_len is not None else None,
-            "k_store": k_store,
-            "v_store": v_store,
-            "k_pages": k_pages,
-            "v_pages": v_pages,
-            "page_size": int(effective_kv_page_size) if effective_kv_page_size is not None else None,
-            "valid_len": int(valid_len),
-            "k_prefix": k_prefix,
-            "v_prefix": v_prefix,
-            "prefix_pages": int(prefix_pages),
-            "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
-            "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
-            "tail_frozen": bool(tail_frozen) if cache_mode == "paged" else False,
-            "paged_packed": bool(paged_packed) if cache_mode == "paged" else False,
-        }
+        cache_k = (k_all if (cache_mode != "paged" or store_dense_paged_views) else None)
+        cache_v = (v_all if (cache_mode != "paged" or store_dense_paged_views) else None)
+        reuse_cache_container = bool(
+            self.cache_container_reuse
+            and isinstance(kv_cache, dict)
+            and bool(append_to_cache)
+            and bool(allow_grad_mutable_cache)
+        )
+        if reuse_cache_container:
+            new_cache = kv_cache
+            new_cache["k"] = cache_k
+            new_cache["v"] = cache_v
+            new_cache["cache_mode"] = cache_mode
+            new_cache["max_cache_len"] = int(max_cache_len) if max_cache_len is not None else None
+            new_cache["k_store"] = k_store
+            new_cache["v_store"] = v_store
+            new_cache["k_pages"] = k_pages
+            new_cache["v_pages"] = v_pages
+            new_cache["page_size"] = int(effective_kv_page_size) if effective_kv_page_size is not None else None
+            new_cache["valid_len"] = int(valid_len)
+            new_cache["k_prefix"] = k_prefix
+            new_cache["v_prefix"] = v_prefix
+            new_cache["prefix_pages"] = int(prefix_pages)
+            new_cache["allow_grad_mutable_cache"] = bool(allow_grad_mutable_cache)
+            new_cache["allow_grad_inplace_paged_cache"] = bool(allow_grad_inplace_paged_cache)
+            new_cache["tail_frozen"] = bool(tail_frozen) if cache_mode == "paged" else False
+            new_cache["paged_packed"] = bool(paged_packed) if cache_mode == "paged" else False
+        else:
+            new_cache = {
+                "k": cache_k,
+                "v": cache_v,
+                "cache_mode": cache_mode,
+                "max_cache_len": int(max_cache_len) if max_cache_len is not None else None,
+                "k_store": k_store,
+                "v_store": v_store,
+                "k_pages": k_pages,
+                "v_pages": v_pages,
+                "page_size": int(effective_kv_page_size) if effective_kv_page_size is not None else None,
+                "valid_len": int(valid_len),
+                "k_prefix": k_prefix,
+                "v_prefix": v_prefix,
+                "prefix_pages": int(prefix_pages),
+                "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
+                "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
+                "tail_frozen": bool(tail_frozen) if cache_mode == "paged" else False,
+                "paged_packed": bool(paged_packed) if cache_mode == "paged" else False,
+            }
         if total_t0 is not None:
             stats = self._layer_step_profile_stats
             stats["calls"] += 1
@@ -1759,19 +1789,41 @@ class TransformerEncoderSimple(Module):
         if len(kv_cache) != len(self.layers):
             raise ValueError(f"kv_cache length {len(kv_cache)} != num_layers {len(self.layers)}")
 
-        new_cache = []
-        for layer, cache in zip(self.layers, kv_cache):
-            output, cache_next = layer.forward_step(
-                output,
-                kv_cache=cache,
-                append_to_cache=append_to_cache,
-                max_cache_len=max_cache_len,
-                kv_cache_mode=kv_cache_mode,
-                kv_cache_page_size=kv_cache_page_size,
-                allow_grad_mutable_cache=allow_grad_mutable_cache,
-                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
-            )
-            new_cache.append(cache_next)
+        reuse_cache_list = bool(
+            isinstance(kv_cache, list)
+            and bool(append_to_cache)
+            and bool(allow_grad_mutable_cache)
+            and bool(self.layers[0].cache_container_reuse if len(self.layers) > 0 else True)
+        )
+        if reuse_cache_list:
+            new_cache = kv_cache
+            layer_iter = zip(range(len(self.layers)), self.layers, kv_cache)
+            for layer_idx, layer, cache in layer_iter:
+                output, cache_next = layer.forward_step(
+                    output,
+                    kv_cache=cache,
+                    append_to_cache=append_to_cache,
+                    max_cache_len=max_cache_len,
+                    kv_cache_mode=kv_cache_mode,
+                    kv_cache_page_size=kv_cache_page_size,
+                    allow_grad_mutable_cache=allow_grad_mutable_cache,
+                    allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+                )
+                new_cache[layer_idx] = cache_next
+        else:
+            new_cache = []
+            for layer, cache in zip(self.layers, kv_cache):
+                output, cache_next = layer.forward_step(
+                    output,
+                    kv_cache=cache,
+                    append_to_cache=append_to_cache,
+                    max_cache_len=max_cache_len,
+                    kv_cache_mode=kv_cache_mode,
+                    kv_cache_page_size=kv_cache_page_size,
+                    allow_grad_mutable_cache=allow_grad_mutable_cache,
+                    allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+                )
+                new_cache.append(cache_next)
 
         if self.norm is not None:
             output = self.norm(output)
