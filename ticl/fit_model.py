@@ -87,6 +87,10 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-kernel-profiler-log-every-batches", "train_kernel_profiler_log_every_batches"),
         ("--train-kernel-profiler-export-trace", "train_kernel_profiler_export_trace"),
         ("--train-kernel-profiler-summary-top-k", "train_kernel_profiler_summary_top_k"),
+        ("--pg-compile-observe-recompiles", "pg_compile_observe_recompiles"),
+        ("--pg-compile-observe-log-every-batches", "pg_compile_observe_log_every_batches"),
+        ("--pg-compile-observe-output-path", "pg_compile_observe_output_path"),
+        ("--pg-compile-observe-reset-after-warmup", "pg_compile_observe_reset_after_warmup"),
     )
     for flag, key in profiler_flags:
         if _cli_flag_is_set(argv, flag):

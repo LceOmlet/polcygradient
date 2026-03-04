@@ -1,5 +1,6 @@
 import math
 import os
+import json
 import time, wandb
 import random
 import gc
@@ -365,6 +366,63 @@ def _compile_policy_forward_step(
     except Exception as e:
         print(f"[pg-compile-warn] failed to compile forward_policy_step, fallback to eager: {e}")
         return policy_forward_step, False
+
+
+def _snapshot_dynamo_counters():
+    try:
+        from torch._dynamo.utils import counters as dynamo_counters
+    except Exception:
+        return None
+    snapshot = {}
+    try:
+        groups_iter = dynamo_counters.items()
+    except Exception:
+        return None
+    for group_name, group_counter in groups_iter:
+        try:
+            items_iter = group_counter.items()
+        except Exception:
+            continue
+        group_snap = {}
+        for key, value in items_iter:
+            try:
+                group_snap[str(key)] = int(value)
+            except Exception:
+                continue
+        snapshot[str(group_name)] = group_snap
+    return snapshot
+
+
+def _diff_dynamo_counters(current_snapshot, baseline_snapshot):
+    if not isinstance(current_snapshot, dict):
+        return {}
+    baseline_snapshot = baseline_snapshot if isinstance(baseline_snapshot, dict) else {}
+    delta = {}
+    for group_name in set(current_snapshot.keys()) | set(baseline_snapshot.keys()):
+        cur_group = current_snapshot.get(group_name, {})
+        base_group = baseline_snapshot.get(group_name, {})
+        if not isinstance(cur_group, dict):
+            cur_group = {}
+        if not isinstance(base_group, dict):
+            base_group = {}
+        for key_name in set(cur_group.keys()) | set(base_group.keys()):
+            cur_v = int(cur_group.get(key_name, 0) or 0)
+            base_v = int(base_group.get(key_name, 0) or 0)
+            dv = int(cur_v - base_v)
+            if dv != 0:
+                delta[f"{group_name}.{key_name}"] = dv
+    return delta
+
+
+def _format_compile_counter_delta(counter_delta, max_items=8):
+    if not isinstance(counter_delta, dict) or len(counter_delta) == 0:
+        return "none"
+    items = sorted(
+        counter_delta.items(),
+        key=lambda kv: (-abs(int(kv[1])), str(kv[0])),
+    )
+    top_items = items[: int(max(1, max_items))]
+    return ",".join(f"{k}:{int(v):+d}" for k, v in top_items)
 
 
 def _build_policy_step_fn(
@@ -1029,6 +1087,10 @@ def train_epoch_policy_gradient(
     pg_torch_compile_mode="reduce-overhead",
     pg_torch_compile_fullgraph=False,
     pg_torch_compile_dynamic=False,
+    pg_compile_observe_recompiles=False,
+    pg_compile_observe_log_every_batches=1,
+    pg_compile_observe_output_path=None,
+    pg_compile_observe_reset_after_warmup=True,
     epoch_idx=None,
     progress_bar=False,
     epoch_profiler=None,
@@ -1308,6 +1370,28 @@ def train_epoch_policy_gradient(
         compile_warmup_chunk_cap = int(batch_size)
     compile_warmup_chunk_cap = int(max(1, min(int(batch_size), compile_warmup_chunk_cap)))
     compile_warmup_done = not bool(compile_warmup_enabled)
+    compile_observe_enabled = bool(pg_torch_compile) and bool(pg_compile_observe_recompiles)
+    try:
+        compile_observe_log_every_batches = int(pg_compile_observe_log_every_batches)
+    except Exception:
+        compile_observe_log_every_batches = 1
+    compile_observe_log_every_batches = int(max(1, compile_observe_log_every_batches))
+    compile_observe_output_path = (
+        str(pg_compile_observe_output_path).strip()
+        if pg_compile_observe_output_path is not None
+        else None
+    )
+    if compile_observe_output_path == "":
+        compile_observe_output_path = None
+    compile_observe_reset_after_warmup = bool(pg_compile_observe_reset_after_warmup)
+    compile_counter_prev_snapshot = _snapshot_dynamo_counters() if compile_observe_enabled else None
+    if compile_observe_output_path is not None:
+        try:
+            out_dir = os.path.dirname(os.path.abspath(compile_observe_output_path))
+            if out_dir:
+                os.makedirs(out_dir, exist_ok=True)
+        except Exception:
+            compile_observe_output_path = None
 
     iterator = range(steps_per_epoch)
     if progress_bar:
@@ -1454,6 +1538,12 @@ def train_epoch_policy_gradient(
                     batch_policy_step_layer_paged_dense_calls = 0
                     batch_compile_warmup_wall = 0.0
                     batch_compile_warmup_ok = None
+                    batch_compile_counter_delta_nonzero = 0
+                    batch_compile_counter_delta_total = 0
+                    batch_compile_counter_delta_graph_breaks = 0
+                    batch_compile_counter_delta_unique_graphs = 0
+                    batch_compile_counter_delta_recompiles = 0
+                    batch_compile_counter_delta_summary = "none"
                     batch_pg_loss_signature = None
                     try:
                         sig_fn = getattr(env_prior, "policy_gradient_loss_signature", None)
@@ -1559,12 +1649,16 @@ def train_epoch_policy_gradient(
                         warmup_dt = float(time.perf_counter() - warmup_t0)
                         batch_compile_warmup_wall = float(warmup_dt)
                         batch_compile_warmup_ok = bool(warmup_ok)
+                        if compile_observe_enabled and compile_observe_reset_after_warmup:
+                            compile_counter_prev_snapshot = _snapshot_dynamo_counters()
                         print(
                             "[pg-compile-warmup] "
                             f"ok={int(bool(warmup_ok))} steps={int(compile_warmup_steps)} "
                             f"chunk={int(warmup_chunk_bs)} n_samples={int(warmup_n_samples)} "
                             f"wall_s={warmup_dt:.3f}"
                         )
+                        if compile_observe_enabled and compile_observe_reset_after_warmup:
+                            print("[pg-compile-observe] baseline reset after compile warmup.")
     
                     batch_oom = False
                     for chunk_start in range(0, batch_size, current_rollout_chunk_size):
@@ -2242,6 +2336,80 @@ def train_epoch_policy_gradient(
                         batch_policy_step_layer_paged_dense_calls += int(
                             step_profile_tail.get("transformer_layer_paged_path_dense", 0) or 0
                         )
+
+                if compile_observe_enabled:
+                    compile_counter_curr_snapshot = _snapshot_dynamo_counters()
+                    compile_counter_delta = _diff_dynamo_counters(
+                        compile_counter_curr_snapshot,
+                        compile_counter_prev_snapshot,
+                    )
+                    compile_counter_prev_snapshot = compile_counter_curr_snapshot
+                    batch_compile_counter_delta_nonzero = int(len(compile_counter_delta))
+                    batch_compile_counter_delta_total = int(
+                        sum(abs(int(v)) for v in compile_counter_delta.values())
+                    )
+                    batch_compile_counter_delta_graph_breaks = int(
+                        sum(
+                            int(v)
+                            for k, v in compile_counter_delta.items()
+                            if "graph_break" in str(k).lower()
+                        )
+                    )
+                    batch_compile_counter_delta_unique_graphs = int(
+                        compile_counter_delta.get("stats.unique_graphs", 0)
+                        + compile_counter_delta.get("stats.unique_graph", 0)
+                    )
+                    batch_compile_counter_delta_recompiles = int(
+                        sum(
+                            int(v)
+                            for k, v in compile_counter_delta.items()
+                            if "recompile" in str(k).lower()
+                        )
+                    )
+                    batch_compile_counter_delta_summary = _format_compile_counter_delta(
+                        compile_counter_delta,
+                        max_items=10,
+                    )
+                    if compile_observe_output_path is not None:
+                        try:
+                            with open(compile_observe_output_path, "a", encoding="utf-8") as f:
+                                f.write(
+                                    json.dumps(
+                                        {
+                                            "epoch": int(batch_epoch_for_profile),
+                                            "batch": int(batch),
+                                            "batch_status": (
+                                                "oom"
+                                                if batch_oom
+                                                else ("loss_nonfinite" if batch_nonfinite else "ok")
+                                            ),
+                                            "delta_nonzero": int(batch_compile_counter_delta_nonzero),
+                                            "delta_total_abs": int(batch_compile_counter_delta_total),
+                                            "delta_graph_breaks": int(batch_compile_counter_delta_graph_breaks),
+                                            "delta_unique_graphs": int(batch_compile_counter_delta_unique_graphs),
+                                            "delta_recompiles": int(batch_compile_counter_delta_recompiles),
+                                            "delta": {
+                                                str(k): int(v)
+                                                for k, v in compile_counter_delta.items()
+                                            },
+                                        },
+                                        ensure_ascii=True,
+                                        sort_keys=True,
+                                    )
+                                    + "\n"
+                                )
+                        except Exception:
+                            pass
+                    if should_log_phase or (((batch + 1) % compile_observe_log_every_batches) == 0):
+                        print(
+                            f"[pg-compile-observe] epoch={batch_epoch_for_profile} batch={batch} "
+                            f"delta_nonzero={int(batch_compile_counter_delta_nonzero)} "
+                            f"delta_total_abs={int(batch_compile_counter_delta_total)} "
+                            f"recompiles={int(batch_compile_counter_delta_recompiles)} "
+                            f"graph_breaks={int(batch_compile_counter_delta_graph_breaks)} "
+                            f"unique_graphs={int(batch_compile_counter_delta_unique_graphs)} "
+                            f"delta_top={batch_compile_counter_delta_summary}"
+                        )
     
                 stage_cuda_ms = {"rollout": None, "backward": None}
                 if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
@@ -2364,6 +2532,14 @@ def train_epoch_policy_gradient(
                     rollout_breakdown_suffix += f" compile_warmup_s={batch_compile_warmup_wall:.3f}"
                     if batch_compile_warmup_ok is not None:
                         rollout_breakdown_suffix += f" compile_warmup_ok={int(bool(batch_compile_warmup_ok))}"
+                if compile_observe_enabled:
+                    rollout_breakdown_suffix += (
+                        f" compile_counter_delta_nonzero={int(batch_compile_counter_delta_nonzero)}"
+                        f" compile_counter_delta_total_abs={int(batch_compile_counter_delta_total)}"
+                        f" compile_counter_recompiles={int(batch_compile_counter_delta_recompiles)}"
+                        f" compile_counter_graph_breaks={int(batch_compile_counter_delta_graph_breaks)}"
+                        f" compile_counter_unique_graphs={int(batch_compile_counter_delta_unique_graphs)}"
+                    )
                 if batch_policy_step_total_ms > 0.0:
                     policy_step_encode_share = float(batch_policy_step_encode_ms / max(1e-9, batch_policy_step_total_ms))
                     policy_step_transformer_share = float(
@@ -2505,6 +2681,22 @@ def train_epoch_policy_gradient(
                                 stage_extra["compile_warmup_s"] = float(batch_compile_warmup_wall)
                                 if batch_compile_warmup_ok is not None:
                                     stage_extra["compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
+                            if compile_observe_enabled:
+                                stage_extra["compile_counter_delta_nonzero"] = int(
+                                    batch_compile_counter_delta_nonzero
+                                )
+                                stage_extra["compile_counter_delta_total_abs"] = int(
+                                    batch_compile_counter_delta_total
+                                )
+                                stage_extra["compile_counter_recompiles"] = int(
+                                    batch_compile_counter_delta_recompiles
+                                )
+                                stage_extra["compile_counter_graph_breaks"] = int(
+                                    batch_compile_counter_delta_graph_breaks
+                                )
+                                stage_extra["compile_counter_unique_graphs"] = int(
+                                    batch_compile_counter_delta_unique_graphs
+                                )
                         if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                             stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                             stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
@@ -2690,6 +2882,22 @@ def train_epoch_policy_gradient(
                                     wandb_payload["pg_gpu/compile_warmup_s"] = float(batch_compile_warmup_wall)
                                     if batch_compile_warmup_ok is not None:
                                         wandb_payload["pg_gpu/compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
+                                if compile_observe_enabled:
+                                    wandb_payload["pg_gpu/compile_counter_delta_nonzero"] = int(
+                                        batch_compile_counter_delta_nonzero
+                                    )
+                                    wandb_payload["pg_gpu/compile_counter_delta_total_abs"] = int(
+                                        batch_compile_counter_delta_total
+                                    )
+                                    wandb_payload["pg_gpu/compile_counter_recompiles"] = int(
+                                        batch_compile_counter_delta_recompiles
+                                    )
+                                    wandb_payload["pg_gpu/compile_counter_graph_breaks"] = int(
+                                        batch_compile_counter_delta_graph_breaks
+                                    )
+                                    wandb_payload["pg_gpu/compile_counter_unique_graphs"] = int(
+                                        batch_compile_counter_delta_unique_graphs
+                                    )
                             if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                                 wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                                 wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
@@ -3395,6 +3603,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_torch_compile_mode="reduce-overhead",
           pg_torch_compile_fullgraph=False,
           pg_torch_compile_dynamic=False,
+          pg_compile_observe_recompiles=False,
+          pg_compile_observe_log_every_batches=1,
+          pg_compile_observe_output_path=None,
+          pg_compile_observe_reset_after_warmup=True,
           ):
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
@@ -3752,6 +3964,13 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     f"samples={int(compile_warmup_samples_print)}, "
                     f"chunk={int(max(1, min(int(dl.batch_size), compile_warmup_chunk_print)))})",
                 )
+                print(
+                    "Policy compile recompile observability:",
+                    bool(pg_compile_observe_recompiles),
+                    f"(log_every_batches={int(max(1, pg_compile_observe_log_every_batches))}, "
+                    f"reset_after_warmup={bool(pg_compile_observe_reset_after_warmup)}, "
+                    f"output_path={pg_compile_observe_output_path})",
+                )
             try:
                 from torch.nn.attention import sdpa_kernel as _sdpa_kernel_probe  # noqa: F401
                 sdpa_api_available = True
@@ -3913,6 +4132,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     pg_torch_compile_mode=pg_torch_compile_mode,
                     pg_torch_compile_fullgraph=pg_torch_compile_fullgraph,
                     pg_torch_compile_dynamic=pg_torch_compile_dynamic,
+                    pg_compile_observe_recompiles=pg_compile_observe_recompiles,
+                    pg_compile_observe_log_every_batches=pg_compile_observe_log_every_batches,
+                    pg_compile_observe_output_path=pg_compile_observe_output_path,
+                    pg_compile_observe_reset_after_warmup=pg_compile_observe_reset_after_warmup,
                     epoch_idx=epoch,
                     progress_bar=progress_bar,
                     epoch_profiler=train_profiler,

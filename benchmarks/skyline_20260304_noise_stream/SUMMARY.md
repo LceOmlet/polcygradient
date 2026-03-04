@@ -682,3 +682,114 @@ Decision:
 - keep TBPTT merge-guard instrumentation/safety path.
 - do not mainline async-inline transition commit path (reverted).
 - keep skyline on non-compile eager path with `batch_wall_excl_compile_s` as KPI.
+
+## Continuation pass (2026-03-04): policy-step cache launch compression + compile recompile observability
+
+### Scope
+
+- target dominant forward hotspot `policy_step_transformer_share` on non-compile path.
+- avoid pseudo tuning; reduce real kernel launch/copy count in `forward_step` cache path.
+- add CLI-level compile/recompile observability so warmup pollution and recompile storms are separable from KPI.
+
+### Code changes
+
+- `ticl/models/layer.py`
+  - `TransformerEncoderLayer._concat_dim2` switched to single `torch.cat` kernel path.
+  - COW tail-page growth paths (`_append_to_kv_pages_cow*`) now reuse `_concat_dim2`
+    instead of manual `new_empty + two slice-copy` sequence.
+  - added ablation switch:
+    - `TICL_POLICY_CAT_FUSION` (default `1`, `0` restores old manual copy path).
+- `ticl/train.py`, `ticl/cli_parsing.py`, `ticl/model_configs.py`, `ticl/fit_model.py`
+  - added compile observability CLI knobs:
+    - `--pg-compile-observe-recompiles`
+    - `--pg-compile-observe-log-every-batches`
+    - `--pg-compile-observe-output-path`
+    - `--pg-compile-observe-reset-after-warmup`
+  - new per-batch metrics (log/stage/wandb/jsonl):
+    - `compile_counter_delta_nonzero`
+    - `compile_counter_delta_total_abs`
+    - `compile_counter_recompiles`
+    - `compile_counter_graph_breaks`
+    - `compile_counter_unique_graphs`
+  - warmup completion can reset compile-counter baseline to remove warmup contamination.
+
+### Fixed-seed hard A/B (`TICL_POLICY_CAT_FUSION`)
+
+Command base (same workload/seed, only cat-fusion toggle differs):
+
+```bash
+TICL_PROFILE_ROLLOUT_TIMING=1 TICL_PROFILE_ROLLOUT_BREAKDOWN=1 TICL_POLICY_STEP_PROFILE=1 \
+CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
+  python -u -m ticl.fit_model rlpfn \
+  --seed-everything True \
+  --epochs 1 --num-steps 1 \
+  --validate False --rl-validate-enabled False --progress-bar False \
+  --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 \
+  --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2
+```
+
+Logs:
+
+- `cat_fusion=on`: `20260304_133800_seeded_catfusion_on.log`
+- `cat_fusion=off`: `20260304_133950_seeded_catfusion_off.log`
+
+Metrics (`off -> on`):
+
+- `rollout_s`: `61.405 -> 56.086` (`-8.7%`)
+- `backward_s`: `35.856 -> 32.027` (`-10.7%`)
+- `batch_wall_excl_compile_s`: `97.261 -> 88.113` (`-9.4%`)
+- `policy_step_total_ms`: `15104.23 -> 13397.00` (`-11.3%`)
+- `policy_step_transformer_share`: `0.929 -> 0.918`
+
+### Layer-profile evidence (same branch)
+
+Logs:
+
+- `cat_fusion=on`: `20260304_132100_seeded_mainline_catfuse_layerprofile.log`
+- `cat_fusion=off`: `20260304_134430_seeded_catfusion_off_layerprofile.log`
+
+Key decomposition (`off -> on`):
+
+- `policy_step_tf_layer_total_ms`: `13895.13 -> 12235.98` (`-11.9%`)
+- `policy_step_tf_layer_cache_share`: `0.189 -> 0.077` (major cache-path reduction)
+- paged dispatch remained identical route family (`single/flashp`, no dense fallback promotion).
+
+Conclusion:
+
+- dominant pseudo-serial cache copy/concat path is a real bottleneck;
+  replacing multi-copy sequence with cat-fused path provides robust end-to-end gain.
+- this is retained as mainline default (`TICL_POLICY_CAT_FUSION=1`).
+
+### Compile observability probe (CLI path verification)
+
+Probe log:
+
+- `20260304_134900_seeded_compileobserve_probe_v2.log`
+- counters jsonl:
+  `20260304_134900_seeded_compileobserve_probe_v2.counters.jsonl`
+
+Probe config highlights:
+
+- `--pg-torch-compile True`
+- `--pg-compile-observe-recompiles True`
+- `--pg-compile-observe-log-every-batches 1`
+- `--pg-compile-observe-reset-after-warmup True`
+- warmup isolated by env:
+  `TICL_POLICY_COMPILE_WARMUP=1`,
+  `TICL_POLICY_COMPILE_WARMUP_STEPS=1`,
+  `TICL_POLICY_COMPILE_WARMUP_SAMPLES=2`,
+  `TICL_POLICY_COMPILE_WARMUP_CHUNK=8`.
+
+Observed:
+
+- compile log now emits explicit per-batch counter deltas.
+- `compile_counter_recompiles=1` (capturing `unimplemented.recompile_limit reached` delta).
+- KPI remains warmup-excluded:
+  - `batch_wall_excl_compile_s=102.777`
+  - `batch_wall_incl_compile_s=123.572`
+  - `compile_warmup_s=20.795`
+
+Decision:
+
+- keep compile path off mainline skyline.
+- keep new compile observability knobs enabled for targeted probe runs to isolate recompile pollution.

@@ -33,6 +33,10 @@ def _is_torch_compiling():
     return False
 
 
+_CAT_FUSION_ENV = str(os.environ.get("TICL_POLICY_CAT_FUSION", "1")).strip().lower()
+_CAT_FUSION_ENABLED = _CAT_FUSION_ENV not in {"0", "false", "no", "off"}
+
+
 class BiAttentionEncoderLayer(Module):
     def __init__(self, d_model, nhead, dim_feedforward=2048, dropout=0.1, activation="relu",
                  layer_norm_eps=1e-5, batch_first=True, pre_norm=False,
@@ -366,6 +370,9 @@ class TransformerEncoderLayer(Module):
             raise ValueError("concat requires at least one chunk.")
         if len(chunks) == 1:
             return chunks[0]
+        if _CAT_FUSION_ENABLED:
+            # Prefer a single cat kernel over multiple explicit slice-copy launches.
+            return torch.cat(tuple(chunks), dim=2)
         total_len = int(sum(int(t.shape[2]) for t in chunks))
         out = chunks[0].new_empty(
             (chunks[0].shape[0], chunks[0].shape[1], total_len, chunks[0].shape[3])
@@ -990,13 +997,8 @@ class TransformerEncoderLayer(Module):
             if last_cap < int(page_size):
                 prev_k = new_k_pages[-1]
                 prev_v = new_v_pages[-1]
-                prev_len = int(prev_k.shape[2])
-                grown_k = prev_k.new_empty((prev_k.shape[0], prev_k.shape[1], prev_len + 1, prev_k.shape[3]))
-                grown_v = prev_v.new_empty((prev_v.shape[0], prev_v.shape[1], prev_len + 1, prev_v.shape[3]))
-                grown_k[:, :, :prev_len, :] = prev_k
-                grown_v[:, :, :prev_len, :] = prev_v
-                grown_k[:, :, prev_len: prev_len + 1, :] = k_new_bhld
-                grown_v[:, :, prev_len: prev_len + 1, :] = v_new_bhld
+                grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
                 new_k_pages[-1] = grown_k
                 new_v_pages[-1] = grown_v
                 return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1048,12 +1050,8 @@ class TransformerEncoderLayer(Module):
             prev_v = new_v_pages[-1]
             prev_len = int(prev_k.shape[2])
             if prev_len < int(page_size):
-                grown_k = prev_k.new_empty((prev_k.shape[0], prev_k.shape[1], prev_len + 1, prev_k.shape[3]))
-                grown_v = prev_v.new_empty((prev_v.shape[0], prev_v.shape[1], prev_len + 1, prev_v.shape[3]))
-                grown_k[:, :, :prev_len, :] = prev_k
-                grown_v[:, :, :prev_len, :] = prev_v
-                grown_k[:, :, prev_len: prev_len + 1, :] = k_new_bhld
-                grown_v[:, :, prev_len: prev_len + 1, :] = v_new_bhld
+                grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
                 new_k_pages[-1] = grown_k
                 new_v_pages[-1] = grown_v
                 return new_k_pages, new_v_pages, int(valid_len) + 1
