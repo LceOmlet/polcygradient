@@ -806,13 +806,14 @@ class EnvironmentPrior:
 
         def transition_fn(x, generators_for_noise=None):
             x_dual = torch.cat([x, x], dim=0)
-            generators_dual = None
-            if generators_for_noise is not None:
+            if generators_for_noise is None:
+                out_dual = dual_fn(x_dual)
+            else:
                 generators_list = list(generators_for_noise)
                 if len(generators_list) != batch_size:
                     raise ValueError("generators_for_noise must match batch size")
                 generators_dual = generators_list + generators_list
-            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+                out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
             x_next = out_dual[:batch_size, :state_cap]
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
@@ -845,13 +846,14 @@ class EnvironmentPrior:
 
         def transition_fn(x, generators_for_noise=None):
             x_dual = torch.cat([x, x], dim=0)
-            generators_dual = None
-            if generators_for_noise is not None:
+            if generators_for_noise is None:
+                out_dual = dual_fn(x_dual)
+            else:
                 generators_list = list(generators_for_noise)
                 if len(generators_list) != batch_size:
                     raise ValueError("generators_for_noise must match batch size")
                 generators_dual = generators_list + generators_list
-            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+                out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
             x_next = out_dual[:batch_size, :state_cap]
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
@@ -2257,6 +2259,14 @@ class EnvironmentPrior:
             and rollout_generators is None
             and len(structure_groups) > 1
         )
+        transition_lerp_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_LERP_FUSION", "0")).strip().lower()
+        transition_lerp_fusion = bool(transition_lerp_fusion_flag in {"1", "true", "yes", "on"})
+        if transition_lerp_fusion:
+            def _mix_state_fn(prev_state, next_state, alpha_state):
+                return torch.lerp(prev_state, next_state, alpha_state)
+        else:
+            def _mix_state_fn(prev_state, next_state, alpha_state):
+                return (1.0 - alpha_state) * prev_state + alpha_state * next_state
         policy_cuda_pairs = []
         transition_cuda_pairs = []
         policy_wall_s = 0.0
@@ -2449,6 +2459,7 @@ class EnvironmentPrior:
                 group["rollout_generators"] = rollout_generators[group_cursor: group_cursor + group_bs]
             else:
                 group["rollout_generators"] = None
+            group["has_rollout_generators"] = bool(group["rollout_generators"] is not None)
             group_cursor += group_bs
         if group_cursor != batch_size:
             raise RuntimeError("family-group rollout internal subgroup cursor mismatch")
@@ -2823,6 +2834,7 @@ class EnvironmentPrior:
                 use_fused_transition = bool(group.get("use_fused_transition", False)) and callable(
                     transition_generator_g
                 )
+                has_rollout_generators = bool(group.get("has_rollout_generators", False))
                 stream_transition = group.get("stream_transition", None)
                 stream_y = group.get("stream_y", None)
                 stream_x = group.get("stream_x", None)
@@ -2832,10 +2844,13 @@ class EnvironmentPrior:
                     if stream_transition is not None:
                         launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                         with torch.cuda.stream(stream_transition):
-                            x_next_g, reward_next_raw_g = transition_generator_g(
-                                env_in,
-                                generators_for_noise=group["rollout_generators"],
-                            )
+                            if has_rollout_generators:
+                                x_next_g, reward_next_raw_g = transition_generator_g(
+                                    env_in,
+                                    generators_for_noise=group["rollout_generators"],
+                                )
+                            else:
+                                x_next_g, reward_next_raw_g = transition_generator_g(env_in)
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                         pending_async_group_ops[pending_async_group_count] = (
                             group_slice,
@@ -2854,29 +2869,38 @@ class EnvironmentPrior:
                             transition_fused_launch_wall_s += float(launch_dt)
                     else:
                         fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                        x_next_g, reward_next_raw_g = transition_generator_g(
-                            env_in,
-                            generators_for_noise=group["rollout_generators"],
-                        )
+                        if has_rollout_generators:
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                env_in,
+                                generators_for_noise=group["rollout_generators"],
+                            )
+                        else:
+                            x_next_g, reward_next_raw_g = transition_generator_g(env_in)
                         reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                         if profile_rollout_timing and fused_wall_t0 is not None:
                             transition_fused_wall_s += (time.perf_counter() - fused_wall_t0)
                         transition_fused_call_count += 1
-                        state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                        state_next_g = _mix_state_fn(state_in, x_next_g, alpha_g)
                         reward_next_raw[group_slice] = reward_next_raw_g
                         state_next[group_slice, :state_dim_g] = state_next_g
                 elif (stream_y is not None) and (stream_x is not None):
                     launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
-                        reward_next_raw_g = reward_scale_g * env_g["y_generator"](
-                            env_in,
-                            generators_for_noise=group["rollout_generators"],
-                        ).reshape(-1)
+                        if has_rollout_generators:
+                            reward_next_raw_g = reward_scale_g * env_g["y_generator"](
+                                env_in,
+                                generators_for_noise=group["rollout_generators"],
+                            ).reshape(-1)
+                        else:
+                            reward_next_raw_g = reward_scale_g * env_g["y_generator"](env_in).reshape(-1)
                     with torch.cuda.stream(stream_x):
-                        x_next_g = env_g["x_generator"](
-                            env_in,
-                            generators_for_noise=group["rollout_generators"],
-                        )
+                        if has_rollout_generators:
+                            x_next_g = env_g["x_generator"](
+                                env_in,
+                                generators_for_noise=group["rollout_generators"],
+                            )
+                        else:
+                            x_next_g = env_g["x_generator"](env_in)
                     pending_async_group_ops[pending_async_group_count] = (
                         group_slice,
                         alpha_g,
@@ -2891,20 +2915,26 @@ class EnvironmentPrior:
                         transition_group_launch_wall_s += float(launch_dt)
                 else:
                     y_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                    reward_next_raw_g = reward_scale_g * env_g["y_generator"](
-                        env_in,
-                        generators_for_noise=group["rollout_generators"],
-                    ).reshape(-1)
+                    if has_rollout_generators:
+                        reward_next_raw_g = reward_scale_g * env_g["y_generator"](
+                            env_in,
+                            generators_for_noise=group["rollout_generators"],
+                        ).reshape(-1)
+                    else:
+                        reward_next_raw_g = reward_scale_g * env_g["y_generator"](env_in).reshape(-1)
                     if profile_rollout_timing and y_wall_t0 is not None:
                         transition_y_wall_s += (time.perf_counter() - y_wall_t0)
                     x_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                    x_next_g = env_g["x_generator"](
-                        env_in,
-                        generators_for_noise=group["rollout_generators"],
-                    )
+                    if has_rollout_generators:
+                        x_next_g = env_g["x_generator"](
+                            env_in,
+                            generators_for_noise=group["rollout_generators"],
+                        )
+                    else:
+                        x_next_g = env_g["x_generator"](env_in)
                     if profile_rollout_timing and x_wall_t0 is not None:
                         transition_x_wall_s += (time.perf_counter() - x_wall_t0)
-                    state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                    state_next_g = _mix_state_fn(state_in, x_next_g, alpha_g)
                     reward_next_raw[group_slice] = reward_next_raw_g
                     state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and group_wall_t0 is not None:
@@ -2921,7 +2951,7 @@ class EnvironmentPrior:
                 for op_idx in range(pending_async_group_count):
                     group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, _ = pending_async_group_ops[op_idx]
                     state_in = state_t[group_slice, :state_dim_g]
-                    state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                    state_next_g = _mix_state_fn(state_in, x_next_g, alpha_g)
                     reward_next_raw[group_slice] = reward_next_raw_g
                     state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and state_update_wall_t0 is not None:
@@ -3085,6 +3115,7 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
                 rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
+                rollout_profile["transition_lerp_fusion_enabled"] = int(bool(transition_lerp_fusion))
         self.last_rollout_profile = rollout_profile
         return x_steps, y_steps, infos
 
@@ -4007,6 +4038,7 @@ class EnvironmentPrior:
                             "transition_fused_enabled": 0,
                             "transition_group_count": 0,
                             "transition_async_enabled": 0,
+                            "transition_lerp_fusion_enabled": 0,
                             "noise_mode": None,
                             "noise_block_size": 0,
                             "steps": int(n_samples),
@@ -4059,6 +4091,12 @@ class EnvironmentPrior:
                         max(
                             int(rollout_profile_acc.get("transition_async_enabled", 0) or 0),
                             int(group_profile.get("transition_async_enabled", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_lerp_fusion_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_lerp_fusion_enabled", 0) or 0),
+                            int(group_profile.get("transition_lerp_fusion_enabled", 0) or 0),
                         )
                     )
                     group_noise_mode = group_profile.get("noise_mode", None)
@@ -4347,6 +4385,9 @@ class EnvironmentPrior:
                 stats["rollout_transition_async_enabled"] = int(
                     rollout_profile.get("transition_async_enabled", 0) or 0
                 )
+                stats["rollout_transition_lerp_fusion_enabled"] = int(
+                    rollout_profile.get("transition_lerp_fusion_enabled", 0) or 0
+                )
                 stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
                 stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
             return loss, rollout, stats
@@ -4486,6 +4527,9 @@ class EnvironmentPrior:
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             stats["rollout_transition_async_enabled"] = int(
                 rollout_profile.get("transition_async_enabled", 0) or 0
+            )
+            stats["rollout_transition_lerp_fusion_enabled"] = int(
+                rollout_profile.get("transition_lerp_fusion_enabled", 0) or 0
             )
             stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
             stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)

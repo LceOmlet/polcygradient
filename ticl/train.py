@@ -1516,6 +1516,7 @@ def train_epoch_policy_gradient(
                     batch_rollout_transition_fused_enabled = 0
                     batch_rollout_transition_group_count = 0
                     batch_rollout_transition_async_enabled = 0
+                    batch_rollout_transition_lerp_fusion_enabled = 0
                     batch_rollout_noise_mode = None
                     batch_rollout_noise_block_size = None
                     batch_policy_step_calls = 0
@@ -2210,6 +2211,20 @@ def train_epoch_policy_gradient(
                                 )
                             except Exception:
                                 pass
+                        transition_lerp_fusion_enabled = pg_stats_chunk.get(
+                            "rollout_transition_lerp_fusion_enabled",
+                            None,
+                        )
+                        if transition_lerp_fusion_enabled is not None:
+                            try:
+                                batch_rollout_transition_lerp_fusion_enabled = int(
+                                    max(
+                                        int(batch_rollout_transition_lerp_fusion_enabled),
+                                        int(transition_lerp_fusion_enabled),
+                                    )
+                                )
+                            except Exception:
+                                pass
                         rollout_noise_mode = pg_stats_chunk.get("rollout_noise_mode", None)
                         if rollout_noise_mode is not None:
                             batch_rollout_noise_mode = str(rollout_noise_mode)
@@ -2516,6 +2531,11 @@ def train_epoch_policy_gradient(
                             f" rollout_transition_group_launch_share={transition_group_launch_share:.3f}"
                             f" rollout_transition_group_sync_share={transition_group_sync_share:.3f}"
                         )
+                    if int(batch_rollout_transition_lerp_fusion_enabled) > 0:
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_lerp_fusion_enabled="
+                            f"{int(batch_rollout_transition_lerp_fusion_enabled)}"
+                        )
                 if batch_rollout_noise_mode is not None:
                     rollout_breakdown_suffix += f" rollout_noise_mode={batch_rollout_noise_mode}"
                 if batch_rollout_noise_block_size is not None:
@@ -2729,6 +2749,9 @@ def train_epoch_policy_gradient(
                                     batch_rollout_transition_group_sync_wall_ms
                                     / max(1e-9, batch_rollout_transition_wall_ms)
                                 )
+                            stage_extra["rollout_transition_lerp_fusion_enabled"] = int(
+                                batch_rollout_transition_lerp_fusion_enabled
+                            )
                             stage_extra["rollout_transition_env_pack_share"] = float(
                                 batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
@@ -2930,6 +2953,9 @@ def train_epoch_policy_gradient(
                                         batch_rollout_transition_group_sync_wall_ms
                                         / max(1e-9, batch_rollout_transition_wall_ms)
                                     )
+                                wandb_payload["pg_gpu/rollout_transition_lerp_fusion_enabled"] = int(
+                                    batch_rollout_transition_lerp_fusion_enabled
+                                )
                                 wandb_payload["pg_gpu/rollout_transition_env_pack_share"] = float(
                                     batch_rollout_transition_env_pack_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                                 )

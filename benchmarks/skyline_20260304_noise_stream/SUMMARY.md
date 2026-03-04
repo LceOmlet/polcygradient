@@ -793,3 +793,66 @@ Decision:
 
 - keep compile path off mainline skyline.
 - keep new compile observability knobs enabled for targeted probe runs to isolate recompile pollution.
+
+## Continuation pass (2026-03-04): transition hot-loop hard probes (fixed-seed, wall-only KPI)
+
+### Scope
+
+- continue attacking dominant rollout serial path in `EnvironmentPrior` transition loop.
+- keep KPI strict: fixed-seed A/B, compare only `batch_wall_excl_compile_s`.
+- reject pseudo-optimization if not monotonic under same workload.
+
+### Code changes (kept)
+
+- `ticl/priors/environment_prior.py`
+  - transition fused generator now has explicit no-noise fast path:
+    avoid per-call `generators_for_noise` list-dupe handling when rollout generators are absent
+    (mainline case).
+  - added transition mix observability key:
+    `rollout_transition_lerp_fusion_enabled`.
+- `ticl/train.py`
+  - plumbed/printed/wandb-exported `rollout_transition_lerp_fusion_enabled`.
+
+### Hard probes (fixed-seed, same command/workload)
+
+Command base:
+
+```bash
+TICL_PROFILE_ROLLOUT_TIMING=1 TICL_PROFILE_ROLLOUT_BREAKDOWN=1 \
+TICL_POLICY_STEP_PROFILE=1 TICL_TRANSFORMER_LAYER_STEP_PROFILE=1 \
+CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
+  python -u -m ticl.fit_model rlpfn \
+  --seed-everything True \
+  --epochs 1 --num-steps 1 \
+  --validate False --rl-validate-enabled False --progress-bar False \
+  --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 \
+  --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2
+```
+
+Logs:
+
+- baseline (`lerp=0`, `merge_auto=0`):
+  `20260304_abalign_lerp0_mergeauto0.log`
+- probe (`lerp=1`, `merge_auto=0`):
+  `20260304_abalign_lerp1_mergeauto0.log`
+- probe (`flash_prefix_async=0`, `lerp=0`, `merge_auto=0`):
+  `20260304_probe_flashprefix_async0_lerp0_merge0.log`
+- exploratory (`lerp=1`, `merge_auto=1`):
+  `20260304_abalign_lerp1_mergeauto1.log`
+
+Key metrics:
+
+- `lerp=0 -> lerp=1` (both `merge_auto=0`):
+  - `batch_wall_excl_compile_s`: `85.832 -> 86.587` (`+0.88%`, worse)
+  - `rollout_transition_state_update_share`: `0.057 -> 0.038` (local share improved)
+  - `rollout_instage_backward_share`: `0.564 -> 0.582` (overall worsened)
+- `flash_prefix_async=1 -> 0` (with `lerp=0`, `merge_auto=0`):
+  - `batch_wall_excl_compile_s`: `85.832 -> 87.081` (`+1.46%`, worse)
+- `merge_auto=1` exploratory run:
+  - emitted OOM pre-fallback then retried; run not clean for skyline acceptance.
+
+Decision:
+
+- do not mainline `transition_lerp_fusion` as default (kept as probe flag only).
+- keep `flash_prefix_async` default ON.
+- keep TBPTT stream merge auto default OFF for stable skyline (OOM-safe by default).
