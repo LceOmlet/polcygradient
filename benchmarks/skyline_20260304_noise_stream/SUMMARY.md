@@ -400,3 +400,54 @@ Decision:
 
 - keep `merge_windows=1` as skyline default (merge>1 still non-viable under
   current horizon/model).
+
+## Continuation pass (2026-03-04, code-only in current sandbox): transition fused generator + non-compile step launch reduction
+
+### Code changes
+
+- `EnvironmentPrior` transition hot loop:
+  - enabled fused transition generator path (`x_next + reward_next` in one batched call)
+    via `TICL_POLICY_FUSED_TRANSITION_GENERATOR` (default `1`).
+  - integrated fused path into transition-group async scheduler:
+    - fused groups use one stream (`stream_transition`) and unified sync,
+    - non-fused groups keep dual `stream_y/stream_x`.
+  - added observability fields:
+    - `rollout_transition_fused_share`
+    - `rollout_transition_fused_launch_share`
+    - `rollout_transition_fused_calls`
+    - `rollout_transition_fused_groups`
+    - `rollout_transition_fused_enabled`
+  - fields propagated through rollout aggregation and `stats` export.
+
+- `TransformerEncoderLayer` (`forward_step`, non-compile path):
+  - added flash-prefix low-length dense fallback threshold:
+    - `TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS` (default `192`).
+  - when `valid_len <= threshold` in paged `flash_prefix` train mode, route to
+    single dense SDPA (one attention launch) instead of dual prefix/tail flash
+    launches + merge.
+
+- `train.py` observability:
+  - rollout phase now logs/records/wandb-exports fused-transition shares/counts.
+  - startup config print now includes:
+    - `Policy transition fused generator`
+    - `Policy transition stream fusion`
+    - `Policy flash-prefix dense max tokens`
+
+### Validation status in this sandbox
+
+- syntax check:
+  - `python -m py_compile ticl/priors/environment_prior.py ticl/models/layer.py ticl/train.py`
+- unit checks (family-group policy rollout):
+  - passed:
+    - `test_environment_prior_rollout_with_policy_family_grouping_matches_serial_in_deterministic_setup`
+    - `test_environment_prior_rollout_with_policy_family_grouping_batches_policy_calls`
+    - `test_environment_prior_rollout_with_policy_family_grouping_uses_coarse_subgroups`
+
+### Benchmark status
+
+- attempted authoritative command (`python -m ticl.fit_model rlpfn --epochs 1 --num-steps 1`, with rollout profile flags),
+  but current execution sandbox cannot initialize CUDA:
+  - `torch.cuda.is_available() == False`
+  - `cudaGetDeviceCount error 304`
+  - `nvidia-smi: Failed to initialize NVML`
+- therefore this pass is code-complete but **not yet GPU-measured** in current sandbox.

@@ -164,6 +164,13 @@ class TransformerEncoderLayer(Module):
             flashprefix_page_size_env = 128
         self.paged_attn_flashprefix_page_size = int(max(1, flashprefix_page_size_env))
         try:
+            flashprefix_dense_tokens_env = int(
+                os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "192")
+            )
+        except Exception:
+            flashprefix_dense_tokens_env = 192
+        self.paged_attn_flashprefix_dense_max_tokens = int(max(0, flashprefix_dense_tokens_env))
+        try:
             dense_page_size_env = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
         except Exception:
             dense_page_size_env = 48
@@ -647,6 +654,26 @@ class TransformerEncoderLayer(Module):
                 and train_mode == "flash_prefix"
                 and (not bool(clone_kv_for_grad))
             ):
+                dense_token_cap = int(max(0, self.paged_attn_flashprefix_dense_max_tokens))
+                if (
+                    dense_token_cap > 0
+                    and int(valid_len) <= dense_token_cap
+                    and (prefix_k is not None)
+                    and (prefix_v is not None)
+                ):
+                    prefix_len = int(prefix_k.shape[2])
+                    if prefix_len >= int(valid_len):
+                        k_all = prefix_k[:, :, :int(valid_len), :]
+                        v_all = prefix_v[:, :, :int(valid_len), :]
+                    else:
+                        tail_take = int(valid_len) - prefix_len
+                        tail_k = k_pages[-1][:, :, :tail_take, :]
+                        tail_v = v_pages[-1][:, :, :tail_take, :]
+                        k_all = self._concat_dim2([prefix_k, tail_k])
+                        v_all = self._concat_dim2([prefix_v, tail_v])
+                    if stats is not None:
+                        stats["paged_path_dense"] += 1
+                    return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
                 return self._forward_step_attn_ff_paged_flash_prefix(

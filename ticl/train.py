@@ -1362,6 +1362,11 @@ def train_epoch_policy_gradient(
                     batch_rollout_transition_env_pack_wall_ms = 0.0
                     batch_rollout_transition_state_update_wall_ms = 0.0
                     batch_rollout_transition_noise_wall_ms = 0.0
+                    batch_rollout_transition_fused_wall_ms = 0.0
+                    batch_rollout_transition_fused_launch_wall_ms = 0.0
+                    batch_rollout_transition_fused_call_count = 0
+                    batch_rollout_transition_fused_group_count = 0
+                    batch_rollout_transition_fused_enabled = 0
                     batch_rollout_transition_group_count = 0
                     batch_rollout_transition_async_enabled = 0
                     batch_rollout_noise_mode = None
@@ -1911,6 +1916,43 @@ def train_epoch_policy_gradient(
                                 batch_rollout_transition_noise_wall_ms += float(transition_noise_wall_ms)
                             except Exception:
                                 pass
+                        transition_fused_wall_ms = pg_stats_chunk.get("rollout_transition_fused_wall_ms", None)
+                        if transition_fused_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_fused_wall_ms += float(transition_fused_wall_ms)
+                            except Exception:
+                                pass
+                        transition_fused_launch_wall_ms = pg_stats_chunk.get(
+                            "rollout_transition_fused_launch_wall_ms", None
+                        )
+                        if transition_fused_launch_wall_ms is not None:
+                            try:
+                                batch_rollout_transition_fused_launch_wall_ms += float(transition_fused_launch_wall_ms)
+                            except Exception:
+                                pass
+                        transition_fused_call_count = pg_stats_chunk.get("rollout_transition_fused_call_count", None)
+                        if transition_fused_call_count is not None:
+                            try:
+                                batch_rollout_transition_fused_call_count += int(transition_fused_call_count)
+                            except Exception:
+                                pass
+                        transition_fused_group_count = pg_stats_chunk.get("rollout_transition_fused_group_count", None)
+                        if transition_fused_group_count is not None:
+                            try:
+                                batch_rollout_transition_fused_group_count += int(transition_fused_group_count)
+                            except Exception:
+                                pass
+                        transition_fused_enabled = pg_stats_chunk.get("rollout_transition_fused_enabled", None)
+                        if transition_fused_enabled is not None:
+                            try:
+                                batch_rollout_transition_fused_enabled = int(
+                                    max(
+                                        int(batch_rollout_transition_fused_enabled),
+                                        int(transition_fused_enabled),
+                                    )
+                                )
+                            except Exception:
+                                pass
                         transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
                         if transition_group_count is not None:
                             try:
@@ -2103,6 +2145,9 @@ def train_epoch_policy_gradient(
                     transition_noise_share = float(
                         batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                     )
+                    transition_fused_share = float(
+                        batch_rollout_transition_fused_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                    )
                     rollout_breakdown_suffix += (
                         f" rollout_policy_wall_ms={batch_rollout_policy_wall_ms:.2f}"
                         f" rollout_transition_wall_ms={batch_rollout_transition_wall_ms:.2f}"
@@ -2111,8 +2156,23 @@ def train_epoch_policy_gradient(
                         f" rollout_transition_env_pack_share={transition_env_pack_share:.3f}"
                         f" rollout_transition_state_update_share={transition_state_update_share:.3f}"
                         f" rollout_transition_noise_share={transition_noise_share:.3f}"
+                        f" rollout_transition_fused_share={transition_fused_share:.3f}"
+                        f" rollout_transition_fused_calls={int(batch_rollout_transition_fused_call_count)}"
+                        f" rollout_transition_fused_groups={int(batch_rollout_transition_fused_group_count)}"
                         f" rollout_transition_group_count={int(batch_rollout_transition_group_count)}"
                     )
+                    if (
+                        int(batch_rollout_transition_fused_enabled) > 0
+                        or batch_rollout_transition_fused_launch_wall_ms > 0.0
+                    ):
+                        transition_fused_launch_share = float(
+                            batch_rollout_transition_fused_launch_wall_ms
+                            / max(1e-9, batch_rollout_transition_wall_ms)
+                        )
+                        rollout_breakdown_suffix += (
+                            f" rollout_transition_fused_enabled={int(batch_rollout_transition_fused_enabled)}"
+                            f" rollout_transition_fused_launch_share={transition_fused_launch_share:.3f}"
+                        )
                     if not transition_async_mode:
                         transition_y_share = float(
                             batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
@@ -2331,6 +2391,26 @@ def train_epoch_policy_gradient(
                             stage_extra["rollout_transition_noise_share"] = float(
                                 batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                             )
+                            stage_extra["rollout_transition_fused_share"] = float(
+                                batch_rollout_transition_fused_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                            )
+                            stage_extra["rollout_transition_fused_calls"] = int(
+                                batch_rollout_transition_fused_call_count
+                            )
+                            stage_extra["rollout_transition_fused_groups"] = int(
+                                batch_rollout_transition_fused_group_count
+                            )
+                            if (
+                                int(batch_rollout_transition_fused_enabled) > 0
+                                or batch_rollout_transition_fused_launch_wall_ms > 0.0
+                            ):
+                                stage_extra["rollout_transition_fused_enabled"] = int(
+                                    batch_rollout_transition_fused_enabled
+                                )
+                                stage_extra["rollout_transition_fused_launch_share"] = float(
+                                    batch_rollout_transition_fused_launch_wall_ms
+                                    / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
                             stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
                             if batch_rollout_noise_mode is not None:
                                 stage_extra["rollout_noise_mode"] = str(batch_rollout_noise_mode)
@@ -2489,6 +2569,26 @@ def train_epoch_policy_gradient(
                                 wandb_payload["pg_gpu/rollout_transition_noise_share"] = float(
                                     batch_rollout_transition_noise_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
                                 )
+                                wandb_payload["pg_gpu/rollout_transition_fused_share"] = float(
+                                    batch_rollout_transition_fused_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_fused_calls"] = int(
+                                    batch_rollout_transition_fused_call_count
+                                )
+                                wandb_payload["pg_gpu/rollout_transition_fused_groups"] = int(
+                                    batch_rollout_transition_fused_group_count
+                                )
+                                if (
+                                    int(batch_rollout_transition_fused_enabled) > 0
+                                    or batch_rollout_transition_fused_launch_wall_ms > 0.0
+                                ):
+                                    wandb_payload["pg_gpu/rollout_transition_fused_enabled"] = int(
+                                        batch_rollout_transition_fused_enabled
+                                    )
+                                    wandb_payload["pg_gpu/rollout_transition_fused_launch_share"] = float(
+                                        batch_rollout_transition_fused_launch_wall_ms
+                                        / max(1e-9, batch_rollout_transition_wall_ms)
+                                    )
                                 wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
                                     batch_rollout_transition_group_count
                                 )
@@ -3256,6 +3356,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 env_backend,
                 f"(grouping={env_grouping}, strict_rng_match={env_strict})",
             )
+            transition_fused_env = str(os.environ.get("TICL_POLICY_FUSED_TRANSITION_GENERATOR", "1")).strip().lower()
+            transition_fused_on = transition_fused_env not in {"0", "false", "no", "off"}
+            transition_stream_env = str(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION", "1")).strip().lower()
+            transition_stream_on = transition_stream_env in {"1", "true", "yes", "on"}
+            print("Policy transition fused generator:", bool(transition_fused_on))
+            print("Policy transition stream fusion:", bool(transition_stream_on))
             pg_normalize_rewards = bool(getattr(env_prior, "config", {}).get("policy_gradient_normalize_rewards", False))
             pg_discount = float(getattr(env_prior, "config", {}).get("discount", 1.0))
             print(
@@ -3340,6 +3446,16 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 flash_prefix_async_env = str(os.environ.get("TICL_POLICY_FLASH_PREFIX_ASYNC", "1")).strip().lower()
                 flash_prefix_async_on = flash_prefix_async_env in {"1", "true", "yes", "on"}
                 print("Policy flash-prefix async:", bool(flash_prefix_async_on))
+                try:
+                    flashprefix_dense_tokens = int(
+                        os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "192")
+                    )
+                except Exception:
+                    flashprefix_dense_tokens = 192
+                print(
+                    "Policy flash-prefix dense max tokens:",
+                    int(max(0, flashprefix_dense_tokens)),
+                )
                 try:
                     dense_page_cap = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))
                 except Exception:

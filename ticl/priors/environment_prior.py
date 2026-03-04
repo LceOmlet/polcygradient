@@ -110,6 +110,10 @@ class EnvironmentPrior:
         self._rollout_executor_workers = 0
         envgen_bmm_flag = str(os.environ.get("TICL_POLICY_ENVGEN_BMM", "1")).strip().lower()
         self.envgen_bmm = envgen_bmm_flag not in {"0", "false", "no", "off"}
+        fused_transition_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GENERATOR", "1")
+        ).strip().lower()
+        self.fused_transition_generator = fused_transition_flag not in {"0", "false", "no", "off"}
 
     def __del__(self):
         executor = getattr(self, "_rollout_executor", None)
@@ -744,6 +748,116 @@ class EnvironmentPrior:
 
         return fn
 
+    def _build_scm_hetero_transition_batch_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        depth_values,
+        activation_names,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return None
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
+        dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
+        if torch.is_tensor(depth_values):
+            depth_values_dual = torch.cat(
+                [
+                    depth_values.to(device=device, dtype=torch.long),
+                    depth_values.to(device=device, dtype=torch.long),
+                ],
+                dim=0,
+            )
+        elif isinstance(depth_values, (list, tuple)):
+            depth_list = [max(2, int(d)) for d in depth_values]
+            depth_values_dual = depth_list + depth_list
+        else:
+            depth_scalar = int(max(2, int(depth_values)))
+            depth_values_dual = [depth_scalar] * (2 * batch_size)
+        if isinstance(activation_names, str):
+            activation_names_dual = [activation_names] * (2 * batch_size)
+        else:
+            activation_list = list(activation_names)
+            if len(activation_list) != batch_size:
+                raise ValueError("activation_names must match h_list length")
+            activation_names_dual = activation_list + activation_list
+        input_mask_dual = None
+        if input_mask is not None:
+            input_mask_t = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            input_mask_dual = torch.cat([input_mask_t, input_mask_t], dim=0)
+        h_list_dual = list(h_list) + list(h_list)
+        dual_fn = self._build_scm_hetero_batch_fn(
+            in_dims=dual_in_dims,
+            out_dims=dual_out_dims,
+            h_list=h_list_dual,
+            device=device,
+            depth_values=depth_values_dual,
+            activation_names=activation_names_dual,
+            generators=None,
+            input_mask=input_mask_dual,
+        )
+        state_cap = int(state_dims.max().item())
+
+        def transition_fn(x, generators_for_noise=None):
+            x_dual = torch.cat([x, x], dim=0)
+            generators_dual = None
+            if generators_for_noise is not None:
+                generators_list = list(generators_for_noise)
+                if len(generators_list) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+                generators_dual = generators_list + generators_list
+            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+            x_next = out_dual[:batch_size, :state_cap]
+            reward_next = out_dual[batch_size:, :1]
+            return x_next, reward_next
+
+        return transition_fn
+
+    def _build_gp_hetero_transition_batch_fn(self, in_dims, state_dims, h_list, device, input_mask=None):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return None
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
+        dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
+        input_mask_dual = None
+        if input_mask is not None:
+            input_mask_t = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            input_mask_dual = torch.cat([input_mask_t, input_mask_t], dim=0)
+        h_list_dual = list(h_list) + list(h_list)
+        dual_fn = self._build_gp_hetero_batch_fn(
+            in_dims=dual_in_dims,
+            out_dims=dual_out_dims,
+            h_list=h_list_dual,
+            device=device,
+            generators=None,
+            input_mask=input_mask_dual,
+        )
+        state_cap = int(state_dims.max().item())
+
+        def transition_fn(x, generators_for_noise=None):
+            x_dual = torch.cat([x, x], dim=0)
+            generators_dual = None
+            if generators_for_noise is not None:
+                generators_list = list(generators_for_noise)
+                if len(generators_list) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+                generators_dual = generators_list + generators_list
+            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+            x_next = out_dual[:batch_size, :state_cap]
+            reward_next = out_dual[batch_size:, :1]
+            return x_next, reward_next
+
+        return transition_fn
+
     def _sample_environment_family_coarse_batch(self, h_list, device, rng_seeds=None):
         if not h_list:
             raise ValueError("h_list must be non-empty")
@@ -799,6 +913,14 @@ class EnvironmentPrior:
             if z_i > 0:
                 input_mask[bi, zero_start: zero_start + z_i] = 1.0
 
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        enable_fused_transition = bool(
+            self.fused_transition_generator
+            and device_obj.type == "cuda"
+            and generators is None
+        )
+        transition_generator = None
+
         if family == "scm":
             depth_values = [max(2, int(h["num_layers"])) for h in h_list]
             activation_values = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
@@ -832,6 +954,16 @@ class EnvironmentPrior:
                 generators=generators,
                 input_mask=input_mask,
             )
+            if enable_fused_transition:
+                transition_generator = self._build_scm_hetero_transition_batch_fn(
+                    in_dims=in_dims,
+                    state_dims=state_dims,
+                    h_list=h_list,
+                    device=device,
+                    depth_values=depth_values,
+                    activation_names=activation_values,
+                    input_mask=input_mask,
+                )
         else:
             x_generator = self._build_gp_hetero_batch_fn(
                 in_dims=in_dims,
@@ -841,6 +973,14 @@ class EnvironmentPrior:
                 generators=generators,
                 input_mask=input_mask,
             )
+            if enable_fused_transition:
+                transition_generator = self._build_gp_hetero_transition_batch_fn(
+                    in_dims=in_dims,
+                    state_dims=state_dims,
+                    h_list=h_list,
+                    device=device,
+                    input_mask=input_mask,
+                )
             y_generator = self._build_gp_hetero_batch_fn(
                 in_dims=in_dims,
                 out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
@@ -931,6 +1071,7 @@ class EnvironmentPrior:
             "action_slot_dim": int(action_slot_dims.max().item()),
             "x_generator": x_generator,
             "y_generator": y_generator,
+            "transition_generator": transition_generator,
             "policy_generator": policy_generator,
             "alpha": alpha,
             "init_state_std": init_state_std,
@@ -2128,6 +2269,10 @@ class EnvironmentPrior:
         transition_env_pack_wall_s = 0.0
         transition_state_update_wall_s = 0.0
         transition_noise_wall_s = 0.0
+        transition_fused_wall_s = 0.0
+        transition_fused_launch_wall_s = 0.0
+        transition_fused_call_count = 0
+        transition_fused_group_count = 0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -2222,6 +2367,10 @@ class EnvironmentPrior:
             group_rollout_generators = None
             if rollout_generators is not None:
                 group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
+            transition_generator = env_batch.get("transition_generator", None)
+            use_fused_transition = bool(callable(transition_generator))
+            if use_fused_transition:
+                transition_fused_group_count += 1
             group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
             transition_groups.append(
                 {
@@ -2237,8 +2386,23 @@ class EnvironmentPrior:
                     "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
                     "rollout_generators": group_rollout_generators,
                     "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
-                    "stream_y": (torch.cuda.Stream(device=device_obj) if transition_stream_fusion else None),
-                    "stream_x": (torch.cuda.Stream(device=device_obj) if transition_stream_fusion else None),
+                    "transition_generator": transition_generator,
+                    "use_fused_transition": use_fused_transition,
+                    "stream_transition": (
+                        torch.cuda.Stream(device=device_obj)
+                        if (transition_stream_fusion and use_fused_transition)
+                        else None
+                    ),
+                    "stream_y": (
+                        torch.cuda.Stream(device=device_obj)
+                        if (transition_stream_fusion and (not use_fused_transition))
+                        else None
+                    ),
+                    "stream_x": (
+                        torch.cuda.Stream(device=device_obj)
+                        if (transition_stream_fusion and (not use_fused_transition))
+                        else None
+                    ),
                 }
             )
 
@@ -2655,11 +2819,52 @@ class EnvironmentPrior:
 
                 reward_scale_g = group["reward_scale_view"]
                 alpha_g = group["alpha_view"]
+                transition_generator_g = group.get("transition_generator", None)
+                use_fused_transition = bool(group.get("use_fused_transition", False)) and callable(
+                    transition_generator_g
+                )
+                stream_transition = group.get("stream_transition", None)
                 stream_y = group.get("stream_y", None)
                 stream_x = group.get("stream_x", None)
                 reward_next_raw_g = None
                 x_next_g = None
-                if (stream_y is not None) and (stream_x is not None):
+                if use_fused_transition:
+                    if stream_transition is not None:
+                        launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                        with torch.cuda.stream(stream_transition):
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                env_in,
+                                generators_for_noise=group["rollout_generators"],
+                            )
+                            reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
+                        pending_async_group_ops[pending_async_group_count] = (
+                            group_slice,
+                            alpha_g,
+                            state_dim_g,
+                            x_next_g,
+                            reward_next_raw_g,
+                            (stream_transition,),
+                        )
+                        pending_async_group_count += 1
+                        transition_fused_call_count += 1
+                        if profile_rollout_timing and launch_wall_t0 is not None:
+                            launch_dt = time.perf_counter() - launch_wall_t0
+                            transition_group_launch_wall_s += float(launch_dt)
+                            transition_fused_launch_wall_s += float(launch_dt)
+                    else:
+                        fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                        x_next_g, reward_next_raw_g = transition_generator_g(
+                            env_in,
+                            generators_for_noise=group["rollout_generators"],
+                        )
+                        reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
+                        if profile_rollout_timing and fused_wall_t0 is not None:
+                            transition_fused_wall_s += (time.perf_counter() - fused_wall_t0)
+                        transition_fused_call_count += 1
+                        state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                        reward_next_raw[group_slice] = reward_next_raw_g
+                        state_next[group_slice, :state_dim_g] = state_next_g
+                elif (stream_y is not None) and (stream_x is not None):
                     launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
                         reward_next_raw_g = reward_scale_g * env_g["y_generator"](
@@ -2677,8 +2882,7 @@ class EnvironmentPrior:
                         state_dim_g,
                         x_next_g,
                         reward_next_raw_g,
-                        stream_y,
-                        stream_x,
+                        (stream_y, stream_x),
                     )
                     pending_async_group_count += 1
                     if profile_rollout_timing and launch_wall_t0 is not None:
@@ -2709,12 +2913,12 @@ class EnvironmentPrior:
                 sync_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 cur_stream = torch.cuda.current_stream(device=device_obj)
                 for op_idx in range(pending_async_group_count):
-                    _, _, _, _, _, stream_y, stream_x = pending_async_group_ops[op_idx]
-                    cur_stream.wait_stream(stream_y)
-                    cur_stream.wait_stream(stream_x)
+                    _, _, _, _, _, stream_tuple = pending_async_group_ops[op_idx]
+                    for stream in stream_tuple:
+                        cur_stream.wait_stream(stream)
                 state_update_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 for op_idx in range(pending_async_group_count):
-                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, _, _ = pending_async_group_ops[op_idx]
+                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, _ = pending_async_group_ops[op_idx]
                     state_in = state_t[group_slice, :state_dim_g]
                     state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                     reward_next_raw[group_slice] = reward_next_raw_g
@@ -2871,6 +3075,13 @@ class EnvironmentPrior:
                 rollout_profile["transition_env_pack_wall_ms"] = float(transition_env_pack_wall_s * 1000.0)
                 rollout_profile["transition_state_update_wall_ms"] = float(transition_state_update_wall_s * 1000.0)
                 rollout_profile["transition_noise_wall_ms"] = float(transition_noise_wall_s * 1000.0)
+                rollout_profile["transition_fused_wall_ms"] = float(transition_fused_wall_s * 1000.0)
+                rollout_profile["transition_fused_launch_wall_ms"] = float(
+                    transition_fused_launch_wall_s * 1000.0
+                )
+                rollout_profile["transition_fused_call_count"] = int(transition_fused_call_count)
+                rollout_profile["transition_fused_group_count"] = int(transition_fused_group_count)
+                rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
                 rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
         self.last_rollout_profile = rollout_profile
@@ -3788,6 +3999,11 @@ class EnvironmentPrior:
                             "transition_env_pack_wall_ms": 0.0,
                             "transition_state_update_wall_ms": 0.0,
                             "transition_noise_wall_ms": 0.0,
+                            "transition_fused_wall_ms": 0.0,
+                            "transition_fused_launch_wall_ms": 0.0,
+                            "transition_fused_call_count": 0,
+                            "transition_fused_group_count": 0,
+                            "transition_fused_enabled": 0,
                             "transition_group_count": 0,
                             "transition_async_enabled": 0,
                             "noise_mode": None,
@@ -3818,6 +4034,24 @@ class EnvironmentPrior:
                     )
                     rollout_profile_acc["transition_noise_wall_ms"] += float(
                         group_profile.get("transition_noise_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_fused_wall_ms"] += float(
+                        group_profile.get("transition_fused_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_fused_launch_wall_ms"] += float(
+                        group_profile.get("transition_fused_launch_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_fused_call_count"] += int(
+                        group_profile.get("transition_fused_call_count", 0)
+                    )
+                    rollout_profile_acc["transition_fused_group_count"] += int(
+                        group_profile.get("transition_fused_group_count", 0)
+                    )
+                    rollout_profile_acc["transition_fused_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_fused_enabled", 0) or 0),
+                            int(group_profile.get("transition_fused_enabled", 0) or 0),
+                        )
                     )
                     rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
                     rollout_profile_acc["transition_async_enabled"] = int(
@@ -4093,6 +4327,21 @@ class EnvironmentPrior:
                 stats["rollout_transition_noise_wall_ms"] = float(
                     rollout_profile.get("transition_noise_wall_ms", 0.0)
                 )
+                stats["rollout_transition_fused_wall_ms"] = float(
+                    rollout_profile.get("transition_fused_wall_ms", 0.0)
+                )
+                stats["rollout_transition_fused_launch_wall_ms"] = float(
+                    rollout_profile.get("transition_fused_launch_wall_ms", 0.0)
+                )
+                stats["rollout_transition_fused_call_count"] = int(
+                    rollout_profile.get("transition_fused_call_count", 0) or 0
+                )
+                stats["rollout_transition_fused_group_count"] = int(
+                    rollout_profile.get("transition_fused_group_count", 0) or 0
+                )
+                stats["rollout_transition_fused_enabled"] = int(
+                    rollout_profile.get("transition_fused_enabled", 0) or 0
+                )
                 stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
                 stats["rollout_transition_async_enabled"] = int(
                     rollout_profile.get("transition_async_enabled", 0) or 0
@@ -4217,6 +4466,21 @@ class EnvironmentPrior:
             )
             stats["rollout_transition_noise_wall_ms"] = float(
                 rollout_profile.get("transition_noise_wall_ms", 0.0)
+            )
+            stats["rollout_transition_fused_wall_ms"] = float(
+                rollout_profile.get("transition_fused_wall_ms", 0.0)
+            )
+            stats["rollout_transition_fused_launch_wall_ms"] = float(
+                rollout_profile.get("transition_fused_launch_wall_ms", 0.0)
+            )
+            stats["rollout_transition_fused_call_count"] = int(
+                rollout_profile.get("transition_fused_call_count", 0) or 0
+            )
+            stats["rollout_transition_fused_group_count"] = int(
+                rollout_profile.get("transition_fused_group_count", 0) or 0
+            )
+            stats["rollout_transition_fused_enabled"] = int(
+                rollout_profile.get("transition_fused_enabled", 0) or 0
             )
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             stats["rollout_transition_async_enabled"] = int(
