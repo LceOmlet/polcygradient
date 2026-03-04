@@ -1217,6 +1217,31 @@ def train_epoch_policy_gradient(
     if (not math.isfinite(tbptt_merge_auto_reserved_frac)) or tbptt_merge_auto_reserved_frac <= 0.0:
         tbptt_merge_auto_reserved_frac = 0.72
     tbptt_merge_auto_reserved_frac = float(min(0.98, max(0.50, tbptt_merge_auto_reserved_frac)))
+    tbptt_merge_guard_flag = str(
+        os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD", "1")
+    ).strip().lower()
+    tbptt_merge_guard_enabled = (
+        tbptt_merge_guard_flag not in {"0", "false", "no", "off"}
+        and current_tbptt_window is not None
+    )
+    try:
+        tbptt_merge_guard_min_free_gb = float(
+            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_MIN_FREE_GB", "12.0")
+        )
+    except Exception:
+        tbptt_merge_guard_min_free_gb = 12.0
+    if (not math.isfinite(tbptt_merge_guard_min_free_gb)) or tbptt_merge_guard_min_free_gb < 0.0:
+        tbptt_merge_guard_min_free_gb = 12.0
+    tbptt_merge_guard_min_free_bytes = int(tbptt_merge_guard_min_free_gb * (1024.0 ** 3))
+    try:
+        tbptt_merge_guard_reserved_frac = float(
+            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_RESERVED_FRAC", "0.82")
+        )
+    except Exception:
+        tbptt_merge_guard_reserved_frac = 0.82
+    if (not math.isfinite(tbptt_merge_guard_reserved_frac)) or tbptt_merge_guard_reserved_frac <= 0.0:
+        tbptt_merge_guard_reserved_frac = 0.82
+    tbptt_merge_guard_reserved_frac = float(min(0.98, max(0.50, tbptt_merge_guard_reserved_frac)))
     if policy_rollout_chunk_size is None:
         # Default: run rollout chunks at full batch width.
         rollout_chunk_cap = batch_size
@@ -1385,6 +1410,8 @@ def train_epoch_policy_gradient(
                     batch_tbptt_stream_merge_windows = 1
                     batch_tbptt_stream_backward_launches = 0
                     batch_tbptt_stream_backward_roots = 0
+                    batch_tbptt_stream_merge_guard_prefallbacks = 0
+                    batch_tbptt_stream_merge_guard_flushes = 0
                     batch_step_wall = 0.0
                     batch_rollout_policy_cuda_ms = 0.0
                     batch_rollout_transition_cuda_ms = 0.0
@@ -1582,6 +1609,30 @@ def train_epoch_policy_gradient(
                                         )
                                     )
                                     tbptt_stream_merge_windows = int(auto_target if allow_auto_merge else 1)
+                            if (
+                                int(tbptt_stream_merge_windows) > 1
+                                and tbptt_merge_guard_enabled
+                                and device_obj.type == "cuda"
+                                and torch.cuda.is_available()
+                            ):
+                                try:
+                                    mem_reserved_now = int(torch.cuda.memory_reserved(device_obj))
+                                    mem_total_now = int(torch.cuda.get_device_properties(device_obj).total_memory)
+                                except Exception:
+                                    mem_reserved_now = 0
+                                    mem_total_now = 0
+                                free_now = int(max(0, mem_total_now - mem_reserved_now))
+                                allow_merge_prefight = bool(
+                                    (mem_total_now > 0)
+                                    and (free_now >= int(tbptt_merge_guard_min_free_bytes))
+                                    and (
+                                        mem_reserved_now
+                                        <= int(float(mem_total_now) * float(tbptt_merge_guard_reserved_frac))
+                                    )
+                                )
+                                if not allow_merge_prefight:
+                                    tbptt_stream_merge_windows = 1
+                                    batch_tbptt_stream_merge_guard_prefallbacks += 1
                             batch_tbptt_stream_merge_windows = max(
                                 int(batch_tbptt_stream_merge_windows),
                                 int(tbptt_stream_merge_windows),
@@ -1595,6 +1646,35 @@ def train_epoch_policy_gradient(
     
                         if tbptt_stream_backward_active:
                             backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
+                            tbptt_merge_guard_active = bool(
+                                (tbptt_pending_window_losses is not None)
+                                and tbptt_merge_guard_enabled
+                                and device_obj.type == "cuda"
+                                and torch.cuda.is_available()
+                            )
+
+                            def _tbptt_merge_guard_should_flush_pending():
+                                if (
+                                    (not tbptt_merge_guard_active)
+                                    or tbptt_pending_window_losses is None
+                                    or (len(tbptt_pending_window_losses) <= 0)
+                                ):
+                                    return False
+                                try:
+                                    mem_reserved_now = int(torch.cuda.memory_reserved(device_obj))
+                                    mem_total_now = int(torch.cuda.get_device_properties(device_obj).total_memory)
+                                except Exception:
+                                    return False
+                                if mem_total_now <= 0:
+                                    return False
+                                free_now = int(max(0, mem_total_now - mem_reserved_now))
+                                return bool(
+                                    (free_now < int(tbptt_merge_guard_min_free_bytes))
+                                    or (
+                                        mem_reserved_now
+                                        > int(float(mem_total_now) * float(tbptt_merge_guard_reserved_frac))
+                                    )
+                                )
 
                             def _tbptt_backward_from_losses(window_losses_scaled):
                                 nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
@@ -1649,8 +1729,12 @@ def train_epoch_policy_gradient(
                                 _tbptt_backward_from_losses(merged_losses)
 
                             def _tbptt_chunk_loss_sink(weighted_window_loss):
+                                nonlocal batch_tbptt_stream_merge_guard_flushes
                                 window_loss_scaled = weighted_window_loss * backward_scale
                                 if tbptt_pending_window_losses is not None:
+                                    if _tbptt_merge_guard_should_flush_pending():
+                                        batch_tbptt_stream_merge_guard_flushes += 1
+                                        _tbptt_flush_pending_windows()
                                     tbptt_pending_window_losses.append(window_loss_scaled)
                                     if len(tbptt_pending_window_losses) < int(tbptt_stream_merge_windows):
                                         return
@@ -2364,6 +2448,14 @@ def train_epoch_policy_gradient(
                         f" rollout_instage_backward_s={batch_rollout_backward_overlap_wall:.3f}"
                         f" rollout_instage_backward_share={rollout_instage_backward_share:.3f}"
                     )
+                    if int(batch_tbptt_stream_merge_guard_flushes) > 0:
+                        rollout_breakdown_suffix += (
+                            f" tbptt_stream_merge_guard_flushes={int(batch_tbptt_stream_merge_guard_flushes)}"
+                        )
+                    if int(batch_tbptt_stream_merge_guard_prefallbacks) > 0:
+                        rollout_breakdown_suffix += (
+                            f" tbptt_stream_merge_guard_prefallbacks={int(batch_tbptt_stream_merge_guard_prefallbacks)}"
+                        )
                 if batch_pg_loss_signature is not None:
                     rollout_breakdown_suffix += f" pg_loss_sig={batch_pg_loss_signature}"
                 host_mem_snapshot = _get_host_memory_snapshot()
@@ -2494,6 +2586,12 @@ def train_epoch_policy_gradient(
                                 stage_extra["rollout_instage_backward_s"] = float(batch_rollout_backward_overlap_wall)
                                 stage_extra["rollout_instage_backward_share"] = float(
                                     batch_rollout_backward_overlap_wall / max(1e-9, batch_rollout_wall)
+                                )
+                                stage_extra["tbptt_stream_merge_guard_flushes"] = int(
+                                    batch_tbptt_stream_merge_guard_flushes
+                                )
+                                stage_extra["tbptt_stream_merge_guard_prefallbacks"] = int(
+                                    batch_tbptt_stream_merge_guard_prefallbacks
                                 )
                         if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                             stage_extra["policy_step_calls"] = int(batch_policy_step_calls)
@@ -2680,6 +2778,12 @@ def train_epoch_policy_gradient(
                                     )
                                     wandb_payload["pg_gpu/rollout_instage_backward_share"] = float(
                                         batch_rollout_backward_overlap_wall / max(1e-9, batch_rollout_wall)
+                                    )
+                                    wandb_payload["pg_gpu/tbptt_stream_merge_guard_flushes"] = int(
+                                        batch_tbptt_stream_merge_guard_flushes
+                                    )
+                                    wandb_payload["pg_gpu/tbptt_stream_merge_guard_prefallbacks"] = int(
+                                        batch_tbptt_stream_merge_guard_prefallbacks
                                     )
                             if stage_name == "rollout" and batch_policy_step_total_ms > 0.0:
                                 wandb_payload["pg_gpu/policy_step_calls"] = int(batch_policy_step_calls)
@@ -3576,6 +3680,29 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                         f"max_windows={int(max(1, tbptt_merge_auto_max_print))}",
                         f"min_free_gb={float(max(0.0, tbptt_merge_auto_min_free_print)):.1f}",
                         f"reserved_frac={float(min(0.98, max(0.50, tbptt_merge_auto_reserved_print))):.2f}",
+                    )
+                tbptt_merge_guard_env = str(
+                    os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD", "1")
+                ).strip().lower()
+                tbptt_merge_guard_on_print = tbptt_merge_guard_env not in {"0", "false", "no", "off"}
+                print("Policy TBPTT stream merge guard:", bool(tbptt_merge_guard_on_print))
+                if bool(tbptt_merge_guard_on_print):
+                    try:
+                        tbptt_merge_guard_min_free_print = float(
+                            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_MIN_FREE_GB", "12.0")
+                        )
+                    except Exception:
+                        tbptt_merge_guard_min_free_print = 12.0
+                    try:
+                        tbptt_merge_guard_reserved_print = float(
+                            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_RESERVED_FRAC", "0.82")
+                        )
+                    except Exception:
+                        tbptt_merge_guard_reserved_print = 0.82
+                    print(
+                        "Policy TBPTT stream merge guard config:",
+                        f"min_free_gb={float(max(0.0, tbptt_merge_guard_min_free_print)):.1f}",
+                        f"reserved_frac={float(min(0.98, max(0.50, tbptt_merge_guard_reserved_print))):.2f}",
                     )
             try:
                 pg_env_replay_steps_print = int(max(1, int(pg_env_replay_steps)))

@@ -616,3 +616,69 @@ Decision:
 - do **not** mainline Triton/compile for current skyline.
 - keep skyline KPI on `batch_wall_excl_compile_s` and continue non-compile
   kernel-path optimization as the primary track.
+
+## Continuation pass (2026-03-04): transition async inline-commit probe + TBPTT merge guard
+
+### Scope
+
+- continue attacking dominant pseudo-serial sections:
+  - transition-group async scheduling in `EnvironmentPrior` rollout hot loop,
+  - TBPTT streaming backward launch granularity with strict OOM safety.
+
+### Code changes retained
+
+- `train.py`:
+  - added TBPTT stream-merge runtime guard (non-compile):
+    - `TICL_POLICY_TBPTT_STREAM_MERGE_GUARD` (default `1`)
+    - `TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_MIN_FREE_GB` (default `12.0`)
+    - `TICL_POLICY_TBPTT_STREAM_MERGE_GUARD_RESERVED_FRAC` (default `0.82`)
+  - guard checks CUDA memory before buffering additional TBPTT window roots and
+    can force early flush to avoid merge-induced memory spikes.
+  - added per-chunk preflight guard downgrade (`merge_windows -> 1`) when
+    initial memory headroom is already below guard thresholds.
+  - observability fields added:
+    - `tbptt_stream_merge_guard_flushes` (log/stage/wandb).
+    - `tbptt_stream_merge_guard_prefallbacks` (log/stage/wandb).
+  - startup now prints TBPTT merge-guard config.
+
+### Code changes probed then reverted (not mainlined)
+
+- `EnvironmentPrior` transition path async inline-commit:
+  - tried writing `state_next/reward_next_raw` directly inside per-group streams
+    and removing default-stream post-sync state-update loop.
+- fixed-seed probes showed decomposition shifts (`transition_state_update_share`
+  near `0`), but end-to-end wall did not improve robustly; variant was reverted
+  to avoid pseudo optimization drift.
+
+### Logs
+
+- baseline reference (pre-pass eager):
+  - `20260304_121550_seeded_eager_baseline_dense64.log`
+- async-inline probe:
+  - `20260304_123036_seeded_mainline_asyncinline_default.log`
+  - `20260304_123359_seeded_mainline_asyncinline_default_rep2.log`
+- merge-window probe with guard:
+  - `20260304_123206_seeded_mainline_asyncinline_merge2_guard.log`
+- merge-window probe after preflight-guard extension:
+  - `20260304_123909_seeded_mainline_merge2_guard_prefight.log`
+- post-revert + retained merge-guard mainline check:
+  - `20260304_123614_seeded_mainline_after_revert_with_mergeguard.log`
+
+### Key observations
+
+- async-inline transition probe:
+  - reduced measured transition post-sync state-update share to ~`0`,
+  - but fixed-seed wall metrics did not show stable gain across repeats.
+- TBPTT merge=2 with guard still hit first-attempt OOM and auto fallback:
+  - `[pg-oom] ... reducing TBPTT stream merge windows to 1`
+  - peak alloc/reserved reached `45.56/46.28 GiB`
+  - final effective stats returned to merge=`1` (`tbptt_stream_backward_calls=16`).
+- preflight guard extension did not eliminate this case:
+  - `tbptt_stream_merge_guard_prefallbacks` stayed `0` in the probe log,
+  - OOM still occurred before any effective merge reduction, then runtime
+    fallback forced merge windows to `1`.
+
+Decision:
+- keep TBPTT merge-guard instrumentation/safety path.
+- do not mainline async-inline transition commit path (reverted).
+- keep skyline on non-compile eager path with `batch_wall_excl_compile_s` as KPI.
