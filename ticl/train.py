@@ -1181,6 +1181,42 @@ def train_epoch_policy_gradient(
         except Exception:
             current_tbptt_stream_merge_windows = 1
         current_tbptt_stream_merge_windows = int(max(1, current_tbptt_stream_merge_windows))
+    tbptt_merge_auto_flag = str(
+        os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO", "0")
+    ).strip().lower()
+    tbptt_merge_auto_enabled = (
+        tbptt_merge_auto_flag in {"1", "true", "yes", "on"}
+        and current_tbptt_window is not None
+    )
+    try:
+        tbptt_merge_auto_max_windows = int(
+            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MAX_WINDOWS", "2")
+        )
+    except Exception:
+        tbptt_merge_auto_max_windows = 2
+    tbptt_merge_auto_max_windows = int(max(1, tbptt_merge_auto_max_windows))
+    if tbptt_merge_auto_enabled:
+        current_tbptt_stream_merge_windows = int(
+            max(int(current_tbptt_stream_merge_windows), int(tbptt_merge_auto_max_windows))
+        )
+    try:
+        tbptt_merge_auto_min_free_gb = float(
+            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MIN_FREE_GB", "18.0")
+        )
+    except Exception:
+        tbptt_merge_auto_min_free_gb = 18.0
+    if (not math.isfinite(tbptt_merge_auto_min_free_gb)) or tbptt_merge_auto_min_free_gb < 0.0:
+        tbptt_merge_auto_min_free_gb = 18.0
+    tbptt_merge_auto_min_free_bytes = int(tbptt_merge_auto_min_free_gb * (1024.0 ** 3))
+    try:
+        tbptt_merge_auto_reserved_frac = float(
+            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_RESERVED_FRAC", "0.72")
+        )
+    except Exception:
+        tbptt_merge_auto_reserved_frac = 0.72
+    if (not math.isfinite(tbptt_merge_auto_reserved_frac)) or tbptt_merge_auto_reserved_frac <= 0.0:
+        tbptt_merge_auto_reserved_frac = 0.72
+    tbptt_merge_auto_reserved_frac = float(min(0.98, max(0.50, tbptt_merge_auto_reserved_frac)))
     if policy_rollout_chunk_size is None:
         # Default: run rollout chunks at full batch width.
         rollout_chunk_cap = batch_size
@@ -1520,6 +1556,32 @@ def train_epoch_policy_gradient(
                         if tbptt_stream_backward_active:
                             batch_tbptt_stream_backward_active = True
                             tbptt_stream_merge_windows = int(max(1, current_tbptt_stream_merge_windows))
+                            if (
+                                tbptt_merge_auto_enabled
+                                and device_obj.type == "cuda"
+                                and torch.cuda.is_available()
+                            ):
+                                auto_target = int(min(
+                                    max(1, tbptt_stream_merge_windows),
+                                    max(1, tbptt_merge_auto_max_windows),
+                                ))
+                                if auto_target > 1:
+                                    try:
+                                        mem_reserved_now = int(torch.cuda.memory_reserved(device_obj))
+                                        mem_total_now = int(torch.cuda.get_device_properties(device_obj).total_memory)
+                                    except Exception:
+                                        mem_reserved_now = 0
+                                        mem_total_now = 0
+                                    free_now = int(max(0, mem_total_now - mem_reserved_now))
+                                    allow_auto_merge = bool(
+                                        (mem_total_now > 0)
+                                        and (free_now >= int(tbptt_merge_auto_min_free_bytes))
+                                        and (
+                                            mem_reserved_now
+                                            <= int(float(mem_total_now) * float(tbptt_merge_auto_reserved_frac))
+                                        )
+                                    )
+                                    tbptt_stream_merge_windows = int(auto_target if allow_auto_merge else 1)
                             batch_tbptt_stream_merge_windows = max(
                                 int(batch_tbptt_stream_merge_windows),
                                 int(tbptt_stream_merge_windows),
@@ -2208,14 +2270,14 @@ def train_epoch_policy_gradient(
                     rollout_breakdown_suffix += (
                         f" rollout_noise_block_size={int(batch_rollout_noise_block_size)}"
                     )
+                batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
+                batch_wall_incl_compile = float(batch_wall_excl_compile + batch_compile_warmup_wall)
+                rollout_breakdown_suffix += (
+                    f" batch_wall_excl_compile_s={batch_wall_excl_compile:.3f}"
+                    f" batch_wall_incl_compile_s={batch_wall_incl_compile:.3f}"
+                )
                 if batch_compile_warmup_wall > 0.0:
-                    batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
-                    batch_wall_incl_compile = float(batch_wall_excl_compile + batch_compile_warmup_wall)
-                    rollout_breakdown_suffix += (
-                        f" compile_warmup_s={batch_compile_warmup_wall:.3f}"
-                        f" batch_wall_excl_compile_s={batch_wall_excl_compile:.3f}"
-                        f" batch_wall_incl_compile_s={batch_wall_incl_compile:.3f}"
-                    )
+                    rollout_breakdown_suffix += f" compile_warmup_s={batch_compile_warmup_wall:.3f}"
                     if batch_compile_warmup_ok is not None:
                         rollout_breakdown_suffix += f" compile_warmup_ok={int(bool(batch_compile_warmup_ok))}"
                 if batch_policy_step_total_ms > 0.0:
@@ -2341,15 +2403,16 @@ def train_epoch_policy_gradient(
                             stage_extra["rollout_policy_share"] = float(
                                 batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
                             )
-                        if stage_name == "rollout" and batch_compile_warmup_wall > 0.0:
+                        if stage_name == "rollout":
                             batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
-                            stage_extra["compile_warmup_s"] = float(batch_compile_warmup_wall)
                             stage_extra["batch_wall_excl_compile_s"] = float(batch_wall_excl_compile)
                             stage_extra["batch_wall_incl_compile_s"] = float(
                                 batch_wall_excl_compile + batch_compile_warmup_wall
                             )
-                            if batch_compile_warmup_ok is not None:
-                                stage_extra["compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
+                            if batch_compile_warmup_wall > 0.0:
+                                stage_extra["compile_warmup_s"] = float(batch_compile_warmup_wall)
+                                if batch_compile_warmup_ok is not None:
+                                    stage_extra["compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
                         if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                             stage_extra["rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                             stage_extra["rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
@@ -2519,15 +2582,16 @@ def train_epoch_policy_gradient(
                                 wandb_payload["pg_gpu/rollout_policy_share"] = float(
                                     batch_rollout_policy_cuda_ms / max(1e-9, rollout_breakdown_total_ms)
                                 )
-                            if stage_name == "rollout" and batch_compile_warmup_wall > 0.0:
+                            if stage_name == "rollout":
                                 batch_wall_excl_compile = float(batch_rollout_wall + batch_backward_wall + batch_step_wall)
-                                wandb_payload["pg_gpu/compile_warmup_s"] = float(batch_compile_warmup_wall)
                                 wandb_payload["pg_gpu/batch_wall_excl_compile_s"] = float(batch_wall_excl_compile)
                                 wandb_payload["pg_gpu/batch_wall_incl_compile_s"] = float(
                                     batch_wall_excl_compile + batch_compile_warmup_wall
                                 )
-                                if batch_compile_warmup_ok is not None:
-                                    wandb_payload["pg_gpu/compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
+                                if batch_compile_warmup_wall > 0.0:
+                                    wandb_payload["pg_gpu/compile_warmup_s"] = float(batch_compile_warmup_wall)
+                                    if batch_compile_warmup_ok is not None:
+                                        wandb_payload["pg_gpu/compile_warmup_ok"] = int(bool(batch_compile_warmup_ok))
                             if stage_name == "rollout" and rollout_wall_total_ms > 0.0:
                                 wandb_payload["pg_gpu/rollout_policy_wall_ms"] = float(batch_rollout_policy_wall_ms)
                                 wandb_payload["pg_gpu/rollout_transition_wall_ms"] = float(batch_rollout_transition_wall_ms)
@@ -3483,6 +3547,36 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 except Exception:
                     tbptt_merge_windows_print = 1
                 print("Policy TBPTT stream merge windows:", int(tbptt_merge_windows_print))
+                tbptt_merge_auto_env = str(
+                    os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO", "0")
+                ).strip().lower()
+                tbptt_merge_auto_on_print = tbptt_merge_auto_env in {"1", "true", "yes", "on"}
+                print("Policy TBPTT stream merge auto:", bool(tbptt_merge_auto_on_print))
+                if bool(tbptt_merge_auto_on_print):
+                    try:
+                        tbptt_merge_auto_max_print = int(
+                            max(1, int(os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MAX_WINDOWS", "2")))
+                        )
+                    except Exception:
+                        tbptt_merge_auto_max_print = 2
+                    try:
+                        tbptt_merge_auto_min_free_print = float(
+                            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MIN_FREE_GB", "18.0")
+                        )
+                    except Exception:
+                        tbptt_merge_auto_min_free_print = 18.0
+                    try:
+                        tbptt_merge_auto_reserved_print = float(
+                            os.environ.get("TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_RESERVED_FRAC", "0.72")
+                        )
+                    except Exception:
+                        tbptt_merge_auto_reserved_print = 0.72
+                    print(
+                        "Policy TBPTT stream merge auto config:",
+                        f"max_windows={int(max(1, tbptt_merge_auto_max_print))}",
+                        f"min_free_gb={float(max(0.0, tbptt_merge_auto_min_free_print)):.1f}",
+                        f"reserved_frac={float(min(0.98, max(0.50, tbptt_merge_auto_reserved_print))):.2f}",
+                    )
             try:
                 pg_env_replay_steps_print = int(max(1, int(pg_env_replay_steps)))
             except Exception:

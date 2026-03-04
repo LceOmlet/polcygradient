@@ -533,3 +533,47 @@ Range conclusion:
 
 Note:
 - short fixed-seed single-batch runs still have normal runtime variance; skyline decisions use A/B direction + multi-run evidence, not one outlier.
+
+## Continuation pass (2026-03-04): warmup-excluded skyline metric hardening + TBPTT merge safety
+
+### Metric hardening
+
+- `train.py` rollout logs now always emit:
+  - `batch_wall_excl_compile_s`
+  - `batch_wall_incl_compile_s`
+- regardless of whether compile warmup is active.
+- when compile warmup exists, `compile_warmup_s` remains explicitly emitted.
+
+Purpose:
+- skyline parser can use a single stable metric (`batch_wall_excl_compile_s`) as
+  the primary throughput KPI and avoid warmup contamination.
+
+### TBPTT merge auto (safety-first)
+
+- added optional auto-merge scheduler:
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO` (default `0`)
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MAX_WINDOWS` (default `2`)
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_MIN_FREE_GB` (default `18`)
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO_RESERVED_FRAC` (default `0.72`)
+- rationale:
+  - attempt to reduce backward launch count only when memory headroom is safe.
+  - avoid silent OOM/instability by keeping default-off until per-workload
+    range is validated.
+
+### Auto-merge probe and decision
+
+- probe log: `20260304_115246_seeded_mainline_tbpttmergeauto.log`
+  - auto path attempted merge>1, hit OOM, then auto-fell back to merge=1.
+  - peak alloc/reserved reached `45.56/46.28 GiB`.
+- decision:
+  - keep `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0` as default for skyline stability.
+  - retain feature for explicit, workload-specific exploration.
+
+### Post-hardening mainline check
+
+- `20260304_115430_seeded_mainline_default_after_mergeautooff.log`
+  - `rollout_s=58.061`
+  - `backward_s=32.982`
+  - `batch_wall_excl_compile_s=91.043`
+  - `batch_wall_incl_compile_s=91.043`
+  - `rollout_instage_backward_share=0.568`
