@@ -165,10 +165,10 @@ class TransformerEncoderLayer(Module):
         self.paged_attn_flashprefix_page_size = int(max(1, flashprefix_page_size_env))
         try:
             flashprefix_dense_tokens_env = int(
-                os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "192")
+                os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "64")
             )
         except Exception:
-            flashprefix_dense_tokens_env = 192
+            flashprefix_dense_tokens_env = 64
         self.paged_attn_flashprefix_dense_max_tokens = int(max(0, flashprefix_dense_tokens_env))
         try:
             dense_page_size_env = int(os.environ.get("TICL_POLICY_PAGED_ATTN_DENSE_PAGE_SIZE", "128"))

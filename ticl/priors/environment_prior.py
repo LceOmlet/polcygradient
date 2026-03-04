@@ -2850,6 +2850,7 @@ class EnvironmentPrior:
                         if profile_rollout_timing and launch_wall_t0 is not None:
                             launch_dt = time.perf_counter() - launch_wall_t0
                             transition_group_launch_wall_s += float(launch_dt)
+                            transition_fused_wall_s += float(launch_dt)
                             transition_fused_launch_wall_s += float(launch_dt)
                     else:
                         fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None

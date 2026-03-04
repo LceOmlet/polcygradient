@@ -3448,10 +3448,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print("Policy flash-prefix async:", bool(flash_prefix_async_on))
                 try:
                     flashprefix_dense_tokens = int(
-                        os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "192")
+                        os.environ.get("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "64")
                     )
                 except Exception:
-                    flashprefix_dense_tokens = 192
+                    flashprefix_dense_tokens = 64
                 print(
                     "Policy flash-prefix dense max tokens:",
                     int(max(0, flashprefix_dense_tokens)),

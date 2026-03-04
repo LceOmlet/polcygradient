@@ -451,3 +451,85 @@ Decision:
   - `cudaGetDeviceCount error 304`
   - `nvidia-smi: Failed to initialize NVML`
 - therefore this pass is code-complete but **not yet GPU-measured** in current sandbox.
+
+## Continuation pass (2026-03-04, CUDA restored): fixed-seed A/B + threshold-range validation
+
+### Baseline command
+
+```bash
+TICL_PROFILE_ROLLOUT_TIMING=1 TICL_PROFILE_ROLLOUT_BREAKDOWN=1 TICL_POLICY_STEP_PROFILE=1 \
+CONDA_NO_PLUGINS=true conda run --no-capture-output -n rlpfn \
+  python -u -m ticl.fit_model rlpfn \
+  --seed-everything True \
+  --epochs 1 --num-steps 1 \
+  --validate False --rl-validate-enabled False --progress-bar False \
+  --train-profiler-enabled True --train-profiler-wandb False --train-profiler-log-every-batches 1 \
+  --train-gpu-observer-enabled True --train-gpu-observer-interval-sec 0.2
+```
+
+Note:
+- this pass runs with `policy torch.compile=False`, so no compile warmup is executed.
+- skyline wall metric therefore equals warmup-excluded wall (for compile-enabled runs, use `batch_wall_excl_compile_s`).
+
+### Hard A/B (same fixed seed, only new kernel-path switches differ)
+
+- `fused_on`:
+  - `20260304_113228_seeded_mainline_fused_on.log`
+  - `rollout_s=58.168`, `backward_s=33.532`
+  - `rollout_transition_wall_ms=7214.64`
+  - `policy_step_total_ms=14536.16`
+- `fused_off + dense0`:
+  - `20260304_113349_seeded_mainline_fused_off_dense0.log`
+  - `rollout_s=69.922`, `backward_s=39.634`
+  - `rollout_transition_wall_ms=12411.39`
+  - `policy_step_total_ms=15174.61`
+
+Result (`off -> on`):
+- `rollout_s`: `69.922 -> 58.168` (`-16.81%`)
+- `backward_s`: `39.634 -> 33.532` (`-15.40%`)
+- `rollout_transition_wall_ms`: `12411.39 -> 7214.64` (`-41.87%`)
+- `policy_step_total_ms`: `15174.61 -> 14536.16` (`-4.20%`)
+
+Interpretation:
+- dominant win comes from transition hot-loop launch reduction (fused path), not parameter micro-tuning.
+- this directly addresses transition-group pseudo-parallel bottleneck.
+
+### Observability fix (avoid pseudo signal)
+
+- `20260304_113844_seeded_mainline_fused_on_metricfix.log`
+- previous fused async path could show `rollout_transition_fused_share=0.000` (misleading).
+- after metric fix:
+  - `rollout_transition_fused_share=0.815`
+  - `rollout_transition_fused_launch_share=0.815`
+- now fused share reflects actual async launch cost and avoids pseudo observation.
+
+### Flash-prefix dense fallback parameter sweep (range validation)
+
+All runs use `TICL_POLICY_FUSED_TRANSITION_GENERATOR=1`.
+
+- `dense_max_tokens=0`:
+  - `20260304_113523_seeded_ablation_fused_on_dense0.log`
+  - `rollout_s=58.507`, `backward_s=33.719`, `policy_step_total_ms=14611.49`
+- `dense_max_tokens=64`:
+  - `20260304_114020_seeded_ablation_fused_on_dense64.log`
+  - `rollout_s=57.575`, `backward_s=32.830`, `policy_step_total_ms=14573.14`
+- `dense_max_tokens=512`:
+  - `20260304_114140_seeded_ablation_fused_on_dense512.log`
+  - `rollout_s=59.208`, `backward_s=33.602`, `policy_step_total_ms=15148.44`
+
+Range conclusion:
+- too-large threshold (`512`) regresses wall time (dense path over-expands).
+- small threshold (`64`) is best among tested values on fixed workload.
+- default updated to:
+  - `TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS=64`
+- this is a bounded non-compile optimization range, reducing risk of parameter-induced instability.
+
+### Mainline check after default update
+
+- `20260304_114315_seeded_mainline_default64.log`
+  - confirms startup default print: `Policy flash-prefix dense max tokens: 64`
+  - `rollout_s=59.595`, `backward_s=34.533`
+  - `rollout_transition_fused_share=0.820`
+
+Note:
+- short fixed-seed single-batch runs still have normal runtime variance; skyline decisions use A/B direction + multi-run evidence, not one outlier.
