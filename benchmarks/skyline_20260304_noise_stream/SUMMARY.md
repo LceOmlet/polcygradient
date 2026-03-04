@@ -577,3 +577,42 @@ Purpose:
   - `batch_wall_excl_compile_s=91.043`
   - `batch_wall_incl_compile_s=91.043`
   - `rollout_instage_backward_share=0.568`
+
+## Small-scope Triton/compile probe retry (2026-03-04, fixed seed, single threshold)
+
+### Scope (as requested)
+
+- single probe configuration:
+  - `pg_torch_compile=True`
+  - backend `inductor`, mode `reduce-overhead` (runtime auto-adjusted to `default`)
+  - `TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS=64`
+  - compile warmup isolated:
+    - `TICL_POLICY_COMPILE_WARMUP=1`
+    - `TICL_POLICY_COMPILE_WARMUP_STEPS=1`
+    - `TICL_POLICY_COMPILE_WARMUP_SAMPLES=2`
+    - `TICL_POLICY_COMPILE_WARMUP_CHUNK=8`
+- comparison baseline (same fixed seed/workload, eager):
+  - `20260304_121550_seeded_eager_baseline_dense64.log`
+- probe run:
+  - `20260304_121732_seeded_triton_probe_inductor_dense64_retry.log`
+
+### A/B result (eager -> compile)
+
+- `batch_wall_excl_compile_s`: `91.057 -> 111.666` (`+22.6%`, worse)
+- `batch_wall_incl_compile_s`: `91.057 -> 133.340`
+- `compile_warmup_s`: `0 -> 21.674` (`compile_warmup_ok=1`)
+- `rollout_s`: `57.914 -> 76.600` (`+32.3%`, worse)
+- `backward_s`: `33.143 -> 35.066` (`+5.8%`, worse)
+- `policy_step_total_ms`: `14637.78 -> 14782.40` (`+1.0%`, no gain)
+- peak alloc/reserved: `30.97/31.72 GiB -> 30.99/31.91 GiB` (similar)
+
+### Probe diagnosis
+
+- compile run emitted `torch._dynamo hit config.recompile_limit (8)` with
+  dynamic paged-KV shape mismatch (`k_pages` length change), i.e. compile storm
+  risk is still present in this path.
+
+Decision:
+- do **not** mainline Triton/compile for current skyline.
+- keep skyline KPI on `batch_wall_excl_compile_s` and continue non-compile
+  kernel-path optimization as the primary track.
