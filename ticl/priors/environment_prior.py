@@ -11,6 +11,25 @@ import torch.nn.functional as F
 from ticl.distributions import parse_distributions, sample_distributions
 from ticl.utils import default_device
 
+_STATE_POSTPROCESS_INPLACE_ENV = str(
+    os.environ.get("TICL_POLICY_STATE_POSTPROCESS_INPLACE", "0")
+).strip().lower()
+_STATE_POSTPROCESS_INPLACE = _STATE_POSTPROCESS_INPLACE_ENV not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+_REWARD_MASK_BUFFER_REUSE_ENV = str(
+    os.environ.get("TICL_POLICY_REWARD_MASK_BUFFER_REUSE", "0")
+).strip().lower()
+_REWARD_MASK_BUFFER_REUSE = _REWARD_MASK_BUFFER_REUSE_ENV not in {
+    "0",
+    "false",
+    "no",
+    "off",
+}
+
 
 class EnvironmentPrior:
     """
@@ -66,6 +85,68 @@ class EnvironmentPrior:
         cfg.setdefault("reward_scale", {"distribution": "uniform", "min": 0.1, "max": 10.0})
         cfg.setdefault("reward_clip", 10.0)
         cfg.setdefault("state_clip", 8.0)
+        # Optional residual highway on state update:
+        # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
+        cfg.setdefault("state_highway_enabled", False)
+        cfg.setdefault("state_highway_lambda", 0.0)
+        state_highway_enabled_env = os.environ.get("TICL_STATE_HIGHWAY_ENABLED")
+        if state_highway_enabled_env is not None:
+            cfg["state_highway_enabled"] = state_highway_enabled_env.strip().lower() not in {
+                "0",
+                "false",
+                "no",
+                "off",
+                "",
+            }
+        state_highway_lambda_env = os.environ.get("TICL_STATE_HIGHWAY_LAMBDA")
+        if state_highway_lambda_env is not None:
+            try:
+                cfg["state_highway_lambda"] = float(state_highway_lambda_env)
+            except ValueError:
+                pass
+        # anti-explosion&vanishing-v2:
+        # two-sided corridor regularization on log gain of consecutive
+        # state increments.
+        cfg.setdefault("anti_explosion_vanishing_v2_enabled", False)
+        cfg.setdefault("anti_explosion_vanishing_v2_lambda", 0.05)
+        cfg.setdefault("anti_explosion_vanishing_v2_gain_lo", 0.85)
+        cfg.setdefault("anti_explosion_vanishing_v2_gain_hi", 1.15)
+        cfg.setdefault("anti_explosion_vanishing_v2_huber_delta", 0.05)
+        cfg.setdefault("anti_explosion_vanishing_v2_eps", 1e-6)
+        cfg.setdefault("anti_explosion_vanishing_v2_detach_reference", True)
+        # anti-explosion&vanishing-v3:
+        # decoupled drift+tail regularization on log gain of consecutive
+        # latent-state increments.
+        cfg.setdefault("anti_explosion_vanishing_v3_enabled", False)
+        cfg.setdefault("anti_explosion_vanishing_v3_lambda_drift", 0.02)
+        cfg.setdefault("anti_explosion_vanishing_v3_lambda_tail", 0.05)
+        cfg.setdefault("anti_explosion_vanishing_v3_gain_lo", 0.85)
+        cfg.setdefault("anti_explosion_vanishing_v3_gain_hi", 1.15)
+        cfg.setdefault("anti_explosion_vanishing_v3_tail_tau", 0.02)
+        cfg.setdefault("anti_explosion_vanishing_v3_eps", 1e-6)
+        cfg.setdefault("anti_explosion_vanishing_v3_detach_reference", True)
+        # anti-explosion&vanishing-v4:
+        # controlled highway-subspace residual update + gain regularization.
+        cfg.setdefault("anti_explosion_vanishing_v4_enabled", False)
+        cfg.setdefault("anti_explosion_vanishing_v4_lambda_drift", 0.08)
+        cfg.setdefault("anti_explosion_vanishing_v4_lambda_tail", 0.25)
+        cfg.setdefault("anti_explosion_vanishing_v4_gain_lo", 0.97)
+        cfg.setdefault("anti_explosion_vanishing_v4_gain_hi", 1.03)
+        cfg.setdefault("anti_explosion_vanishing_v4_tail_tau", 0.010)
+        cfg.setdefault("anti_explosion_vanishing_v4_eps", 1e-6)
+        cfg.setdefault("anti_explosion_vanishing_v4_detach_reference", True)
+        cfg.setdefault("anti_explosion_vanishing_v4_highway_ratio", 0.25)
+        cfg.setdefault("anti_explosion_vanishing_v4_update_scale", 0.08)
+        cfg.setdefault("anti_explosion_vanishing_v4_update_clip", 0.0)
+        # anti-explosion&vanishing-v5:
+        # detached reward-signal thermostat. This rescales PG loss magnitude
+        # using per-batch reward std while preserving ascent direction.
+        cfg.setdefault("anti_explosion_vanishing_v5_enabled", False)
+        cfg.setdefault("anti_explosion_vanishing_v5_target_std", 0.25)
+        cfg.setdefault("anti_explosion_vanishing_v5_scale_lo", 0.5)
+        cfg.setdefault("anti_explosion_vanishing_v5_scale_hi", 4.0)
+        cfg.setdefault("anti_explosion_vanishing_v5_eps", 1e-6)
+        cfg.setdefault("anti_explosion_vanishing_v5_detach_reference", True)
 
         # Reward normalization / policy-gradient stability.
         # When False, PG optimizes raw discounted reward mean directly.
@@ -76,7 +157,7 @@ class EnvironmentPrior:
         # Lipschitz safeguards for differentiable rollout stability.
         # Enabling this projects sampled linear maps by Frobenius norm:
         # ||W||_2 <= ||W||_F <= lipschitz_weight_fro_norm_max.
-        cfg.setdefault("lipschitz_enforce", True)
+        cfg.setdefault("lipschitz_enforce", False)
         cfg.setdefault("lipschitz_weight_fro_norm_max", 1.0)
         # GP effective output-scale cap used in Jacobian bound.
         cfg.setdefault("lipschitz_gp_outputscale_max", 1.0)
@@ -106,6 +187,9 @@ class EnvironmentPrior:
         self.config = parse_distributions(cfg)
         self.last_runtime_info = []
         self.last_rollout_profile = None
+        self.last_rollout_v2 = None
+        self.last_rollout_v3 = None
+        self.last_rollout_v4 = None
         self._rollout_executor = None
         self._rollout_executor_workers = 0
         envgen_bmm_flag = str(os.environ.get("TICL_POLICY_ENVGEN_BMM", "1")).strip().lower()
@@ -187,13 +271,13 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_lipschitz_weight_cap(h):
-        if not bool(h.get("lipschitz_enforce", True)):
+        if not bool(h.get("lipschitz_enforce", False)):
             return None
         return EnvironmentPrior._optional_positive_scalar(h.get("lipschitz_weight_fro_norm_max", 1.0))
 
     @staticmethod
     def _resolve_lipschitz_gp_outputscale_cap(h):
-        if not bool(h.get("lipschitz_enforce", True)):
+        if not bool(h.get("lipschitz_enforce", False)):
             return None
         return EnvironmentPrior._optional_positive_scalar(h.get("lipschitz_gp_outputscale_max", 1.0))
 
@@ -355,6 +439,1457 @@ class EnvironmentPrior:
             return float(np.random.uniform(lo, hi))
         return float(h.get("reward_dropout_ratio", 0.0))
 
+    @staticmethod
+    def _coerce_bool(value):
+        if torch.is_tensor(value):
+            if value.dtype == torch.bool:
+                return value
+            if value.numel() == 1:
+                return bool(value.item())
+            return value != 0
+        if isinstance(value, str):
+            return value.strip().lower() not in {"0", "false", "no", "off", ""}
+        return bool(value)
+
+    @staticmethod
+    def _resolve_state_highway_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("state_highway_enabled", False))
+
+    @staticmethod
+    def _resolve_state_highway_lambda(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("state_highway_lambda", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(min(1.0, max(0.0, v)))
+
+    @staticmethod
+    def _apply_state_postprocess(
+        state_next_raw,
+        state_prev,
+        state_clip,
+        state_highway_enabled=False,
+        state_highway_lambda=0.0,
+    ):
+        clip = state_clip
+        if not torch.is_tensor(clip):
+            clip = torch.as_tensor(clip, device=state_next_raw.device, dtype=state_next_raw.dtype)
+        else:
+            clip = clip.to(device=state_next_raw.device, dtype=state_next_raw.dtype)
+        if clip.ndim == state_next_raw.ndim - 1:
+            clip = clip.unsqueeze(-1)
+
+        state_bounded = state_next_raw
+        if _STATE_POSTPROCESS_INPLACE:
+            # Hot-path in-place postprocess to cut per-step temporary allocations.
+            state_bounded.clamp_(min=-clip, max=clip)
+            state_bounded.tanh_()
+        else:
+            state_bounded = torch.maximum(torch.minimum(state_next_raw, clip), -clip)
+            state_bounded = torch.tanh(state_bounded)
+
+        enabled = EnvironmentPrior._coerce_bool(state_highway_enabled)
+        if torch.is_tensor(enabled):
+            enabled_mask = enabled.to(device=state_next_raw.device)
+            if enabled_mask.dtype != torch.bool:
+                enabled_mask = enabled_mask != 0
+            if enabled_mask.ndim == state_next_raw.ndim - 1:
+                enabled_mask = enabled_mask.unsqueeze(-1)
+            if not bool(enabled_mask.any().item()):
+                return state_bounded
+        elif not bool(enabled):
+            return state_bounded
+        else:
+            enabled_mask = None
+
+        lam = state_highway_lambda
+        if torch.is_tensor(lam):
+            lam_t = lam.to(device=state_next_raw.device, dtype=state_next_raw.dtype)
+            if lam_t.ndim == state_next_raw.ndim - 1:
+                lam_t = lam_t.unsqueeze(-1)
+            lam_t = lam_t.clamp(0.0, 1.0)
+        else:
+            lam_t = float(lam)
+            if not math.isfinite(lam_t):
+                lam_t = 0.0
+            lam_t = min(1.0, max(0.0, lam_t))
+
+        state_mixed = lam_t * state_prev + (1.0 - lam_t) * state_bounded
+        if enabled_mask is not None:
+            return torch.where(enabled_mask, state_mixed, state_bounded)
+        return state_mixed
+
+    def _resolve_aev2_config(self):
+        enabled = self._coerce_bool(self.config.get("anti_explosion_vanishing_v2_enabled", False))
+        enabled = bool(enabled)
+        lam = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v2_lambda", 0.05))
+        if (not math.isfinite(lam)) or lam < 0.0:
+            lam = 0.0
+        gain_lo = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v2_gain_lo", 0.85))
+        gain_hi = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v2_gain_hi", 1.15))
+        if (not math.isfinite(gain_lo)) or gain_lo <= 0.0:
+            gain_lo = 0.85
+        if (not math.isfinite(gain_hi)) or gain_hi <= 0.0:
+            gain_hi = 1.15
+        gain_lo = max(1e-6, float(gain_lo))
+        gain_hi = max(gain_lo + 1e-6, float(gain_hi))
+        huber_delta = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v2_huber_delta", 0.05))
+        if (not math.isfinite(huber_delta)) or huber_delta < 0.0:
+            huber_delta = 0.05
+        eps = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v2_eps", 1e-6))
+        if (not math.isfinite(eps)) or eps <= 0.0:
+            eps = 1e-6
+        detach_reference = self._coerce_bool(
+            self.config.get("anti_explosion_vanishing_v2_detach_reference", True)
+        )
+        return {
+            "enabled": bool(enabled),
+            "lambda": float(lam),
+            "gain_lo": float(gain_lo),
+            "gain_hi": float(gain_hi),
+            "log_gain_lo": float(math.log(gain_lo)),
+            "log_gain_hi": float(math.log(gain_hi)),
+            "huber_delta": float(huber_delta),
+            "eps": float(eps),
+            "detach_reference": bool(detach_reference),
+        }
+
+    @staticmethod
+    def _aev2_new_accumulator(enabled, device, dtype):
+        return {
+            "enabled": bool(enabled),
+            "penalty_sum": torch.zeros((), device=device, dtype=dtype),
+            "pairs": 0,
+            "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_count": 0,
+            "gain_min": None,
+            "gain_max": None,
+        }
+
+    @staticmethod
+    def _aev2_update_accumulator(acc, prev_delta, curr_delta, aev2_cfg):
+        if (not bool(acc.get("enabled", False))) or (prev_delta is None):
+            return
+
+        prev = prev_delta
+        curr = curr_delta
+        if prev.ndim == 1:
+            prev = prev.unsqueeze(0)
+            curr = curr.unsqueeze(0)
+
+        eps = float(aev2_cfg["eps"])
+        prev_rms = torch.sqrt(torch.mean(prev * prev, dim=-1) + eps)
+        if bool(aev2_cfg.get("detach_reference", True)):
+            prev_rms = prev_rms.detach()
+        curr_rms = torch.sqrt(torch.mean(curr * curr, dim=-1) + eps)
+        gain = curr_rms / (prev_rms + eps)
+        log_gain = torch.log(gain + eps)
+
+        v_hi = F.relu(log_gain - float(aev2_cfg["log_gain_hi"]))
+        v_lo = F.relu(float(aev2_cfg["log_gain_lo"]) - log_gain)
+        violation = v_hi + v_lo
+        huber_delta = float(aev2_cfg["huber_delta"])
+        if huber_delta > 0.0:
+            delta_t = torch.as_tensor(huber_delta, device=violation.device, dtype=violation.dtype)
+            penalty_vec = torch.where(
+                violation <= delta_t,
+                0.5 * violation * violation / delta_t,
+                violation - 0.5 * delta_t,
+            )
+        else:
+            penalty_vec = violation * violation
+
+        acc["penalty_sum"] = acc["penalty_sum"] + penalty_vec.mean()
+        acc["pairs"] = int(acc["pairs"]) + 1
+
+        gain_det = gain.detach()
+        gain_det64 = gain_det.to(dtype=torch.float64)
+        acc["gain_sum"] = acc["gain_sum"] + gain_det64.sum()
+        acc["gain_sumsq"] = acc["gain_sumsq"] + (gain_det64 * gain_det64).sum()
+        acc["gain_count"] = int(acc["gain_count"]) + int(gain_det64.numel())
+        gain_min = gain_det.min().detach()
+        gain_max = gain_det.max().detach()
+        acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+
+    @staticmethod
+    def _aev2_finalize_accumulator(acc, device, dtype, detach_penalty=False):
+        enabled = bool(acc.get("enabled", False))
+        penalty_sum = acc.get("penalty_sum", None)
+        pairs = int(acc.get("pairs", 0))
+        if penalty_sum is None:
+            penalty_mean = torch.zeros((), device=device, dtype=dtype)
+        elif pairs > 0:
+            penalty_mean = penalty_sum / float(max(1, pairs))
+        else:
+            penalty_mean = torch.zeros((), device=device, dtype=penalty_sum.dtype)
+        if detach_penalty and torch.is_tensor(penalty_mean):
+            penalty_mean = penalty_mean.detach()
+
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.to(device=device, dtype=dtype).detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.to(device=device, dtype=dtype).detach()
+
+        return {
+            "enabled": int(enabled),
+            "penalty_mean": penalty_mean,
+            "pairs": int(pairs),
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+        }
+
+    @staticmethod
+    def _aev2_accumulate_window_summary(det_acc, window_summary, device):
+        if (not isinstance(det_acc, dict)) or (not isinstance(window_summary, dict)):
+            return
+        det_acc["pairs"] = int(det_acc.get("pairs", 0)) + int(window_summary.get("pairs", 0))
+        penalty_w = window_summary.get("penalty_mean", None)
+        if torch.is_tensor(penalty_w):
+            det_acc["penalty_sum"] = det_acc["penalty_sum"] + (
+                penalty_w.detach() * float(max(1, int(window_summary.get("pairs", 0))))
+            )
+        gain_sum_w = window_summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum_w):
+            det_acc["gain_sum"] = det_acc["gain_sum"] + gain_sum_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        gain_sumsq_w = window_summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq_w):
+            det_acc["gain_sumsq"] = det_acc["gain_sumsq"] + gain_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["gain_count"] = int(det_acc.get("gain_count", 0)) + int(window_summary.get("gain_count", 0))
+        gain_min_w = window_summary.get("gain_min", None)
+        if torch.is_tensor(gain_min_w):
+            det_acc["gain_min"] = (
+                gain_min_w.detach()
+                if det_acc.get("gain_min", None) is None
+                else torch.minimum(det_acc["gain_min"], gain_min_w.detach())
+            )
+        gain_max_w = window_summary.get("gain_max", None)
+        if torch.is_tensor(gain_max_w):
+            det_acc["gain_max"] = (
+                gain_max_w.detach()
+                if det_acc.get("gain_max", None) is None
+                else torch.maximum(det_acc["gain_max"], gain_max_w.detach())
+            )
+
+    @staticmethod
+    def _aev2_merge_rollout_summary(acc, summary, batch_weight, device, dtype):
+        if not isinstance(summary, dict):
+            return acc
+        if int(summary.get("enabled", 0)) == 0:
+            return acc
+
+        w = float(max(0.0, batch_weight))
+        if acc is None:
+            acc = {
+                "enabled": 1,
+                "penalty_mean_weighted": None,
+                "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_count": 0,
+                "gain_min": None,
+                "gain_max": None,
+            }
+
+        penalty_mean = summary.get("penalty_mean", None)
+        if torch.is_tensor(penalty_mean):
+            term = penalty_mean * w
+            if acc["penalty_mean_weighted"] is None:
+                acc["penalty_mean_weighted"] = term
+            else:
+                acc["penalty_mean_weighted"] = acc["penalty_mean_weighted"] + term
+
+        gain_sum = summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum):
+            acc["gain_sum"] = acc["gain_sum"] + gain_sum.to(device=device, dtype=torch.float64)
+        gain_sumsq = summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq):
+            acc["gain_sumsq"] = acc["gain_sumsq"] + gain_sumsq.to(device=device, dtype=torch.float64)
+        acc["gain_count"] = int(acc["gain_count"]) + int(summary.get("gain_count", 0))
+
+        gain_min = summary.get("gain_min", None)
+        if torch.is_tensor(gain_min):
+            gain_min = gain_min.to(device=device, dtype=dtype)
+            acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        gain_max = summary.get("gain_max", None)
+        if torch.is_tensor(gain_max):
+            gain_max = gain_max.to(device=device, dtype=dtype)
+            acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+        return acc
+
+    @staticmethod
+    def _aev2_finalize_rollout_summary(acc, device, dtype):
+        if acc is None:
+            return None
+        penalty_weighted = acc.get("penalty_mean_weighted", None)
+        if penalty_weighted is None:
+            penalty_weighted = torch.zeros((), device=device, dtype=dtype)
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.detach()
+        return {
+            "enabled": 1,
+            "penalty_mean": penalty_weighted,
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": gain_count,
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+        }
+
+    def _resolve_aev3_config(self):
+        enabled = self._coerce_bool(self.config.get("anti_explosion_vanishing_v3_enabled", False))
+        enabled = bool(enabled)
+        lam_drift = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_lambda_drift", 0.02))
+        if (not math.isfinite(lam_drift)) or lam_drift < 0.0:
+            lam_drift = 0.0
+        lam_tail = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_lambda_tail", 0.05))
+        if (not math.isfinite(lam_tail)) or lam_tail < 0.0:
+            lam_tail = 0.0
+        gain_lo = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_gain_lo", 0.85))
+        gain_hi = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_gain_hi", 1.15))
+        if (not math.isfinite(gain_lo)) or gain_lo <= 0.0:
+            gain_lo = 0.85
+        if (not math.isfinite(gain_hi)) or gain_hi <= 0.0:
+            gain_hi = 1.15
+        gain_lo = max(1e-6, float(gain_lo))
+        gain_hi = max(gain_lo + 1e-6, float(gain_hi))
+        tail_tau = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_tail_tau", 0.02))
+        if (not math.isfinite(tail_tau)) or tail_tau <= 0.0:
+            tail_tau = 0.02
+        eps = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v3_eps", 1e-6))
+        if (not math.isfinite(eps)) or eps <= 0.0:
+            eps = 1e-6
+        detach_reference = self._coerce_bool(
+            self.config.get("anti_explosion_vanishing_v3_detach_reference", True)
+        )
+        return {
+            "enabled": bool(enabled),
+            "lambda_drift": float(lam_drift),
+            "lambda_tail": float(lam_tail),
+            "gain_lo": float(gain_lo),
+            "gain_hi": float(gain_hi),
+            "log_gain_lo": float(math.log(gain_lo)),
+            "log_gain_hi": float(math.log(gain_hi)),
+            "tail_tau": float(tail_tau),
+            "eps": float(eps),
+            "detach_reference": bool(detach_reference),
+        }
+
+    @staticmethod
+    def _aev3_new_accumulator(enabled, device, dtype, aev3_cfg=None):
+        if aev3_cfg is None:
+            aev3_cfg = {}
+        return {
+            "enabled": bool(enabled),
+            "lambda_drift": float(aev3_cfg.get("lambda_drift", 0.0)),
+            "lambda_tail": float(aev3_cfg.get("lambda_tail", 0.0)),
+            "gain_lo": float(aev3_cfg.get("gain_lo", 0.0)),
+            "gain_hi": float(aev3_cfg.get("gain_hi", 0.0)),
+            "log_gain_lo": float(aev3_cfg.get("log_gain_lo", 0.0)),
+            "log_gain_hi": float(aev3_cfg.get("log_gain_hi", 0.0)),
+            "drift_sum": torch.zeros((), device=device, dtype=dtype),
+            "tail_sum": torch.zeros((), device=device, dtype=dtype),
+            "pairs": 0,
+            "log_gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "log_gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "log_gain_count": 0,
+            "tail_low_count": 0,
+            "tail_high_count": 0,
+            "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_count": 0,
+            "gain_min": None,
+            "gain_max": None,
+        }
+
+    @staticmethod
+    def _aev3_update_accumulator(acc, prev_delta, curr_delta, aev3_cfg):
+        if (not bool(acc.get("enabled", False))) or (prev_delta is None):
+            return
+
+        prev = prev_delta
+        curr = curr_delta
+        if prev.ndim == 1:
+            prev = prev.unsqueeze(0)
+            curr = curr.unsqueeze(0)
+
+        eps = float(aev3_cfg["eps"])
+        prev_rms = torch.sqrt(torch.mean(prev * prev, dim=-1) + eps)
+        if bool(aev3_cfg.get("detach_reference", True)):
+            prev_rms = prev_rms.detach()
+        curr_rms = torch.sqrt(torch.mean(curr * curr, dim=-1) + eps)
+        gain = curr_rms / (prev_rms + eps)
+        log_gain = torch.log(gain + eps)
+
+        tau = float(aev3_cfg.get("tail_tau", 0.02))
+        if tau <= 0.0:
+            tau = 1e-6
+        tau_t = torch.as_tensor(tau, device=log_gain.device, dtype=log_gain.dtype)
+        low_margin = (float(aev3_cfg["log_gain_lo"]) - log_gain) / tau_t
+        high_margin = (log_gain - float(aev3_cfg["log_gain_hi"])) / tau_t
+        tail_penalty_vec = (F.softplus(low_margin) + F.softplus(high_margin)) * tau_t
+
+        acc["drift_sum"] = acc["drift_sum"] + log_gain.mean()
+        acc["tail_sum"] = acc["tail_sum"] + tail_penalty_vec.mean()
+        acc["pairs"] = int(acc["pairs"]) + 1
+
+        log_gain_det64 = log_gain.detach().to(dtype=torch.float64)
+        acc["log_gain_sum"] = acc["log_gain_sum"] + log_gain_det64.sum()
+        acc["log_gain_sumsq"] = acc["log_gain_sumsq"] + (log_gain_det64 * log_gain_det64).sum()
+        acc["log_gain_count"] = int(acc["log_gain_count"]) + int(log_gain_det64.numel())
+        acc["tail_low_count"] = int(acc["tail_low_count"]) + int(
+            (log_gain_det64 < float(aev3_cfg["log_gain_lo"])).sum().item()
+        )
+        acc["tail_high_count"] = int(acc["tail_high_count"]) + int(
+            (log_gain_det64 > float(aev3_cfg["log_gain_hi"])).sum().item()
+        )
+
+        gain_det = gain.detach()
+        gain_det64 = gain_det.to(dtype=torch.float64)
+        acc["gain_sum"] = acc["gain_sum"] + gain_det64.sum()
+        acc["gain_sumsq"] = acc["gain_sumsq"] + (gain_det64 * gain_det64).sum()
+        acc["gain_count"] = int(acc["gain_count"]) + int(gain_det64.numel())
+        gain_min = gain_det.min().detach()
+        gain_max = gain_det.max().detach()
+        acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+
+    @staticmethod
+    def _aev3_finalize_accumulator(acc, device, dtype, detach_penalty=False):
+        enabled = bool(acc.get("enabled", False))
+        pairs = int(acc.get("pairs", 0))
+        drift_sum = acc.get("drift_sum", None)
+        tail_sum = acc.get("tail_sum", None)
+        if pairs > 0 and torch.is_tensor(drift_sum):
+            drift_mean = drift_sum / float(pairs)
+        else:
+            drift_mean = torch.zeros((), device=device, dtype=dtype)
+        if pairs > 0 and torch.is_tensor(tail_sum):
+            tail_mean = tail_sum / float(pairs)
+        else:
+            tail_mean = torch.zeros((), device=device, dtype=dtype)
+
+        penalty_drift = drift_mean * drift_mean
+        penalty_tail = tail_mean
+        lambda_drift = float(acc.get("lambda_drift", 0.0))
+        lambda_tail = float(acc.get("lambda_tail", 0.0))
+        penalty_mean = (penalty_drift * lambda_drift) + (penalty_tail * lambda_tail)
+        if detach_penalty:
+            penalty_drift = penalty_drift.detach()
+            penalty_tail = penalty_tail.detach()
+            penalty_mean = penalty_mean.detach()
+
+        log_gain_count = int(acc.get("log_gain_count", 0))
+        log_gain_sum = acc.get("log_gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        log_gain_sumsq = acc.get("log_gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if log_gain_count > 0:
+            log_gain_mean64 = log_gain_sum / float(log_gain_count)
+            log_gain_var64 = (log_gain_sumsq / float(log_gain_count)) - (log_gain_mean64 * log_gain_mean64)
+            log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+            log_gain_mean = log_gain_mean64.to(dtype=dtype).detach()
+            log_gain_std = log_gain_std64.to(dtype=dtype).detach()
+        else:
+            log_gain_mean = torch.zeros((), device=device, dtype=dtype)
+            log_gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        tail_low_count = int(acc.get("tail_low_count", 0))
+        tail_high_count = int(acc.get("tail_high_count", 0))
+        if log_gain_count > 0:
+            tail_low_share = torch.as_tensor(
+                float(tail_low_count) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+            tail_high_share = torch.as_tensor(
+                float(tail_high_count) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            tail_low_share = torch.zeros((), device=device, dtype=dtype)
+            tail_high_share = torch.zeros((), device=device, dtype=dtype)
+
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.to(device=device, dtype=dtype).detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.to(device=device, dtype=dtype).detach()
+
+        return {
+            "enabled": int(enabled),
+            "pairs": int(pairs),
+            "lambda_drift": float(lambda_drift),
+            "lambda_tail": float(lambda_tail),
+            "gain_lo": float(acc.get("gain_lo", 0.0)),
+            "gain_hi": float(acc.get("gain_hi", 0.0)),
+            "penalty_drift": penalty_drift,
+            "penalty_tail": penalty_tail,
+            "penalty_mean": penalty_mean,
+            "log_gain_sum": log_gain_sum,
+            "log_gain_sumsq": log_gain_sumsq,
+            "log_gain_count": int(log_gain_count),
+            "log_gain_mean": log_gain_mean,
+            "log_gain_std": log_gain_std,
+            "tail_low_count": int(tail_low_count),
+            "tail_high_count": int(tail_high_count),
+            "tail_low_share": tail_low_share,
+            "tail_high_share": tail_high_share,
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+        }
+
+    @staticmethod
+    def _aev3_accumulate_window_summary(det_acc, window_summary, device):
+        if (not isinstance(det_acc, dict)) or (not isinstance(window_summary, dict)):
+            return
+        pairs_w = int(window_summary.get("pairs", 0))
+        det_acc["pairs"] = int(det_acc.get("pairs", 0)) + pairs_w
+        penalty_drift_w = window_summary.get("penalty_drift", None)
+        if torch.is_tensor(penalty_drift_w):
+            det_acc["drift_sum"] = det_acc["drift_sum"] + (penalty_drift_w.detach() * float(max(1, pairs_w)))
+        penalty_tail_w = window_summary.get("penalty_tail", None)
+        if torch.is_tensor(penalty_tail_w):
+            det_acc["tail_sum"] = det_acc["tail_sum"] + (penalty_tail_w.detach() * float(max(1, pairs_w)))
+
+        log_gain_sum_w = window_summary.get("log_gain_sum", None)
+        if torch.is_tensor(log_gain_sum_w):
+            det_acc["log_gain_sum"] = det_acc["log_gain_sum"] + log_gain_sum_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        log_gain_sumsq_w = window_summary.get("log_gain_sumsq", None)
+        if torch.is_tensor(log_gain_sumsq_w):
+            det_acc["log_gain_sumsq"] = det_acc["log_gain_sumsq"] + log_gain_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["log_gain_count"] = int(det_acc.get("log_gain_count", 0)) + int(window_summary.get("log_gain_count", 0))
+        det_acc["tail_low_count"] = int(det_acc.get("tail_low_count", 0)) + int(window_summary.get("tail_low_count", 0))
+        det_acc["tail_high_count"] = int(det_acc.get("tail_high_count", 0)) + int(window_summary.get("tail_high_count", 0))
+
+        gain_sum_w = window_summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum_w):
+            det_acc["gain_sum"] = det_acc["gain_sum"] + gain_sum_w.detach().to(device=device, dtype=torch.float64)
+        gain_sumsq_w = window_summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq_w):
+            det_acc["gain_sumsq"] = det_acc["gain_sumsq"] + gain_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["gain_count"] = int(det_acc.get("gain_count", 0)) + int(window_summary.get("gain_count", 0))
+        gain_min_w = window_summary.get("gain_min", None)
+        if torch.is_tensor(gain_min_w):
+            det_acc["gain_min"] = (
+                gain_min_w.detach()
+                if det_acc.get("gain_min", None) is None
+                else torch.minimum(det_acc["gain_min"], gain_min_w.detach())
+            )
+        gain_max_w = window_summary.get("gain_max", None)
+        if torch.is_tensor(gain_max_w):
+            det_acc["gain_max"] = (
+                gain_max_w.detach()
+                if det_acc.get("gain_max", None) is None
+                else torch.maximum(det_acc["gain_max"], gain_max_w.detach())
+            )
+
+    @staticmethod
+    def _aev3_merge_rollout_summary(acc, summary, batch_weight, device, dtype):
+        if not isinstance(summary, dict):
+            return acc
+        if int(summary.get("enabled", 0)) == 0:
+            return acc
+
+        w = float(max(0.0, batch_weight))
+        if acc is None:
+            acc = {
+                "enabled": 1,
+                "lambda_drift": float(summary.get("lambda_drift", 0.0)),
+                "lambda_tail": float(summary.get("lambda_tail", 0.0)),
+                "gain_lo": float(summary.get("gain_lo", 0.0)),
+                "gain_hi": float(summary.get("gain_hi", 0.0)),
+                "penalty_mean_weighted": None,
+                "penalty_drift_weighted": None,
+                "penalty_tail_weighted": None,
+                "log_gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "log_gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "log_gain_count": 0,
+                "tail_low_count": 0,
+                "tail_high_count": 0,
+                "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_count": 0,
+                "gain_min": None,
+                "gain_max": None,
+            }
+
+        penalty_mean = summary.get("penalty_mean", None)
+        if torch.is_tensor(penalty_mean):
+            term = penalty_mean * w
+            if acc["penalty_mean_weighted"] is None:
+                acc["penalty_mean_weighted"] = term
+            else:
+                acc["penalty_mean_weighted"] = acc["penalty_mean_weighted"] + term
+        penalty_drift = summary.get("penalty_drift", None)
+        if torch.is_tensor(penalty_drift):
+            term = penalty_drift * w
+            if acc["penalty_drift_weighted"] is None:
+                acc["penalty_drift_weighted"] = term
+            else:
+                acc["penalty_drift_weighted"] = acc["penalty_drift_weighted"] + term
+        penalty_tail = summary.get("penalty_tail", None)
+        if torch.is_tensor(penalty_tail):
+            term = penalty_tail * w
+            if acc["penalty_tail_weighted"] is None:
+                acc["penalty_tail_weighted"] = term
+            else:
+                acc["penalty_tail_weighted"] = acc["penalty_tail_weighted"] + term
+
+        log_gain_sum = summary.get("log_gain_sum", None)
+        if torch.is_tensor(log_gain_sum):
+            acc["log_gain_sum"] = acc["log_gain_sum"] + log_gain_sum.to(device=device, dtype=torch.float64)
+        log_gain_sumsq = summary.get("log_gain_sumsq", None)
+        if torch.is_tensor(log_gain_sumsq):
+            acc["log_gain_sumsq"] = acc["log_gain_sumsq"] + log_gain_sumsq.to(device=device, dtype=torch.float64)
+        acc["log_gain_count"] = int(acc["log_gain_count"]) + int(summary.get("log_gain_count", 0))
+        acc["tail_low_count"] = int(acc["tail_low_count"]) + int(summary.get("tail_low_count", 0))
+        acc["tail_high_count"] = int(acc["tail_high_count"]) + int(summary.get("tail_high_count", 0))
+
+        gain_sum = summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum):
+            acc["gain_sum"] = acc["gain_sum"] + gain_sum.to(device=device, dtype=torch.float64)
+        gain_sumsq = summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq):
+            acc["gain_sumsq"] = acc["gain_sumsq"] + gain_sumsq.to(device=device, dtype=torch.float64)
+        acc["gain_count"] = int(acc["gain_count"]) + int(summary.get("gain_count", 0))
+        gain_min = summary.get("gain_min", None)
+        if torch.is_tensor(gain_min):
+            gain_min = gain_min.to(device=device, dtype=dtype)
+            acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        gain_max = summary.get("gain_max", None)
+        if torch.is_tensor(gain_max):
+            gain_max = gain_max.to(device=device, dtype=dtype)
+            acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+        return acc
+
+    @staticmethod
+    def _aev3_finalize_rollout_summary(acc, device, dtype):
+        if acc is None:
+            return None
+        penalty_mean = acc.get("penalty_mean_weighted", None)
+        if penalty_mean is None:
+            penalty_mean = torch.zeros((), device=device, dtype=dtype)
+        penalty_drift = acc.get("penalty_drift_weighted", None)
+        if penalty_drift is None:
+            penalty_drift = torch.zeros((), device=device, dtype=dtype)
+        penalty_tail = acc.get("penalty_tail_weighted", None)
+        if penalty_tail is None:
+            penalty_tail = torch.zeros((), device=device, dtype=dtype)
+
+        log_gain_count = int(acc.get("log_gain_count", 0))
+        log_gain_sum = acc.get("log_gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        log_gain_sumsq = acc.get("log_gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if log_gain_count > 0:
+            log_gain_mean64 = log_gain_sum / float(log_gain_count)
+            log_gain_var64 = (log_gain_sumsq / float(log_gain_count)) - (log_gain_mean64 * log_gain_mean64)
+            log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+            log_gain_mean = log_gain_mean64.to(dtype=dtype).detach()
+            log_gain_std = log_gain_std64.to(dtype=dtype).detach()
+            tail_low_share = torch.as_tensor(
+                float(acc.get("tail_low_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+            tail_high_share = torch.as_tensor(
+                float(acc.get("tail_high_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            log_gain_mean = torch.zeros((), device=device, dtype=dtype)
+            log_gain_std = torch.zeros((), device=device, dtype=dtype)
+            tail_low_share = torch.zeros((), device=device, dtype=dtype)
+            tail_high_share = torch.zeros((), device=device, dtype=dtype)
+
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.detach()
+
+        return {
+            "enabled": 1,
+            "lambda_drift": float(acc.get("lambda_drift", 0.0)),
+            "lambda_tail": float(acc.get("lambda_tail", 0.0)),
+            "gain_lo": float(acc.get("gain_lo", 0.0)),
+            "gain_hi": float(acc.get("gain_hi", 0.0)),
+            "penalty_mean": penalty_mean,
+            "penalty_drift": penalty_drift,
+            "penalty_tail": penalty_tail,
+            "log_gain_sum": log_gain_sum,
+            "log_gain_sumsq": log_gain_sumsq,
+            "log_gain_count": int(log_gain_count),
+            "log_gain_mean": log_gain_mean,
+            "log_gain_std": log_gain_std,
+            "tail_low_count": int(acc.get("tail_low_count", 0)),
+            "tail_high_count": int(acc.get("tail_high_count", 0)),
+            "tail_low_share": tail_low_share,
+            "tail_high_share": tail_high_share,
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+        }
+
+    def _resolve_aev4_config(self):
+        enabled = self._coerce_bool(self.config.get("anti_explosion_vanishing_v4_enabled", False))
+        enabled = bool(enabled)
+        lam_drift = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_lambda_drift", 0.08))
+        if (not math.isfinite(lam_drift)) or lam_drift < 0.0:
+            lam_drift = 0.0
+        lam_tail = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_lambda_tail", 0.25))
+        if (not math.isfinite(lam_tail)) or lam_tail < 0.0:
+            lam_tail = 0.0
+        gain_lo = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_gain_lo", 0.97))
+        gain_hi = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_gain_hi", 1.03))
+        if (not math.isfinite(gain_lo)) or gain_lo <= 0.0:
+            gain_lo = 0.97
+        if (not math.isfinite(gain_hi)) or gain_hi <= 0.0:
+            gain_hi = 1.03
+        gain_lo = max(1e-6, float(gain_lo))
+        gain_hi = max(gain_lo + 1e-6, float(gain_hi))
+        tail_tau = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_tail_tau", 0.010))
+        if (not math.isfinite(tail_tau)) or tail_tau <= 0.0:
+            tail_tau = 0.010
+        eps = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_eps", 1e-6))
+        if (not math.isfinite(eps)) or eps <= 0.0:
+            eps = 1e-6
+        detach_reference = self._coerce_bool(
+            self.config.get("anti_explosion_vanishing_v4_detach_reference", True)
+        )
+        highway_ratio = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_highway_ratio", 0.25))
+        if (not math.isfinite(highway_ratio)) or highway_ratio <= 0.0:
+            highway_ratio = 0.25
+        highway_ratio = float(min(1.0, max(0.01, highway_ratio)))
+        update_scale = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_update_scale", 0.08))
+        if (not math.isfinite(update_scale)) or update_scale <= 0.0:
+            update_scale = 0.08
+        update_scale = float(min(1.0, max(1e-6, update_scale)))
+        update_clip = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v4_update_clip", 0.0))
+        if not math.isfinite(update_clip):
+            update_clip = 0.0
+        update_clip = float(max(0.0, update_clip))
+        return {
+            "enabled": bool(enabled),
+            "lambda_drift": float(lam_drift),
+            "lambda_tail": float(lam_tail),
+            "gain_lo": float(gain_lo),
+            "gain_hi": float(gain_hi),
+            "log_gain_lo": float(math.log(gain_lo)),
+            "log_gain_hi": float(math.log(gain_hi)),
+            "tail_tau": float(tail_tau),
+            "eps": float(eps),
+            "detach_reference": bool(detach_reference),
+            "highway_ratio": float(highway_ratio),
+            "update_scale": float(update_scale),
+            "update_clip": float(update_clip),
+        }
+
+    def _resolve_aev5_config(self):
+        enabled = self._coerce_bool(self.config.get("anti_explosion_vanishing_v5_enabled", False))
+        enabled = bool(enabled)
+        target_std = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v5_target_std", 0.25))
+        if (not math.isfinite(target_std)) or target_std <= 0.0:
+            target_std = 0.25
+        scale_lo = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v5_scale_lo", 0.5))
+        scale_hi = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v5_scale_hi", 4.0))
+        if (not math.isfinite(scale_lo)) or scale_lo <= 0.0:
+            scale_lo = 0.5
+        if (not math.isfinite(scale_hi)) or scale_hi <= 0.0:
+            scale_hi = 4.0
+        scale_lo = max(1e-6, float(scale_lo))
+        scale_hi = max(scale_lo, float(scale_hi))
+        eps = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v5_eps", 1e-6))
+        if (not math.isfinite(eps)) or eps <= 0.0:
+            eps = 1e-6
+        detach_reference = self._coerce_bool(
+            self.config.get("anti_explosion_vanishing_v5_detach_reference", True)
+        )
+        return {
+            "enabled": bool(enabled),
+            "target_std": float(target_std),
+            "scale_lo": float(scale_lo),
+            "scale_hi": float(scale_hi),
+            "eps": float(eps),
+            "detach_reference": bool(detach_reference),
+        }
+
+    @staticmethod
+    def _aev4_highway_dim(last_dim, aev4_cfg):
+        d = int(last_dim)
+        if d <= 0:
+            return 0
+        ratio = float(aev4_cfg.get("highway_ratio", 0.25))
+        if not math.isfinite(ratio):
+            ratio = 0.25
+        ratio = min(1.0, max(0.01, ratio))
+        return int(min(d, max(1, round(float(d) * ratio))))
+
+    @staticmethod
+    def _apply_aev4_state_update(state_prev, state_next_post, aev4_cfg):
+        if not bool(aev4_cfg.get("enabled", False)):
+            return state_next_post, None
+        if state_next_post.shape[-1] <= 0:
+            return state_next_post, None
+        highway_dim = EnvironmentPrior._aev4_highway_dim(state_next_post.shape[-1], aev4_cfg)
+        if highway_dim <= 0:
+            return state_next_post, None
+
+        update_scale = float(aev4_cfg.get("update_scale", 0.12))
+        if (not math.isfinite(update_scale)) or update_scale <= 0.0:
+            return state_next_post, None
+        update_scale = min(1.0, max(1e-6, update_scale))
+        update_clip = float(aev4_cfg.get("update_clip", 0.0))
+        if (not math.isfinite(update_clip)) or update_clip < 0.0:
+            update_clip = 0.0
+
+        residual = state_next_post[..., :highway_dim] - state_prev[..., :highway_dim]
+        clip_hit_share = torch.zeros((), device=state_next_post.device, dtype=torch.float32)
+        if update_clip > 0.0:
+            clip_abs = torch.as_tensor(update_clip, device=residual.device, dtype=residual.dtype)
+            clip_hit_share = (residual.detach().abs() > clip_abs).to(torch.float32).mean()
+            residual = torch.clamp(residual, min=-clip_abs, max=clip_abs)
+        controlled = state_prev[..., :highway_dim] + (residual * update_scale)
+        out = state_next_post.clone()
+        out[..., :highway_dim] = controlled
+        return out, {
+            "highway_dim": int(highway_dim),
+            "clip_hit_share": clip_hit_share,
+        }
+
+    @staticmethod
+    def _aev4_new_accumulator(enabled, device, dtype, aev4_cfg=None):
+        if aev4_cfg is None:
+            aev4_cfg = {}
+        return {
+            "enabled": bool(enabled),
+            "lambda_drift": float(aev4_cfg.get("lambda_drift", 0.0)),
+            "lambda_tail": float(aev4_cfg.get("lambda_tail", 0.0)),
+            "gain_lo": float(aev4_cfg.get("gain_lo", 0.0)),
+            "gain_hi": float(aev4_cfg.get("gain_hi", 0.0)),
+            "log_gain_lo": float(aev4_cfg.get("log_gain_lo", 0.0)),
+            "log_gain_hi": float(aev4_cfg.get("log_gain_hi", 0.0)),
+            "highway_ratio": float(aev4_cfg.get("highway_ratio", 0.25)),
+            "update_scale": float(aev4_cfg.get("update_scale", 0.12)),
+            "update_clip": float(aev4_cfg.get("update_clip", 0.0)),
+            "drift_sum": torch.zeros((), device=device, dtype=dtype),
+            "tail_sum": torch.zeros((), device=device, dtype=dtype),
+            "pairs": 0,
+            "log_gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "log_gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "log_gain_count": 0,
+            "tail_low_count": 0,
+            "tail_high_count": 0,
+            "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_count": 0,
+            "gain_min": None,
+            "gain_max": None,
+            "update_rms_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "update_rms_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "update_rms_count": 0,
+            "clip_hit_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "clip_hit_count": 0,
+        }
+
+    @staticmethod
+    def _aev4_update_accumulator(acc, prev_delta, curr_delta, aev4_cfg, step_aux=None):
+        if (not bool(acc.get("enabled", False))) or (prev_delta is None):
+            return
+        if curr_delta is None or curr_delta.shape[-1] <= 0:
+            return
+        highway_dim = EnvironmentPrior._aev4_highway_dim(curr_delta.shape[-1], aev4_cfg)
+        if highway_dim <= 0:
+            return
+
+        prev = prev_delta[..., :highway_dim]
+        curr = curr_delta[..., :highway_dim]
+        if prev.ndim == 1:
+            prev = prev.unsqueeze(0)
+            curr = curr.unsqueeze(0)
+
+        eps = float(aev4_cfg.get("eps", 1e-6))
+        prev_rms = torch.sqrt(torch.mean(prev * prev, dim=-1) + eps)
+        if bool(aev4_cfg.get("detach_reference", True)):
+            prev_rms = prev_rms.detach()
+        curr_rms = torch.sqrt(torch.mean(curr * curr, dim=-1) + eps)
+        gain = curr_rms / (prev_rms + eps)
+        log_gain = torch.log(gain + eps)
+
+        tau = float(aev4_cfg.get("tail_tau", 0.016))
+        if tau <= 0.0:
+            tau = 1e-6
+        tau_t = torch.as_tensor(tau, device=log_gain.device, dtype=log_gain.dtype)
+        low_margin = (float(aev4_cfg["log_gain_lo"]) - log_gain) / tau_t
+        high_margin = (log_gain - float(aev4_cfg["log_gain_hi"])) / tau_t
+        tail_penalty_vec = (F.softplus(low_margin) + F.softplus(high_margin)) * tau_t
+
+        acc["drift_sum"] = acc["drift_sum"] + log_gain.mean()
+        acc["tail_sum"] = acc["tail_sum"] + tail_penalty_vec.mean()
+        acc["pairs"] = int(acc["pairs"]) + 1
+
+        log_gain_det64 = log_gain.detach().to(dtype=torch.float64)
+        acc["log_gain_sum"] = acc["log_gain_sum"] + log_gain_det64.sum()
+        acc["log_gain_sumsq"] = acc["log_gain_sumsq"] + (log_gain_det64 * log_gain_det64).sum()
+        acc["log_gain_count"] = int(acc["log_gain_count"]) + int(log_gain_det64.numel())
+        acc["tail_low_count"] = int(acc["tail_low_count"]) + int(
+            (log_gain_det64 < float(aev4_cfg["log_gain_lo"])).sum().item()
+        )
+        acc["tail_high_count"] = int(acc["tail_high_count"]) + int(
+            (log_gain_det64 > float(aev4_cfg["log_gain_hi"])).sum().item()
+        )
+
+        gain_det = gain.detach()
+        gain_det64 = gain_det.to(dtype=torch.float64)
+        acc["gain_sum"] = acc["gain_sum"] + gain_det64.sum()
+        acc["gain_sumsq"] = acc["gain_sumsq"] + (gain_det64 * gain_det64).sum()
+        acc["gain_count"] = int(acc["gain_count"]) + int(gain_det64.numel())
+        gain_min = gain_det.min().detach()
+        gain_max = gain_det.max().detach()
+        acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+
+        curr_rms_det = curr_rms.detach().to(dtype=torch.float64)
+        acc["update_rms_sum"] = acc["update_rms_sum"] + curr_rms_det.sum()
+        acc["update_rms_sumsq"] = acc["update_rms_sumsq"] + (curr_rms_det * curr_rms_det).sum()
+        acc["update_rms_count"] = int(acc["update_rms_count"]) + int(curr_rms_det.numel())
+        if isinstance(step_aux, dict):
+            clip_hit_share = step_aux.get("clip_hit_share", None)
+            if torch.is_tensor(clip_hit_share):
+                acc["clip_hit_sum"] = acc["clip_hit_sum"] + clip_hit_share.detach().to(
+                    device=curr.device, dtype=torch.float64
+                )
+                acc["clip_hit_count"] = int(acc["clip_hit_count"]) + 1
+
+    @staticmethod
+    def _aev4_finalize_accumulator(acc, device, dtype, detach_penalty=False):
+        enabled = bool(acc.get("enabled", False))
+        pairs = int(acc.get("pairs", 0))
+        drift_sum = acc.get("drift_sum", None)
+        tail_sum = acc.get("tail_sum", None)
+        if pairs > 0 and torch.is_tensor(drift_sum):
+            drift_mean = drift_sum / float(pairs)
+        else:
+            drift_mean = torch.zeros((), device=device, dtype=dtype)
+        if pairs > 0 and torch.is_tensor(tail_sum):
+            tail_mean = tail_sum / float(pairs)
+        else:
+            tail_mean = torch.zeros((), device=device, dtype=dtype)
+
+        penalty_drift = drift_mean * drift_mean
+        penalty_tail = tail_mean
+        lambda_drift = float(acc.get("lambda_drift", 0.0))
+        lambda_tail = float(acc.get("lambda_tail", 0.0))
+        penalty_mean = (penalty_drift * lambda_drift) + (penalty_tail * lambda_tail)
+        if detach_penalty:
+            penalty_drift = penalty_drift.detach()
+            penalty_tail = penalty_tail.detach()
+            penalty_mean = penalty_mean.detach()
+
+        log_gain_count = int(acc.get("log_gain_count", 0))
+        log_gain_sum = acc.get("log_gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        log_gain_sumsq = acc.get("log_gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if log_gain_count > 0:
+            log_gain_mean64 = log_gain_sum / float(log_gain_count)
+            log_gain_var64 = (log_gain_sumsq / float(log_gain_count)) - (log_gain_mean64 * log_gain_mean64)
+            log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+            log_gain_mean = log_gain_mean64.to(dtype=dtype).detach()
+            log_gain_std = log_gain_std64.to(dtype=dtype).detach()
+            tail_low_share = torch.as_tensor(
+                float(acc.get("tail_low_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+            tail_high_share = torch.as_tensor(
+                float(acc.get("tail_high_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            log_gain_mean = torch.zeros((), device=device, dtype=dtype)
+            log_gain_std = torch.zeros((), device=device, dtype=dtype)
+            tail_low_share = torch.zeros((), device=device, dtype=dtype)
+            tail_high_share = torch.zeros((), device=device, dtype=dtype)
+
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.to(device=device, dtype=dtype).detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.to(device=device, dtype=dtype).detach()
+
+        update_rms_count = int(acc.get("update_rms_count", 0))
+        update_rms_sum = acc.get("update_rms_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        update_rms_sumsq = acc.get("update_rms_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if update_rms_count > 0:
+            update_rms_mean64 = update_rms_sum / float(update_rms_count)
+            update_rms_var64 = (
+                (update_rms_sumsq / float(update_rms_count)) - (update_rms_mean64 * update_rms_mean64)
+            )
+            update_rms_std64 = torch.sqrt(torch.clamp(update_rms_var64, min=0.0))
+            update_rms_mean = update_rms_mean64.to(dtype=dtype).detach()
+            update_rms_std = update_rms_std64.to(dtype=dtype).detach()
+        else:
+            update_rms_mean = torch.zeros((), device=device, dtype=dtype)
+            update_rms_std = torch.zeros((), device=device, dtype=dtype)
+
+        clip_hit_count = int(acc.get("clip_hit_count", 0))
+        clip_hit_sum = acc.get("clip_hit_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if clip_hit_count > 0:
+            clip_hit_share = (clip_hit_sum / float(clip_hit_count)).to(dtype=dtype).detach()
+        else:
+            clip_hit_share = torch.zeros((), device=device, dtype=dtype)
+
+        return {
+            "enabled": int(enabled),
+            "pairs": int(pairs),
+            "lambda_drift": float(lambda_drift),
+            "lambda_tail": float(lambda_tail),
+            "gain_lo": float(acc.get("gain_lo", 0.0)),
+            "gain_hi": float(acc.get("gain_hi", 0.0)),
+            "highway_ratio": float(acc.get("highway_ratio", 0.25)),
+            "update_scale": float(acc.get("update_scale", 0.12)),
+            "update_clip": float(acc.get("update_clip", 0.0)),
+            "drift_mean": drift_mean,
+            "tail_mean": tail_mean,
+            "penalty_drift": penalty_drift,
+            "penalty_tail": penalty_tail,
+            "penalty_mean": penalty_mean,
+            "log_gain_sum": log_gain_sum,
+            "log_gain_sumsq": log_gain_sumsq,
+            "log_gain_count": int(log_gain_count),
+            "log_gain_mean": log_gain_mean,
+            "log_gain_std": log_gain_std,
+            "tail_low_count": int(acc.get("tail_low_count", 0)),
+            "tail_high_count": int(acc.get("tail_high_count", 0)),
+            "tail_low_share": tail_low_share,
+            "tail_high_share": tail_high_share,
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+            "update_rms_sum": update_rms_sum,
+            "update_rms_sumsq": update_rms_sumsq,
+            "update_rms_count": int(update_rms_count),
+            "update_rms_mean": update_rms_mean,
+            "update_rms_std": update_rms_std,
+            "clip_hit_sum": clip_hit_sum,
+            "clip_hit_count": int(clip_hit_count),
+            "clip_hit_share": clip_hit_share,
+        }
+
+    @staticmethod
+    def _aev4_accumulate_window_summary(det_acc, window_summary, device):
+        if (not isinstance(det_acc, dict)) or (not isinstance(window_summary, dict)):
+            return
+        pairs_w = int(window_summary.get("pairs", 0))
+        det_acc["pairs"] = int(det_acc.get("pairs", 0)) + pairs_w
+        drift_mean_w = window_summary.get("drift_mean", None)
+        if torch.is_tensor(drift_mean_w):
+            det_acc["drift_sum"] = det_acc["drift_sum"] + (drift_mean_w.detach() * float(max(1, pairs_w)))
+        tail_mean_w = window_summary.get("tail_mean", None)
+        if torch.is_tensor(tail_mean_w):
+            det_acc["tail_sum"] = det_acc["tail_sum"] + (tail_mean_w.detach() * float(max(1, pairs_w)))
+
+        log_gain_sum_w = window_summary.get("log_gain_sum", None)
+        if torch.is_tensor(log_gain_sum_w):
+            det_acc["log_gain_sum"] = det_acc["log_gain_sum"] + log_gain_sum_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        log_gain_sumsq_w = window_summary.get("log_gain_sumsq", None)
+        if torch.is_tensor(log_gain_sumsq_w):
+            det_acc["log_gain_sumsq"] = det_acc["log_gain_sumsq"] + log_gain_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["log_gain_count"] = int(det_acc.get("log_gain_count", 0)) + int(window_summary.get("log_gain_count", 0))
+        det_acc["tail_low_count"] = int(det_acc.get("tail_low_count", 0)) + int(window_summary.get("tail_low_count", 0))
+        det_acc["tail_high_count"] = int(det_acc.get("tail_high_count", 0)) + int(window_summary.get("tail_high_count", 0))
+
+        gain_sum_w = window_summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum_w):
+            det_acc["gain_sum"] = det_acc["gain_sum"] + gain_sum_w.detach().to(device=device, dtype=torch.float64)
+        gain_sumsq_w = window_summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq_w):
+            det_acc["gain_sumsq"] = det_acc["gain_sumsq"] + gain_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["gain_count"] = int(det_acc.get("gain_count", 0)) + int(window_summary.get("gain_count", 0))
+        gain_min_w = window_summary.get("gain_min", None)
+        if torch.is_tensor(gain_min_w):
+            det_acc["gain_min"] = (
+                gain_min_w.detach()
+                if det_acc.get("gain_min", None) is None
+                else torch.minimum(det_acc["gain_min"], gain_min_w.detach())
+            )
+        gain_max_w = window_summary.get("gain_max", None)
+        if torch.is_tensor(gain_max_w):
+            det_acc["gain_max"] = (
+                gain_max_w.detach()
+                if det_acc.get("gain_max", None) is None
+                else torch.maximum(det_acc["gain_max"], gain_max_w.detach())
+            )
+
+        update_rms_sum_w = window_summary.get("update_rms_sum", None)
+        if torch.is_tensor(update_rms_sum_w):
+            det_acc["update_rms_sum"] = det_acc["update_rms_sum"] + update_rms_sum_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        update_rms_sumsq_w = window_summary.get("update_rms_sumsq", None)
+        if torch.is_tensor(update_rms_sumsq_w):
+            det_acc["update_rms_sumsq"] = det_acc["update_rms_sumsq"] + update_rms_sumsq_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["update_rms_count"] = int(det_acc.get("update_rms_count", 0)) + int(window_summary.get("update_rms_count", 0))
+        clip_hit_sum_w = window_summary.get("clip_hit_sum", None)
+        if torch.is_tensor(clip_hit_sum_w):
+            det_acc["clip_hit_sum"] = det_acc["clip_hit_sum"] + clip_hit_sum_w.detach().to(
+                device=device, dtype=torch.float64
+            )
+        det_acc["clip_hit_count"] = int(det_acc.get("clip_hit_count", 0)) + int(window_summary.get("clip_hit_count", 0))
+
+    @staticmethod
+    def _aev4_merge_rollout_summary(acc, summary, batch_weight, device, dtype):
+        if not isinstance(summary, dict):
+            return acc
+        if int(summary.get("enabled", 0)) == 0:
+            return acc
+
+        w = float(max(0.0, batch_weight))
+        if acc is None:
+            acc = {
+                "enabled": 1,
+                "lambda_drift": float(summary.get("lambda_drift", 0.0)),
+                "lambda_tail": float(summary.get("lambda_tail", 0.0)),
+                "gain_lo": float(summary.get("gain_lo", 0.0)),
+                "gain_hi": float(summary.get("gain_hi", 0.0)),
+                "highway_ratio": float(summary.get("highway_ratio", 0.25)),
+                "update_scale": float(summary.get("update_scale", 0.12)),
+                "update_clip": float(summary.get("update_clip", 0.0)),
+                "penalty_mean_weighted": None,
+                "penalty_drift_weighted": None,
+                "penalty_tail_weighted": None,
+                "log_gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "log_gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "log_gain_count": 0,
+                "tail_low_count": 0,
+                "tail_high_count": 0,
+                "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_count": 0,
+                "gain_min": None,
+                "gain_max": None,
+                "update_rms_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "update_rms_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "update_rms_count": 0,
+                "clip_hit_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "clip_hit_count": 0,
+            }
+
+        penalty_mean = summary.get("penalty_mean", None)
+        if torch.is_tensor(penalty_mean):
+            term = penalty_mean * w
+            if acc["penalty_mean_weighted"] is None:
+                acc["penalty_mean_weighted"] = term
+            else:
+                acc["penalty_mean_weighted"] = acc["penalty_mean_weighted"] + term
+        penalty_drift = summary.get("penalty_drift", None)
+        if torch.is_tensor(penalty_drift):
+            term = penalty_drift * w
+            if acc["penalty_drift_weighted"] is None:
+                acc["penalty_drift_weighted"] = term
+            else:
+                acc["penalty_drift_weighted"] = acc["penalty_drift_weighted"] + term
+        penalty_tail = summary.get("penalty_tail", None)
+        if torch.is_tensor(penalty_tail):
+            term = penalty_tail * w
+            if acc["penalty_tail_weighted"] is None:
+                acc["penalty_tail_weighted"] = term
+            else:
+                acc["penalty_tail_weighted"] = acc["penalty_tail_weighted"] + term
+
+        log_gain_sum = summary.get("log_gain_sum", None)
+        if torch.is_tensor(log_gain_sum):
+            acc["log_gain_sum"] = acc["log_gain_sum"] + log_gain_sum.to(device=device, dtype=torch.float64)
+        log_gain_sumsq = summary.get("log_gain_sumsq", None)
+        if torch.is_tensor(log_gain_sumsq):
+            acc["log_gain_sumsq"] = acc["log_gain_sumsq"] + log_gain_sumsq.to(device=device, dtype=torch.float64)
+        acc["log_gain_count"] = int(acc["log_gain_count"]) + int(summary.get("log_gain_count", 0))
+        acc["tail_low_count"] = int(acc["tail_low_count"]) + int(summary.get("tail_low_count", 0))
+        acc["tail_high_count"] = int(acc["tail_high_count"]) + int(summary.get("tail_high_count", 0))
+
+        gain_sum = summary.get("gain_sum", None)
+        if torch.is_tensor(gain_sum):
+            acc["gain_sum"] = acc["gain_sum"] + gain_sum.to(device=device, dtype=torch.float64)
+        gain_sumsq = summary.get("gain_sumsq", None)
+        if torch.is_tensor(gain_sumsq):
+            acc["gain_sumsq"] = acc["gain_sumsq"] + gain_sumsq.to(device=device, dtype=torch.float64)
+        acc["gain_count"] = int(acc["gain_count"]) + int(summary.get("gain_count", 0))
+        gain_min = summary.get("gain_min", None)
+        if torch.is_tensor(gain_min):
+            gain_min = gain_min.to(device=device, dtype=dtype)
+            acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+        gain_max = summary.get("gain_max", None)
+        if torch.is_tensor(gain_max):
+            gain_max = gain_max.to(device=device, dtype=dtype)
+            acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+
+        update_rms_sum = summary.get("update_rms_sum", None)
+        if torch.is_tensor(update_rms_sum):
+            acc["update_rms_sum"] = acc["update_rms_sum"] + update_rms_sum.to(device=device, dtype=torch.float64)
+        update_rms_sumsq = summary.get("update_rms_sumsq", None)
+        if torch.is_tensor(update_rms_sumsq):
+            acc["update_rms_sumsq"] = acc["update_rms_sumsq"] + update_rms_sumsq.to(
+                device=device, dtype=torch.float64
+            )
+        acc["update_rms_count"] = int(acc["update_rms_count"]) + int(summary.get("update_rms_count", 0))
+        clip_hit_sum = summary.get("clip_hit_sum", None)
+        if torch.is_tensor(clip_hit_sum):
+            acc["clip_hit_sum"] = acc["clip_hit_sum"] + clip_hit_sum.to(device=device, dtype=torch.float64)
+        acc["clip_hit_count"] = int(acc["clip_hit_count"]) + int(summary.get("clip_hit_count", 0))
+        return acc
+
+    @staticmethod
+    def _aev4_finalize_rollout_summary(acc, device, dtype):
+        if acc is None:
+            return None
+        penalty_mean = acc.get("penalty_mean_weighted", None)
+        if penalty_mean is None:
+            penalty_mean = torch.zeros((), device=device, dtype=dtype)
+        penalty_drift = acc.get("penalty_drift_weighted", None)
+        if penalty_drift is None:
+            penalty_drift = torch.zeros((), device=device, dtype=dtype)
+        penalty_tail = acc.get("penalty_tail_weighted", None)
+        if penalty_tail is None:
+            penalty_tail = torch.zeros((), device=device, dtype=dtype)
+
+        log_gain_count = int(acc.get("log_gain_count", 0))
+        log_gain_sum = acc.get("log_gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        log_gain_sumsq = acc.get("log_gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if log_gain_count > 0:
+            log_gain_mean64 = log_gain_sum / float(log_gain_count)
+            log_gain_var64 = (log_gain_sumsq / float(log_gain_count)) - (log_gain_mean64 * log_gain_mean64)
+            log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+            log_gain_mean = log_gain_mean64.to(dtype=dtype).detach()
+            log_gain_std = log_gain_std64.to(dtype=dtype).detach()
+            tail_low_share = torch.as_tensor(
+                float(acc.get("tail_low_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+            tail_high_share = torch.as_tensor(
+                float(acc.get("tail_high_count", 0)) / float(log_gain_count),
+                device=device,
+                dtype=dtype,
+            )
+        else:
+            log_gain_mean = torch.zeros((), device=device, dtype=dtype)
+            log_gain_std = torch.zeros((), device=device, dtype=dtype)
+            tail_low_share = torch.zeros((), device=device, dtype=dtype)
+            tail_high_share = torch.zeros((), device=device, dtype=dtype)
+
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = gain_std64.to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+
+        gain_min = acc.get("gain_min", None)
+        if gain_min is None:
+            gain_min = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_min = gain_min.detach()
+        gain_max = acc.get("gain_max", None)
+        if gain_max is None:
+            gain_max = torch.zeros((), device=device, dtype=dtype)
+        else:
+            gain_max = gain_max.detach()
+
+        update_rms_count = int(acc.get("update_rms_count", 0))
+        update_rms_sum = acc.get("update_rms_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        update_rms_sumsq = acc.get("update_rms_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if update_rms_count > 0:
+            update_rms_mean64 = update_rms_sum / float(update_rms_count)
+            update_rms_var64 = (
+                (update_rms_sumsq / float(update_rms_count)) - (update_rms_mean64 * update_rms_mean64)
+            )
+            update_rms_std64 = torch.sqrt(torch.clamp(update_rms_var64, min=0.0))
+            update_rms_mean = update_rms_mean64.to(dtype=dtype).detach()
+            update_rms_std = update_rms_std64.to(dtype=dtype).detach()
+        else:
+            update_rms_mean = torch.zeros((), device=device, dtype=dtype)
+            update_rms_std = torch.zeros((), device=device, dtype=dtype)
+
+        clip_hit_count = int(acc.get("clip_hit_count", 0))
+        clip_hit_sum = acc.get("clip_hit_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if clip_hit_count > 0:
+            clip_hit_share = (clip_hit_sum / float(clip_hit_count)).to(dtype=dtype).detach()
+        else:
+            clip_hit_share = torch.zeros((), device=device, dtype=dtype)
+
+        return {
+            "enabled": 1,
+            "lambda_drift": float(acc.get("lambda_drift", 0.0)),
+            "lambda_tail": float(acc.get("lambda_tail", 0.0)),
+            "gain_lo": float(acc.get("gain_lo", 0.0)),
+            "gain_hi": float(acc.get("gain_hi", 0.0)),
+            "highway_ratio": float(acc.get("highway_ratio", 0.25)),
+            "update_scale": float(acc.get("update_scale", 0.12)),
+            "update_clip": float(acc.get("update_clip", 0.0)),
+            "penalty_mean": penalty_mean,
+            "penalty_drift": penalty_drift,
+            "penalty_tail": penalty_tail,
+            "log_gain_sum": log_gain_sum,
+            "log_gain_sumsq": log_gain_sumsq,
+            "log_gain_count": int(log_gain_count),
+            "log_gain_mean": log_gain_mean,
+            "log_gain_std": log_gain_std,
+            "tail_low_count": int(acc.get("tail_low_count", 0)),
+            "tail_high_count": int(acc.get("tail_high_count", 0)),
+            "tail_low_share": tail_low_share,
+            "tail_high_share": tail_high_share,
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+            "update_rms_sum": update_rms_sum,
+            "update_rms_sumsq": update_rms_sumsq,
+            "update_rms_count": int(update_rms_count),
+            "update_rms_mean": update_rms_mean,
+            "update_rms_std": update_rms_std,
+            "clip_hit_sum": clip_hit_sum,
+            "clip_hit_count": int(clip_hit_count),
+            "clip_hit_share": clip_hit_share,
+        }
+
     def _sample_environment(self, h, device, rng_seed=None):
         family = str(h["family"]).lower()
         if family not in {"scm", "gp"}:
@@ -372,6 +1907,7 @@ class EnvironmentPrior:
         x_generator = builder(in_dim, state_dim, h, device, generator=local_generator)  # for s_{t+1}
         y_generator = builder(in_dim, 1, h, device, generator=local_generator)          # for r_{t+1}
         policy_generator = builder(in_dim, action_dim, h, device, generator=local_generator)
+        aev4_cfg = self._resolve_aev4_config()
 
         env = {
             "family": family,
@@ -394,6 +1930,12 @@ class EnvironmentPrior:
             "reward_scale": float(h["reward_scale"]),
             "reward_clip": float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0)))),
             "state_clip": float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))),
+            "state_highway_enabled": bool(self._resolve_state_highway_enabled(h)),
+            "state_highway_lambda": float(self._resolve_state_highway_lambda(h)),
+            "aev4_enabled": bool(aev4_cfg.get("enabled", False)),
+            "aev4_highway_ratio": float(aev4_cfg.get("highway_ratio", 0.25)),
+            "aev4_update_scale": float(aev4_cfg.get("update_scale", 0.12)),
+            "aev4_update_clip": float(aev4_cfg.get("update_clip", 0.0)),
             "reward_dropout_enabled": bool(h.get("reward_dropout_enabled", True)),
             "reward_dropout_impute_zero": bool(h.get("reward_dropout_impute_zero", True)),
             "reward_dropout_ratio": float(max(0.0, min(1.0, self._sample_reward_dropout_ratio(h)))),
@@ -1027,6 +2569,41 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        state_highway_enabled = torch.tensor(
+            [bool(self._resolve_state_highway_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_highway_lambda = torch.tensor(
+            [float(self._resolve_state_highway_lambda(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_enabled = torch.full(
+            (batch_size,),
+            bool(aev4_cfg.get("enabled", False)),
+            device=device,
+            dtype=torch.bool,
+        )
+        aev4_highway_ratio = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("highway_ratio", 0.25)),
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_update_scale = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("update_scale", 0.12)),
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_update_clip = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("update_clip", 0.0)),
+            device=device,
+            dtype=torch.float32,
+        )
         reward_dropout_enabled = torch.tensor(
             [bool(h.get("reward_dropout_enabled", True)) for h in h_list],
             device=device,
@@ -1082,6 +2659,12 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_highway_enabled": state_highway_enabled,
+            "state_highway_lambda": state_highway_lambda,
+            "aev4_enabled": aev4_enabled,
+            "aev4_highway_ratio": aev4_highway_ratio,
+            "aev4_update_scale": aev4_update_scale,
+            "aev4_update_clip": aev4_update_clip,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
@@ -1236,6 +2819,7 @@ class EnvironmentPrior:
     def _sample_environment_batch(self, h_list, device, rng_seeds=None):
         if not h_list:
             raise ValueError("h_list must be non-empty for vectorized rollout")
+        batch_size = int(len(h_list))
         schema_sig = self._environment_structure_signature(h_list[0])
         for h in h_list[1:]:
             if self._environment_structure_signature(h) != schema_sig:
@@ -1291,6 +2875,41 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        state_highway_enabled = torch.tensor(
+            [bool(self._resolve_state_highway_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_highway_lambda = torch.tensor(
+            [float(self._resolve_state_highway_lambda(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_enabled = torch.full(
+            (batch_size,),
+            bool(aev4_cfg.get("enabled", False)),
+            device=device,
+            dtype=torch.bool,
+        )
+        aev4_highway_ratio = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("highway_ratio", 0.25)),
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_update_scale = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("update_scale", 0.12)),
+            device=device,
+            dtype=torch.float32,
+        )
+        aev4_update_clip = torch.full(
+            (batch_size,),
+            float(aev4_cfg.get("update_clip", 0.0)),
+            device=device,
+            dtype=torch.float32,
+        )
         reward_dropout_enabled = torch.tensor(
             [bool(h.get("reward_dropout_enabled", True)) for h in h_list],
             device=device,
@@ -1328,6 +2947,12 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_highway_enabled": state_highway_enabled,
+            "state_highway_lambda": state_highway_lambda,
+            "aev4_enabled": aev4_enabled,
+            "aev4_highway_ratio": aev4_highway_ratio,
+            "aev4_update_scale": aev4_update_scale,
+            "aev4_update_clip": aev4_update_clip,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
@@ -1403,6 +3028,48 @@ class EnvironmentPrior:
             reward_dropout_ratio_cpu = [float(v) for v in reward_dropout_ratio]
         else:
             reward_dropout_ratio_cpu = [float(reward_dropout_ratio)] * batch_size
+        state_highway_enabled = env.get("state_highway_enabled", False)
+        if torch.is_tensor(state_highway_enabled):
+            state_highway_enabled_cpu = state_highway_enabled.detach().cpu().tolist()
+        elif isinstance(state_highway_enabled, (list, tuple)):
+            state_highway_enabled_cpu = [bool(v) for v in state_highway_enabled]
+        else:
+            state_highway_enabled_cpu = [bool(state_highway_enabled)] * batch_size
+        state_highway_lambda = env.get("state_highway_lambda", 0.0)
+        if torch.is_tensor(state_highway_lambda):
+            state_highway_lambda_cpu = state_highway_lambda.detach().cpu().tolist()
+        elif isinstance(state_highway_lambda, (list, tuple)):
+            state_highway_lambda_cpu = [float(v) for v in state_highway_lambda]
+        else:
+            state_highway_lambda_cpu = [float(state_highway_lambda)] * batch_size
+        aev4_enabled = env.get("aev4_enabled", False)
+        if torch.is_tensor(aev4_enabled):
+            aev4_enabled_cpu = aev4_enabled.detach().cpu().tolist()
+        elif isinstance(aev4_enabled, (list, tuple)):
+            aev4_enabled_cpu = [bool(v) for v in aev4_enabled]
+        else:
+            aev4_enabled_cpu = [bool(aev4_enabled)] * batch_size
+        aev4_highway_ratio = env.get("aev4_highway_ratio", 0.25)
+        if torch.is_tensor(aev4_highway_ratio):
+            aev4_highway_ratio_cpu = aev4_highway_ratio.detach().cpu().tolist()
+        elif isinstance(aev4_highway_ratio, (list, tuple)):
+            aev4_highway_ratio_cpu = [float(v) for v in aev4_highway_ratio]
+        else:
+            aev4_highway_ratio_cpu = [float(aev4_highway_ratio)] * batch_size
+        aev4_update_scale = env.get("aev4_update_scale", 0.12)
+        if torch.is_tensor(aev4_update_scale):
+            aev4_update_scale_cpu = aev4_update_scale.detach().cpu().tolist()
+        elif isinstance(aev4_update_scale, (list, tuple)):
+            aev4_update_scale_cpu = [float(v) for v in aev4_update_scale]
+        else:
+            aev4_update_scale_cpu = [float(aev4_update_scale)] * batch_size
+        aev4_update_clip = env.get("aev4_update_clip", 0.0)
+        if torch.is_tensor(aev4_update_clip):
+            aev4_update_clip_cpu = aev4_update_clip.detach().cpu().tolist()
+        elif isinstance(aev4_update_clip, (list, tuple)):
+            aev4_update_clip_cpu = [float(v) for v in aev4_update_clip]
+        else:
+            aev4_update_clip_cpu = [float(aev4_update_clip)] * batch_size
 
         def _env_value_at(key, b, cast_int=False):
             value = env[key]
@@ -1436,6 +3103,12 @@ class EnvironmentPrior:
                     "state_abs_max": float(state_abs_max_cpu[b]),
                     "reward_dropout_ratio": float(reward_dropout_ratio_cpu[b]),
                     "reward_drop_frac_realized": float(reward_drop_frac_cpu[b]),
+                    "state_highway_enabled": bool(state_highway_enabled_cpu[b]),
+                    "state_highway_lambda": float(state_highway_lambda_cpu[b]),
+                    "aev4_enabled": bool(aev4_enabled_cpu[b]),
+                    "aev4_highway_ratio": float(aev4_highway_ratio_cpu[b]),
+                    "aev4_update_scale": float(aev4_update_scale_cpu[b]),
+                    "aev4_update_clip": float(aev4_update_clip_cpu[b]),
                 }
             )
         return infos
@@ -1540,6 +3213,11 @@ class EnvironmentPrior:
         env_obs_start = state_dim
         env_action_start = state_dim + obs_dim
         env_noise_start = env_action_start + action_dim
+        reward_mask_next_buf = (
+            torch.empty((batch_size,), device=device, dtype=torch.float32)
+            if _REWARD_MASK_BUFFER_REUSE
+            else None
+        )
 
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
@@ -1578,7 +3256,10 @@ class EnvironmentPrior:
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
             )
-            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            if reward_mask_next_buf is None:
+                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            else:
+                reward_mask_next = reward_mask_next_buf.fill_(1.0)
 
             if dropout_draws is not None:
                 drop_mask = dropout_active & (dropout_draws[t] < env["reward_dropout_ratio"])
@@ -1591,9 +3272,13 @@ class EnvironmentPrior:
             state_next = (1.0 - env["alpha"][:, None]) * state_t + env["alpha"][:, None] * x_next
             if state_noise is not None:
                 state_next = state_next + state_noise[t] * env["state_noise_std"][:, None]
-            state_clip = env["state_clip"][:, None]
-            state_next = torch.maximum(torch.minimum(state_next, state_clip), -state_clip)
-            state_next = torch.tanh(state_next)
+            state_next = self._apply_state_postprocess(
+                state_next_raw=state_next,
+                state_prev=state_t,
+                state_clip=env["state_clip"],
+                state_highway_enabled=env.get("state_highway_enabled", False),
+                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            )
 
             y_steps[t] = reward_next
             reward_values[t] = reward_next.detach()
@@ -1672,6 +3357,8 @@ class EnvironmentPrior:
         rng_seeds=None,
         tbptt_window=None,
         tbptt_reward_sink=None,
+        tbptt_reward_sink_supports_aux=False,
+        store_rewards=True,
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
@@ -1731,7 +3418,11 @@ class EnvironmentPrior:
             if collect_x
             else None
         )
-        y_steps = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+        y_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if bool(store_rewards)
+            else None
+        )
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -1755,6 +3446,45 @@ class EnvironmentPrior:
                 tbptt_window_active = True
                 tbptt_window_size = w
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        aev2_cfg = self._resolve_aev2_config()
+        aev2_enabled = bool(aev2_cfg.get("enabled", False))
+        aev2_prev_delta = None
+        aev3_cfg = self._resolve_aev3_config()
+        aev3_enabled = bool(aev3_cfg.get("enabled", False))
+        aev3_prev_delta = None
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_reg_enabled = bool(aev4_cfg.get("enabled", False))
+        aev4_prev_delta = None
+        aev2_streaming_sink = bool(
+            aev2_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev3_streaming_sink = bool(
+            aev3_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev4_streaming_sink = bool(
+            aev4_reg_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+        aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+        aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
+        aev3_det_acc = self._aev3_new_accumulator(
+            aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg
+        )
+        aev4_acc = self._aev4_new_accumulator(
+            aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
+        aev4_det_acc = self._aev4_new_accumulator(
+            aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
 
         strict_seed_mode = rollout_generators is not None
         transition_noise = None
@@ -1957,6 +3687,11 @@ class EnvironmentPrior:
         env_obs_start = state_dim
         env_action_start = state_dim + obs_dim
         env_noise_start = env_action_start + action_dim
+        reward_mask_next_buf = (
+            torch.empty((batch_size,), device=device, dtype=torch.float32)
+            if _REWARD_MASK_BUFFER_REUSE
+            else None
+        )
 
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
@@ -2082,7 +3817,10 @@ class EnvironmentPrior:
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
             )
-            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            if reward_mask_next_buf is None:
+                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            else:
+                reward_mask_next = reward_mask_next_buf.fill_(1.0)
 
             dropout_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             dropout_timed = False
@@ -2133,19 +3871,42 @@ class EnvironmentPrior:
                 state_next = state_next + state_noise[t] * env["state_noise_std"][:, None]
             if profile_rollout_timing and state_noise_timed and state_noise_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
-            state_clip = env["state_clip"][:, None]
-            state_next = torch.maximum(torch.minimum(state_next, state_clip), -state_clip)
-            state_next = torch.tanh(state_next)
+            state_next = self._apply_state_postprocess(
+                state_next_raw=state_next,
+                state_prev=state_t,
+                state_clip=env["state_clip"],
+                state_highway_enabled=env.get("state_highway_enabled", False),
+                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            )
+            aev4_step_aux = None
+            if aev4_reg_enabled:
+                state_next, aev4_step_aux = self._apply_aev4_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    aev4_cfg=aev4_cfg,
+                )
+            state_delta = state_next - state_t
+            if aev2_enabled and (aev2_prev_delta is not None):
+                self._aev2_update_accumulator(aev2_acc, aev2_prev_delta, state_delta, aev2_cfg)
+            aev2_prev_delta = state_delta
+            if aev3_enabled and (aev3_prev_delta is not None):
+                self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
+            aev3_prev_delta = state_delta
+            if aev4_reg_enabled and (aev4_prev_delta is not None):
+                self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
+            aev4_prev_delta = state_delta
             if transition_cuda_start is not None:
                 transition_cuda_end = torch.cuda.Event(enable_timing=True)
                 transition_cuda_end.record()
                 transition_cuda_pairs.append((transition_cuda_start, transition_cuda_end))
 
             if tbptt_window_active:
-                y_steps[t] = reward_next.detach()
+                if y_steps is not None:
+                    y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
             else:
-                y_steps[t] = reward_next
+                if y_steps is not None:
+                    y_steps[t] = reward_next
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
@@ -2166,9 +3927,62 @@ class EnvironmentPrior:
                         reward_t = reward_t.detach()
                         reward_mask_t = reward_mask_t.detach()
                         env_in = env_in.detach()
+                        if aev2_prev_delta is not None:
+                            aev2_prev_delta = aev2_prev_delta.detach()
+                        if aev3_prev_delta is not None:
+                            aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev4_prev_delta is not None:
+                            aev4_prev_delta = aev4_prev_delta.detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        tbptt_reward_sink(rewards_window)
+                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                            payload_aux = {}
+                            if aev2_streaming_sink:
+                                aev2_window_summary = self._aev2_finalize_accumulator(
+                                    aev2_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev2"] = aev2_window_summary
+                                self._aev2_accumulate_window_summary(aev2_det_acc, aev2_window_summary, device=device)
+                                aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+                            if aev3_streaming_sink:
+                                aev3_window_summary = self._aev3_finalize_accumulator(
+                                    aev3_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev3"] = aev3_window_summary
+                                self._aev3_accumulate_window_summary(aev3_det_acc, aev3_window_summary, device=device)
+                                aev3_acc = self._aev3_new_accumulator(
+                                    aev3_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev3_cfg=aev3_cfg,
+                                )
+                            if aev4_streaming_sink:
+                                aev4_window_summary = self._aev4_finalize_accumulator(
+                                    aev4_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev4"] = aev4_window_summary
+                                self._aev4_accumulate_window_summary(aev4_det_acc, aev4_window_summary, device=device)
+                                aev4_acc = self._aev4_new_accumulator(
+                                    aev4_reg_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev4_cfg=aev4_cfg,
+                                )
+                            if ("aev2" in payload_aux) and (len(payload_aux) == 1):
+                                tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
+                            else:
+                                tbptt_reward_sink((rewards_window, payload_aux))
+                        else:
+                            tbptt_reward_sink(rewards_window)
 
         if collect_runtime_info:
             reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
@@ -2197,6 +4011,62 @@ class EnvironmentPrior:
                 "transition_noise_wall_ms": float(transition_noise_wall_s * 1000.0),
             }
         self.last_rollout_profile = rollout_profile
+        if aev2_enabled:
+            if aev2_streaming_sink:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+            self.last_rollout_v2["lambda"] = float(aev2_cfg.get("lambda", 0.0))
+            self.last_rollout_v2["gain_lo"] = float(aev2_cfg.get("gain_lo", 0.0))
+            self.last_rollout_v2["gain_hi"] = float(aev2_cfg.get("gain_hi", 0.0))
+        else:
+            self.last_rollout_v2 = None
+        if aev3_enabled:
+            if aev3_streaming_sink:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v3 = None
+        if aev4_reg_enabled:
+            if aev4_streaming_sink:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v4 = None
+        if y_steps is None:
+            y_steps = torch.empty((0, batch_size), device=device, dtype=torch.float32)
         return x_steps, y_steps, infos
 
     def _rollout_family_group_vectorized_with_policy(
@@ -2213,6 +4083,8 @@ class EnvironmentPrior:
         rollout_rng_seeds=None,
         tbptt_window=None,
         tbptt_reward_sink=None,
+        tbptt_reward_sink_supports_aux=False,
+        store_rewards=True,
     ):
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
@@ -2257,6 +4129,17 @@ class EnvironmentPrior:
             and rollout_generators is None
             and len(structure_groups) > 1
         )
+        async_group_commit_flag = str(
+            os.environ.get("TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM", "auto")
+        ).strip().lower()
+        if async_group_commit_flag in {"1", "true", "yes", "on"}:
+            async_group_commit_in_stream = True
+        elif async_group_commit_flag in {"0", "false", "no", "off"}:
+            async_group_commit_in_stream = False
+        else:
+            # Auto: when transition-group stream fusion is active, commit each
+            # group update in its stream and only synchronize once per step.
+            async_group_commit_in_stream = bool(transition_stream_fusion)
         policy_cuda_pairs = []
         transition_cuda_pairs = []
         policy_wall_s = 0.0
@@ -2291,6 +4174,12 @@ class EnvironmentPrior:
         reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_highway_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_highway_lambda = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        aev4_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        aev4_highway_ratio = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        aev4_update_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        aev4_update_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_dropout_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         reward_dropout_impute_zero = torch.empty((batch_size,), device=device, dtype=torch.bool)
         reward_dropout_ratio = torch.empty((batch_size,), device=device, dtype=torch.float32)
@@ -2358,6 +4247,12 @@ class EnvironmentPrior:
             reward_clip[group_idx] = env_batch["reward_clip"]
             alpha[group_idx] = env_batch["alpha"]
             state_clip[group_idx] = env_batch["state_clip"]
+            state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
+            state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
+            aev4_enabled[group_idx] = env_batch.get("aev4_enabled", False)
+            aev4_highway_ratio[group_idx] = env_batch.get("aev4_highway_ratio", 0.25)
+            aev4_update_scale[group_idx] = env_batch.get("aev4_update_scale", 0.12)
+            aev4_update_clip[group_idx] = env_batch.get("aev4_update_clip", 0.0)
             reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
             reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
             reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
@@ -2433,6 +4328,12 @@ class EnvironmentPrior:
             reward_clip = reward_clip.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
+            state_highway_enabled = state_highway_enabled.index_select(0, perm)
+            state_highway_lambda = state_highway_lambda.index_select(0, perm)
+            aev4_enabled = aev4_enabled.index_select(0, perm)
+            aev4_highway_ratio = aev4_highway_ratio.index_select(0, perm)
+            aev4_update_scale = aev4_update_scale.index_select(0, perm)
+            aev4_update_clip = aev4_update_clip.index_select(0, perm)
             reward_dropout_enabled = reward_dropout_enabled.index_select(0, perm)
             reward_dropout_impute_zero = reward_dropout_impute_zero.index_select(0, perm)
             reward_dropout_ratio = reward_dropout_ratio.index_select(0, perm)
@@ -2501,7 +4402,11 @@ class EnvironmentPrior:
             if collect_x
             else None
         )
-        y_steps = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+        y_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if bool(store_rewards)
+            else None
+        )
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -2526,6 +4431,45 @@ class EnvironmentPrior:
                 tbptt_window_active = True
                 tbptt_window_size = w
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        aev2_cfg = self._resolve_aev2_config()
+        aev2_enabled = bool(aev2_cfg.get("enabled", False))
+        aev2_prev_delta = None
+        aev3_cfg = self._resolve_aev3_config()
+        aev3_enabled = bool(aev3_cfg.get("enabled", False))
+        aev3_prev_delta = None
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_reg_enabled = bool(aev4_cfg.get("enabled", False))
+        aev4_prev_delta = None
+        aev2_streaming_sink = bool(
+            aev2_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev3_streaming_sink = bool(
+            aev3_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev4_streaming_sink = bool(
+            aev4_reg_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+        aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+        aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
+        aev3_det_acc = self._aev3_new_accumulator(
+            aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg
+        )
+        aev4_acc = self._aev4_new_accumulator(
+            aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
+        aev4_det_acc = self._aev4_new_accumulator(
+            aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
 
         strict_seed_mode = rollout_generators is not None
         noise_block_size = 0
@@ -2652,8 +4596,59 @@ class EnvironmentPrior:
             "reward_dropout_ratio": reward_dropout_ratio,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
+            "state_highway_enabled": state_highway_enabled,
+            "state_highway_lambda": state_highway_lambda,
+            "aev4_enabled": aev4_enabled,
+            "aev4_highway_ratio": aev4_highway_ratio,
+            "aev4_update_scale": aev4_update_scale,
+            "aev4_update_clip": aev4_update_clip,
         }
 
+        # Precompute token-layout scatter metadata once and reuse in the rollout
+        # loop. This is semantically equivalent and reduces per-step index work.
+        token_layout_prepack_flag = str(os.environ.get("TICL_POLICY_TOKEN_LAYOUT_PREPACK", "1")).strip().lower()
+        token_layout_prepack = token_layout_prepack_flag not in {"0", "false", "no", "off"}
+        token_obs_write_cap = 0
+        token_obs_valid = None
+        token_reward_rows = None
+        token_reward_cols = None
+        token_mask_rows = None
+        token_mask_cols = None
+        token_action_write_cap = 0
+        token_action_dst_rows = None
+        token_action_dst_cols = None
+        token_action_src_cols = None
+        if collect_x and num_features > 0 and token_layout_prepack:
+            token_obs_write_cap = int(min(max_obs_dim, num_features))
+            if token_obs_write_cap > 0:
+                obs_cap = torch.minimum(obs_dims, obs_slot_dims).unsqueeze(1)
+                obs_cols = torch.arange(token_obs_write_cap, device=device, dtype=torch.long).unsqueeze(0)
+                token_obs_valid = (obs_cols < obs_cap).to(dtype=torch.float32)
+
+            token_reward_cols = obs_slot_dims
+            token_reward_rows = torch.nonzero(token_reward_cols < num_features, as_tuple=False).squeeze(1)
+
+            token_mask_cols = obs_slot_dims + 1
+            token_mask_rows = torch.nonzero(token_mask_cols < num_features, as_tuple=False).squeeze(1)
+
+            token_action_write_cap = int(min(max_action_dim, num_features))
+            if token_action_write_cap > 0:
+                action_positions = torch.arange(token_action_write_cap, device=device, dtype=torch.long).unsqueeze(0)
+                action_start = (obs_slot_dims + 2).unsqueeze(1)
+                action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
+                token_action_cols = action_start + action_positions
+                token_action_valid = (action_positions < action_cap) & (token_action_cols < num_features)
+                if torch.any(token_action_valid):
+                    token_action_assign = torch.nonzero(token_action_valid, as_tuple=False)
+                    token_action_dst_rows = token_action_assign[:, 0]
+                    token_action_src_cols = token_action_assign[:, 1]
+                    token_action_dst_cols = token_action_cols[token_action_valid]
+
+        reward_mask_next_buf = (
+            torch.empty((batch_size,), device=device, dtype=torch.float32)
+            if _REWARD_MASK_BUFFER_REUSE
+            else None
+        )
         for t in range(n_samples):
             obs_t = state_t[:, :max_obs_dim] * obs_mask
             if collect_x:
@@ -2661,34 +4656,57 @@ class EnvironmentPrior:
                     token_row = x_steps[t]
                     token_row.zero_()
                     if num_features > 0:
-                        obs_cap = torch.minimum(obs_dims, obs_slot_dims)
-                        obs_write_cap = min(max_obs_dim, num_features)
-                        if obs_write_cap > 0:
-                            obs_cols = torch.arange(obs_write_cap, device=device).unsqueeze(0)
-                            obs_valid = (obs_cols < obs_cap.unsqueeze(1)).to(dtype=obs_t.dtype)
-                            token_row[:, :obs_write_cap] = obs_t[:, :obs_write_cap].detach() * obs_valid
+                        if token_layout_prepack:
+                            if token_obs_valid is not None:
+                                token_row[:, :token_obs_write_cap] = (
+                                    obs_t[:, :token_obs_write_cap].detach() * token_obs_valid
+                                )
 
-                        reward_cols = obs_slot_dims
-                        reward_rows = torch.nonzero(reward_cols < num_features, as_tuple=False).squeeze(1)
-                        if reward_rows.numel() > 0:
-                            token_row[reward_rows, reward_cols[reward_rows]] = reward_t[reward_rows].detach()
+                            if token_reward_rows is not None and token_reward_rows.numel() > 0:
+                                token_row[token_reward_rows, token_reward_cols[token_reward_rows]] = (
+                                    reward_t[token_reward_rows].detach()
+                                )
 
-                        mask_cols = obs_slot_dims + 1
-                        mask_rows = torch.nonzero(mask_cols < num_features, as_tuple=False).squeeze(1)
-                        if mask_rows.numel() > 0:
-                            token_row[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
+                            if token_mask_rows is not None and token_mask_rows.numel() > 0:
+                                token_row[token_mask_rows, token_mask_cols[token_mask_rows]] = (
+                                    reward_mask_t[token_mask_rows].detach()
+                                )
 
-                        action_write_cap = min(max_action_dim, num_features)
-                        if action_write_cap > 0:
-                            action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
-                            action_start = (obs_slot_dims + 2).unsqueeze(1)
-                            action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
-                            action_cols = action_start + action_positions
-                            action_valid = (action_positions < action_cap) & (action_cols < num_features)
-                            if torch.any(action_valid):
-                                action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
-                                action_src = action_t[:, :action_write_cap].detach()
-                                token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
+                            if token_action_dst_rows is not None:
+                                action_src = action_t[:, :token_action_write_cap].detach()
+                                token_row[token_action_dst_rows, token_action_dst_cols] = action_src[
+                                    token_action_dst_rows,
+                                    token_action_src_cols,
+                                ]
+                        else:
+                            obs_cap = torch.minimum(obs_dims, obs_slot_dims)
+                            obs_write_cap = min(max_obs_dim, num_features)
+                            if obs_write_cap > 0:
+                                obs_cols = torch.arange(obs_write_cap, device=device).unsqueeze(0)
+                                obs_valid = (obs_cols < obs_cap.unsqueeze(1)).to(dtype=obs_t.dtype)
+                                token_row[:, :obs_write_cap] = obs_t[:, :obs_write_cap].detach() * obs_valid
+
+                            reward_cols = obs_slot_dims
+                            reward_rows = torch.nonzero(reward_cols < num_features, as_tuple=False).squeeze(1)
+                            if reward_rows.numel() > 0:
+                                token_row[reward_rows, reward_cols[reward_rows]] = reward_t[reward_rows].detach()
+
+                            mask_cols = obs_slot_dims + 1
+                            mask_rows = torch.nonzero(mask_cols < num_features, as_tuple=False).squeeze(1)
+                            if mask_rows.numel() > 0:
+                                token_row[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
+
+                            action_write_cap = min(max_action_dim, num_features)
+                            if action_write_cap > 0:
+                                action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
+                                action_start = (obs_slot_dims + 2).unsqueeze(1)
+                                action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
+                                action_cols = action_start + action_positions
+                                action_valid = (action_positions < action_cap) & (action_cols < num_features)
+                                if torch.any(action_valid):
+                                    action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
+                                    action_src = action_t[:, :action_write_cap].detach()
+                                    token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
 
             if policy_accepts_reward_mask:
                 policy_cuda_start = None
@@ -2751,16 +4769,22 @@ class EnvironmentPrior:
             if t < single_eval_pos:
                 if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
                     action_next = torch.tanh(
-                        action_next + action_noise_train_block[noise_block_idx] * action_noise_train_std[:, None]
+                        action_next
+                        + action_noise_train_block[noise_block_idx] * action_noise_train_std[:, None]
                     ) * action_mask
                 elif action_noise_train is not None:
-                    action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_train_std[:, None]) * action_mask
+                    action_next = torch.tanh(
+                        action_next + action_noise_train[t] * action_noise_train_std[:, None]
+                    ) * action_mask
             elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
                 action_next = torch.tanh(
-                    action_next + action_noise_eval_block[noise_block_idx] * action_noise_eval_std[:, None]
+                    action_next
+                    + action_noise_eval_block[noise_block_idx] * action_noise_eval_std[:, None]
                 ) * action_mask
             elif action_noise_eval is not None:
-                action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_eval_std[:, None]) * action_mask
+                action_next = torch.tanh(
+                    action_next + action_noise_eval[t] * action_noise_eval_std[:, None]
+                ) * action_mask
 
             if noise_streaming_mode and noise_block_idx is not None:
                 noise_t = transition_noise_block[noise_block_idx]
@@ -2782,7 +4806,10 @@ class EnvironmentPrior:
                 transition_noise_wall_s += (time.perf_counter() - noise_timing_t0)
 
             reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
-            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            if reward_mask_next_buf is None:
+                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            else:
+                reward_mask_next = reward_mask_next_buf.fill_(1.0)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
             transition_cuda_start = None
@@ -2790,8 +4817,14 @@ class EnvironmentPrior:
             if profile_rollout_breakdown_cuda:
                 transition_cuda_start = torch.cuda.Event(enable_timing=True)
                 transition_cuda_start.record()
-            pending_async_group_ops = ([None] * int(len(transition_groups))) if transition_stream_fusion else None
+            pending_async_group_ops = None
             pending_async_group_count = 0
+            pending_async_streams = None
+            if transition_stream_fusion:
+                if async_group_commit_in_stream:
+                    pending_async_streams = []
+                else:
+                    pending_async_group_ops = [None] * int(len(transition_groups))
             for group in transition_groups:
                 group_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 group_slice = group["slice"]
@@ -2837,15 +4870,19 @@ class EnvironmentPrior:
                                 generators_for_noise=group["rollout_generators"],
                             )
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
-                        pending_async_group_ops[pending_async_group_count] = (
-                            group_slice,
-                            alpha_g,
-                            state_dim_g,
-                            x_next_g,
-                            reward_next_raw_g,
-                            (stream_transition,),
-                        )
-                        pending_async_group_count += 1
+                            if async_group_commit_in_stream:
+                                state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                                reward_next_raw[group_slice] = reward_next_raw_g
+                                state_next[group_slice, :state_dim_g] = state_next_g
+                        if async_group_commit_in_stream:
+                            pending_async_streams.append((stream_transition,))
+                        else:
+                            pending_async_group_ops[pending_async_group_count] = (
+                                "deferred_commit",
+                                (group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g),
+                                (stream_transition,),
+                            )
+                            pending_async_group_count += 1
                         transition_fused_call_count += 1
                         if profile_rollout_timing and launch_wall_t0 is not None:
                             launch_dt = time.perf_counter() - launch_wall_t0
@@ -2872,20 +4909,25 @@ class EnvironmentPrior:
                             env_in,
                             generators_for_noise=group["rollout_generators"],
                         ).reshape(-1)
+                        if async_group_commit_in_stream:
+                            reward_next_raw[group_slice] = reward_next_raw_g
                     with torch.cuda.stream(stream_x):
                         x_next_g = env_g["x_generator"](
                             env_in,
                             generators_for_noise=group["rollout_generators"],
                         )
-                    pending_async_group_ops[pending_async_group_count] = (
-                        group_slice,
-                        alpha_g,
-                        state_dim_g,
-                        x_next_g,
-                        reward_next_raw_g,
-                        (stream_y, stream_x),
-                    )
-                    pending_async_group_count += 1
+                        if async_group_commit_in_stream:
+                            state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                            state_next[group_slice, :state_dim_g] = state_next_g
+                    if async_group_commit_in_stream:
+                        pending_async_streams.append((stream_y, stream_x))
+                    else:
+                        pending_async_group_ops[pending_async_group_count] = (
+                            "deferred_commit",
+                            (group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g),
+                            (stream_y, stream_x),
+                        )
+                        pending_async_group_count += 1
                     if profile_rollout_timing and launch_wall_t0 is not None:
                         launch_dt = time.perf_counter() - launch_wall_t0
                         transition_group_launch_wall_s += float(launch_dt)
@@ -2910,16 +4952,31 @@ class EnvironmentPrior:
                 if profile_rollout_timing and group_wall_t0 is not None:
                     transition_group_wall_s += (time.perf_counter() - group_wall_t0)
 
+            if pending_async_streams:
+                sync_wall_t0 = time.perf_counter() if profile_rollout_timing else None
+                cur_stream = torch.cuda.current_stream(device=device_obj)
+                for stream_tuple in pending_async_streams:
+                    for stream in stream_tuple:
+                        cur_stream.wait_stream(stream)
+                if profile_rollout_timing and sync_wall_t0 is not None:
+                    sync_dt = time.perf_counter() - sync_wall_t0
+                    transition_group_sync_wall_s += float(sync_dt)
+                    transition_group_wall_s += float(sync_dt)
+
             if pending_async_group_count > 0:
                 sync_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 cur_stream = torch.cuda.current_stream(device=device_obj)
                 for op_idx in range(pending_async_group_count):
-                    _, _, _, _, _, stream_tuple = pending_async_group_ops[op_idx]
+                    op_meta = pending_async_group_ops[op_idx]
+                    stream_tuple = op_meta[-1]
                     for stream in stream_tuple:
                         cur_stream.wait_stream(stream)
                 state_update_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 for op_idx in range(pending_async_group_count):
-                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, _ = pending_async_group_ops[op_idx]
+                    op_meta = pending_async_group_ops[op_idx]
+                    if op_meta[0] != "deferred_commit":
+                        continue
+                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g = op_meta[1]
                     state_in = state_t[group_slice, :state_dim_g]
                     state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                     reward_next_raw[group_slice] = reward_next_raw_g
@@ -2950,8 +5007,21 @@ class EnvironmentPrior:
                 state_next = state_next + state_noise_t * state_noise_std[:, None]
                 if profile_rollout_timing and state_noise_timing_t0 is not None:
                     transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
-            state_next = torch.maximum(torch.minimum(state_next, state_clip[:, None]), -state_clip[:, None])
-            state_next = torch.tanh(state_next)
+            state_next = self._apply_state_postprocess(
+                state_next_raw=state_next,
+                state_prev=state_t,
+                state_clip=state_clip,
+                state_highway_enabled=state_highway_enabled,
+                state_highway_lambda=state_highway_lambda,
+            )
+            aev4_step_aux = None
+            if aev4_reg_enabled:
+                # Family-group vectorization uses one global v4 config.
+                state_next, aev4_step_aux = self._apply_aev4_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    aev4_cfg=aev4_cfg,
+                )
             if transition_cuda_start is not None:
                 transition_cuda_end = torch.cuda.Event(enable_timing=True)
                 transition_cuda_end.record()
@@ -2960,12 +5030,24 @@ class EnvironmentPrior:
                 transition_wall_s += (time.perf_counter() - transition_wall_t0)
 
             state_next = state_next * state_mask
+            state_delta = state_next - state_t
+            if aev2_enabled and (aev2_prev_delta is not None):
+                self._aev2_update_accumulator(aev2_acc, aev2_prev_delta, state_delta, aev2_cfg)
+            aev2_prev_delta = state_delta
+            if aev3_enabled and (aev3_prev_delta is not None):
+                self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
+            aev3_prev_delta = state_delta
+            if aev4_reg_enabled and (aev4_prev_delta is not None):
+                self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
+            aev4_prev_delta = state_delta
             action_next = action_next * action_mask
             if tbptt_window_active:
-                y_steps[t] = reward_next.detach()
+                if y_steps is not None:
+                    y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
             else:
-                y_steps[t] = reward_next
+                if y_steps is not None:
+                    y_steps[t] = reward_next
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
@@ -2985,17 +5067,72 @@ class EnvironmentPrior:
                         action_t = action_t.detach()
                         reward_t = reward_t.detach()
                         reward_mask_t = reward_mask_t.detach()
+                        if aev2_prev_delta is not None:
+                            aev2_prev_delta = aev2_prev_delta.detach()
+                        if aev3_prev_delta is not None:
+                            aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev4_prev_delta is not None:
+                            aev4_prev_delta = aev4_prev_delta.detach()
                         for group in transition_groups:
                             group["env_in"] = group["env_in"].detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        if needs_unpermute:
-                            tbptt_reward_sink(rewards_window.index_select(1, inv_perm))
+                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                            payload_aux = {}
+                            if aev2_streaming_sink:
+                                aev2_window_summary = self._aev2_finalize_accumulator(
+                                    aev2_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev2"] = aev2_window_summary
+                                self._aev2_accumulate_window_summary(aev2_det_acc, aev2_window_summary, device=device)
+                                aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
+                            if aev3_streaming_sink:
+                                aev3_window_summary = self._aev3_finalize_accumulator(
+                                    aev3_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev3"] = aev3_window_summary
+                                self._aev3_accumulate_window_summary(aev3_det_acc, aev3_window_summary, device=device)
+                                aev3_acc = self._aev3_new_accumulator(
+                                    aev3_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev3_cfg=aev3_cfg,
+                                )
+                            if aev4_streaming_sink:
+                                aev4_window_summary = self._aev4_finalize_accumulator(
+                                    aev4_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev4"] = aev4_window_summary
+                                self._aev4_accumulate_window_summary(aev4_det_acc, aev4_window_summary, device=device)
+                                aev4_acc = self._aev4_new_accumulator(
+                                    aev4_reg_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev4_cfg=aev4_cfg,
+                                )
+                            payload_rewards = rewards_window.index_select(1, inv_perm) if needs_unpermute else rewards_window
+                            if ("aev2" in payload_aux) and (len(payload_aux) == 1):
+                                tbptt_reward_sink((payload_rewards, payload_aux["aev2"]))
+                            else:
+                                tbptt_reward_sink((payload_rewards, payload_aux))
                         else:
-                            tbptt_reward_sink(rewards_window)
+                            if needs_unpermute:
+                                tbptt_reward_sink(rewards_window.index_select(1, inv_perm))
+                            else:
+                                tbptt_reward_sink(rewards_window)
 
         if needs_unpermute:
-            y_steps = y_steps.index_select(1, inv_perm)
+            if y_steps is not None:
+                y_steps = y_steps.index_select(1, inv_perm)
             if collect_x:
                 x_steps = x_steps.index_select(1, inv_perm)
 
@@ -3012,6 +5149,10 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
                 action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
                 reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
+                aev4_enabled_meta = aev4_enabled.index_select(0, inv_perm)
+                aev4_highway_ratio_meta = aev4_highway_ratio.index_select(0, inv_perm)
+                aev4_update_scale_meta = aev4_update_scale.index_select(0, inv_perm)
+                aev4_update_clip_meta = aev4_update_clip.index_select(0, inv_perm)
                 inv_perm_cpu = inv_perm.detach().cpu().tolist()
                 family_meta = [family_list[int(i)] for i in inv_perm_cpu]
             else:
@@ -3023,6 +5164,10 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims
                 action_slot_dims_meta = action_slot_dims
                 reward_dropout_ratio_meta = reward_dropout_ratio
+                aev4_enabled_meta = aev4_enabled
+                aev4_highway_ratio_meta = aev4_highway_ratio
+                aev4_update_scale_meta = aev4_update_scale
+                aev4_update_clip_meta = aev4_update_clip
                 family_meta = family_list
 
             reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
@@ -3036,6 +5181,10 @@ class EnvironmentPrior:
                 "obs_slot_dim": obs_slot_dims_meta,
                 "action_slot_dim": action_slot_dims_meta,
                 "reward_dropout_ratio": reward_dropout_ratio_meta,
+                "aev4_enabled": aev4_enabled_meta,
+                "aev4_highway_ratio": aev4_highway_ratio_meta,
+                "aev4_update_scale": aev4_update_scale_meta,
+                "aev4_update_clip": aev4_update_clip_meta,
             }
             infos = self._build_vectorized_runtime_info(
                 env=env_meta,
@@ -3085,7 +5234,66 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
                 rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
+                rollout_profile["transition_async_commit_in_stream"] = int(
+                    bool(transition_stream_fusion and async_group_commit_in_stream)
+                )
         self.last_rollout_profile = rollout_profile
+        if aev2_enabled:
+            if aev2_streaming_sink:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+            self.last_rollout_v2["lambda"] = float(aev2_cfg.get("lambda", 0.0))
+            self.last_rollout_v2["gain_lo"] = float(aev2_cfg.get("gain_lo", 0.0))
+            self.last_rollout_v2["gain_hi"] = float(aev2_cfg.get("gain_hi", 0.0))
+        else:
+            self.last_rollout_v2 = None
+        if aev3_enabled:
+            if aev3_streaming_sink:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v3 = None
+        if aev4_reg_enabled:
+            if aev4_streaming_sink:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_acc,
+                    device=device,
+                    dtype=torch.float32,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v4 = None
+        if y_steps is None:
+            y_steps = torch.empty((0, batch_size), device=device, dtype=torch.float32)
         return x_steps, y_steps, infos
 
     def _rollout_single(
@@ -3101,6 +5309,8 @@ class EnvironmentPrior:
         rng_seed=None,
         tbptt_window=None,
         tbptt_reward_sink=None,
+        tbptt_reward_sink_supports_aux=False,
+        store_rewards=True,
     ):
         n_samples = int(n_samples)
         num_features = int(num_features)
@@ -3141,7 +5351,11 @@ class EnvironmentPrior:
         cache = None
 
         x_steps = torch.empty((n_samples, num_features), device=device, dtype=state_t.dtype) if collect_x else None
-        y_steps = torch.empty((n_samples,), device=device, dtype=state_t.dtype)
+        y_steps = (
+            torch.empty((n_samples,), device=device, dtype=state_t.dtype)
+            if bool(store_rewards)
+            else None
+        )
         state_abs_max = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_values = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_drop_count = 0 if collect_runtime_info else None
@@ -3153,6 +5367,43 @@ class EnvironmentPrior:
                 tbptt_window_active = True
                 tbptt_window_size = w
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        aev2_cfg = self._resolve_aev2_config()
+        aev2_enabled = bool(aev2_cfg.get("enabled", False))
+        aev2_prev_delta = None
+        aev3_cfg = self._resolve_aev3_config()
+        aev3_enabled = bool(aev3_cfg.get("enabled", False))
+        aev3_prev_delta = None
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_enabled = bool(aev4_cfg.get("enabled", False))
+        aev4_prev_delta = None
+        aev2_streaming_sink = bool(
+            aev2_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev3_streaming_sink = bool(
+            aev3_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev4_streaming_sink = bool(
+            aev4_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
+        aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
+        aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=state_t.dtype, aev3_cfg=aev3_cfg)
+        aev3_det_acc = self._aev3_new_accumulator(
+            aev3_enabled, device=device, dtype=state_t.dtype, aev3_cfg=aev3_cfg
+        )
+        aev4_acc = self._aev4_new_accumulator(aev4_enabled, device=device, dtype=state_t.dtype, aev4_cfg=aev4_cfg)
+        aev4_det_acc = self._aev4_new_accumulator(
+            aev4_enabled, device=device, dtype=state_t.dtype, aev4_cfg=aev4_cfg
+        )
 
         zero_pad_t = torch.zeros(zero_pad_dim, device=device, dtype=state_t.dtype)
 
@@ -3393,14 +5644,38 @@ class EnvironmentPrior:
                         generator=state_noise_generator,
                     )
                 state_next = state_next + state_noise_t * env["state_noise_std"]
-            state_next = torch.clamp(state_next, -env["state_clip"], env["state_clip"])
-            state_next = torch.tanh(state_next)
+            state_next = self._apply_state_postprocess(
+                state_next_raw=state_next,
+                state_prev=state_t,
+                state_clip=env["state_clip"],
+                state_highway_enabled=env.get("state_highway_enabled", False),
+                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            )
+            aev4_step_aux = None
+            if aev4_enabled:
+                state_next, aev4_step_aux = self._apply_aev4_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    aev4_cfg=aev4_cfg,
+                )
+            state_delta = state_next - state_t
+            if aev2_enabled and (aev2_prev_delta is not None):
+                self._aev2_update_accumulator(aev2_acc, aev2_prev_delta, state_delta, aev2_cfg)
+            aev2_prev_delta = state_delta
+            if aev3_enabled and (aev3_prev_delta is not None):
+                self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
+            aev3_prev_delta = state_delta
+            if aev4_enabled and (aev4_prev_delta is not None):
+                self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
+            aev4_prev_delta = state_delta
 
             if tbptt_window_active:
-                y_steps[t] = reward_next.detach()
+                if y_steps is not None:
+                    y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
             else:
-                y_steps[t] = reward_next
+                if y_steps is not None:
+                    y_steps[t] = reward_next
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = torch.abs(state_next).max().detach()
@@ -3420,9 +5695,64 @@ class EnvironmentPrior:
                         action_t = action_t.detach()
                         reward_t = reward_t.detach()
                         reward_mask_t = reward_mask_t.detach()
+                        if aev2_prev_delta is not None:
+                            aev2_prev_delta = aev2_prev_delta.detach()
+                        if aev3_prev_delta is not None:
+                            aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev4_prev_delta is not None:
+                            aev4_prev_delta = aev4_prev_delta.detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        tbptt_reward_sink(rewards_window)
+                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                            payload_aux = {}
+                            if aev2_streaming_sink:
+                                aev2_window_summary = self._aev2_finalize_accumulator(
+                                    aev2_acc,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev2"] = aev2_window_summary
+                                self._aev2_accumulate_window_summary(aev2_det_acc, aev2_window_summary, device=device)
+                                aev2_acc = self._aev2_new_accumulator(
+                                    aev2_enabled, device=device, dtype=state_t.dtype
+                                )
+                            if aev3_streaming_sink:
+                                aev3_window_summary = self._aev3_finalize_accumulator(
+                                    aev3_acc,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev3"] = aev3_window_summary
+                                self._aev3_accumulate_window_summary(aev3_det_acc, aev3_window_summary, device=device)
+                                aev3_acc = self._aev3_new_accumulator(
+                                    aev3_enabled,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    aev3_cfg=aev3_cfg,
+                                )
+                            if aev4_streaming_sink:
+                                aev4_window_summary = self._aev4_finalize_accumulator(
+                                    aev4_acc,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    detach_penalty=False,
+                                )
+                                payload_aux["aev4"] = aev4_window_summary
+                                self._aev4_accumulate_window_summary(aev4_det_acc, aev4_window_summary, device=device)
+                                aev4_acc = self._aev4_new_accumulator(
+                                    aev4_enabled,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    aev4_cfg=aev4_cfg,
+                                )
+                            if ("aev2" in payload_aux) and (len(payload_aux) == 1):
+                                tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
+                            else:
+                                tbptt_reward_sink((rewards_window, payload_aux))
+                        else:
+                            tbptt_reward_sink(rewards_window)
 
         x = x_steps
         y = y_steps
@@ -3445,9 +5775,69 @@ class EnvironmentPrior:
                 "state_abs_max": float(state_abs_for_stats.max().cpu()),
                 "reward_dropout_ratio": float(env["reward_dropout_ratio"]),
                 "reward_drop_frac_realized": float(reward_drop_count / max(1, int(n_samples))),
+                "state_highway_enabled": bool(env.get("state_highway_enabled", False)),
+                "state_highway_lambda": float(env.get("state_highway_lambda", 0.0)),
+                "aev4_enabled": bool(env.get("aev4_enabled", False)),
+                "aev4_highway_ratio": float(env.get("aev4_highway_ratio", 0.25)),
+                "aev4_update_scale": float(env.get("aev4_update_scale", 0.12)),
+                "aev4_update_clip": float(env.get("aev4_update_clip", 0.0)),
             }
         else:
             info = None
+        if aev2_enabled:
+            if aev2_streaming_sink:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_det_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v2 = self._aev2_finalize_accumulator(
+                    aev2_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=False,
+                )
+            self.last_rollout_v2["lambda"] = float(aev2_cfg.get("lambda", 0.0))
+            self.last_rollout_v2["gain_lo"] = float(aev2_cfg.get("gain_lo", 0.0))
+            self.last_rollout_v2["gain_hi"] = float(aev2_cfg.get("gain_hi", 0.0))
+        else:
+            self.last_rollout_v2 = None
+        if aev3_enabled:
+            if aev3_streaming_sink:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_det_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v3 = self._aev3_finalize_accumulator(
+                    aev3_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v3 = None
+        if aev4_enabled:
+            if aev4_streaming_sink:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_det_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=True,
+                )
+            else:
+                self.last_rollout_v4 = self._aev4_finalize_accumulator(
+                    aev4_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                    detach_penalty=False,
+                )
+        else:
+            self.last_rollout_v4 = None
         return x, y, info
 
     def _get_rollout_executor(self, workers):
@@ -3629,6 +6019,11 @@ class EnvironmentPrior:
         state_noise_std = float(env["state_noise_std"])
         reward_dropout_ratio = float(env["reward_dropout_ratio"])
         reward_impute_zero = bool(env["reward_dropout_impute_zero"])
+        reward_mask_next_buf = (
+            torch.empty((batch_size,), device=device, dtype=torch.float32)
+            if _REWARD_MASK_BUFFER_REUSE
+            else None
+        )
 
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
@@ -3671,7 +6066,10 @@ class EnvironmentPrior:
                 for bi, g in enumerate(rollout_generators):
                     reward_next_raw[bi] = reward_scale * env["y_generator"](env_in[bi: bi + 1], generator=g).reshape(())
             reward_next = torch.clamp(reward_next_raw, -reward_clip, reward_clip)
-            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            if reward_mask_next_buf is None:
+                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+            else:
+                reward_mask_next = reward_mask_next_buf.fill_(1.0)
 
             if dropout_draws is not None:
                 drop_mask = dropout_draws[t] < reward_dropout_ratio
@@ -3689,8 +6087,13 @@ class EnvironmentPrior:
             state_next = (1.0 - alpha) * state_t + alpha * x_next
             if state_noise is not None:
                 state_next = state_next + state_noise[t] * state_noise_std
-            state_next = torch.clamp(state_next, -state_clip, state_clip)
-            state_next = torch.tanh(state_next)
+            state_next = self._apply_state_postprocess(
+                state_next_raw=state_next,
+                state_prev=state_t,
+                state_clip=state_clip,
+                state_highway_enabled=env.get("state_highway_enabled", False),
+                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            )
 
             y_steps[t] = reward_next
             reward_values[t] = reward_next.detach()
@@ -3710,6 +6113,8 @@ class EnvironmentPrior:
             single_eval_pos=single_eval_pos,
         )
 
+        if y_steps is None:
+            y_steps = torch.empty((0,), device=device, dtype=state_t.dtype)
         return x_steps, y_steps, infos
 
     def get_batch(self, batch_size, n_samples, num_features, device=default_device, epoch=None, single_eval_pos=None):
@@ -3873,9 +6278,11 @@ class EnvironmentPrior:
         collect_runtime_info=True,
         tbptt_window=None,
         tbptt_reward_sink=None,
+        tbptt_reward_sink_supports_aux=False,
         h_list_override=None,
         env_seeds_override=None,
         rollout_seeds_override=None,
+        store_rewards=True,
     ):
         """
         Differentiable rollout for policy optimization.
@@ -3893,8 +6300,15 @@ class EnvironmentPrior:
         num_features = int(num_features)
         collect_runtime_info = bool(collect_runtime_info)
         self.last_rollout_profile = None
+        self.last_rollout_v2 = None
+        self.last_rollout_v3 = None
+        store_rewards = bool(store_rewards)
         x = torch.empty((n_samples, batch_size, num_features), device=device, dtype=torch.float32) if collect_x else None
-        rewards = torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+        rewards = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if store_rewards
+            else torch.empty((0, batch_size), device=device, dtype=torch.float32)
+        )
         infos = [None] * batch_size
 
         backend = self._resolve_batch_parallel_backend()
@@ -3930,6 +6344,9 @@ class EnvironmentPrior:
                 sig = self._environment_group_signature(h, effective_grouping_mode)
                 grouped.setdefault(sig, []).append((b, h))
             rollout_profile_acc = None
+            rollout_v2_acc = None
+            rollout_v3_acc = None
+            rollout_v4_acc = None
 
             for group in grouped.values():
                 group_indices = [idx for idx, _ in group]
@@ -3958,6 +6375,8 @@ class EnvironmentPrior:
                         rollout_rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
                         tbptt_reward_sink=tbptt_reward_sink,
+                        tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
+                        store_rewards=store_rewards,
                     )
                 else:
                     env_batch = self._sample_environment_batch(
@@ -3978,12 +6397,39 @@ class EnvironmentPrior:
                         rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
                         tbptt_reward_sink=tbptt_reward_sink,
+                        tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
+                        store_rewards=store_rewards,
                     )
                 if collect_x:
                     x[:, group_indices] = x_group
-                rewards[:, group_indices] = y_group
+                if store_rewards:
+                    rewards[:, group_indices] = y_group
                 for local_idx, global_idx in enumerate(group_indices):
                     infos[global_idx] = infos_group[local_idx]
+                group_v2 = self.last_rollout_v2
+                rollout_v2_acc = self._aev2_merge_rollout_summary(
+                    rollout_v2_acc,
+                    group_v2,
+                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                group_v3 = self.last_rollout_v3
+                rollout_v3_acc = self._aev3_merge_rollout_summary(
+                    rollout_v3_acc,
+                    group_v3,
+                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                group_v4 = self.last_rollout_v4
+                rollout_v4_acc = self._aev4_merge_rollout_summary(
+                    rollout_v4_acc,
+                    group_v4,
+                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
+                    device=device,
+                    dtype=torch.float32,
+                )
                 group_profile = self.last_rollout_profile
                 if isinstance(group_profile, dict):
                     if rollout_profile_acc is None:
@@ -4076,6 +6522,21 @@ class EnvironmentPrior:
                     if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
                         rollout_profile_acc["noise_block_size"] = group_noise_block_size
             self.last_rollout_profile = rollout_profile_acc
+            self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
+                rollout_v2_acc,
+                device=device,
+                dtype=torch.float32,
+            )
+            self.last_rollout_v3 = self._aev3_finalize_rollout_summary(
+                rollout_v3_acc,
+                device=device,
+                dtype=torch.float32,
+            )
+            self.last_rollout_v4 = self._aev4_finalize_rollout_summary(
+                rollout_v4_acc,
+                device=device,
+                dtype=torch.float32,
+            )
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
                 "x": x,
@@ -4083,9 +6544,15 @@ class EnvironmentPrior:
                 "info": self.last_runtime_info,
                 "single_eval_pos": single_eval_pos,
                 "rollout_profile": self.last_rollout_profile,
+                "aev2": self.last_rollout_v2,
+                "aev3": self.last_rollout_v3,
+                "aev4": self.last_rollout_v4,
             }
 
         # Fallback serial baseline for explicit non-vectorized backend.
+        rollout_v2_acc = None
+        rollout_v3_acc = None
+        rollout_v4_acc = None
         for b, h in enumerate(h_list):
             env = self._sample_environment(
                 h=h,
@@ -4104,19 +6571,61 @@ class EnvironmentPrior:
                 rng_seed=(rollout_seeds[b] if rollout_seeds is not None else None),
                 tbptt_window=tbptt_window,
                 tbptt_reward_sink=tbptt_reward_sink,
+                tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
+                store_rewards=store_rewards,
             )
             if collect_x:
                 x[:, b] = x_one
-            rewards[:, b] = y_one
+            if store_rewards:
+                rewards[:, b] = y_one
             infos[b] = info
+            rollout_v2_acc = self._aev2_merge_rollout_summary(
+                rollout_v2_acc,
+                self.last_rollout_v2,
+                batch_weight=(1.0 / float(max(1, batch_size))),
+                device=device,
+                dtype=torch.float32,
+            )
+            rollout_v3_acc = self._aev3_merge_rollout_summary(
+                rollout_v3_acc,
+                self.last_rollout_v3,
+                batch_weight=(1.0 / float(max(1, batch_size))),
+                device=device,
+                dtype=torch.float32,
+            )
+            rollout_v4_acc = self._aev4_merge_rollout_summary(
+                rollout_v4_acc,
+                self.last_rollout_v4,
+                batch_weight=(1.0 / float(max(1, batch_size))),
+                device=device,
+                dtype=torch.float32,
+            )
         self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
         self.last_rollout_profile = None
+        self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
+            rollout_v2_acc,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.last_rollout_v3 = self._aev3_finalize_rollout_summary(
+            rollout_v3_acc,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.last_rollout_v4 = self._aev4_finalize_rollout_summary(
+            rollout_v4_acc,
+            device=device,
+            dtype=torch.float32,
+        )
         return {
             "x": x,
             "rewards": rewards,
             "info": self.last_runtime_info,
             "single_eval_pos": single_eval_pos,
             "rollout_profile": self.last_rollout_profile,
+            "aev2": self.last_rollout_v2,
+            "aev3": self.last_rollout_v3,
+            "aev4": self.last_rollout_v4,
         }
 
     def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True, return_stats=False):
@@ -4169,6 +6678,10 @@ class EnvironmentPrior:
 
         # Bump this tag whenever PG loss form changes.
         loss_form = str(self.config.get("policy_gradient_loss_form", "pg_v2"))
+        aev2_cfg = self._resolve_aev2_config()
+        aev3_cfg = self._resolve_aev3_config()
+        aev4_cfg = self._resolve_aev4_config()
+        aev5_cfg = self._resolve_aev5_config()
         return (
             f"{loss_form}"
             f"|norm={int(bool(normalize))}"
@@ -4177,6 +6690,25 @@ class EnvironmentPrior:
             f"|eps={_fmt_float(eps)}"
             f"|clip={_fmt_float(clip)}"
             f"|rclip={_fmt_float(reward_clip_value)}"
+            f"|aev2={int(bool(aev2_cfg.get('enabled', False)))}"
+            f"|aev2lam={_fmt_float(aev2_cfg.get('lambda', 0.0))}"
+            f"|aev2glo={_fmt_float(aev2_cfg.get('gain_lo', 0.0))}"
+            f"|aev2ghi={_fmt_float(aev2_cfg.get('gain_hi', 0.0))}"
+            f"|aev3={int(bool(aev3_cfg.get('enabled', False)))}"
+            f"|aev3ld={_fmt_float(aev3_cfg.get('lambda_drift', 0.0))}"
+            f"|aev3lt={_fmt_float(aev3_cfg.get('lambda_tail', 0.0))}"
+            f"|aev3glo={_fmt_float(aev3_cfg.get('gain_lo', 0.0))}"
+            f"|aev3ghi={_fmt_float(aev3_cfg.get('gain_hi', 0.0))}"
+            f"|aev4={int(bool(aev4_cfg.get('enabled', False)))}"
+            f"|aev4ld={_fmt_float(aev4_cfg.get('lambda_drift', 0.0))}"
+            f"|aev4lt={_fmt_float(aev4_cfg.get('lambda_tail', 0.0))}"
+            f"|aev4glo={_fmt_float(aev4_cfg.get('gain_lo', 0.0))}"
+            f"|aev4ghi={_fmt_float(aev4_cfg.get('gain_hi', 0.0))}"
+            f"|aev4u={_fmt_float(aev4_cfg.get('update_scale', 0.0))}"
+            f"|aev5={int(bool(aev5_cfg.get('enabled', False)))}"
+            f"|aev5t={_fmt_float(aev5_cfg.get('target_std', 0.0))}"
+            f"|aev5slo={_fmt_float(aev5_cfg.get('scale_lo', 0.0))}"
+            f"|aev5shi={_fmt_float(aev5_cfg.get('scale_hi', 0.0))}"
         )
 
     def policy_gradient_loss_from_rewards(
@@ -4187,6 +6719,7 @@ class EnvironmentPrior:
         detach_stats=True,
         eps=None,
         clip=None,
+        aev5_cfg=None,
     ):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
@@ -4233,17 +6766,59 @@ class EnvironmentPrior:
             objective_tensor = weighted
         objective = objective_tensor.mean()
         loss = -objective
+        reward_std_for_scale = rewards.std(unbiased=False)
+
+        if aev5_cfg is None:
+            aev5_cfg = self._resolve_aev5_config()
+        aev5_enabled = bool(aev5_cfg.get("enabled", False))
+        aev5_scale_raw = torch.ones((), device=rewards.device, dtype=rewards.dtype)
+        aev5_scale = torch.ones((), device=rewards.device, dtype=rewards.dtype)
+        if aev5_enabled:
+            std_ref = reward_std_for_scale
+            if bool(aev5_cfg.get("detach_reference", True)):
+                std_ref = std_ref.detach()
+            eps_aev5 = float(aev5_cfg.get("eps", 1e-6))
+            target_std = float(aev5_cfg.get("target_std", 0.25))
+            scale_lo = float(aev5_cfg.get("scale_lo", 0.5))
+            scale_hi = float(aev5_cfg.get("scale_hi", 4.0))
+            aev5_scale_raw = torch.as_tensor(
+                target_std,
+                device=std_ref.device,
+                dtype=std_ref.dtype,
+            ) / (std_ref + float(max(1e-12, eps_aev5)))
+            aev5_scale = torch.clamp(aev5_scale_raw, min=scale_lo, max=scale_hi)
+            aev5_scale = torch.nan_to_num(
+                aev5_scale,
+                nan=1.0,
+                posinf=float(scale_hi),
+                neginf=float(scale_lo),
+            )
+            loss = loss * aev5_scale
 
         stats = {
             "objective": objective.detach(),
             "reward_mean": rewards.mean().detach(),
-            "reward_std": rewards.std(unbiased=False).detach(),
+            "reward_std": reward_std_for_scale.detach(),
             "reward_min": reward_min,
             "reward_max": reward_max,
             "reward_abs_max": reward_abs_max,
             "reward_clip_hit_share": reward_clip_hit_share.detach(),
             "reward_norm_clip_hit_share": norm_clip_hit_share.detach(),
         }
+        if aev5_enabled:
+            stats["aev5_enabled"] = int(aev5_enabled)
+            stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
+            stats["aev5_scale_lo"] = float(aev5_cfg.get("scale_lo", 0.5))
+            stats["aev5_scale_hi"] = float(aev5_cfg.get("scale_hi", 4.0))
+            stats["aev5_loss_mul"] = aev5_scale.detach().to(dtype=torch.float32)
+            stats["aev5_scale"] = aev5_scale.detach().to(dtype=torch.float32)
+            stats["aev5_scale_raw"] = aev5_scale_raw.detach().to(dtype=torch.float32)
+            stats["aev5_reward_std_ref"] = (
+                reward_std_for_scale.detach().to(dtype=torch.float32)
+            )
+            stats["objective_with_aev5"] = (
+                objective.detach() * aev5_scale.detach().to(dtype=objective.detach().dtype)
+            ).to(dtype=torch.float32)
         return loss, stats
 
     def rollout_policy_gradient_loss(
@@ -4278,6 +6853,19 @@ class EnvironmentPrior:
             if 0 < w < n_samples:
                 tbptt_window_active = True
                 tbptt_window_size = w
+        aev2_cfg = self._resolve_aev2_config()
+        aev2_enabled = bool(aev2_cfg.get("enabled", False))
+        aev2_lambda = float(aev2_cfg.get("lambda", 0.0))
+        aev3_cfg = self._resolve_aev3_config()
+        aev3_enabled = bool(aev3_cfg.get("enabled", False))
+        aev3_lambda_drift = float(aev3_cfg.get("lambda_drift", 0.0))
+        aev3_lambda_tail = float(aev3_cfg.get("lambda_tail", 0.0))
+        aev4_cfg = self._resolve_aev4_config()
+        aev4_enabled = bool(aev4_cfg.get("enabled", False))
+        aev4_lambda_drift = float(aev4_cfg.get("lambda_drift", 0.0))
+        aev4_lambda_tail = float(aev4_cfg.get("lambda_tail", 0.0))
+        aev5_cfg = self._resolve_aev5_config()
+        aev5_enabled = bool(aev5_cfg.get("enabled", False))
 
         if not tbptt_window_active:
             rollout = self.rollout_with_policy(
@@ -4290,6 +6878,7 @@ class EnvironmentPrior:
                 single_eval_pos=single_eval_pos,
                 collect_x=collect_x,
                 collect_runtime_info=False,
+                tbptt_reward_sink_supports_aux=False,
                 h_list_override=h_list_override,
                 env_seeds_override=env_seeds_override,
                 rollout_seeds_override=rollout_seeds_override,
@@ -4301,7 +6890,245 @@ class EnvironmentPrior:
                 detach_stats=detach_stats,
                 eps=eps,
                 clip=clip,
+                aev5_cfg=aev5_cfg,
             )
+            if aev2_enabled:
+                aev2_rollout = rollout.get("aev2", None)
+                aev2_penalty = None
+                if isinstance(aev2_rollout, dict):
+                    aev2_penalty = aev2_rollout.get("penalty_mean", None)
+                if torch.is_tensor(aev2_penalty):
+                    if aev2_lambda > 0.0:
+                        loss = loss + (aev2_penalty * aev2_lambda)
+                    stats["aev2_penalty"] = aev2_penalty.detach()
+                    stats["aev2_loss_add"] = (aev2_penalty.detach() * float(aev2_lambda))
+                    stats["objective_with_aev2"] = (
+                        stats["objective"] - (aev2_penalty.detach() * float(aev2_lambda))
+                    )
+                if isinstance(aev2_rollout, dict):
+                    stats["aev2_gain_mean"] = aev2_rollout.get(
+                        "gain_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev2_gain_std"] = aev2_rollout.get(
+                        "gain_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev2_gain_min"] = aev2_rollout.get(
+                        "gain_min",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev2_gain_max"] = aev2_rollout.get(
+                        "gain_max",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                stats["aev2_enabled"] = int(aev2_enabled)
+                stats["aev2_lambda"] = float(aev2_lambda)
+                stats["aev2_gain_lo"] = float(aev2_cfg.get("gain_lo", 0.0))
+                stats["aev2_gain_hi"] = float(aev2_cfg.get("gain_hi", 0.0))
+                if "aev2_penalty" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev2_penalty"] = zero_t
+                    stats["aev2_loss_add"] = zero_t
+                    stats["objective_with_aev2"] = stats["objective"]
+                if "aev2_gain_mean" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev2_gain_mean"] = zero_t
+                    stats["aev2_gain_std"] = zero_t
+                    stats["aev2_gain_min"] = zero_t
+                    stats["aev2_gain_max"] = zero_t
+            if aev3_enabled:
+                aev3_rollout = rollout.get("aev3", None)
+                aev3_penalty = None
+                aev3_penalty_drift = None
+                aev3_penalty_tail = None
+                if isinstance(aev3_rollout, dict):
+                    aev3_penalty = aev3_rollout.get("penalty_mean", None)
+                    aev3_penalty_drift = aev3_rollout.get("penalty_drift", None)
+                    aev3_penalty_tail = aev3_rollout.get("penalty_tail", None)
+                if torch.is_tensor(aev3_penalty):
+                    loss = loss + aev3_penalty
+                    stats["aev3_penalty"] = aev3_penalty.detach()
+                    stats["aev3_loss_add"] = aev3_penalty.detach()
+                    stats["objective_with_aev3"] = stats["objective"] - aev3_penalty.detach()
+                if torch.is_tensor(aev3_penalty_drift):
+                    stats["aev3_penalty_drift"] = aev3_penalty_drift.detach()
+                if torch.is_tensor(aev3_penalty_tail):
+                    stats["aev3_penalty_tail"] = aev3_penalty_tail.detach()
+                if isinstance(aev3_rollout, dict):
+                    stats["aev3_log_gain_mean"] = aev3_rollout.get(
+                        "log_gain_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_log_gain_std"] = aev3_rollout.get(
+                        "log_gain_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_tail_low_share"] = aev3_rollout.get(
+                        "tail_low_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_tail_high_share"] = aev3_rollout.get(
+                        "tail_high_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_gain_mean"] = aev3_rollout.get(
+                        "gain_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_gain_std"] = aev3_rollout.get(
+                        "gain_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_gain_min"] = aev3_rollout.get(
+                        "gain_min",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev3_gain_max"] = aev3_rollout.get(
+                        "gain_max",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                stats["aev3_enabled"] = int(aev3_enabled)
+                stats["aev3_lambda_drift"] = float(aev3_lambda_drift)
+                stats["aev3_lambda_tail"] = float(aev3_lambda_tail)
+                stats["aev3_gain_lo"] = float(aev3_cfg.get("gain_lo", 0.0))
+                stats["aev3_gain_hi"] = float(aev3_cfg.get("gain_hi", 0.0))
+                if "aev3_penalty" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev3_penalty"] = zero_t
+                    stats["aev3_loss_add"] = zero_t
+                    stats["objective_with_aev3"] = stats["objective"]
+                if "aev3_penalty_drift" not in stats:
+                    stats["aev3_penalty_drift"] = torch.zeros(
+                        (), device=rollout["rewards"].device, dtype=torch.float32
+                    )
+                if "aev3_penalty_tail" not in stats:
+                    stats["aev3_penalty_tail"] = torch.zeros(
+                        (), device=rollout["rewards"].device, dtype=torch.float32
+                    )
+                if "aev3_log_gain_mean" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev3_log_gain_mean"] = zero_t
+                    stats["aev3_log_gain_std"] = zero_t
+                    stats["aev3_tail_low_share"] = zero_t
+                    stats["aev3_tail_high_share"] = zero_t
+                    stats["aev3_gain_mean"] = zero_t
+                    stats["aev3_gain_std"] = zero_t
+                    stats["aev3_gain_min"] = zero_t
+                    stats["aev3_gain_max"] = zero_t
+            if aev4_enabled:
+                aev4_rollout = rollout.get("aev4", None)
+                aev4_penalty = None
+                aev4_penalty_drift = None
+                aev4_penalty_tail = None
+                if isinstance(aev4_rollout, dict):
+                    aev4_penalty = aev4_rollout.get("penalty_mean", None)
+                    aev4_penalty_drift = aev4_rollout.get("penalty_drift", None)
+                    aev4_penalty_tail = aev4_rollout.get("penalty_tail", None)
+                if torch.is_tensor(aev4_penalty):
+                    loss = loss + aev4_penalty
+                    stats["aev4_penalty"] = aev4_penalty.detach()
+                    stats["aev4_loss_add"] = aev4_penalty.detach()
+                    stats["objective_with_aev4"] = stats["objective"] - aev4_penalty.detach()
+                if torch.is_tensor(aev4_penalty_drift):
+                    stats["aev4_penalty_drift"] = aev4_penalty_drift.detach()
+                if torch.is_tensor(aev4_penalty_tail):
+                    stats["aev4_penalty_tail"] = aev4_penalty_tail.detach()
+                if isinstance(aev4_rollout, dict):
+                    stats["aev4_log_gain_mean"] = aev4_rollout.get(
+                        "log_gain_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_log_gain_std"] = aev4_rollout.get(
+                        "log_gain_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_tail_low_share"] = aev4_rollout.get(
+                        "tail_low_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_tail_high_share"] = aev4_rollout.get(
+                        "tail_high_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_gain_mean"] = aev4_rollout.get(
+                        "gain_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_gain_std"] = aev4_rollout.get(
+                        "gain_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_gain_min"] = aev4_rollout.get(
+                        "gain_min",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_gain_max"] = aev4_rollout.get(
+                        "gain_max",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_update_rms_mean"] = aev4_rollout.get(
+                        "update_rms_mean",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_update_rms_std"] = aev4_rollout.get(
+                        "update_rms_std",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                    stats["aev4_clip_hit_share"] = aev4_rollout.get(
+                        "clip_hit_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                stats["aev4_enabled"] = int(aev4_enabled)
+                stats["aev4_lambda_drift"] = float(aev4_lambda_drift)
+                stats["aev4_lambda_tail"] = float(aev4_lambda_tail)
+                stats["aev4_gain_lo"] = float(aev4_cfg.get("gain_lo", 0.0))
+                stats["aev4_gain_hi"] = float(aev4_cfg.get("gain_hi", 0.0))
+                stats["aev4_highway_ratio"] = float(aev4_cfg.get("highway_ratio", 0.25))
+                stats["aev4_update_scale"] = float(aev4_cfg.get("update_scale", 0.12))
+                stats["aev4_update_clip"] = float(aev4_cfg.get("update_clip", 0.0))
+                if "aev4_penalty" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev4_penalty"] = zero_t
+                    stats["aev4_loss_add"] = zero_t
+                    stats["objective_with_aev4"] = stats["objective"]
+                if "aev4_penalty_drift" not in stats:
+                    stats["aev4_penalty_drift"] = torch.zeros(
+                        (), device=rollout["rewards"].device, dtype=torch.float32
+                    )
+                if "aev4_penalty_tail" not in stats:
+                    stats["aev4_penalty_tail"] = torch.zeros(
+                        (), device=rollout["rewards"].device, dtype=torch.float32
+                    )
+                if "aev4_log_gain_mean" not in stats:
+                    zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                    stats["aev4_log_gain_mean"] = zero_t
+                    stats["aev4_log_gain_std"] = zero_t
+                    stats["aev4_tail_low_share"] = zero_t
+                    stats["aev4_tail_high_share"] = zero_t
+                    stats["aev4_gain_mean"] = zero_t
+                    stats["aev4_gain_std"] = zero_t
+                    stats["aev4_gain_min"] = zero_t
+                    stats["aev4_gain_max"] = zero_t
+                    stats["aev4_update_rms_mean"] = zero_t
+                    stats["aev4_update_rms_std"] = zero_t
+                    stats["aev4_clip_hit_share"] = zero_t
+            if aev5_enabled:
+                zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                stats["aev5_enabled"] = int(aev5_enabled)
+                stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
+                stats["aev5_scale_lo"] = float(aev5_cfg.get("scale_lo", 0.5))
+                stats["aev5_scale_hi"] = float(aev5_cfg.get("scale_hi", 4.0))
+                if "aev5_loss_mul" not in stats:
+                    stats["aev5_loss_mul"] = torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                if "aev5_scale" not in stats:
+                    stats["aev5_scale"] = stats["aev5_loss_mul"]
+                if "aev5_scale_raw" not in stats:
+                    stats["aev5_scale_raw"] = stats["aev5_scale"]
+                if "aev5_reward_std_ref" not in stats:
+                    stats["aev5_reward_std_ref"] = stats.get("reward_std", zero_t)
+                if "objective_with_aev5" not in stats:
+                    stats["objective_with_aev5"] = stats["objective"] * stats["aev5_loss_mul"]
             rollout_profile = rollout.get("rollout_profile", None)
             if isinstance(rollout_profile, dict):
                 stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
@@ -4347,6 +7174,9 @@ class EnvironmentPrior:
                 stats["rollout_transition_async_enabled"] = int(
                     rollout_profile.get("transition_async_enabled", 0) or 0
                 )
+                stats["rollout_transition_async_commit_in_stream"] = int(
+                    rollout_profile.get("transition_async_commit_in_stream", 0) or 0
+                )
                 stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
                 stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
             return loss, rollout, stats
@@ -4354,15 +7184,95 @@ class EnvironmentPrior:
         reward_sum = None
         reward_sumsq = None
         reward_count = 0
+        reward_min_accum = None
+        reward_max_accum = None
+        reward_absmax_accum = None
+        reward_clip_hit_accum = None
+        reward_norm_clip_hit_accum = None
         weighted_losses = []
         objective_accum = None
         total_weight = 0.0
+        aev2_penalty_accum = None
+        aev2_gain_sum_accum = None
+        aev2_gain_sumsq_accum = None
+        aev2_gain_count_accum = 0
+        aev2_gain_min_accum = None
+        aev2_gain_max_accum = None
+        aev3_penalty_accum = None
+        aev3_penalty_drift_accum = None
+        aev3_penalty_tail_accum = None
+        aev3_log_gain_sum_accum = None
+        aev3_log_gain_sumsq_accum = None
+        aev3_log_gain_count_accum = 0
+        aev3_tail_low_count_accum = 0
+        aev3_tail_high_count_accum = 0
+        aev3_gain_sum_accum = None
+        aev3_gain_sumsq_accum = None
+        aev3_gain_count_accum = 0
+        aev3_gain_min_accum = None
+        aev3_gain_max_accum = None
+        aev4_penalty_accum = None
+        aev4_penalty_drift_accum = None
+        aev4_penalty_tail_accum = None
+        aev4_log_gain_sum_accum = None
+        aev4_log_gain_sumsq_accum = None
+        aev4_log_gain_count_accum = 0
+        aev4_tail_low_count_accum = 0
+        aev4_tail_high_count_accum = 0
+        aev4_gain_sum_accum = None
+        aev4_gain_sumsq_accum = None
+        aev4_gain_count_accum = 0
+        aev4_gain_min_accum = None
+        aev4_gain_max_accum = None
+        aev4_update_rms_sum_accum = None
+        aev4_update_rms_sumsq_accum = None
+        aev4_update_rms_count_accum = 0
+        aev4_clip_hit_sum_accum = None
+        aev4_clip_hit_count_accum = 0
+        aev5_scale_accum = None
+        aev5_scale_raw_accum = None
+        aev5_reward_std_ref_accum = None
+        aev5_objective_scaled_accum = None
         n_samples_f = float(max(1, n_samples))
         batch_size_f = float(max(1, batch_size))
 
-        def _tbptt_reward_sink(rewards_window):
+        def _tbptt_reward_sink(reward_payload):
             nonlocal reward_sum, reward_sumsq, reward_count
             nonlocal objective_accum, total_weight
+            nonlocal reward_min_accum, reward_max_accum, reward_absmax_accum
+            nonlocal reward_clip_hit_accum, reward_norm_clip_hit_accum
+            nonlocal aev2_penalty_accum, aev2_gain_sum_accum, aev2_gain_sumsq_accum
+            nonlocal aev2_gain_count_accum, aev2_gain_min_accum, aev2_gain_max_accum
+            nonlocal aev3_penalty_accum, aev3_penalty_drift_accum, aev3_penalty_tail_accum
+            nonlocal aev3_log_gain_sum_accum, aev3_log_gain_sumsq_accum, aev3_log_gain_count_accum
+            nonlocal aev3_tail_low_count_accum, aev3_tail_high_count_accum
+            nonlocal aev3_gain_sum_accum, aev3_gain_sumsq_accum, aev3_gain_count_accum
+            nonlocal aev3_gain_min_accum, aev3_gain_max_accum
+            nonlocal aev4_penalty_accum, aev4_penalty_drift_accum, aev4_penalty_tail_accum
+            nonlocal aev4_log_gain_sum_accum, aev4_log_gain_sumsq_accum, aev4_log_gain_count_accum
+            nonlocal aev4_tail_low_count_accum, aev4_tail_high_count_accum
+            nonlocal aev4_gain_sum_accum, aev4_gain_sumsq_accum, aev4_gain_count_accum
+            nonlocal aev4_gain_min_accum, aev4_gain_max_accum
+            nonlocal aev4_update_rms_sum_accum, aev4_update_rms_sumsq_accum, aev4_update_rms_count_accum
+            nonlocal aev4_clip_hit_sum_accum, aev4_clip_hit_count_accum
+            nonlocal aev5_scale_accum, aev5_scale_raw_accum, aev5_reward_std_ref_accum, aev5_objective_scaled_accum
+            aev2_window = None
+            aev3_window = None
+            aev4_window = None
+            rewards_window = reward_payload
+            if isinstance(reward_payload, tuple) and len(reward_payload) == 2:
+                rewards_window, aux = reward_payload
+                if isinstance(aux, dict) and (("aev2" in aux) or ("aev3" in aux) or ("aev4" in aux)):
+                    aev2_window = aux.get("aev2", None)
+                    aev3_window = aux.get("aev3", None)
+                    aev4_window = aux.get("aev4", None)
+                else:
+                    if aev2_enabled:
+                        aev2_window = aux
+                    elif aev3_enabled:
+                        aev3_window = aux
+                    elif aev4_enabled:
+                        aev4_window = aux
             loss_window, stats_window = self.policy_gradient_loss_from_rewards(
                 rewards=rewards_window,
                 normalize=normalize,
@@ -4370,7 +7280,21 @@ class EnvironmentPrior:
                 detach_stats=detach_stats,
                 eps=eps,
                 clip=clip,
+                aev5_cfg=aev5_cfg,
             )
+            if aev2_enabled and isinstance(aev2_window, dict):
+                aev2_penalty_window = aev2_window.get("penalty_mean", None)
+                if torch.is_tensor(aev2_penalty_window):
+                    if aev2_lambda > 0.0:
+                        loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
+            if aev3_enabled and isinstance(aev3_window, dict):
+                aev3_penalty_window = aev3_window.get("penalty_mean", None)
+                if torch.is_tensor(aev3_penalty_window):
+                    loss_window = loss_window + aev3_penalty_window
+            if aev4_enabled and isinstance(aev4_window, dict):
+                aev4_penalty_window = aev4_window.get("penalty_mean", None)
+                if torch.is_tensor(aev4_penalty_window):
+                    loss_window = loss_window + aev4_penalty_window
             time_weight = float(rewards_window.shape[0]) / n_samples_f
             batch_weight = float(rewards_window.shape[1]) / batch_size_f
             window_weight = time_weight * batch_weight
@@ -4386,6 +7310,275 @@ class EnvironmentPrior:
             else:
                 objective_accum = objective_accum + objective_term.detach()
             total_weight += window_weight
+            if aev5_enabled:
+                aev5_scale_w = stats_window.get("aev5_scale", None)
+                if torch.is_tensor(aev5_scale_w):
+                    aev5_scale_term = aev5_scale_w.detach() * float(window_weight)
+                    aev5_scale_accum = (
+                        aev5_scale_term if aev5_scale_accum is None else (aev5_scale_accum + aev5_scale_term)
+                    )
+                aev5_scale_raw_w = stats_window.get("aev5_scale_raw", None)
+                if torch.is_tensor(aev5_scale_raw_w):
+                    aev5_scale_raw_term = aev5_scale_raw_w.detach() * float(window_weight)
+                    aev5_scale_raw_accum = (
+                        aev5_scale_raw_term
+                        if aev5_scale_raw_accum is None
+                        else (aev5_scale_raw_accum + aev5_scale_raw_term)
+                    )
+                aev5_std_ref_w = stats_window.get("aev5_reward_std_ref", None)
+                if torch.is_tensor(aev5_std_ref_w):
+                    aev5_std_ref_term = aev5_std_ref_w.detach() * float(window_weight)
+                    aev5_reward_std_ref_accum = (
+                        aev5_std_ref_term
+                        if aev5_reward_std_ref_accum is None
+                        else (aev5_reward_std_ref_accum + aev5_std_ref_term)
+                    )
+                aev5_obj_scaled_w = stats_window.get("objective_with_aev5", None)
+                if torch.is_tensor(aev5_obj_scaled_w):
+                    aev5_obj_scaled_term = aev5_obj_scaled_w.detach() * float(window_weight)
+                    aev5_objective_scaled_accum = (
+                        aev5_obj_scaled_term
+                        if aev5_objective_scaled_accum is None
+                        else (aev5_objective_scaled_accum + aev5_obj_scaled_term)
+                    )
+            if aev2_enabled and isinstance(aev2_window, dict):
+                aev2_penalty_window = aev2_window.get("penalty_mean", None)
+                if torch.is_tensor(aev2_penalty_window):
+                    penalty_term = aev2_penalty_window.detach() * float(window_weight)
+                    aev2_penalty_accum = (
+                        penalty_term if aev2_penalty_accum is None else (aev2_penalty_accum + penalty_term)
+                    )
+                gain_sum_w = aev2_window.get("gain_sum", None)
+                if torch.is_tensor(gain_sum_w):
+                    gain_sum_w = gain_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev2_gain_sum_accum = (
+                        gain_sum_w if aev2_gain_sum_accum is None else (aev2_gain_sum_accum + gain_sum_w)
+                    )
+                gain_sumsq_w = aev2_window.get("gain_sumsq", None)
+                if torch.is_tensor(gain_sumsq_w):
+                    gain_sumsq_w = gain_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev2_gain_sumsq_accum = (
+                        gain_sumsq_w
+                        if aev2_gain_sumsq_accum is None
+                        else (aev2_gain_sumsq_accum + gain_sumsq_w)
+                    )
+                aev2_gain_count_accum += int(aev2_window.get("gain_count", 0))
+                gain_min_w = aev2_window.get("gain_min", None)
+                if torch.is_tensor(gain_min_w):
+                    gain_min_w = gain_min_w.detach()
+                    aev2_gain_min_accum = (
+                        gain_min_w if aev2_gain_min_accum is None else torch.minimum(aev2_gain_min_accum, gain_min_w)
+                    )
+                gain_max_w = aev2_window.get("gain_max", None)
+                if torch.is_tensor(gain_max_w):
+                    gain_max_w = gain_max_w.detach()
+                    aev2_gain_max_accum = (
+                        gain_max_w if aev2_gain_max_accum is None else torch.maximum(aev2_gain_max_accum, gain_max_w)
+                    )
+            if aev3_enabled and isinstance(aev3_window, dict):
+                aev3_penalty_window = aev3_window.get("penalty_mean", None)
+                if torch.is_tensor(aev3_penalty_window):
+                    penalty_term = aev3_penalty_window.detach() * float(window_weight)
+                    aev3_penalty_accum = (
+                        penalty_term if aev3_penalty_accum is None else (aev3_penalty_accum + penalty_term)
+                    )
+                aev3_penalty_drift_window = aev3_window.get("penalty_drift", None)
+                if torch.is_tensor(aev3_penalty_drift_window):
+                    penalty_drift_term = aev3_penalty_drift_window.detach() * float(window_weight)
+                    aev3_penalty_drift_accum = (
+                        penalty_drift_term
+                        if aev3_penalty_drift_accum is None
+                        else (aev3_penalty_drift_accum + penalty_drift_term)
+                    )
+                aev3_penalty_tail_window = aev3_window.get("penalty_tail", None)
+                if torch.is_tensor(aev3_penalty_tail_window):
+                    penalty_tail_term = aev3_penalty_tail_window.detach() * float(window_weight)
+                    aev3_penalty_tail_accum = (
+                        penalty_tail_term
+                        if aev3_penalty_tail_accum is None
+                        else (aev3_penalty_tail_accum + penalty_tail_term)
+                    )
+                log_gain_sum_w = aev3_window.get("log_gain_sum", None)
+                if torch.is_tensor(log_gain_sum_w):
+                    log_gain_sum_w = log_gain_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev3_log_gain_sum_accum = (
+                        log_gain_sum_w
+                        if aev3_log_gain_sum_accum is None
+                        else (aev3_log_gain_sum_accum + log_gain_sum_w)
+                    )
+                log_gain_sumsq_w = aev3_window.get("log_gain_sumsq", None)
+                if torch.is_tensor(log_gain_sumsq_w):
+                    log_gain_sumsq_w = log_gain_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev3_log_gain_sumsq_accum = (
+                        log_gain_sumsq_w
+                        if aev3_log_gain_sumsq_accum is None
+                        else (aev3_log_gain_sumsq_accum + log_gain_sumsq_w)
+                    )
+                aev3_log_gain_count_accum += int(aev3_window.get("log_gain_count", 0))
+                aev3_tail_low_count_accum += int(aev3_window.get("tail_low_count", 0))
+                aev3_tail_high_count_accum += int(aev3_window.get("tail_high_count", 0))
+                gain_sum_w = aev3_window.get("gain_sum", None)
+                if torch.is_tensor(gain_sum_w):
+                    gain_sum_w = gain_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev3_gain_sum_accum = (
+                        gain_sum_w if aev3_gain_sum_accum is None else (aev3_gain_sum_accum + gain_sum_w)
+                    )
+                gain_sumsq_w = aev3_window.get("gain_sumsq", None)
+                if torch.is_tensor(gain_sumsq_w):
+                    gain_sumsq_w = gain_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev3_gain_sumsq_accum = (
+                        gain_sumsq_w
+                        if aev3_gain_sumsq_accum is None
+                        else (aev3_gain_sumsq_accum + gain_sumsq_w)
+                    )
+                aev3_gain_count_accum += int(aev3_window.get("gain_count", 0))
+                gain_min_w = aev3_window.get("gain_min", None)
+                if torch.is_tensor(gain_min_w):
+                    gain_min_w = gain_min_w.detach()
+                    aev3_gain_min_accum = (
+                        gain_min_w if aev3_gain_min_accum is None else torch.minimum(aev3_gain_min_accum, gain_min_w)
+                    )
+                gain_max_w = aev3_window.get("gain_max", None)
+                if torch.is_tensor(gain_max_w):
+                    gain_max_w = gain_max_w.detach()
+                    aev3_gain_max_accum = (
+                        gain_max_w if aev3_gain_max_accum is None else torch.maximum(aev3_gain_max_accum, gain_max_w)
+                    )
+            if aev4_enabled and isinstance(aev4_window, dict):
+                aev4_penalty_window = aev4_window.get("penalty_mean", None)
+                if torch.is_tensor(aev4_penalty_window):
+                    penalty_term = aev4_penalty_window.detach() * float(window_weight)
+                    aev4_penalty_accum = (
+                        penalty_term if aev4_penalty_accum is None else (aev4_penalty_accum + penalty_term)
+                    )
+                aev4_penalty_drift_window = aev4_window.get("penalty_drift", None)
+                if torch.is_tensor(aev4_penalty_drift_window):
+                    penalty_drift_term = aev4_penalty_drift_window.detach() * float(window_weight)
+                    aev4_penalty_drift_accum = (
+                        penalty_drift_term
+                        if aev4_penalty_drift_accum is None
+                        else (aev4_penalty_drift_accum + penalty_drift_term)
+                    )
+                aev4_penalty_tail_window = aev4_window.get("penalty_tail", None)
+                if torch.is_tensor(aev4_penalty_tail_window):
+                    penalty_tail_term = aev4_penalty_tail_window.detach() * float(window_weight)
+                    aev4_penalty_tail_accum = (
+                        penalty_tail_term
+                        if aev4_penalty_tail_accum is None
+                        else (aev4_penalty_tail_accum + penalty_tail_term)
+                    )
+                log_gain_sum_w = aev4_window.get("log_gain_sum", None)
+                if torch.is_tensor(log_gain_sum_w):
+                    log_gain_sum_w = log_gain_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_log_gain_sum_accum = (
+                        log_gain_sum_w
+                        if aev4_log_gain_sum_accum is None
+                        else (aev4_log_gain_sum_accum + log_gain_sum_w)
+                    )
+                log_gain_sumsq_w = aev4_window.get("log_gain_sumsq", None)
+                if torch.is_tensor(log_gain_sumsq_w):
+                    log_gain_sumsq_w = log_gain_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_log_gain_sumsq_accum = (
+                        log_gain_sumsq_w
+                        if aev4_log_gain_sumsq_accum is None
+                        else (aev4_log_gain_sumsq_accum + log_gain_sumsq_w)
+                    )
+                aev4_log_gain_count_accum += int(aev4_window.get("log_gain_count", 0))
+                aev4_tail_low_count_accum += int(aev4_window.get("tail_low_count", 0))
+                aev4_tail_high_count_accum += int(aev4_window.get("tail_high_count", 0))
+                gain_sum_w = aev4_window.get("gain_sum", None)
+                if torch.is_tensor(gain_sum_w):
+                    gain_sum_w = gain_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_gain_sum_accum = (
+                        gain_sum_w if aev4_gain_sum_accum is None else (aev4_gain_sum_accum + gain_sum_w)
+                    )
+                gain_sumsq_w = aev4_window.get("gain_sumsq", None)
+                if torch.is_tensor(gain_sumsq_w):
+                    gain_sumsq_w = gain_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_gain_sumsq_accum = (
+                        gain_sumsq_w
+                        if aev4_gain_sumsq_accum is None
+                        else (aev4_gain_sumsq_accum + gain_sumsq_w)
+                    )
+                aev4_gain_count_accum += int(aev4_window.get("gain_count", 0))
+                gain_min_w = aev4_window.get("gain_min", None)
+                if torch.is_tensor(gain_min_w):
+                    gain_min_w = gain_min_w.detach()
+                    aev4_gain_min_accum = (
+                        gain_min_w if aev4_gain_min_accum is None else torch.minimum(aev4_gain_min_accum, gain_min_w)
+                    )
+                gain_max_w = aev4_window.get("gain_max", None)
+                if torch.is_tensor(gain_max_w):
+                    gain_max_w = gain_max_w.detach()
+                    aev4_gain_max_accum = (
+                        gain_max_w if aev4_gain_max_accum is None else torch.maximum(aev4_gain_max_accum, gain_max_w)
+                    )
+                update_rms_sum_w = aev4_window.get("update_rms_sum", None)
+                if torch.is_tensor(update_rms_sum_w):
+                    update_rms_sum_w = update_rms_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_update_rms_sum_accum = (
+                        update_rms_sum_w
+                        if aev4_update_rms_sum_accum is None
+                        else (aev4_update_rms_sum_accum + update_rms_sum_w)
+                    )
+                update_rms_sumsq_w = aev4_window.get("update_rms_sumsq", None)
+                if torch.is_tensor(update_rms_sumsq_w):
+                    update_rms_sumsq_w = update_rms_sumsq_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_update_rms_sumsq_accum = (
+                        update_rms_sumsq_w
+                        if aev4_update_rms_sumsq_accum is None
+                        else (aev4_update_rms_sumsq_accum + update_rms_sumsq_w)
+                    )
+                aev4_update_rms_count_accum += int(aev4_window.get("update_rms_count", 0))
+                clip_hit_sum_w = aev4_window.get("clip_hit_sum", None)
+                if torch.is_tensor(clip_hit_sum_w):
+                    clip_hit_sum_w = clip_hit_sum_w.detach().to(device=rewards_window.device, dtype=torch.float64)
+                    aev4_clip_hit_sum_accum = (
+                        clip_hit_sum_w
+                        if aev4_clip_hit_sum_accum is None
+                        else (aev4_clip_hit_sum_accum + clip_hit_sum_w)
+                    )
+                aev4_clip_hit_count_accum += int(aev4_window.get("clip_hit_count", 0))
+            reward_min_w = stats_window.get("reward_min", None)
+            if reward_min_w is not None:
+                reward_min_w = reward_min_w.detach()
+                reward_min_accum = (
+                    reward_min_w
+                    if reward_min_accum is None
+                    else torch.minimum(reward_min_accum, reward_min_w)
+                )
+            reward_max_w = stats_window.get("reward_max", None)
+            if reward_max_w is not None:
+                reward_max_w = reward_max_w.detach()
+                reward_max_accum = (
+                    reward_max_w
+                    if reward_max_accum is None
+                    else torch.maximum(reward_max_accum, reward_max_w)
+                )
+            reward_absmax_w = stats_window.get("reward_abs_max", None)
+            if reward_absmax_w is not None:
+                reward_absmax_w = reward_absmax_w.detach()
+                reward_absmax_accum = (
+                    reward_absmax_w
+                    if reward_absmax_accum is None
+                    else torch.maximum(reward_absmax_accum, reward_absmax_w)
+                )
+            reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
+            if reward_clip_hit_w is not None:
+                reward_clip_hit_w = reward_clip_hit_w.detach() * float(window_weight)
+                reward_clip_hit_accum = (
+                    reward_clip_hit_w
+                    if reward_clip_hit_accum is None
+                    else reward_clip_hit_accum + reward_clip_hit_w
+                )
+            reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
+            if reward_norm_clip_hit_w is not None:
+                reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * float(window_weight)
+                reward_norm_clip_hit_accum = (
+                    reward_norm_clip_hit_w
+                    if reward_norm_clip_hit_accum is None
+                    else reward_norm_clip_hit_accum + reward_norm_clip_hit_w
+                )
 
             rewards_det = rewards_window.detach().to(dtype=torch.float64)
             if reward_sum is None:
@@ -4397,6 +7590,13 @@ class EnvironmentPrior:
             reward_count += int(rewards_det.numel())
 
         rollout = self.rollout_with_policy(
+            # Streaming-TBPTT consumes rewards window-by-window via sink; full
+            # horizon reward tensor is optional and disabled by default.
+            # Enable for diagnostics via TICL_POLICY_TBPTT_STORE_REWARDS=1.
+            store_rewards=(
+                str(os.environ.get("TICL_POLICY_TBPTT_STORE_REWARDS", "0")).strip().lower()
+                in {"1", "true", "yes", "on"}
+            ),
             policy_step_fn=policy_step_fn,
             batch_size=batch_size,
             n_samples=n_samples,
@@ -4408,6 +7608,7 @@ class EnvironmentPrior:
             collect_runtime_info=False,
             tbptt_window=tbptt_window_size,
             tbptt_reward_sink=_tbptt_reward_sink,
+            tbptt_reward_sink_supports_aux=bool(aev2_enabled or aev3_enabled or aev4_enabled),
             h_list_override=h_list_override,
             env_seeds_override=env_seeds_override,
             rollout_seeds_override=rollout_seeds_override,
@@ -4436,12 +7637,423 @@ class EnvironmentPrior:
             reward_std64 = torch.sqrt(torch.clamp(reward_var64, min=0.0))
             reward_mean = reward_mean64.to(dtype=torch.float32).detach()
             reward_std = reward_std64.to(dtype=torch.float32).detach()
+        reward_min = (
+            reward_min_accum
+            if reward_min_accum is not None
+            else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+        )
+        reward_max = (
+            reward_max_accum
+            if reward_max_accum is not None
+            else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+        )
+        reward_absmax = (
+            reward_absmax_accum
+            if reward_absmax_accum is not None
+            else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+        )
+        reward_clip_hit = (
+            reward_clip_hit_accum
+            if reward_clip_hit_accum is not None
+            else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+        )
+        reward_norm_clip_hit = (
+            reward_norm_clip_hit_accum
+            if reward_norm_clip_hit_accum is not None
+            else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+        )
+        if total_weight > 0.0:
+            reward_clip_hit = reward_clip_hit / float(total_weight)
+            reward_norm_clip_hit = reward_norm_clip_hit / float(total_weight)
+
+        aev2_penalty_mean = None
+        aev2_gain_mean = None
+        aev2_gain_std = None
+        aev2_gain_min = None
+        aev2_gain_max = None
+        if aev2_enabled:
+            if (aev2_penalty_accum is not None) and total_weight > 0.0:
+                aev2_penalty_mean = (aev2_penalty_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev2", None), dict):
+                aev2_penalty_rollout = rollout["aev2"].get("penalty_mean", None)
+                if torch.is_tensor(aev2_penalty_rollout):
+                    aev2_penalty_mean = aev2_penalty_rollout.detach()
+            if aev2_gain_count_accum > 0 and (aev2_gain_sum_accum is not None) and (aev2_gain_sumsq_accum is not None):
+                gain_mean64 = aev2_gain_sum_accum / float(aev2_gain_count_accum)
+                gain_var64 = (aev2_gain_sumsq_accum / float(aev2_gain_count_accum)) - (gain_mean64 * gain_mean64)
+                gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+                aev2_gain_mean = gain_mean64.to(dtype=torch.float32).detach()
+                aev2_gain_std = gain_std64.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev2", None), dict):
+                aev2_gain_mean = rollout["aev2"].get("gain_mean", None)
+                aev2_gain_std = rollout["aev2"].get("gain_std", None)
+            if aev2_gain_min_accum is not None:
+                aev2_gain_min = aev2_gain_min_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev2", None), dict):
+                aev2_gain_min = rollout["aev2"].get("gain_min", None)
+            if aev2_gain_max_accum is not None:
+                aev2_gain_max = aev2_gain_max_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev2", None), dict):
+                aev2_gain_max = rollout["aev2"].get("gain_max", None)
+        aev3_penalty_mean = None
+        aev3_penalty_drift_mean = None
+        aev3_penalty_tail_mean = None
+        aev3_log_gain_mean = None
+        aev3_log_gain_std = None
+        aev3_tail_low_share = None
+        aev3_tail_high_share = None
+        aev3_gain_mean = None
+        aev3_gain_std = None
+        aev3_gain_min = None
+        aev3_gain_max = None
+        if aev3_enabled:
+            if (aev3_penalty_accum is not None) and total_weight > 0.0:
+                aev3_penalty_mean = (aev3_penalty_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_penalty_rollout = rollout["aev3"].get("penalty_mean", None)
+                if torch.is_tensor(aev3_penalty_rollout):
+                    aev3_penalty_mean = aev3_penalty_rollout.detach()
+            if (aev3_penalty_drift_accum is not None) and total_weight > 0.0:
+                aev3_penalty_drift_mean = (aev3_penalty_drift_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_penalty_drift_rollout = rollout["aev3"].get("penalty_drift", None)
+                if torch.is_tensor(aev3_penalty_drift_rollout):
+                    aev3_penalty_drift_mean = aev3_penalty_drift_rollout.detach()
+            if (aev3_penalty_tail_accum is not None) and total_weight > 0.0:
+                aev3_penalty_tail_mean = (aev3_penalty_tail_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_penalty_tail_rollout = rollout["aev3"].get("penalty_tail", None)
+                if torch.is_tensor(aev3_penalty_tail_rollout):
+                    aev3_penalty_tail_mean = aev3_penalty_tail_rollout.detach()
+
+            if (
+                aev3_log_gain_count_accum > 0
+                and (aev3_log_gain_sum_accum is not None)
+                and (aev3_log_gain_sumsq_accum is not None)
+            ):
+                log_gain_mean64 = aev3_log_gain_sum_accum / float(aev3_log_gain_count_accum)
+                log_gain_var64 = (
+                    (aev3_log_gain_sumsq_accum / float(aev3_log_gain_count_accum)) - (log_gain_mean64 * log_gain_mean64)
+                )
+                log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+                aev3_log_gain_mean = log_gain_mean64.to(dtype=torch.float32).detach()
+                aev3_log_gain_std = log_gain_std64.to(dtype=torch.float32).detach()
+                aev3_tail_low_share = torch.as_tensor(
+                    float(aev3_tail_low_count_accum) / float(aev3_log_gain_count_accum),
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
+                aev3_tail_high_share = torch.as_tensor(
+                    float(aev3_tail_high_count_accum) / float(aev3_log_gain_count_accum),
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_log_gain_mean = rollout["aev3"].get("log_gain_mean", None)
+                aev3_log_gain_std = rollout["aev3"].get("log_gain_std", None)
+                aev3_tail_low_share = rollout["aev3"].get("tail_low_share", None)
+                aev3_tail_high_share = rollout["aev3"].get("tail_high_share", None)
+
+            if (
+                aev3_gain_count_accum > 0
+                and (aev3_gain_sum_accum is not None)
+                and (aev3_gain_sumsq_accum is not None)
+            ):
+                gain_mean64 = aev3_gain_sum_accum / float(aev3_gain_count_accum)
+                gain_var64 = (aev3_gain_sumsq_accum / float(aev3_gain_count_accum)) - (gain_mean64 * gain_mean64)
+                gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+                aev3_gain_mean = gain_mean64.to(dtype=torch.float32).detach()
+                aev3_gain_std = gain_std64.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_gain_mean = rollout["aev3"].get("gain_mean", None)
+                aev3_gain_std = rollout["aev3"].get("gain_std", None)
+            if aev3_gain_min_accum is not None:
+                aev3_gain_min = aev3_gain_min_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_gain_min = rollout["aev3"].get("gain_min", None)
+            if aev3_gain_max_accum is not None:
+                aev3_gain_max = aev3_gain_max_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev3", None), dict):
+                aev3_gain_max = rollout["aev3"].get("gain_max", None)
+
+        aev4_penalty_mean = None
+        aev4_penalty_drift_mean = None
+        aev4_penalty_tail_mean = None
+        aev4_log_gain_mean = None
+        aev4_log_gain_std = None
+        aev4_tail_low_share = None
+        aev4_tail_high_share = None
+        aev4_gain_mean = None
+        aev4_gain_std = None
+        aev4_gain_min = None
+        aev4_gain_max = None
+        aev4_update_rms_mean = None
+        aev4_update_rms_std = None
+        aev4_clip_hit_share = None
+        if aev4_enabled:
+            if (aev4_penalty_accum is not None) and total_weight > 0.0:
+                aev4_penalty_mean = (aev4_penalty_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_penalty_rollout = rollout["aev4"].get("penalty_mean", None)
+                if torch.is_tensor(aev4_penalty_rollout):
+                    aev4_penalty_mean = aev4_penalty_rollout.detach()
+            if (aev4_penalty_drift_accum is not None) and total_weight > 0.0:
+                aev4_penalty_drift_mean = (aev4_penalty_drift_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_penalty_drift_rollout = rollout["aev4"].get("penalty_drift", None)
+                if torch.is_tensor(aev4_penalty_drift_rollout):
+                    aev4_penalty_drift_mean = aev4_penalty_drift_rollout.detach()
+            if (aev4_penalty_tail_accum is not None) and total_weight > 0.0:
+                aev4_penalty_tail_mean = (aev4_penalty_tail_accum / float(total_weight)).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_penalty_tail_rollout = rollout["aev4"].get("penalty_tail", None)
+                if torch.is_tensor(aev4_penalty_tail_rollout):
+                    aev4_penalty_tail_mean = aev4_penalty_tail_rollout.detach()
+
+            if (
+                aev4_log_gain_count_accum > 0
+                and (aev4_log_gain_sum_accum is not None)
+                and (aev4_log_gain_sumsq_accum is not None)
+            ):
+                log_gain_mean64 = aev4_log_gain_sum_accum / float(aev4_log_gain_count_accum)
+                log_gain_var64 = (
+                    (aev4_log_gain_sumsq_accum / float(aev4_log_gain_count_accum)) - (log_gain_mean64 * log_gain_mean64)
+                )
+                log_gain_std64 = torch.sqrt(torch.clamp(log_gain_var64, min=0.0))
+                aev4_log_gain_mean = log_gain_mean64.to(dtype=torch.float32).detach()
+                aev4_log_gain_std = log_gain_std64.to(dtype=torch.float32).detach()
+                aev4_tail_low_share = torch.as_tensor(
+                    float(aev4_tail_low_count_accum) / float(aev4_log_gain_count_accum),
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
+                aev4_tail_high_share = torch.as_tensor(
+                    float(aev4_tail_high_count_accum) / float(aev4_log_gain_count_accum),
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_log_gain_mean = rollout["aev4"].get("log_gain_mean", None)
+                aev4_log_gain_std = rollout["aev4"].get("log_gain_std", None)
+                aev4_tail_low_share = rollout["aev4"].get("tail_low_share", None)
+                aev4_tail_high_share = rollout["aev4"].get("tail_high_share", None)
+
+            if (
+                aev4_gain_count_accum > 0
+                and (aev4_gain_sum_accum is not None)
+                and (aev4_gain_sumsq_accum is not None)
+            ):
+                gain_mean64 = aev4_gain_sum_accum / float(aev4_gain_count_accum)
+                gain_var64 = (aev4_gain_sumsq_accum / float(aev4_gain_count_accum)) - (gain_mean64 * gain_mean64)
+                gain_std64 = torch.sqrt(torch.clamp(gain_var64, min=0.0))
+                aev4_gain_mean = gain_mean64.to(dtype=torch.float32).detach()
+                aev4_gain_std = gain_std64.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_gain_mean = rollout["aev4"].get("gain_mean", None)
+                aev4_gain_std = rollout["aev4"].get("gain_std", None)
+            if aev4_gain_min_accum is not None:
+                aev4_gain_min = aev4_gain_min_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_gain_min = rollout["aev4"].get("gain_min", None)
+            if aev4_gain_max_accum is not None:
+                aev4_gain_max = aev4_gain_max_accum.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_gain_max = rollout["aev4"].get("gain_max", None)
+
+            if (
+                aev4_update_rms_count_accum > 0
+                and (aev4_update_rms_sum_accum is not None)
+                and (aev4_update_rms_sumsq_accum is not None)
+            ):
+                update_rms_mean64 = aev4_update_rms_sum_accum / float(aev4_update_rms_count_accum)
+                update_rms_var64 = (
+                    (aev4_update_rms_sumsq_accum / float(aev4_update_rms_count_accum))
+                    - (update_rms_mean64 * update_rms_mean64)
+                )
+                update_rms_std64 = torch.sqrt(torch.clamp(update_rms_var64, min=0.0))
+                aev4_update_rms_mean = update_rms_mean64.to(dtype=torch.float32).detach()
+                aev4_update_rms_std = update_rms_std64.to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_update_rms_mean = rollout["aev4"].get("update_rms_mean", None)
+                aev4_update_rms_std = rollout["aev4"].get("update_rms_std", None)
+
+            if (aev4_clip_hit_sum_accum is not None) and (aev4_clip_hit_count_accum > 0):
+                aev4_clip_hit_share = (
+                    aev4_clip_hit_sum_accum / float(max(1, aev4_clip_hit_count_accum))
+                ).to(dtype=torch.float32).detach()
+            elif isinstance(rollout.get("aev4", None), dict):
+                aev4_clip_hit_share = rollout["aev4"].get("clip_hit_share", None)
 
         stats = {
             "objective": objective,
             "reward_mean": reward_mean,
             "reward_std": reward_std,
+            "reward_min": reward_min,
+            "reward_max": reward_max,
+            "reward_abs_max": reward_absmax,
+            "reward_clip_hit_share": reward_clip_hit,
+            "reward_norm_clip_hit_share": reward_norm_clip_hit,
         }
+        if aev2_enabled:
+            zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            if aev2_penalty_mean is None:
+                aev2_penalty_mean = zero_t
+            if aev2_gain_mean is None:
+                aev2_gain_mean = zero_t
+            if aev2_gain_std is None:
+                aev2_gain_std = zero_t
+            if aev2_gain_min is None:
+                aev2_gain_min = zero_t
+            if aev2_gain_max is None:
+                aev2_gain_max = zero_t
+            stats["aev2_enabled"] = int(aev2_enabled)
+            stats["aev2_lambda"] = float(aev2_lambda)
+            stats["aev2_gain_lo"] = float(aev2_cfg.get("gain_lo", 0.0))
+            stats["aev2_gain_hi"] = float(aev2_cfg.get("gain_hi", 0.0))
+            stats["aev2_penalty"] = aev2_penalty_mean
+            stats["aev2_loss_add"] = aev2_penalty_mean * float(aev2_lambda)
+            stats["objective_with_aev2"] = objective - (aev2_penalty_mean * float(aev2_lambda))
+            stats["aev2_gain_mean"] = aev2_gain_mean
+            stats["aev2_gain_std"] = aev2_gain_std
+            stats["aev2_gain_min"] = aev2_gain_min
+            stats["aev2_gain_max"] = aev2_gain_max
+        if aev3_enabled:
+            zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            if aev3_penalty_mean is None:
+                aev3_penalty_mean = zero_t
+            if aev3_penalty_drift_mean is None:
+                aev3_penalty_drift_mean = zero_t
+            if aev3_penalty_tail_mean is None:
+                aev3_penalty_tail_mean = zero_t
+            if aev3_log_gain_mean is None:
+                aev3_log_gain_mean = zero_t
+            if aev3_log_gain_std is None:
+                aev3_log_gain_std = zero_t
+            if aev3_tail_low_share is None:
+                aev3_tail_low_share = zero_t
+            if aev3_tail_high_share is None:
+                aev3_tail_high_share = zero_t
+            if aev3_gain_mean is None:
+                aev3_gain_mean = zero_t
+            if aev3_gain_std is None:
+                aev3_gain_std = zero_t
+            if aev3_gain_min is None:
+                aev3_gain_min = zero_t
+            if aev3_gain_max is None:
+                aev3_gain_max = zero_t
+            stats["aev3_enabled"] = int(aev3_enabled)
+            stats["aev3_lambda_drift"] = float(aev3_lambda_drift)
+            stats["aev3_lambda_tail"] = float(aev3_lambda_tail)
+            stats["aev3_gain_lo"] = float(aev3_cfg.get("gain_lo", 0.0))
+            stats["aev3_gain_hi"] = float(aev3_cfg.get("gain_hi", 0.0))
+            stats["aev3_penalty"] = aev3_penalty_mean
+            stats["aev3_penalty_drift"] = aev3_penalty_drift_mean
+            stats["aev3_penalty_tail"] = aev3_penalty_tail_mean
+            stats["aev3_loss_add"] = aev3_penalty_mean
+            stats["objective_with_aev3"] = objective - aev3_penalty_mean
+            stats["aev3_log_gain_mean"] = aev3_log_gain_mean
+            stats["aev3_log_gain_std"] = aev3_log_gain_std
+            stats["aev3_tail_low_share"] = aev3_tail_low_share
+            stats["aev3_tail_high_share"] = aev3_tail_high_share
+            stats["aev3_gain_mean"] = aev3_gain_mean
+            stats["aev3_gain_std"] = aev3_gain_std
+            stats["aev3_gain_min"] = aev3_gain_min
+            stats["aev3_gain_max"] = aev3_gain_max
+        if aev4_enabled:
+            zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            if aev4_penalty_mean is None:
+                aev4_penalty_mean = zero_t
+            if aev4_penalty_drift_mean is None:
+                aev4_penalty_drift_mean = zero_t
+            if aev4_penalty_tail_mean is None:
+                aev4_penalty_tail_mean = zero_t
+            if aev4_log_gain_mean is None:
+                aev4_log_gain_mean = zero_t
+            if aev4_log_gain_std is None:
+                aev4_log_gain_std = zero_t
+            if aev4_tail_low_share is None:
+                aev4_tail_low_share = zero_t
+            if aev4_tail_high_share is None:
+                aev4_tail_high_share = zero_t
+            if aev4_gain_mean is None:
+                aev4_gain_mean = zero_t
+            if aev4_gain_std is None:
+                aev4_gain_std = zero_t
+            if aev4_gain_min is None:
+                aev4_gain_min = zero_t
+            if aev4_gain_max is None:
+                aev4_gain_max = zero_t
+            if aev4_update_rms_mean is None:
+                aev4_update_rms_mean = zero_t
+            if aev4_update_rms_std is None:
+                aev4_update_rms_std = zero_t
+            if aev4_clip_hit_share is None:
+                aev4_clip_hit_share = zero_t
+            stats["aev4_enabled"] = int(aev4_enabled)
+            stats["aev4_lambda_drift"] = float(aev4_lambda_drift)
+            stats["aev4_lambda_tail"] = float(aev4_lambda_tail)
+            stats["aev4_gain_lo"] = float(aev4_cfg.get("gain_lo", 0.0))
+            stats["aev4_gain_hi"] = float(aev4_cfg.get("gain_hi", 0.0))
+            stats["aev4_highway_ratio"] = float(aev4_cfg.get("highway_ratio", 0.25))
+            stats["aev4_update_scale"] = float(aev4_cfg.get("update_scale", 0.12))
+            stats["aev4_update_clip"] = float(aev4_cfg.get("update_clip", 0.0))
+            stats["aev4_penalty"] = aev4_penalty_mean
+            stats["aev4_penalty_drift"] = aev4_penalty_drift_mean
+            stats["aev4_penalty_tail"] = aev4_penalty_tail_mean
+            stats["aev4_loss_add"] = aev4_penalty_mean
+            stats["objective_with_aev4"] = objective - aev4_penalty_mean
+            stats["aev4_log_gain_mean"] = aev4_log_gain_mean
+            stats["aev4_log_gain_std"] = aev4_log_gain_std
+            stats["aev4_tail_low_share"] = aev4_tail_low_share
+            stats["aev4_tail_high_share"] = aev4_tail_high_share
+            stats["aev4_gain_mean"] = aev4_gain_mean
+            stats["aev4_gain_std"] = aev4_gain_std
+            stats["aev4_gain_min"] = aev4_gain_min
+            stats["aev4_gain_max"] = aev4_gain_max
+            stats["aev4_update_rms_mean"] = aev4_update_rms_mean
+            stats["aev4_update_rms_std"] = aev4_update_rms_std
+            stats["aev4_clip_hit_share"] = aev4_clip_hit_share
+        if aev5_enabled:
+            zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            if total_weight > 0.0:
+                aev5_scale_mean = (
+                    aev5_scale_accum / float(total_weight)
+                    if aev5_scale_accum is not None
+                    else torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                )
+                aev5_scale_raw_mean = (
+                    aev5_scale_raw_accum / float(total_weight)
+                    if aev5_scale_raw_accum is not None
+                    else aev5_scale_mean
+                )
+                aev5_reward_std_ref_mean = (
+                    aev5_reward_std_ref_accum / float(total_weight)
+                    if aev5_reward_std_ref_accum is not None
+                    else reward_std
+                )
+                aev5_objective_scaled_mean = (
+                    aev5_objective_scaled_accum / float(total_weight)
+                    if aev5_objective_scaled_accum is not None
+                    else (objective * aev5_scale_mean)
+                )
+            else:
+                aev5_scale_mean = torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                aev5_scale_raw_mean = aev5_scale_mean
+                aev5_reward_std_ref_mean = reward_std
+                aev5_objective_scaled_mean = objective
+            stats["aev5_enabled"] = int(aev5_enabled)
+            stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
+            stats["aev5_scale_lo"] = float(aev5_cfg.get("scale_lo", 0.5))
+            stats["aev5_scale_hi"] = float(aev5_cfg.get("scale_hi", 4.0))
+            stats["aev5_loss_mul"] = aev5_scale_mean if aev5_scale_mean is not None else torch.ones_like(zero_t)
+            stats["aev5_scale"] = stats["aev5_loss_mul"]
+            stats["aev5_scale_raw"] = aev5_scale_raw_mean if aev5_scale_raw_mean is not None else stats["aev5_scale"]
+            stats["aev5_reward_std_ref"] = (
+                aev5_reward_std_ref_mean if aev5_reward_std_ref_mean is not None else reward_std
+            )
+            stats["objective_with_aev5"] = (
+                aev5_objective_scaled_mean if aev5_objective_scaled_mean is not None else objective
+            )
         rollout_profile = rollout.get("rollout_profile", None)
         if isinstance(rollout_profile, dict):
             stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
@@ -4486,6 +8098,9 @@ class EnvironmentPrior:
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             stats["rollout_transition_async_enabled"] = int(
                 rollout_profile.get("transition_async_enabled", 0) or 0
+            )
+            stats["rollout_transition_async_commit_in_stream"] = int(
+                rollout_profile.get("transition_async_commit_in_stream", 0) or 0
             )
             stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
             stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)

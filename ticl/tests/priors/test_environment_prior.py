@@ -13,6 +13,72 @@ def _seed_everything(seed):
     torch.manual_seed(seed)
 
 
+def test_environment_prior_state_highway_postprocess_toggle_semantics():
+    prior = EnvironmentPrior({})
+    state_prev = torch.tensor([[0.2, -0.3], [0.1, 0.4]], dtype=torch.float32)
+    state_next_raw = torch.tensor([[9.0, -9.0], [0.5, -0.5]], dtype=torch.float32)
+    state_clip = torch.tensor([8.0, 8.0], dtype=torch.float32)
+
+    baseline = torch.tanh(torch.clamp(state_next_raw, -8.0, 8.0))
+
+    out_off = prior._apply_state_postprocess(
+        state_next_raw=state_next_raw,
+        state_prev=state_prev,
+        state_clip=state_clip,
+        state_highway_enabled=False,
+        state_highway_lambda=0.9,
+    )
+    assert torch.allclose(out_off, baseline)
+
+    out_l0 = prior._apply_state_postprocess(
+        state_next_raw=state_next_raw,
+        state_prev=state_prev,
+        state_clip=state_clip,
+        state_highway_enabled=True,
+        state_highway_lambda=0.0,
+    )
+    assert torch.allclose(out_l0, baseline)
+
+    out_l1 = prior._apply_state_postprocess(
+        state_next_raw=state_next_raw,
+        state_prev=state_prev,
+        state_clip=state_clip,
+        state_highway_enabled=True,
+        state_highway_lambda=1.0,
+    )
+    assert torch.allclose(out_l1, state_prev)
+
+
+def test_environment_prior_state_highway_enabled_rollout_smoke():
+    _seed_everything(123)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["state_highway_enabled"] = True
+    env_cfg["state_highway_lambda"] = 0.25
+    prior = EnvironmentPrior(env_cfg)
+
+    x, y, _ = prior.get_batch(
+        batch_size=3,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+    )
+
+    assert torch.isfinite(x).all()
+    assert torch.isfinite(y).all()
+    assert len(prior.last_runtime_info) == 3
+    for row in prior.last_runtime_info:
+        assert bool(row["state_highway_enabled"])
+        assert abs(float(row["state_highway_lambda"]) - 0.25) < 1e-6
+
+
 def test_environment_prior_shapes_and_finite():
     _seed_everything(42)
     config = get_prior_config()
@@ -116,6 +182,313 @@ def test_environment_prior_rollout_with_policy_is_differentiable():
     assert torch.isfinite(rollout["x"]).all()
     assert torch.isfinite(rollout["rewards"]).all()
     assert float(grad_sum) > 0.0
+
+
+def test_environment_prior_tbptt_policy_gradient_stats_include_reward_range():
+    _seed_everything(20260304)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        tbptt_window=4,
+        normalize=False,
+        collect_x=False,
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert "reward_min" in stats
+    assert "reward_max" in stats
+    assert "reward_abs_max" in stats
+    assert "reward_clip_hit_share" in stats
+    assert "reward_norm_clip_hit_share" in stats
+    assert float(stats["reward_abs_max"]) >= 0.0
+
+
+def test_environment_prior_aev2_switch_exposes_method_only_stats():
+    _seed_everything(20260305)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["anti_explosion_vanishing_v2_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v2_lambda"] = 0.1
+    env_cfg["anti_explosion_vanishing_v2_gain_lo"] = 0.85
+    env_cfg["anti_explosion_vanishing_v2_gain_hi"] = 1.15
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+        tbptt_window=4,
+        normalize=False,
+        collect_x=False,
+    )
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(grad_sum) > 0.0
+    assert int(stats.get("aev2_enabled", 0)) == 1
+    assert "aev2_penalty" in stats
+    assert "aev2_loss_add" in stats
+    assert "aev2_gain_mean" in stats
+    assert "aev2_gain_std" in stats
+    assert "aev2_gain_min" in stats
+    assert "aev2_gain_max" in stats
+    assert torch.isfinite(stats["aev2_penalty"])
+    assert torch.isfinite(stats["aev2_loss_add"])
+    assert torch.isfinite(stats["aev2_gain_mean"])
+    assert torch.isfinite(stats["aev2_gain_std"])
+
+
+def test_environment_prior_aev3_switch_exposes_method_only_stats():
+    _seed_everything(20260305 + 1)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["anti_explosion_vanishing_v2_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v3_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v3_lambda_drift"] = 0.02
+    env_cfg["anti_explosion_vanishing_v3_lambda_tail"] = 0.05
+    env_cfg["anti_explosion_vanishing_v3_gain_lo"] = 0.85
+    env_cfg["anti_explosion_vanishing_v3_gain_hi"] = 1.15
+    env_cfg["anti_explosion_vanishing_v3_tail_tau"] = 0.02
+    env_cfg["anti_explosion_vanishing_v3_eps"] = 1e-6
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+        tbptt_window=4,
+        normalize=False,
+        collect_x=False,
+    )
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(grad_sum) > 0.0
+    assert int(stats.get("aev3_enabled", 0)) == 1
+    assert "aev3_penalty" in stats
+    assert "aev3_penalty_drift" in stats
+    assert "aev3_penalty_tail" in stats
+    assert "aev3_loss_add" in stats
+    assert "aev3_log_gain_mean" in stats
+    assert "aev3_log_gain_std" in stats
+    assert "aev3_tail_low_share" in stats
+    assert "aev3_tail_high_share" in stats
+    assert "aev3_gain_mean" in stats
+    assert "aev3_gain_std" in stats
+    assert "aev3_gain_min" in stats
+    assert "aev3_gain_max" in stats
+    assert torch.isfinite(stats["aev3_penalty"])
+    assert torch.isfinite(stats["aev3_penalty_drift"])
+    assert torch.isfinite(stats["aev3_penalty_tail"])
+    assert torch.isfinite(stats["aev3_log_gain_mean"])
+    assert torch.isfinite(stats["aev3_gain_mean"])
+    assert "aev2_penalty" not in stats
+
+
+def test_environment_prior_aev4_switch_exposes_method_only_stats():
+    _seed_everything(20260305 + 2)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["anti_explosion_vanishing_v2_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v3_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v4_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v4_lambda_drift"] = 0.08
+    env_cfg["anti_explosion_vanishing_v4_lambda_tail"] = 0.25
+    env_cfg["anti_explosion_vanishing_v4_gain_lo"] = 0.94
+    env_cfg["anti_explosion_vanishing_v4_gain_hi"] = 1.07
+    env_cfg["anti_explosion_vanishing_v4_tail_tau"] = 0.016
+    env_cfg["anti_explosion_vanishing_v4_eps"] = 1e-6
+    env_cfg["anti_explosion_vanishing_v4_highway_ratio"] = 0.25
+    env_cfg["anti_explosion_vanishing_v4_update_scale"] = 0.12
+    env_cfg["anti_explosion_vanishing_v4_update_clip"] = 0.0
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+        tbptt_window=4,
+        normalize=False,
+        collect_x=False,
+    )
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(grad_sum) > 0.0
+    assert int(stats.get("aev4_enabled", 0)) == 1
+    assert "aev4_penalty" in stats
+    assert "aev4_penalty_drift" in stats
+    assert "aev4_penalty_tail" in stats
+    assert "aev4_loss_add" in stats
+    assert "aev4_log_gain_mean" in stats
+    assert "aev4_log_gain_std" in stats
+    assert "aev4_tail_low_share" in stats
+    assert "aev4_tail_high_share" in stats
+    assert "aev4_gain_mean" in stats
+    assert "aev4_gain_std" in stats
+    assert "aev4_gain_min" in stats
+    assert "aev4_gain_max" in stats
+    assert "aev4_update_rms_mean" in stats
+    assert "aev4_update_rms_std" in stats
+    assert "aev4_clip_hit_share" in stats
+    assert torch.isfinite(stats["aev4_penalty"])
+    assert torch.isfinite(stats["aev4_penalty_drift"])
+    assert torch.isfinite(stats["aev4_penalty_tail"])
+    assert torch.isfinite(stats["aev4_log_gain_mean"])
+    assert torch.isfinite(stats["aev4_gain_mean"])
+    assert "aev2_penalty" not in stats
+    assert "aev3_penalty" not in stats
+
+
+def test_environment_prior_aev5_switch_exposes_method_only_stats():
+    _seed_everything(20260305 + 3)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["anti_explosion_vanishing_v2_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v3_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v4_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v5_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v5_target_std"] = 0.25
+    env_cfg["anti_explosion_vanishing_v5_scale_lo"] = 0.5
+    env_cfg["anti_explosion_vanishing_v5_scale_hi"] = 4.0
+    env_cfg["anti_explosion_vanishing_v5_eps"] = 1e-6
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+        tbptt_window=4,
+        normalize=False,
+        collect_x=False,
+    )
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(grad_sum) > 0.0
+    assert int(stats.get("aev5_enabled", 0)) == 1
+    assert "objective_with_aev5" in stats
+    assert "aev5_loss_mul" in stats
+    assert "aev5_scale" in stats
+    assert "aev5_scale_raw" in stats
+    assert "aev5_reward_std_ref" in stats
+    assert torch.isfinite(stats["objective_with_aev5"])
+    assert torch.isfinite(stats["aev5_loss_mul"])
+    assert torch.isfinite(stats["aev5_scale"])
+    assert torch.isfinite(stats["aev5_scale_raw"])
+    assert torch.isfinite(stats["aev5_reward_std_ref"])
+    assert "aev2_penalty" not in stats
+    assert "aev3_penalty" not in stats
+    assert "aev4_penalty" not in stats
 
 
 def test_environment_prior_rollout_with_policy_clips_rewards():

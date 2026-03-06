@@ -35,6 +35,47 @@ def _is_torch_compiling():
 
 _CAT_FUSION_ENV = str(os.environ.get("TICL_POLICY_CAT_FUSION", "1")).strip().lower()
 _CAT_FUSION_ENABLED = _CAT_FUSION_ENV not in {"0", "false", "no", "off"}
+_TAIL_FREEZE_CLONE_APPEND_ENV = str(
+    os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND", "0")
+).strip().lower()
+_TAIL_FREEZE_CLONE_APPEND_ENABLED = _TAIL_FREEZE_CLONE_APPEND_ENV not in {"0", "false", "no", "off"}
+_TAIL_FREEZE_CLONE_APPEND_GUARD_ENV = str(
+    os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_GUARD", "1")
+).strip().lower()
+_TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED = _TAIL_FREEZE_CLONE_APPEND_GUARD_ENV not in {"0", "false", "no", "off"}
+try:
+    _TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB = float(
+        os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB", "8")
+    )
+except Exception:
+    _TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB = 8.0
+try:
+    _TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC = float(
+        os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC", "0.82")
+    )
+except Exception:
+    _TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC = 0.82
+
+
+def _tail_freeze_clone_append_allowed(device: torch.device) -> bool:
+    if not _TAIL_FREEZE_CLONE_APPEND_ENABLED:
+        return False
+    if (not _TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED) or (device.type != "cuda") or (not torch.cuda.is_available()):
+        return True
+    try:
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        reserved_bytes = torch.cuda.memory_reserved(device_index)
+        free_gib = float(free_bytes) / float(1024 ** 3)
+        reserved_frac = (float(reserved_bytes) / float(total_bytes)) if int(total_bytes) > 0 else 0.0
+        if free_gib < float(_TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB):
+            return False
+        if reserved_frac > float(_TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC):
+            return False
+    except Exception:
+        # Guard must never break the hot path; fail open.
+        return True
+    return True
 
 
 class BiAttentionEncoderLayer(Module):
@@ -183,6 +224,32 @@ class TransformerEncoderLayer(Module):
         self.force_flash_single_page = force_flash_single_page_env in {"1", "true", "yes", "on"}
         flash_prefix_async_env = str(os.environ.get("TICL_POLICY_FLASH_PREFIX_ASYNC", "1")).strip().lower()
         self.flash_prefix_async = flash_prefix_async_env in {"1", "true", "yes", "on"}
+        flash_prefix_zero_fastpath_env = str(
+            os.environ.get("TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH", "1")
+        ).strip().lower()
+        self.flash_prefix_zero_fastpath = flash_prefix_zero_fastpath_env in {"1", "true", "yes", "on"}
+        try:
+            flash_prefix_tail_dense_tokens_env = int(
+                os.environ.get("TICL_POLICY_FLASH_PREFIX_TAIL_DENSE_MAX_TOKENS", "0")
+            )
+        except Exception:
+            flash_prefix_tail_dense_tokens_env = 0
+        # When >0 and prefix exists, route small mutable tail to one dense SDPA
+        # to cut flash-prefix dual-dispatch launch overhead.
+        self.flash_prefix_tail_dense_max_tokens = int(max(0, flash_prefix_tail_dense_tokens_env))
+        inplace_flash_prefix_env = str(
+            os.environ.get("TICL_POLICY_INPLACE_FLASH_PREFIX", "1")
+        ).strip().lower()
+        self.inplace_flash_prefix = inplace_flash_prefix_env in {"1", "true", "yes", "on"}
+        inplace_clone_prefix_env = str(
+            os.environ.get("TICL_POLICY_INPLACE_CLONE_PREFIX", "0")
+        ).strip().lower()
+        self.inplace_clone_prefix = inplace_clone_prefix_env in {"1", "true", "yes", "on"}
+        try:
+            inplace_page_size_env = int(os.environ.get("TICL_POLICY_INPLACE_PAGED_PAGE_SIZE", "0"))
+        except Exception:
+            inplace_page_size_env = 0
+        self.inplace_paged_page_size = int(max(0, inplace_page_size_env))
         self._flash_prefix_streams = {}
         step_profile_flag = str(os.environ.get("TICL_TRANSFORMER_LAYER_STEP_PROFILE", "")).strip().lower()
         self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
@@ -190,6 +257,8 @@ class TransformerEncoderLayer(Module):
         self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
         cache_reuse_flag = str(os.environ.get("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")).strip().lower()
         self.cache_container_reuse = cache_reuse_flag not in {"0", "false", "no", "off"}
+        step_proj_2d_flag = str(os.environ.get("TICL_POLICY_STEP_PROJ_2D", "1")).strip().lower()
+        self.step_proj_2d_fastpath = step_proj_2d_flag not in {"0", "false", "no", "off"}
         self._layer_step_profile_stats = {
             "calls": 0,
             "proj_wall_s": 0.0,
@@ -201,8 +270,19 @@ class TransformerEncoderLayer(Module):
             "finalize_ffn_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
+            "paged_path_flash_prefix_zero_fastpath": 0,
             "paged_path_flash_merge": 0,
             "paged_path_dense": 0,
+            "paged_page_count_sum": 0,
+            "paged_valid_len_sum": 0,
+            "paged_last_page_tokens_sum": 0,
+            "paged_prefix_len_sum": 0,
+            "flash_prefix_valid_tokens_sum": 0,
+            "flash_prefix_prefix_tokens_sum": 0,
+            "flash_prefix_tail_tokens_sum": 0,
+            "dense_valid_tokens_sum": 0,
+            "dense_prefix_tokens_sum": 0,
+            "dense_tail_tokens_sum": 0,
             "total_wall_s": 0.0,
         }
 
@@ -223,8 +303,19 @@ class TransformerEncoderLayer(Module):
             "finalize_ffn_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
+            "paged_path_flash_prefix_zero_fastpath": 0,
             "paged_path_flash_merge": 0,
             "paged_path_dense": 0,
+            "paged_page_count_sum": 0,
+            "paged_valid_len_sum": 0,
+            "paged_last_page_tokens_sum": 0,
+            "paged_prefix_len_sum": 0,
+            "flash_prefix_valid_tokens_sum": 0,
+            "flash_prefix_prefix_tokens_sum": 0,
+            "flash_prefix_tail_tokens_sum": 0,
+            "dense_valid_tokens_sum": 0,
+            "dense_prefix_tokens_sum": 0,
+            "dense_tail_tokens_sum": 0,
             "total_wall_s": 0.0,
         }
         return stats
@@ -533,6 +624,7 @@ class TransformerEncoderLayer(Module):
         prefix_k: Optional[Tensor] = None,
         prefix_v: Optional[Tensor] = None,
         clone_kv_for_grad: bool = False,
+        clone_prefix_for_grad: bool = True,
     ):
         profile_enabled = self._step_profile_enabled_now()
         core_t0 = time.perf_counter() if profile_enabled else None
@@ -551,6 +643,16 @@ class TransformerEncoderLayer(Module):
         if bool(clone_kv_for_grad):
             tail_k = tail_k.clone()
             tail_v = tail_v.clone()
+        if int(prefix_len) == 0 and bool(self.flash_prefix_zero_fastpath):
+            # Zero-prefix case dominates current auto mode in training:
+            # bypass flash-LSE merge/cast chain and dispatch a single SDPA.
+            if profile_enabled:
+                stats = self._layer_step_profile_stats
+                stats["paged_path_flash_prefix_zero_fastpath"] += 1
+                stats["flash_prefix_valid_tokens_sum"] += int(valid_len)
+                stats["flash_prefix_prefix_tokens_sum"] += 0
+                stats["flash_prefix_tail_tokens_sum"] += int(tail_take)
+            return self._forward_step_attn_ff(src_step, q_bhld, tail_k, tail_v)
         q_len = int(q_bhld.shape[2])
         prefix_out = None
         prefix_lse = None
@@ -558,7 +660,7 @@ class TransformerEncoderLayer(Module):
         if prefix_len > 0:
             prefix_chunk_k = prefix_k
             prefix_chunk_v = prefix_v
-            if bool(clone_kv_for_grad):
+            if bool(clone_kv_for_grad) and bool(clone_prefix_for_grad):
                 prefix_chunk_k = prefix_chunk_k.clone()
                 prefix_chunk_v = prefix_chunk_v.clone()
             prefix_stream = self._get_flash_prefix_stream(q_bhld.device)
@@ -590,6 +692,9 @@ class TransformerEncoderLayer(Module):
             stats = self._layer_step_profile_stats
             stats["attn_core_wall_s"] += float(core_dt)
             stats["finalize_wall_s"] += float(finalize_dt)
+            stats["flash_prefix_valid_tokens_sum"] += int(valid_len)
+            stats["flash_prefix_prefix_tokens_sum"] += int(prefix_len)
+            stats["flash_prefix_tail_tokens_sum"] += int(tail_take)
         return out
 
     def _forward_step_attn_ff_paged(
@@ -610,13 +715,13 @@ class TransformerEncoderLayer(Module):
             raise ValueError("Paged KV attention requires valid_len > 0.")
         profile_enabled = self._step_profile_enabled_now()
         stats = self._layer_step_profile_stats if profile_enabled else None
+        if stats is not None:
+            stats["paged_page_count_sum"] += int(len(k_pages))
+            stats["paged_valid_len_sum"] += int(valid_len)
+            stats["paged_last_page_tokens_sum"] += int(k_pages[-1].shape[2]) if len(k_pages) > 0 else 0
+            stats["paged_prefix_len_sum"] += int(prefix_k.shape[2]) if prefix_k is not None else 0
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
-        train_mode = self.paged_attn_train_mode
-        if train_mode == "auto":
-            # Keep runtime routing consistent with training heuristic.
-            train_mode = "flash_prefix" if int(q_bhld.shape[0]) >= 32 else "dense"
-        if q_bhld.device.type != "cuda":
-            train_mode = "dense"
+        train_mode = self._resolve_paged_attn_train_mode(q_bhld)
 
         # Fast path: single-page cache can directly dispatch to SDPA.
         # This is important for no-grad/inference runs where we keep one large
@@ -628,7 +733,10 @@ class TransformerEncoderLayer(Module):
                 torch.is_grad_enabled()
                 and attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
-                and (not bool(clone_kv_for_grad))
+                and (
+                    (not bool(clone_kv_for_grad))
+                    or bool(self.inplace_flash_prefix)
+                )
             ):
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
@@ -640,7 +748,8 @@ class TransformerEncoderLayer(Module):
                     valid_len,
                     prefix_k=prefix_k,
                     prefix_v=prefix_v,
-                    clone_kv_for_grad=False,
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                    clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
             k_all = k_pages[0][:, :, :remaining, :]
             v_all = v_pages[0][:, :, :remaining, :]
@@ -659,10 +768,36 @@ class TransformerEncoderLayer(Module):
             if (
                 attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
-                and (not bool(clone_kv_for_grad))
+                and (
+                    (not bool(clone_kv_for_grad))
+                    or bool(self.inplace_flash_prefix)
+                )
             ):
+                tail_dense_cap = int(max(0, self.flash_prefix_tail_dense_max_tokens))
+                if (
+                    tail_dense_cap > 0
+                    and (not bool(clone_kv_for_grad))
+                    and (prefix_k is not None)
+                    and (prefix_v is not None)
+                ):
+                    prefix_len = int(prefix_k.shape[2])
+                    if prefix_len < int(valid_len):
+                        tail_take = int(valid_len) - prefix_len
+                        if tail_take <= tail_dense_cap:
+                            tail_k = k_pages[-1][:, :, :tail_take, :]
+                            tail_v = v_pages[-1][:, :, :tail_take, :]
+                            k_all = self._concat_dim2([prefix_k, tail_k])
+                            v_all = self._concat_dim2([prefix_v, tail_v])
+                            if stats is not None:
+                                stats["paged_path_dense"] += 1
+                                stats["dense_valid_tokens_sum"] += int(valid_len)
+                                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                                stats["dense_tail_tokens_sum"] += int(tail_take)
+                            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
                 dense_token_cap = int(max(0, self.paged_attn_flashprefix_dense_max_tokens))
                 if (
+                    (not bool(clone_kv_for_grad))
+                    and
                     dense_token_cap > 0
                     and int(valid_len) <= dense_token_cap
                     and (prefix_k is not None)
@@ -680,6 +815,9 @@ class TransformerEncoderLayer(Module):
                         v_all = self._concat_dim2([prefix_v, tail_v])
                     if stats is not None:
                         stats["paged_path_dense"] += 1
+                        stats["dense_valid_tokens_sum"] += int(valid_len)
+                        stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                        stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
                     return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
@@ -691,7 +829,8 @@ class TransformerEncoderLayer(Module):
                     valid_len,
                     prefix_k=prefix_k,
                     prefix_v=prefix_v,
-                    clone_kv_for_grad=False,
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                    clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
             if attn_dropout <= 0.0 and train_mode == "flash_merge":
                 if stats is not None:
@@ -723,6 +862,9 @@ class TransformerEncoderLayer(Module):
                     v_all = self._concat_dim2([prefix_v, tail_v])
                 if stats is not None:
                     stats["paged_path_dense"] += 1
+                    stats["dense_valid_tokens_sum"] += int(valid_len)
+                    stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                    stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
                 return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if bool(clone_kv_for_grad):
@@ -731,12 +873,18 @@ class TransformerEncoderLayer(Module):
                 v_all = v_all.clone()
             if stats is not None:
                 stats["paged_path_dense"] += 1
+                stats["dense_valid_tokens_sum"] += int(valid_len)
+                stats["dense_prefix_tokens_sum"] += 0
+                stats["dense_tail_tokens_sum"] += int(valid_len)
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         if attn_dropout > 0.0:
             k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if stats is not None:
                 stats["paged_path_dense"] += 1
+                stats["dense_valid_tokens_sum"] += int(valid_len)
+                stats["dense_prefix_tokens_sum"] += 0
+                stats["dense_tail_tokens_sum"] += int(valid_len)
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         scale = 1.0 / math.sqrt(float(q_bhld.shape[-1]))
@@ -791,6 +939,15 @@ class TransformerEncoderLayer(Module):
             raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
         attn_bhld = running_num / running_denom.clamp_min(1e-12)
         return self._finalize_forward_step(src_step, attn_bhld)
+
+    def _resolve_paged_attn_train_mode(self, q_bhld: Tensor):
+        train_mode = self.paged_attn_train_mode
+        if train_mode == "auto":
+            # Keep runtime routing consistent with training heuristic.
+            train_mode = "flash_prefix" if int(q_bhld.shape[0]) >= 32 else "dense"
+        if q_bhld.device.type != "cuda":
+            train_mode = "dense"
+        return str(train_mode)
 
     @staticmethod
     def _cache_capacity_from_tensor(k_tensor: Tensor, requested_max_len: Optional[int]):
@@ -983,9 +1140,21 @@ class TransformerEncoderLayer(Module):
             return new_k_pages, new_v_pages, int(valid_len) + 1
 
         if bool(freeze_existing_tail):
-            # TBPTT detach can leave a long immutable tail page. Start a fresh
-            # mutable page for the new window to avoid repeatedly copying that
-            # detached history on every COW append.
+            # TBPTT detach leaves the current tail immutable for old autograd
+            # graphs. To cut later paged-attn launch count, prefer one COW clone
+            # of that tail page and keep appending into the cloned page.
+            # Fallback to opening a new tail page when clone-append is disabled
+            # or the page is already full.
+            if _tail_freeze_clone_append_allowed(k_new_bhld.device) and new_k_pages:
+                prev_k = new_k_pages[-1]
+                prev_v = new_v_pages[-1]
+                prev_len = int(prev_k.shape[2])
+                if prev_len < int(page_size):
+                    grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                    grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
+                    new_k_pages[-1] = grown_k
+                    new_v_pages[-1] = grown_v
+                    return new_k_pages, new_v_pages, int(valid_len) + 1
             new_k_pages.append(k_new_bhld.clone())
             new_v_pages.append(v_new_bhld.clone())
             return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1041,6 +1210,16 @@ class TransformerEncoderLayer(Module):
         new_v_pages = list(v_pages)
 
         if bool(freeze_existing_tail):
+            if _tail_freeze_clone_append_allowed(k_new_bhld.device) and new_k_pages:
+                prev_k = new_k_pages[-1]
+                prev_v = new_v_pages[-1]
+                prev_len = int(prev_k.shape[2])
+                if prev_len < int(page_size):
+                    grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                    grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
+                    new_k_pages[-1] = grown_k
+                    new_v_pages[-1] = grown_v
+                    return new_k_pages, new_v_pages, int(valid_len) + 1
             new_k_pages.append(k_new_bhld.clone())
             new_v_pages.append(v_new_bhld.clone())
             return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1090,19 +1269,50 @@ class TransformerEncoderLayer(Module):
         else:
             src_norm = src_step
 
-        if src_norm.ndim == 3:
-            src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
+        use_step_proj_2d = bool(self.step_proj_2d_fastpath)
+        if use_step_proj_2d:
+            if src_norm.ndim == 3:
+                src_norm_be = src_norm.squeeze(0)  # (B, E)
+            else:
+                src_norm_be = src_norm  # (B, E)
+            n_heads = int(self.self_attn.num_heads)
+            head_dim = int(self.self_attn.embed_dim // n_heads)
+            bsz = int(src_norm_be.shape[0])
         else:
-            src_norm_bld = src_norm.unsqueeze(1)  # (B, 1, E)
+            if src_norm.ndim == 3:
+                src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
+            else:
+                src_norm_bld = src_norm.unsqueeze(1)  # (B, 1, E)
         proj_t0 = time.perf_counter() if profile_enabled else None
         if append_to_cache:
-            q_bld, k_new_bld, v_new_bld = self._project_qkv(src_norm_bld)
-            q_bhld = self._split_heads(q_bld)
-            k_new_bhld = self._split_heads(k_new_bld)
-            v_new_bhld = self._split_heads(v_new_bld)
+            if use_step_proj_2d:
+                qkv_be = F.linear(
+                    src_norm_be,
+                    self.self_attn.in_proj_weight,
+                    self.self_attn.in_proj_bias,
+                )
+                q_bld, k_new_bld, v_new_bld = qkv_be.chunk(3, dim=-1)
+                q_bhld = q_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+                k_new_bhld = k_new_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+                v_new_bhld = v_new_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+            else:
+                q_bld, k_new_bld, v_new_bld = self._project_qkv(src_norm_bld)
+                q_bhld = self._split_heads(q_bld)
+                k_new_bhld = self._split_heads(k_new_bld)
+                v_new_bhld = self._split_heads(v_new_bld)
         else:
-            q_bld = self._project_q(src_norm_bld)
-            q_bhld = self._split_heads(q_bld)
+            if use_step_proj_2d:
+                embed_dim = int(self.self_attn.embed_dim)
+                w_q = self.self_attn.in_proj_weight[:embed_dim]
+                if self.self_attn.in_proj_bias is not None:
+                    b_q = self.self_attn.in_proj_bias[:embed_dim]
+                else:
+                    b_q = None
+                q_bld = F.linear(src_norm_be, w_q, b_q)
+                q_bhld = q_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+            else:
+                q_bld = self._project_q(src_norm_bld)
+                q_bhld = self._split_heads(q_bld)
         proj_dt = (time.perf_counter() - proj_t0) if proj_t0 is not None else 0.0
         if max_cache_len is None and kv_cache is not None:
             max_cache_len = kv_cache.get("max_cache_len", None)
@@ -1142,10 +1352,19 @@ class TransformerEncoderLayer(Module):
             if (not torch.is_grad_enabled()) and (max_cache_len is not None):
                 effective_kv_page_size = int(max(1, max_cache_len))
             elif mutable_paged_grad:
-                if inplace_paged_grad and (max_cache_len is not None):
-                    # Keep one dense page in in-place mode so append stays
-                    # O(1) and avoids page-growth cat churn in TBPTT rollout.
-                    effective_kv_page_size = int(max(1, max_cache_len))
+                if inplace_paged_grad:
+                    # In-place mode with bounded pages:
+                    # avoids dense-page O(T) clone growth while keeping O(1)
+                    # append updates inside each page.
+                    if int(self.inplace_paged_page_size) > 0:
+                        target_page = int(max(8, self.inplace_paged_page_size))
+                    elif self.paged_attn_train_mode == "flash_prefix":
+                        target_page = int(max(8, self.paged_attn_flashprefix_page_size))
+                    elif self.paged_attn_train_mode == "dense":
+                        target_page = int(max(8, self.paged_attn_dense_page_size))
+                    else:
+                        target_page = int(max(8, kv_cache_page_size))
+                    effective_kv_page_size = int(max(8, min(int(kv_cache_page_size), target_page)))
                 else:
                     if self.paged_attn_train_mode == "flash_prefix":
                         # In COW mode, large pages amplify per-step cat/clone
@@ -1350,7 +1569,6 @@ class TransformerEncoderLayer(Module):
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and (not bool(inplace_paged_grad))
             and self.paged_attn_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
@@ -1713,6 +1931,8 @@ class TransformerEncoderSimple(Module):
         self.layers = nn.ModuleList([encoder_layer_creator() for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = norm
+        step_layer_2d_flag = str(os.environ.get("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")).strip().lower()
+        self.step_layer_2d_loop = step_layer_2d_flag not in {"0", "false", "no", "off"}
 
     def consume_step_profile(self):
         calls = 0
@@ -1725,8 +1945,19 @@ class TransformerEncoderSimple(Module):
         finalize_ffn_wall_s = 0.0
         paged_path_single_page = 0
         paged_path_flash_prefix = 0
+        paged_path_flash_prefix_zero_fastpath = 0
         paged_path_flash_merge = 0
         paged_path_dense = 0
+        paged_page_count_sum = 0
+        paged_valid_len_sum = 0
+        paged_last_page_tokens_sum = 0
+        paged_prefix_len_sum = 0
+        flash_prefix_valid_tokens_sum = 0
+        flash_prefix_prefix_tokens_sum = 0
+        flash_prefix_tail_tokens_sum = 0
+        dense_valid_tokens_sum = 0
+        dense_prefix_tokens_sum = 0
+        dense_tail_tokens_sum = 0
         total_wall_s = 0.0
         enabled = False
         for layer in self.layers:
@@ -1749,8 +1980,21 @@ class TransformerEncoderSimple(Module):
             finalize_ffn_wall_s += float(layer_stats.get("finalize_ffn_wall_s", 0.0) or 0.0)
             paged_path_single_page += int(layer_stats.get("paged_path_single_page", 0) or 0)
             paged_path_flash_prefix += int(layer_stats.get("paged_path_flash_prefix", 0) or 0)
+            paged_path_flash_prefix_zero_fastpath += int(
+                layer_stats.get("paged_path_flash_prefix_zero_fastpath", 0) or 0
+            )
             paged_path_flash_merge += int(layer_stats.get("paged_path_flash_merge", 0) or 0)
             paged_path_dense += int(layer_stats.get("paged_path_dense", 0) or 0)
+            paged_page_count_sum += int(layer_stats.get("paged_page_count_sum", 0) or 0)
+            paged_valid_len_sum += int(layer_stats.get("paged_valid_len_sum", 0) or 0)
+            paged_last_page_tokens_sum += int(layer_stats.get("paged_last_page_tokens_sum", 0) or 0)
+            paged_prefix_len_sum += int(layer_stats.get("paged_prefix_len_sum", 0) or 0)
+            flash_prefix_valid_tokens_sum += int(layer_stats.get("flash_prefix_valid_tokens_sum", 0) or 0)
+            flash_prefix_prefix_tokens_sum += int(layer_stats.get("flash_prefix_prefix_tokens_sum", 0) or 0)
+            flash_prefix_tail_tokens_sum += int(layer_stats.get("flash_prefix_tail_tokens_sum", 0) or 0)
+            dense_valid_tokens_sum += int(layer_stats.get("dense_valid_tokens_sum", 0) or 0)
+            dense_prefix_tokens_sum += int(layer_stats.get("dense_prefix_tokens_sum", 0) or 0)
+            dense_tail_tokens_sum += int(layer_stats.get("dense_tail_tokens_sum", 0) or 0)
             total_wall_s += float(layer_stats.get("total_wall_s", 0.0) or 0.0)
         if not enabled:
             return None
@@ -1765,8 +2009,19 @@ class TransformerEncoderSimple(Module):
             "finalize_ffn_wall_s": float(finalize_ffn_wall_s),
             "paged_path_single_page": int(paged_path_single_page),
             "paged_path_flash_prefix": int(paged_path_flash_prefix),
+            "paged_path_flash_prefix_zero_fastpath": int(paged_path_flash_prefix_zero_fastpath),
             "paged_path_flash_merge": int(paged_path_flash_merge),
             "paged_path_dense": int(paged_path_dense),
+            "paged_page_count_sum": int(paged_page_count_sum),
+            "paged_valid_len_sum": int(paged_valid_len_sum),
+            "paged_last_page_tokens_sum": int(paged_last_page_tokens_sum),
+            "paged_prefix_len_sum": int(paged_prefix_len_sum),
+            "flash_prefix_valid_tokens_sum": int(flash_prefix_valid_tokens_sum),
+            "flash_prefix_prefix_tokens_sum": int(flash_prefix_prefix_tokens_sum),
+            "flash_prefix_tail_tokens_sum": int(flash_prefix_tail_tokens_sum),
+            "dense_valid_tokens_sum": int(dense_valid_tokens_sum),
+            "dense_prefix_tokens_sum": int(dense_prefix_tokens_sum),
+            "dense_tail_tokens_sum": int(dense_tail_tokens_sum),
             "total_wall_s": float(total_wall_s),
         }
 
@@ -1808,7 +2063,13 @@ class TransformerEncoderSimple(Module):
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
     ):
-        output = src_step
+        squeeze_seq_dim = bool(
+            self.step_layer_2d_loop
+            and isinstance(src_step, Tensor)
+            and src_step.ndim == 3
+            and int(src_step.shape[0]) == 1
+        )
+        output = src_step.squeeze(0) if squeeze_seq_dim else src_step
         if kv_cache is None:
             kv_cache = [None] * len(self.layers)
         if len(kv_cache) != len(self.layers):
@@ -1852,6 +2113,8 @@ class TransformerEncoderSimple(Module):
 
         if self.norm is not None:
             output = self.norm(output)
+        if squeeze_seq_dim:
+            output = output.unsqueeze(0)
         return output, new_cache
 
     def encode_prefix_to_kv(self, src_prefix: Tensor):

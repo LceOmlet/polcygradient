@@ -1,4 +1,5 @@
 import datetime
+import hashlib
 import json
 import os
 import random
@@ -367,6 +368,68 @@ def init_device(gpu_id, use_cpu):
     return device, rank, num_gpus
 
 
+def _resolve_max_filename_component_bytes(default_value=255):
+    try:
+        v = int(os.environ.get("TICL_MAX_FILENAME_COMPONENT_BYTES", str(default_value)))
+    except Exception:
+        v = int(default_value)
+    # Common Linux filesystems (ext4/xfs) cap filename component at 255 bytes.
+    return int(min(255, max(32, v)))
+
+
+def _truncate_component_with_hash(name, max_bytes):
+    name = str(name)
+    raw = name.encode("utf-8")
+    if len(raw) <= int(max_bytes):
+        return name
+    digest = hashlib.sha1(raw).hexdigest()[:10]
+    suffix = f"_h{digest}"
+    budget = int(max_bytes) - len(suffix.encode("utf-8"))
+    if budget <= 0:
+        return suffix.encode("utf-8")[: int(max_bytes)].decode("utf-8", errors="ignore")
+    prefix_bytes = raw[:budget]
+    while True:
+        try:
+            prefix = prefix_bytes.decode("utf-8")
+            break
+        except UnicodeDecodeError:
+            prefix_bytes = prefix_bytes[:-1]
+            if len(prefix_bytes) == 0:
+                prefix = ""
+                break
+    prefix = prefix.rstrip("._-")
+    if not prefix:
+        return suffix
+    return prefix + suffix
+
+
+def enforce_path_filename_limit(path, *, max_component_bytes=None):
+    """
+    Ensure path basename fits filesystem filename-component limits.
+    Preserves extension and injects a short hash when truncation is needed.
+    """
+    if path is None:
+        return None
+    path_str = str(path)
+    if not path_str.strip():
+        return path_str
+    if max_component_bytes is None:
+        max_component_bytes = _resolve_max_filename_component_bytes()
+    else:
+        max_component_bytes = int(min(255, max(32, int(max_component_bytes))))
+
+    parent = os.path.dirname(path_str)
+    base = os.path.basename(path_str)
+    stem, ext = os.path.splitext(base)
+    ext_bytes = len(ext.encode("utf-8"))
+    stem_budget = max(8, max_component_bytes - ext_bytes)
+    safe_stem = _truncate_component_with_hash(stem, stem_budget)
+    safe_base = f"{safe_stem}{ext}"
+    if parent:
+        return os.path.join(parent, safe_base)
+    return safe_base
+
+
 def get_model_string(config, num_gpus, device, parser):
     # get the subparser for the model type
     subparser = parser._actions[1].choices[config['model_type']]
@@ -392,9 +455,23 @@ def get_model_string(config, num_gpus, device, parser):
     gpu_string = f"_{num_gpus}_gpu{'s' if num_gpus > 1 else ''}" if device != 'cpu' else '_cpu'
     if gpu_string == "_1_gpu":
         gpu_string = ""
-    model_string = (f"{model_type_string}{config_string}{gpu_string}"
-                    f"{'_continue' if config['orchestration']['continue_run'] else '_warm' if config['orchestration']['warm_start_from'] else ''}")
-    model_string = model_string + '_'+datetime.datetime.now().strftime("%m_%d_%Y_%H_%M_%S")
+    model_string = (
+        f"{model_type_string}{config_string}{gpu_string}"
+        f"{'_continue' if config['orchestration']['continue_run'] else '_warm' if config['orchestration']['warm_start_from'] else ''}"
+    )
+    model_string = model_string + '_' + datetime.datetime.now().strftime("%m_%d_%Y_%H_%M_%S")
+    # Reserve bytes for suffixes used by downstream files, e.g.
+    # "{model_string}_epoch_{epoch}.cpkt" and "{model_string}.log".
+    max_component = _resolve_max_filename_component_bytes()
+    reserved_suffix = len("_epoch_999999999.cpkt".encode("utf-8"))
+    model_string_budget = max(32, int(max_component) - int(reserved_suffix))
+    model_string_safe = _truncate_component_with_hash(model_string, model_string_budget)
+    if model_string_safe != model_string:
+        print(
+            "[filename-limit] model_string was truncated to fit filesystem limits "
+            f"(budget={model_string_budget} bytes)."
+        )
+    model_string = model_string_safe
     if config['orchestration']['st_checkpoint_dir'] is not None:
         with open(f"{config['orchestration']['st_checkpoint_dir']}/model_string.txt", 'w') as f:
             f.write(model_string)
@@ -431,6 +508,48 @@ def _checkpoint_is_better(mode, lhs, rhs):
     if mode == "max":
         return float(lhs) > float(rhs)
     return float(lhs) < float(rhs)
+
+
+def _sanitize_metric_token(token):
+    token = str(token).strip()
+    if not token:
+        return "unknown"
+    out = []
+    for ch in token:
+        if ch.isalnum() or ch in ("_", "-", "."):
+            out.append(ch)
+        else:
+            out.append("_")
+    return "".join(out)
+
+
+def _flatten_named_scores(score_obj, prefix=""):
+    if isinstance(score_obj, dict):
+        flat = []
+        for key in sorted(score_obj.keys(), key=lambda k: str(k)):
+            key_token = _sanitize_metric_token(key)
+            next_prefix = key_token if not prefix else f"{prefix}_{key_token}"
+            flat.extend(_flatten_named_scores(score_obj[key], next_prefix))
+        return flat
+    label = prefix if prefix else "value"
+    return [(label, score_obj)]
+
+
+def _format_log_scalar(value):
+    if isinstance(value, (bool, np.bool_)):
+        return str(int(value))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        fv = float(value)
+        if np.isnan(fv):
+            return "nan"
+        if np.isposinf(fv):
+            return "inf"
+        if np.isneginf(fv):
+            return "-inf"
+        return f"{fv:.16g}"
+    return str(value)
 
 
 def make_training_callback(
@@ -558,9 +677,17 @@ def make_training_callback(
 
                     if config.get("model_type") == "rlpfn":
                         print(f"[ext-rl] mean_return_all={validation_score}")
+                        per_env_returns = _flatten_named_scores(per_dataset_score)
+                        for env_name, env_return in per_env_returns:
+                            print(f"[ext-rl] return_{env_name}={_format_log_scalar(env_return)}")
                         try:
                             with open(log_file, "a") as f:
                                 f.write(f"Epoch {epoch} mean_return_all {validation_score}\n")
+                                for env_name, env_return in per_env_returns:
+                                    f.write(
+                                        f"Epoch {epoch} return_{env_name} "
+                                        f"{_format_log_scalar(env_return)}\n"
+                                    )
                         except Exception:
                             pass
                     else:

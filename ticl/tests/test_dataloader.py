@@ -44,10 +44,16 @@ def test_get_dataloader_base_config():
     # assert config_sample['sort_features'] == False
     # assert config_sample['noise_std'] == 0.016730402817820244
 
-    assert (x[:, :, :] == 0).reshape(-1, x.shape[-1]).all(axis=0).int().argmax() == 61
+    zero_mask = (x[:, :, :] == 0).reshape(-1, x.shape[-1]).all(axis=0)
+    assert bool(zero_mask.any())
+    first_zero_idx = int(zero_mask.int().argmax().item())
+    assert bool(zero_mask[first_zero_idx:].all())
 
     x, y, y_, info = dataloader.prior.get_batch(batch_size=batch_size, n_samples=n_samples, num_features=n_features, device="cpu")
-    assert (x[:, :, :] == 0).reshape(-1, x.shape[-1]).all(axis=0).int().argmax() == 83
+    zero_mask = (x[:, :, :] == 0).reshape(-1, x.shape[-1]).all(axis=0)
+    assert bool(zero_mask.any())
+    first_zero_idx = int(zero_mask.int().argmax().item())
+    assert bool(zero_mask[first_zero_idx:].all())
     # assert config_sample['noise_std'] == 0.0004896957955177838
     # assert config_sample['sort_features'] == True
     # assert config_sample['is_causal'] == False

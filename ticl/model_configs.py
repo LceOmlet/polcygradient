@@ -17,6 +17,7 @@ def get_optimizer_config():
         "pg_saved_tensors_cpu_offload": False,
         "pg_saved_tensors_pin_memory": True,
         "pg_oom_debug_raise": False,
+        "pg_oom_fail_fast": False,
         "pg_kv_cache_mode": "auto",
         "pg_kv_cache_page_size": None,
         "pg_tbptt_window": 64,
@@ -31,6 +32,8 @@ def get_optimizer_config():
         "pg_compile_observe_log_every_batches": 1,
         "pg_compile_observe_output_path": None,
         "pg_compile_observe_reset_after_warmup": True,
+        "pg_phase_log_every_batches": 1,
+        "pg_phase_log_file": None,
         "adamw_fused": True,
         "train_profiler_enabled": False,
         "train_profiler_output_path": None,
@@ -223,6 +226,53 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reward_scale": {"distribution": "uniform", "min": 0.1, "max": 10.0},
         "reward_clip": 10.0,
         "state_clip": 8.0,
+        # Optional state residual highway (default off, no behavior change).
+        "state_highway_enabled": False,
+        "state_highway_lambda": 0.0,
+        # anti-explosion&vanishing-v2:
+        # two-sided corridor regularization on log gain of consecutive
+        # latent-state increments.
+        "anti_explosion_vanishing_v2_enabled": False,
+        "anti_explosion_vanishing_v2_lambda": 0.05,
+        "anti_explosion_vanishing_v2_gain_lo": 0.85,
+        "anti_explosion_vanishing_v2_gain_hi": 1.15,
+        "anti_explosion_vanishing_v2_huber_delta": 0.05,
+        "anti_explosion_vanishing_v2_eps": 1e-6,
+        "anti_explosion_vanishing_v2_detach_reference": True,
+        # anti-explosion&vanishing-v3:
+        # decoupled drift+tail regularization on per-step log gain of
+        # latent-state increments.
+        "anti_explosion_vanishing_v3_enabled": False,
+        "anti_explosion_vanishing_v3_lambda_drift": 0.02,
+        "anti_explosion_vanishing_v3_lambda_tail": 0.05,
+        "anti_explosion_vanishing_v3_gain_lo": 0.85,
+        "anti_explosion_vanishing_v3_gain_hi": 1.15,
+        "anti_explosion_vanishing_v3_tail_tau": 0.02,
+        "anti_explosion_vanishing_v3_eps": 1e-6,
+        "anti_explosion_vanishing_v3_detach_reference": True,
+        # anti-explosion&vanishing-v4:
+        # controlled highway-subspace update + drift/tail regularization
+        # on per-step update gain (TBPTT-friendly).
+        "anti_explosion_vanishing_v4_enabled": False,
+        "anti_explosion_vanishing_v4_lambda_drift": 0.08,
+        "anti_explosion_vanishing_v4_lambda_tail": 0.25,
+        "anti_explosion_vanishing_v4_gain_lo": 0.97,
+        "anti_explosion_vanishing_v4_gain_hi": 1.03,
+        "anti_explosion_vanishing_v4_tail_tau": 0.010,
+        "anti_explosion_vanishing_v4_eps": 1e-6,
+        "anti_explosion_vanishing_v4_detach_reference": True,
+        "anti_explosion_vanishing_v4_highway_ratio": 0.25,
+        "anti_explosion_vanishing_v4_update_scale": 0.08,
+        "anti_explosion_vanishing_v4_update_clip": 0.0,
+        # anti-explosion&vanishing-v5:
+        # detached reward-signal thermostat that rescales policy-gradient
+        # loss magnitude without changing ascent direction on sum of rewards.
+        "anti_explosion_vanishing_v5_enabled": False,
+        "anti_explosion_vanishing_v5_target_std": 0.25,
+        "anti_explosion_vanishing_v5_scale_lo": 0.5,
+        "anti_explosion_vanishing_v5_scale_hi": 4.0,
+        "anti_explosion_vanishing_v5_eps": 1e-6,
+        "anti_explosion_vanishing_v5_detach_reference": True,
         # Policy-gradient stability knobs for differentiable rollout.
         # Train objective default: maximize raw discounted reward mean directly.
         "policy_gradient_normalize_rewards": False,
@@ -232,7 +282,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "discount": 1.0,
         # Lipschitz safeguards: project sampled generator matrices by
         # Frobenius norm and cap GP outputscale for bounded transition Jacobians.
-        "lipschitz_enforce": True,
+        "lipschitz_enforce": False,
         "lipschitz_weight_fro_norm_max": 1.0,
         "lipschitz_gp_outputscale_max": 1.0,
         # SCM (aligned with priors/mlp.py names).
@@ -479,8 +529,10 @@ def get_rlpfn_default_config():
     # Keep rollout batch parallel width as large as possible under OOM:
     # shrink TBPTT window first before shrinking rollout chunk.
     config['optimizer']['pg_oom_reduce_tbptt_first'] = True
-    # Allow automatic OOM recovery (TBPTT/chunk shrink) by default.
+    # Fail fast on PG OOM during skyline/perf runs: avoid fallback retries
+    # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
+    config['optimizer']['pg_oom_fail_fast'] = True
     return config
 
 

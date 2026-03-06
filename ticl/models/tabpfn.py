@@ -27,6 +27,10 @@ def _is_torch_compiling():
     return False
 
 
+_SPLIT_ENCODE_FUSION_ENV = str(os.environ.get("TICL_POLICY_SPLIT_ENCODE_FUSION", "1")).strip().lower()
+_SPLIT_ENCODE_FUSION_ENABLED = _SPLIT_ENCODE_FUSION_ENV not in {"0", "false", "no", "off"}
+
+
 class TabPFN(nn.Module):
     def __init__(self, *, n_out, emsize, nhead, nhid_factor, nlayers, n_features, dropout=0.0,  y_encoder_layer=None,
                  decoder=None, input_normalization=False, init_method=None, pre_norm=False,
@@ -100,8 +104,19 @@ class TabPFN(nn.Module):
             "transformer_layer_finalize_ffn_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
+            "transformer_layer_paged_path_flash_prefix_zero_fastpath": 0,
             "transformer_layer_paged_path_flash_merge": 0,
             "transformer_layer_paged_path_dense": 0,
+            "transformer_layer_paged_page_count_sum": 0,
+            "transformer_layer_paged_valid_len_sum": 0,
+            "transformer_layer_paged_last_page_tokens_sum": 0,
+            "transformer_layer_paged_prefix_len_sum": 0,
+            "transformer_layer_flash_prefix_valid_tokens_sum": 0,
+            "transformer_layer_flash_prefix_prefix_tokens_sum": 0,
+            "transformer_layer_flash_prefix_tail_tokens_sum": 0,
+            "transformer_layer_dense_valid_tokens_sum": 0,
+            "transformer_layer_dense_prefix_tokens_sum": 0,
+            "transformer_layer_dense_tail_tokens_sum": 0,
             "transformer_layer_total_wall_s": 0.0,
         }
         self.init_weights()
@@ -126,8 +141,19 @@ class TabPFN(nn.Module):
             "transformer_layer_finalize_ffn_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
+            "transformer_layer_paged_path_flash_prefix_zero_fastpath": 0,
             "transformer_layer_paged_path_flash_merge": 0,
             "transformer_layer_paged_path_dense": 0,
+            "transformer_layer_paged_page_count_sum": 0,
+            "transformer_layer_paged_valid_len_sum": 0,
+            "transformer_layer_paged_last_page_tokens_sum": 0,
+            "transformer_layer_paged_prefix_len_sum": 0,
+            "transformer_layer_flash_prefix_valid_tokens_sum": 0,
+            "transformer_layer_flash_prefix_prefix_tokens_sum": 0,
+            "transformer_layer_flash_prefix_tail_tokens_sum": 0,
+            "transformer_layer_dense_valid_tokens_sum": 0,
+            "transformer_layer_dense_prefix_tokens_sum": 0,
+            "transformer_layer_dense_tail_tokens_sum": 0,
             "transformer_layer_total_wall_s": 0.0,
         }
         return stats
@@ -330,11 +356,44 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_paged_path_flash_prefix"] += int(
                     transformer_layer_profile.get("paged_path_flash_prefix", 0) or 0
                 )
+                stats["transformer_layer_paged_path_flash_prefix_zero_fastpath"] += int(
+                    transformer_layer_profile.get("paged_path_flash_prefix_zero_fastpath", 0) or 0
+                )
                 stats["transformer_layer_paged_path_flash_merge"] += int(
                     transformer_layer_profile.get("paged_path_flash_merge", 0) or 0
                 )
                 stats["transformer_layer_paged_path_dense"] += int(
                     transformer_layer_profile.get("paged_path_dense", 0) or 0
+                )
+                stats["transformer_layer_paged_page_count_sum"] += int(
+                    transformer_layer_profile.get("paged_page_count_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_valid_len_sum"] += int(
+                    transformer_layer_profile.get("paged_valid_len_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_last_page_tokens_sum"] += int(
+                    transformer_layer_profile.get("paged_last_page_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_prefix_len_sum"] += int(
+                    transformer_layer_profile.get("paged_prefix_len_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_valid_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_valid_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_prefix_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_prefix_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_tail_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_tail_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_valid_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_valid_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_prefix_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_prefix_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_tail_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_tail_tokens_sum", 0) or 0
                 )
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache
@@ -412,28 +471,67 @@ class TabPFN(nn.Module):
             else:
                 action_src = action_t
 
-        if obs_copy > 0:
-            obs_enc = F.linear(obs_src[:, :obs_copy], obs_weight[:, :obs_copy], obs_bias)
-        else:
-            obs_enc = obs_bias.unsqueeze(0).expand(batch_size, -1)
-        if reward_idx < obs_dim:
-            reward_weight = obs_weight[:, reward_idx]
-            if y_weight_vec is not None:
-                reward_weight = reward_weight + y_weight_vec
-            obs_enc = obs_enc + reward_scalar * reward_weight.unsqueeze(0)
-        elif y_weight_vec is not None:
-            obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
-        if mask_idx < obs_dim:
-            obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
-        if y_bias_vec is not None:
-            obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
+        if _SPLIT_ENCODE_FUSION_ENABLED:
+            fused_inputs = []
+            fused_weights = []
 
-        if action_copy > 0:
-            action_enc = F.linear(action_src[:, :action_copy], action_weight[:, :action_copy], action_bias)
-        else:
-            action_enc = action_bias.unsqueeze(0).expand(batch_size, -1)
+            if obs_copy > 0:
+                fused_inputs.append(obs_src[:, :obs_copy])
+                fused_weights.append(obs_weight[:, :obs_copy])
+            if action_copy > 0:
+                fused_inputs.append(action_src[:, :action_copy])
+                fused_weights.append(action_weight[:, :action_copy])
+            if reward_idx < obs_dim:
+                reward_weight_col = obs_weight[:, reward_idx].unsqueeze(1)
+                if y_weight_vec is not None:
+                    reward_weight_col = reward_weight_col + y_weight_vec.unsqueeze(1)
+                fused_inputs.append(reward_scalar)
+                fused_weights.append(reward_weight_col)
+            elif y_weight_vec is not None:
+                fused_inputs.append(reward_scalar)
+                fused_weights.append(y_weight_vec.unsqueeze(1))
+            if mask_idx < obs_dim:
+                fused_inputs.append(reward_mask_scalar)
+                fused_weights.append(obs_weight[:, mask_idx].unsqueeze(1))
 
-        token = (obs_enc + action_enc).unsqueeze(0)
+            fused_bias = obs_bias + action_bias
+            if y_bias_vec is not None:
+                fused_bias = fused_bias + y_bias_vec
+
+            if fused_inputs:
+                if len(fused_inputs) == 1:
+                    fused_in = fused_inputs[0]
+                    fused_w = fused_weights[0]
+                else:
+                    fused_in = torch.cat(fused_inputs, dim=1)
+                    fused_w = torch.cat(fused_weights, dim=1)
+                token_be = F.linear(fused_in, fused_w, fused_bias)
+            else:
+                token_be = fused_bias.unsqueeze(0).expand(batch_size, -1)
+            token = token_be.unsqueeze(0)
+        else:
+            if obs_copy > 0:
+                obs_enc = F.linear(obs_src[:, :obs_copy], obs_weight[:, :obs_copy], obs_bias)
+            else:
+                obs_enc = obs_bias.unsqueeze(0).expand(batch_size, -1)
+            if reward_idx < obs_dim:
+                reward_weight = obs_weight[:, reward_idx]
+                if y_weight_vec is not None:
+                    reward_weight = reward_weight + y_weight_vec
+                obs_enc = obs_enc + reward_scalar * reward_weight.unsqueeze(0)
+            elif y_weight_vec is not None:
+                obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
+            if mask_idx < obs_dim:
+                obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+            if y_bias_vec is not None:
+                obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
+
+            if action_copy > 0:
+                action_enc = F.linear(action_src[:, :action_copy], action_weight[:, :action_copy], action_bias)
+            else:
+                action_enc = action_bias.unsqueeze(0).expand(batch_size, -1)
+
+            token = (obs_enc + action_enc).unsqueeze(0)
         if not fuse_y_linear:
             y_in = reward_scalar.reshape(1, batch_size)
             y_enc = self.y_encoder(y_in.unsqueeze(-1) if len(y_in.shape) < len(token.shape) else y_in)
@@ -491,11 +589,44 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_paged_path_flash_prefix"] += int(
                     transformer_layer_profile.get("paged_path_flash_prefix", 0) or 0
                 )
+                stats["transformer_layer_paged_path_flash_prefix_zero_fastpath"] += int(
+                    transformer_layer_profile.get("paged_path_flash_prefix_zero_fastpath", 0) or 0
+                )
                 stats["transformer_layer_paged_path_flash_merge"] += int(
                     transformer_layer_profile.get("paged_path_flash_merge", 0) or 0
                 )
                 stats["transformer_layer_paged_path_dense"] += int(
                     transformer_layer_profile.get("paged_path_dense", 0) or 0
+                )
+                stats["transformer_layer_paged_page_count_sum"] += int(
+                    transformer_layer_profile.get("paged_page_count_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_valid_len_sum"] += int(
+                    transformer_layer_profile.get("paged_valid_len_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_last_page_tokens_sum"] += int(
+                    transformer_layer_profile.get("paged_last_page_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_paged_prefix_len_sum"] += int(
+                    transformer_layer_profile.get("paged_prefix_len_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_valid_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_valid_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_prefix_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_prefix_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_flash_prefix_tail_tokens_sum"] += int(
+                    transformer_layer_profile.get("flash_prefix_tail_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_valid_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_valid_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_prefix_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_prefix_tokens_sum", 0) or 0
+                )
+                stats["transformer_layer_dense_tail_tokens_sum"] += int(
+                    transformer_layer_profile.get("dense_tail_tokens_sum", 0) or 0
                 )
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache

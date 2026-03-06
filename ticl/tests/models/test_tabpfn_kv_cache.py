@@ -24,6 +24,37 @@ def _build_model(recompute_attn=False):
     return model
 
 
+def _materialize_kv_from_layer_cache(layer_cache):
+    k = layer_cache.get("k", None)
+    v = layer_cache.get("v", None)
+    if k is not None and v is not None:
+        return k, v
+
+    k_pages = layer_cache.get("k_pages", None)
+    v_pages = layer_cache.get("v_pages", None)
+    if k_pages is None or v_pages is None:
+        raise AssertionError("Expected dense k/v tensors or paged k_pages/v_pages in layer cache.")
+
+    valid_len = int(layer_cache.get("valid_len", 0))
+    remaining = int(max(0, valid_len))
+    k_chunks = []
+    v_chunks = []
+    for k_page, v_page in zip(k_pages, v_pages):
+        if remaining <= 0:
+            break
+        take = int(min(int(k_page.shape[2]), remaining))
+        if take <= 0:
+            continue
+        k_chunks.append(k_page[:, :, :take, :])
+        v_chunks.append(v_page[:, :, :take, :])
+        remaining -= take
+    if remaining != 0:
+        raise AssertionError("Paged cache pages do not cover valid_len.")
+    if not k_chunks or not v_chunks:
+        raise AssertionError("Paged cache pages are empty.")
+    return torch.cat(k_chunks, dim=2), torch.cat(v_chunks, dim=2)
+
+
 def test_tabpfn_forward_with_kv_matches_full_forward():
     torch.manual_seed(123)
     model = _build_model()
@@ -186,8 +217,10 @@ def test_tabpfn_forward_policy_step_paged_cache_matches_legacy_no_grad():
                 assert layer_paged["v_pages"] is not None
                 assert layer_paged["k_store"] is None
                 assert layer_paged["v_store"] is None
-                assert torch.allclose(layer_paged["k"], layer_legacy["k"], atol=1e-5, rtol=1e-4)
-                assert torch.allclose(layer_paged["v"], layer_legacy["v"], atol=1e-5, rtol=1e-4)
+                paged_k, paged_v = _materialize_kv_from_layer_cache(layer_paged)
+                legacy_k, legacy_v = _materialize_kv_from_layer_cache(layer_legacy)
+                assert torch.allclose(paged_k, legacy_k, atol=1e-5, rtol=1e-4)
+                assert torch.allclose(paged_v, legacy_v, atol=1e-5, rtol=1e-4)
 
 
 def test_tabpfn_forward_policy_step_with_max_cache_len_matches_legacy_backward():
