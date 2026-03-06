@@ -18,8 +18,46 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from git import Repo
 
+# Performance-first defaults for `python -m ticl.fit_model rlpfn`.
+# Use `setdefault` so explicit user/env overrides still take precedence.
+_POSITIVE_POLICY_OPT_DEFAULTS = {
+    "TICL_POLICY_CAT_FUSION": "1",
+    "TICL_POLICY_SPLIT_ENCODE_FUSION": "1",
+    "TICL_POLICY_FINALIZE_2D_FASTPATH": "1",
+    "TICL_POLICY_STEP_PROJ_2D": "1",
+    "TICL_POLICY_STEP_LAYER_2D_LOOP": "1",
+    "TICL_POLICY_STEP_TOKEN_ALLOC_OPT": "1",
+    "TICL_POLICY_TOKEN_LAYOUT_PREPACK": "1",
+    "TICL_POLICY_ASSUME_FINITE_INPUTS": "1",
+    "TICL_POLICY_FUSED_TRANSITION_GENERATOR": "1",
+    "TICL_POLICY_TRANSITION_STREAM_FUSION": "1",
+    "TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM": "1",
+    "TICL_POLICY_ROLLOUT_NOISE_STREAM": "1",
+    "TICL_POLICY_ENVGEN_BMM": "1",
+    "TICL_POLICY_TAIL_FREEZE": "1",
+    "TICL_POLICY_TAIL_FREEZE_CLONE_APPEND": "1",
+    "TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_GUARD": "1",
+    "TICL_POLICY_STATE_POSTPROCESS_INPLACE": "1",
+    "TICL_POLICY_REWARD_MASK_BUFFER_REUSE": "1",
+    "TICL_POLICY_FLASH_PREFIX_ASYNC": "1",
+    "TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH": "1",
+    "TICL_POLICY_INPLACE_FLASH_PREFIX": "1",
+    "TICL_POLICY_FORCE_FLASH_SINGLE_PAGE": "1",
+    "TICL_POLICY_INPLACE_PAGED_KV": "1",
+    "TICL_POLICY_TBPTT_STREAM_MERGE_AUTO": "1",
+    "TICL_POLICY_OOM_FAIL_FAST": "1",
+}
+for _k, _v in _POSITIVE_POLICY_OPT_DEFAULTS.items():
+    os.environ.setdefault(_k, _v)
+
 from ticl.model_builder import get_model
-from ticl.utils import init_device, get_model_string, synetune_handle_checkpoint, make_training_callback
+from ticl.utils import (
+    init_device,
+    get_model_string,
+    synetune_handle_checkpoint,
+    make_training_callback,
+    enforce_path_filename_limit,
+)
 from ticl.config_utils import compare_dicts, flatten_dict, update_config
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.model_configs import get_model_default_config
@@ -62,6 +100,47 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         if "optimizer" not in config:
             config["optimizer"] = {}
         config["optimizer"]["pg_env_replay_steps"] = args.optimizer.pg_env_replay_steps
+    env_override_flags = (
+        ("--anti-explosion-vanishing-v2-enabled", "anti_explosion_vanishing_v2_enabled"),
+        ("--anti-explosion-vanishing-v2-lambda", "anti_explosion_vanishing_v2_lambda"),
+        ("--anti-explosion-vanishing-v2-gain-lo", "anti_explosion_vanishing_v2_gain_lo"),
+        ("--anti-explosion-vanishing-v2-gain-hi", "anti_explosion_vanishing_v2_gain_hi"),
+        ("--anti-explosion-vanishing-v2-huber-delta", "anti_explosion_vanishing_v2_huber_delta"),
+        ("--anti-explosion-vanishing-v2-eps", "anti_explosion_vanishing_v2_eps"),
+        ("--anti-explosion-vanishing-v2-detach-reference", "anti_explosion_vanishing_v2_detach_reference"),
+        ("--anti-explosion-vanishing-v3-enabled", "anti_explosion_vanishing_v3_enabled"),
+        ("--anti-explosion-vanishing-v3-lambda-drift", "anti_explosion_vanishing_v3_lambda_drift"),
+        ("--anti-explosion-vanishing-v3-lambda-tail", "anti_explosion_vanishing_v3_lambda_tail"),
+        ("--anti-explosion-vanishing-v3-gain-lo", "anti_explosion_vanishing_v3_gain_lo"),
+        ("--anti-explosion-vanishing-v3-gain-hi", "anti_explosion_vanishing_v3_gain_hi"),
+        ("--anti-explosion-vanishing-v3-tail-tau", "anti_explosion_vanishing_v3_tail_tau"),
+        ("--anti-explosion-vanishing-v3-eps", "anti_explosion_vanishing_v3_eps"),
+        ("--anti-explosion-vanishing-v3-detach-reference", "anti_explosion_vanishing_v3_detach_reference"),
+        ("--anti-explosion-vanishing-v4-enabled", "anti_explosion_vanishing_v4_enabled"),
+        ("--anti-explosion-vanishing-v4-lambda-drift", "anti_explosion_vanishing_v4_lambda_drift"),
+        ("--anti-explosion-vanishing-v4-lambda-tail", "anti_explosion_vanishing_v4_lambda_tail"),
+        ("--anti-explosion-vanishing-v4-gain-lo", "anti_explosion_vanishing_v4_gain_lo"),
+        ("--anti-explosion-vanishing-v4-gain-hi", "anti_explosion_vanishing_v4_gain_hi"),
+        ("--anti-explosion-vanishing-v4-tail-tau", "anti_explosion_vanishing_v4_tail_tau"),
+        ("--anti-explosion-vanishing-v4-eps", "anti_explosion_vanishing_v4_eps"),
+        ("--anti-explosion-vanishing-v4-detach-reference", "anti_explosion_vanishing_v4_detach_reference"),
+        ("--anti-explosion-vanishing-v4-highway-ratio", "anti_explosion_vanishing_v4_highway_ratio"),
+        ("--anti-explosion-vanishing-v4-update-scale", "anti_explosion_vanishing_v4_update_scale"),
+        ("--anti-explosion-vanishing-v4-update-clip", "anti_explosion_vanishing_v4_update_clip"),
+        ("--anti-explosion-vanishing-v5-enabled", "anti_explosion_vanishing_v5_enabled"),
+        ("--anti-explosion-vanishing-v5-target-std", "anti_explosion_vanishing_v5_target_std"),
+        ("--anti-explosion-vanishing-v5-scale-lo", "anti_explosion_vanishing_v5_scale_lo"),
+        ("--anti-explosion-vanishing-v5-scale-hi", "anti_explosion_vanishing_v5_scale_hi"),
+        ("--anti-explosion-vanishing-v5-eps", "anti_explosion_vanishing_v5_eps"),
+        ("--anti-explosion-vanishing-v5-detach-reference", "anti_explosion_vanishing_v5_detach_reference"),
+    )
+    for flag, key in env_override_flags:
+        if _cli_flag_is_set(argv, flag):
+            if "prior" not in config:
+                config["prior"] = {}
+            if "environment" not in config["prior"]:
+                config["prior"]["environment"] = {}
+            config["prior"]["environment"][key] = getattr(args.prior.environment, key)
     profiler_flags = (
         ("--train-profiler-enabled", "train_profiler_enabled"),
         ("--train-profiler-output-path", "train_profiler_output_path"),
@@ -87,10 +166,13 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-kernel-profiler-log-every-batches", "train_kernel_profiler_log_every_batches"),
         ("--train-kernel-profiler-export-trace", "train_kernel_profiler_export_trace"),
         ("--train-kernel-profiler-summary-top-k", "train_kernel_profiler_summary_top_k"),
+        ("--pg-oom-fail-fast", "pg_oom_fail_fast"),
         ("--pg-compile-observe-recompiles", "pg_compile_observe_recompiles"),
         ("--pg-compile-observe-log-every-batches", "pg_compile_observe_log_every_batches"),
         ("--pg-compile-observe-output-path", "pg_compile_observe_output_path"),
         ("--pg-compile-observe-reset-after-warmup", "pg_compile_observe_reset_after_warmup"),
+        ("--pg-phase-log-every-batches", "pg_phase_log_every_batches"),
+        ("--pg-phase-log-file", "pg_phase_log_file"),
     )
     for flag, key in profiler_flags:
         if _cli_flag_is_set(argv, flag):
@@ -218,6 +300,23 @@ def main(argv, extra_config=None):
         torch.autograd.set_detect_anomaly(True)
 
     model_string = get_model_string(config, num_gpus, device, parser)
+    pg_phase_log_file_default = os.path.join(base_path, "log", f"{model_string}.log")
+    if "optimizer" not in config:
+        config["optimizer"] = {}
+    pg_phase_log_file_cfg = config["optimizer"].get("pg_phase_log_file", None)
+    if pg_phase_log_file_cfg is None or str(pg_phase_log_file_cfg).strip() == "":
+        config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_default
+    pg_phase_log_file_effective = config["optimizer"].get("pg_phase_log_file", None)
+    if pg_phase_log_file_effective is not None and str(pg_phase_log_file_effective).strip() != "":
+        pg_phase_log_file_safe = enforce_path_filename_limit(pg_phase_log_file_effective)
+        if str(pg_phase_log_file_safe) != str(pg_phase_log_file_effective):
+            print(
+                "[filename-limit] pg_phase_log_file basename was truncated to fit filesystem limits:"
+                f" {pg_phase_log_file_safe}"
+            )
+        config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_safe
+    if config["optimizer"].get("pg_phase_log_every_batches", None) is None:
+        config["optimizer"]["pg_phase_log_every_batches"] = 1
     save_callback = make_training_callback(
         save_every, 
         model_string, 
