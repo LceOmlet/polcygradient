@@ -101,7 +101,13 @@ class TabPFN(nn.Module):
             "transformer_layer_attn_core_wall_s": 0.0,
             "transformer_layer_finalize_wall_s": 0.0,
             "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_linear_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_norm_wall_s": 0.0,
             "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear1_act_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear2_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_residual_norm_wall_s": 0.0,
             "transformer_layer_finalize_compiled_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
@@ -139,7 +145,13 @@ class TabPFN(nn.Module):
             "transformer_layer_attn_core_wall_s": 0.0,
             "transformer_layer_finalize_wall_s": 0.0,
             "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_linear_wall_s": 0.0,
+            "transformer_layer_finalize_attn_outproj_norm_wall_s": 0.0,
             "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear1_act_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_linear2_wall_s": 0.0,
+            "transformer_layer_finalize_ffn_residual_norm_wall_s": 0.0,
             "transformer_layer_finalize_compiled_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
@@ -368,8 +380,26 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_finalize_attn_outproj_wall_s"] += float(
                     transformer_layer_profile.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
                 )
+                stats["transformer_layer_finalize_attn_outproj_linear_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_linear_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_attn_outproj_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_norm_wall_s", 0.0) or 0.0
+                )
                 stats["transformer_layer_finalize_ffn_wall_s"] += float(
                     transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear1_act_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear1_act_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear2_residual_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear2_residual_norm_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear2_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear2_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_residual_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_residual_norm_wall_s", 0.0) or 0.0
                 )
                 stats["transformer_layer_finalize_compiled_wall_s"] += float(
                     transformer_layer_profile.get("finalize_compiled_wall_s", 0.0) or 0.0
@@ -604,8 +634,26 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_finalize_attn_outproj_wall_s"] += float(
                     transformer_layer_profile.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
                 )
+                stats["transformer_layer_finalize_attn_outproj_linear_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_linear_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_attn_outproj_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_attn_outproj_norm_wall_s", 0.0) or 0.0
+                )
                 stats["transformer_layer_finalize_ffn_wall_s"] += float(
                     transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear1_act_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear1_act_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear2_residual_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear2_residual_norm_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_linear2_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_linear2_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_ffn_residual_norm_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_ffn_residual_norm_wall_s", 0.0) or 0.0
                 )
                 stats["transformer_layer_finalize_compiled_wall_s"] += float(
                     transformer_layer_profile.get("finalize_compiled_wall_s", 0.0) or 0.0

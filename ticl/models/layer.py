@@ -255,6 +255,15 @@ class TransformerEncoderLayer(Module):
         self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
         finalize_2d_flag = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
         self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
+        finalize_2d_default_gelu_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH", "0")
+        ).strip().lower()
+        self.finalize_2d_zero_dropout_postnorm_gelu_fastpath = finalize_2d_default_gelu_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
         finalize_compile_flag = str(
             os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE", "0")
         ).strip().lower()
@@ -276,6 +285,7 @@ class TransformerEncoderLayer(Module):
         ).strip().lower()
         self.finalize_torch_compile_dynamic = finalize_compile_dynamic_flag in {"1", "true", "yes", "on"}
         self._finalize_2d_compiled = None
+        self._finalize_2d_compiled_key = None
         self._finalize_2d_compile_failed = False
         cache_reuse_flag = str(os.environ.get("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")).strip().lower()
         self.cache_container_reuse = cache_reuse_flag not in {"0", "false", "no", "off"}
@@ -289,7 +299,13 @@ class TransformerEncoderLayer(Module):
             "attn_core_wall_s": 0.0,
             "finalize_wall_s": 0.0,
             "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_attn_outproj_linear_wall_s": 0.0,
+            "finalize_attn_outproj_norm_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_ffn_linear1_act_wall_s": 0.0,
+            "finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "finalize_ffn_linear2_wall_s": 0.0,
+            "finalize_ffn_residual_norm_wall_s": 0.0,
             "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
@@ -310,6 +326,8 @@ class TransformerEncoderLayer(Module):
         }
 
         self.activation = _get_activation_fn(activation)
+        activation_name = str(activation).strip().lower() if isinstance(activation, str) else ""
+        self.activation_is_gelu = (activation_name == "gelu") or (self.activation is F.gelu)
 
     def consume_forward_step_profile(self):
         if not bool(self.layer_step_profile_enabled):
@@ -323,7 +341,13 @@ class TransformerEncoderLayer(Module):
             "attn_core_wall_s": 0.0,
             "finalize_wall_s": 0.0,
             "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_attn_outproj_linear_wall_s": 0.0,
+            "finalize_attn_outproj_norm_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_ffn_linear1_act_wall_s": 0.0,
+            "finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "finalize_ffn_linear2_wall_s": 0.0,
+            "finalize_ffn_residual_norm_wall_s": 0.0,
             "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
@@ -389,12 +413,26 @@ class TransformerEncoderLayer(Module):
     def finalize_compile_active(self):
         return bool(self.finalize_torch_compile) and callable(getattr(torch, "compile", None))
 
+    def _finalize_2d_zero_dropout_postnorm_gelu_active(self):
+        return (
+            bool(self.finalize_2d_zero_dropout_postnorm_gelu_fastpath)
+            and (not self.pre_norm)
+            and bool(self.activation_is_gelu)
+            and float(self.dropout1.p) <= 0.0
+            and float(self.dropout.p) <= 0.0
+            and float(self.dropout2.p) <= 0.0
+        )
+
     def _resolve_finalize_2d_callable(self):
         eager_fn = self._finalize_forward_step_2d_eager
+        eager_key = "generic"
+        if self._finalize_2d_zero_dropout_postnorm_gelu_active():
+            eager_fn = self._finalize_forward_step_2d_zero_dropout_postnorm_gelu_eager
+            eager_key = "zero_dropout_postnorm_gelu"
         if (not self.finalize_compile_active()) or self._finalize_2d_compile_failed or _is_torch_compiling():
             return eager_fn, False
         compiled_fn = self._finalize_2d_compiled
-        if compiled_fn is None:
+        if (compiled_fn is None) or (self._finalize_2d_compiled_key != eager_key):
             try:
                 compiled_fn = torch.compile(
                     eager_fn,
@@ -407,6 +445,7 @@ class TransformerEncoderLayer(Module):
                 self._finalize_2d_compile_failed = True
                 compiled_fn = None
             self._finalize_2d_compiled = compiled_fn
+            self._finalize_2d_compiled_key = eager_key if compiled_fn is not None else None
         if compiled_fn is None:
             return eager_fn, False
         return compiled_fn, True
@@ -474,33 +513,49 @@ class TransformerEncoderLayer(Module):
             )
         return src
 
-    def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
-        profile_enabled = self._step_profile_enabled_now()
-        outproj_t0 = time.perf_counter() if profile_enabled else None
-        input_was_3d = src_step.ndim == 3
-        if input_was_3d:
-            src_step_2d = src_step.squeeze(0)
-            src_step_3d = src_step
-        else:
-            src_step_2d = src_step
-            src_step_3d = src_step.unsqueeze(0)
-        use_2d_fastpath = bool(self.finalize_2d_fastpath) and int(attn_bhld.shape[2]) == 1
-        if use_2d_fastpath:
-            # forward_step hot path uses single-token query (L=1); keep
-            # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
-            attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
-            finalize_2d_fn, finalize_2d_compiled = self._resolve_finalize_2d_callable()
-            compiled_t0 = time.perf_counter() if (profile_enabled and bool(finalize_2d_compiled)) else None
-            src = finalize_2d_fn(src_step_2d, attn_bld)
-            compiled_dt = (time.perf_counter() - compiled_t0) if compiled_t0 is not None else 0.0
-            if profile_enabled and bool(finalize_2d_compiled):
-                self._layer_step_profile_stats["finalize_compiled_wall_s"] += float(compiled_dt)
-            return src.unsqueeze(0) if input_was_3d else src
-        else:
-            attn_bld = self._merge_heads(attn_bhld)
-            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
-            src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
-            src = src_step_3d + self.dropout1(src2)
+    def _finalize_forward_step_2d_zero_dropout_postnorm_gelu_eager(
+        self,
+        src_step_2d: Tensor,
+        attn_step_2d: Tensor,
+    ):
+        # This is an exact eager specialization for the dominant policy-step
+        # setting: single-token finalize, zero dropout, post-norm, GELU.
+        src = src_step_2d + F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        src = F.layer_norm(
+            src,
+            self.norm1.normalized_shape,
+            self.norm1.weight,
+            self.norm1.bias,
+            self.norm1.eps,
+        )
+        src2_ff = F.linear(src, self.linear1.weight, self.linear1.bias)
+        src2_ff = F.gelu(src2_ff)
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        src = src + src2_ff
+        return F.layer_norm(
+            src,
+            self.norm2.normalized_shape,
+            self.norm2.weight,
+            self.norm2.bias,
+            self.norm2.eps,
+        )
+
+    def _finalize_forward_step_2d_eager_profiled(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        outproj_linear_t0 = time.perf_counter()
+        attn_step_2d = F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        if self.training and float(self.dropout1.p) > 0.0:
+            attn_step_2d = F.dropout(attn_step_2d, p=float(self.dropout1.p), training=True)
+        src = src_step_2d + attn_step_2d
+        outproj_linear_dt = time.perf_counter() - outproj_linear_t0
+        outproj_norm_t0 = time.perf_counter()
         if not self.pre_norm:
             src = F.layer_norm(
                 src,
@@ -509,9 +564,10 @@ class TransformerEncoderLayer(Module):
                 self.norm1.bias,
                 self.norm1.eps,
             )
-        outproj_dt = (time.perf_counter() - outproj_t0) if outproj_t0 is not None else 0.0
+        outproj_norm_dt = time.perf_counter() - outproj_norm_t0
+        outproj_dt = outproj_linear_dt + outproj_norm_dt
 
-        ffn_t0 = time.perf_counter() if profile_enabled else None
+        ffn_linear1_act_t0 = time.perf_counter()
         if self.pre_norm:
             src_ff = F.layer_norm(
                 src,
@@ -526,9 +582,189 @@ class TransformerEncoderLayer(Module):
         src2_ff = self.activation(src2_ff)
         if self.training and float(self.dropout.p) > 0.0:
             src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+        ffn_linear1_act_dt = time.perf_counter() - ffn_linear1_act_t0
+        ffn_linear2_t0 = time.perf_counter()
         src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
         if self.training and float(self.dropout2.p) > 0.0:
             src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+        ffn_linear2_dt = time.perf_counter() - ffn_linear2_t0
+        ffn_residual_norm_t0 = time.perf_counter()
+        src = src + src2_ff
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        ffn_residual_norm_dt = time.perf_counter() - ffn_residual_norm_t0
+        ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+        ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
+        return (
+            src,
+            outproj_dt,
+            ffn_dt,
+            outproj_linear_dt,
+            outproj_norm_dt,
+            ffn_linear1_act_dt,
+            ffn_linear2_residual_norm_dt,
+            ffn_linear2_dt,
+            ffn_residual_norm_dt,
+        )
+
+    def _finalize_forward_step_2d_zero_dropout_postnorm_gelu_profiled(
+        self,
+        src_step_2d: Tensor,
+        attn_step_2d: Tensor,
+    ):
+        outproj_linear_t0 = time.perf_counter()
+        src = src_step_2d + F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        outproj_linear_dt = time.perf_counter() - outproj_linear_t0
+        outproj_norm_t0 = time.perf_counter()
+        src = F.layer_norm(
+            src,
+            self.norm1.normalized_shape,
+            self.norm1.weight,
+            self.norm1.bias,
+            self.norm1.eps,
+        )
+        outproj_norm_dt = time.perf_counter() - outproj_norm_t0
+        outproj_dt = outproj_linear_dt + outproj_norm_dt
+
+        ffn_linear1_act_t0 = time.perf_counter()
+        src2_ff = F.linear(src, self.linear1.weight, self.linear1.bias)
+        src2_ff = F.gelu(src2_ff)
+        ffn_linear1_act_dt = time.perf_counter() - ffn_linear1_act_t0
+        ffn_linear2_t0 = time.perf_counter()
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        ffn_linear2_dt = time.perf_counter() - ffn_linear2_t0
+        ffn_residual_norm_t0 = time.perf_counter()
+        src = src + src2_ff
+        src = F.layer_norm(
+            src,
+            self.norm2.normalized_shape,
+            self.norm2.weight,
+            self.norm2.bias,
+            self.norm2.eps,
+        )
+        ffn_residual_norm_dt = time.perf_counter() - ffn_residual_norm_t0
+        ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+        ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
+        return (
+            src,
+            outproj_dt,
+            ffn_dt,
+            outproj_linear_dt,
+            outproj_norm_dt,
+            ffn_linear1_act_dt,
+            ffn_linear2_residual_norm_dt,
+            ffn_linear2_dt,
+            ffn_residual_norm_dt,
+        )
+
+    def _finalize_forward_step_2d_profiled(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        if self._finalize_2d_zero_dropout_postnorm_gelu_active():
+            return self._finalize_forward_step_2d_zero_dropout_postnorm_gelu_profiled(
+                src_step_2d,
+                attn_step_2d,
+            )
+        return self._finalize_forward_step_2d_eager_profiled(src_step_2d, attn_step_2d)
+
+    def _finalize_forward_step_2d_direct(self, src_step_2d: Tensor, attn_step_2d: Tensor, profile_enabled: bool):
+        finalize_2d_fn, finalize_2d_compiled = self._resolve_finalize_2d_callable()
+        stats = self._layer_step_profile_stats if profile_enabled else None
+        if profile_enabled and (not bool(finalize_2d_compiled)):
+            (
+                src,
+                outproj_dt,
+                ffn_dt,
+                outproj_linear_dt,
+                outproj_norm_dt,
+                ffn_linear1_act_dt,
+                ffn_linear2_residual_norm_dt,
+                ffn_linear2_dt,
+                ffn_residual_norm_dt,
+            ) = self._finalize_forward_step_2d_profiled(src_step_2d, attn_step_2d)
+            if stats is not None:
+                stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
+                stats["finalize_attn_outproj_linear_wall_s"] += float(outproj_linear_dt)
+                stats["finalize_attn_outproj_norm_wall_s"] += float(outproj_norm_dt)
+                stats["finalize_ffn_wall_s"] += float(ffn_dt)
+                stats["finalize_ffn_linear1_act_wall_s"] += float(ffn_linear1_act_dt)
+                stats["finalize_ffn_linear2_residual_norm_wall_s"] += float(ffn_linear2_residual_norm_dt)
+                stats["finalize_ffn_linear2_wall_s"] += float(ffn_linear2_dt)
+                stats["finalize_ffn_residual_norm_wall_s"] += float(ffn_residual_norm_dt)
+            return src
+        compiled_t0 = time.perf_counter() if (profile_enabled and bool(finalize_2d_compiled)) else None
+        src = finalize_2d_fn(src_step_2d, attn_step_2d)
+        if stats is not None and compiled_t0 is not None:
+            stats["finalize_compiled_wall_s"] += float(time.perf_counter() - compiled_t0)
+        return src
+
+    def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
+        profile_enabled = self._step_profile_enabled_now()
+        outproj_linear_t0 = time.perf_counter() if profile_enabled else None
+        input_was_3d = src_step.ndim == 3
+        if input_was_3d:
+            src_step_2d = src_step.squeeze(0)
+            src_step_3d = src_step
+        else:
+            src_step_2d = src_step
+            src_step_3d = src_step.unsqueeze(0)
+        use_2d_fastpath = bool(self.finalize_2d_fastpath) and int(attn_bhld.shape[2]) == 1
+        if use_2d_fastpath:
+            # forward_step hot path uses single-token query (L=1); keep
+            # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
+            attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
+            src = self._finalize_forward_step_2d_direct(src_step_2d, attn_bld, profile_enabled=profile_enabled)
+            return src.unsqueeze(0) if input_was_3d else src
+        else:
+            attn_bld = self._merge_heads(attn_bhld)
+            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
+            src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
+            src = src_step_3d + self.dropout1(src2)
+        outproj_linear_dt = (time.perf_counter() - outproj_linear_t0) if outproj_linear_t0 is not None else 0.0
+        outproj_norm_t0 = time.perf_counter() if profile_enabled else None
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm1.normalized_shape,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        outproj_norm_dt = (time.perf_counter() - outproj_norm_t0) if outproj_norm_t0 is not None else 0.0
+        outproj_dt = outproj_linear_dt + outproj_norm_dt
+
+        ffn_linear1_act_t0 = time.perf_counter() if profile_enabled else None
+        if self.pre_norm:
+            src_ff = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        else:
+            src_ff = src
+        src2_ff = F.linear(src_ff, self.linear1.weight, self.linear1.bias)
+        src2_ff = self.activation(src2_ff)
+        if self.training and float(self.dropout.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+        ffn_linear1_act_dt = (
+            time.perf_counter() - ffn_linear1_act_t0
+        ) if ffn_linear1_act_t0 is not None else 0.0
+        ffn_linear2_t0 = time.perf_counter() if profile_enabled else None
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        if self.training and float(self.dropout2.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+        ffn_linear2_dt = (time.perf_counter() - ffn_linear2_t0) if ffn_linear2_t0 is not None else 0.0
+        ffn_residual_norm_t0 = time.perf_counter() if profile_enabled else None
         src = src + src2_ff
 
         if not self.pre_norm:
@@ -539,11 +775,21 @@ class TransformerEncoderLayer(Module):
                 self.norm2.bias,
                 self.norm2.eps,
             )
-        ffn_dt = (time.perf_counter() - ffn_t0) if ffn_t0 is not None else 0.0
+        ffn_residual_norm_dt = (
+            time.perf_counter() - ffn_residual_norm_t0
+        ) if ffn_residual_norm_t0 is not None else 0.0
+        ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+        ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
         if profile_enabled:
             stats = self._layer_step_profile_stats
             stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
+            stats["finalize_attn_outproj_linear_wall_s"] += float(outproj_linear_dt)
+            stats["finalize_attn_outproj_norm_wall_s"] += float(outproj_norm_dt)
             stats["finalize_ffn_wall_s"] += float(ffn_dt)
+            stats["finalize_ffn_linear1_act_wall_s"] += float(ffn_linear1_act_dt)
+            stats["finalize_ffn_linear2_residual_norm_wall_s"] += float(ffn_linear2_residual_norm_dt)
+            stats["finalize_ffn_linear2_wall_s"] += float(ffn_linear2_dt)
+            stats["finalize_ffn_residual_norm_wall_s"] += float(ffn_residual_norm_dt)
         return src if input_was_3d else src.squeeze(0)
 
     def _forward_step_attn_ff(self, src_step: Tensor, q_bhld: Tensor, k_all: Tensor, v_all: Tensor):
@@ -1052,6 +1298,7 @@ class TransformerEncoderLayer(Module):
             raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
         attn_bhld = running_num / running_denom.clamp_min(1e-12)
         return self._finalize_forward_step(src_step, attn_bhld)
+
 
     def _resolve_paged_attn_train_mode(self, q_bhld: Tensor):
         train_mode = self.paged_attn_train_mode
@@ -2125,7 +2372,13 @@ class TransformerEncoderSimple(Module):
         attn_core_wall_s = 0.0
         finalize_wall_s = 0.0
         finalize_attn_outproj_wall_s = 0.0
+        finalize_attn_outproj_linear_wall_s = 0.0
+        finalize_attn_outproj_norm_wall_s = 0.0
         finalize_ffn_wall_s = 0.0
+        finalize_ffn_linear1_act_wall_s = 0.0
+        finalize_ffn_linear2_residual_norm_wall_s = 0.0
+        finalize_ffn_linear2_wall_s = 0.0
+        finalize_ffn_residual_norm_wall_s = 0.0
         finalize_compiled_wall_s = 0.0
         paged_path_single_page = 0
         paged_path_flash_prefix = 0
@@ -2161,7 +2414,25 @@ class TransformerEncoderSimple(Module):
             finalize_attn_outproj_wall_s += float(
                 layer_stats.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
             )
+            finalize_attn_outproj_linear_wall_s += float(
+                layer_stats.get("finalize_attn_outproj_linear_wall_s", 0.0) or 0.0
+            )
+            finalize_attn_outproj_norm_wall_s += float(
+                layer_stats.get("finalize_attn_outproj_norm_wall_s", 0.0) or 0.0
+            )
             finalize_ffn_wall_s += float(layer_stats.get("finalize_ffn_wall_s", 0.0) or 0.0)
+            finalize_ffn_linear1_act_wall_s += float(
+                layer_stats.get("finalize_ffn_linear1_act_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_linear2_residual_norm_wall_s += float(
+                layer_stats.get("finalize_ffn_linear2_residual_norm_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_linear2_wall_s += float(
+                layer_stats.get("finalize_ffn_linear2_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_residual_norm_wall_s += float(
+                layer_stats.get("finalize_ffn_residual_norm_wall_s", 0.0) or 0.0
+            )
             finalize_compiled_wall_s += float(layer_stats.get("finalize_compiled_wall_s", 0.0) or 0.0)
             paged_path_single_page += int(layer_stats.get("paged_path_single_page", 0) or 0)
             paged_path_flash_prefix += int(layer_stats.get("paged_path_flash_prefix", 0) or 0)
@@ -2191,7 +2462,13 @@ class TransformerEncoderSimple(Module):
             "attn_core_wall_s": float(attn_core_wall_s),
             "finalize_wall_s": float(finalize_wall_s),
             "finalize_attn_outproj_wall_s": float(finalize_attn_outproj_wall_s),
+            "finalize_attn_outproj_linear_wall_s": float(finalize_attn_outproj_linear_wall_s),
+            "finalize_attn_outproj_norm_wall_s": float(finalize_attn_outproj_norm_wall_s),
             "finalize_ffn_wall_s": float(finalize_ffn_wall_s),
+            "finalize_ffn_linear1_act_wall_s": float(finalize_ffn_linear1_act_wall_s),
+            "finalize_ffn_linear2_residual_norm_wall_s": float(finalize_ffn_linear2_residual_norm_wall_s),
+            "finalize_ffn_linear2_wall_s": float(finalize_ffn_linear2_wall_s),
+            "finalize_ffn_residual_norm_wall_s": float(finalize_ffn_residual_norm_wall_s),
             "finalize_compiled_wall_s": float(finalize_compiled_wall_s),
             "paged_path_single_page": int(paged_path_single_page),
             "paged_path_flash_prefix": int(paged_path_flash_prefix),

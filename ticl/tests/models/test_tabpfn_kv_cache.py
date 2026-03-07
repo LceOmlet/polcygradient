@@ -345,6 +345,60 @@ def test_forward_policy_step_finalize_compile_preserves_semantics(monkeypatch):
         assert torch.allclose(grad_base, grad_compiled, atol=1e-5, rtol=1e-4)
 
 
+def test_forward_policy_step_finalize_default_eager_fastpath_preserves_semantics(monkeypatch):
+    torch.manual_seed(44)
+    monkeypatch.setenv("TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH", "0")
+    model_base = _build_model()
+    monkeypatch.setenv("TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH", "1")
+    model_fast = _build_model()
+    model_fast.load_state_dict(model_base.state_dict())
+    model_base.train()
+    model_fast.train()
+
+    assert not model_base.transformer_encoder.layers[0]._finalize_2d_zero_dropout_postnorm_gelu_active()
+    assert model_fast.transformer_encoder.layers[0]._finalize_2d_zero_dropout_postnorm_gelu_active()
+
+    steps = 4
+    x_tokens = torch.randn(steps, 2, 12)
+    y_tokens = torch.randn(steps, 2)
+
+    cache_base = None
+    cache_fast = None
+    outs_base = []
+    outs_fast = []
+    with torch.enable_grad():
+        for t in range(steps):
+            out_base, cache_base = model_base.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_base,
+            )
+            out_fast, cache_fast = model_fast.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_fast,
+            )
+            outs_base.append(out_base)
+            outs_fast.append(out_fast)
+
+    out_base_all = torch.cat(outs_base, dim=0)
+    out_fast_all = torch.cat(outs_fast, dim=0)
+    assert torch.allclose(out_base_all, out_fast_all, atol=1e-5, rtol=1e-4)
+
+    model_base.zero_grad(set_to_none=True)
+    model_fast.zero_grad(set_to_none=True)
+    loss_base = out_base_all.square().mean()
+    loss_fast = out_fast_all.square().mean()
+    loss_base.backward()
+    loss_fast.backward()
+
+    grads_base = [p.grad.detach().clone() for p in model_base.parameters() if p.grad is not None]
+    grads_fast = [p.grad.detach().clone() for p in model_fast.parameters() if p.grad is not None]
+    assert len(grads_base) == len(grads_fast)
+    for grad_base, grad_fast in zip(grads_base, grads_fast):
+        assert torch.allclose(grad_base, grad_fast, atol=1e-5, rtol=1e-4)
+
+
 def test_tabpfn_forward_policy_step_with_max_cache_len_matches_legacy_backward():
     torch.manual_seed(37)
     model_cap = _build_model()

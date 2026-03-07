@@ -2469,3 +2469,1420 @@ Next bottlenecks:
     the first projection or adjacent policy path
 - next family-level target:
   - `gp` input/RFF projection
+
+## 2026-03-07 08:58: GP input/RFF projection active-dim packing still negative
+
+Goal:
+
+- stay strictly on the `gp` input/RFF projection path after the `scm`
+  hidden-stack skyline
+- reduce `gp` rollout forward overhead without returning to grouping,
+  split-branch, or generic ragged side paths
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED`
+  - added an exact active-dim packing path for the `gp` input/RFF projection
+  - kept all variants behind the same opt-in flag; default remains off
+- `ticl/train.py`
+  - startup log now prints `Policy fused transition GP input/RFF fused`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added `gp_input_rff_fused_transition_matches_legacy_dual_semantics`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `gp_input_rff_fused_transition_matches_legacy_dual_semantics`
+  - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+  - `paired_transition_matches_legacy_dual_semantics`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=1`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED=0/1`
+
+Logs:
+
+- baseline, GP input/RFF fused disabled:
+  - `20260307_seeded_batch128_gpinputfused_off.log`
+- exact packed-input + layout-tiled Triton:
+  - `20260307_seeded_batch128_gpinputfused_gather_on.log`
+- exact packed-input + prefix-tiled Triton:
+  - `20260307_seeded_batch128_gpinputfused_prefix_on.log`
+- exact packed-input + dense `batch_affine`:
+  - `20260307_seeded_batch128_gpinputfused_packdense_on.log`
+
+Metrics:
+
+- fused disabled:
+  - `batch_wall_excl_compile_s=118.801`
+  - `batch_wall_excl_compile_per_batch_item_s=0.928134`
+  - `rollout_s=75.089`
+  - `backward_s=43.712`
+  - `rollout_forward_est_s=31.376`
+- packed-input + layout-tiled Triton:
+  - `batch_wall_excl_compile_s=126.011`
+  - `batch_wall_excl_compile_per_batch_item_s=0.984462`
+  - `rollout_s=78.853`
+  - `backward_s=47.158`
+  - `rollout_forward_est_s=31.696`
+- packed-input + prefix-tiled Triton:
+  - `batch_wall_excl_compile_s=128.211`
+  - `batch_wall_excl_compile_per_batch_item_s=1.001648`
+  - `rollout_s=80.179`
+  - `backward_s=48.032`
+  - `rollout_forward_est_s=32.148`
+- packed-input + dense `batch_affine`:
+  - `batch_wall_excl_compile_s=127.897`
+  - `batch_wall_excl_compile_per_batch_item_s=0.999199`
+  - `rollout_s=79.979`
+  - `backward_s=47.918`
+  - `rollout_forward_est_s=32.061`
+
+Outcome:
+
+- no new skyline
+- all three exact active-dim packing variants regressed versus baseline:
+  - layout-tiled Triton: `+6.07%`
+  - prefix-tiled Triton: `+7.92%`
+  - packed-input + dense `batch_affine`: `+7.66%`
+
+Interpretation:
+
+- the `gp` input/RFF hotspot is not dominated by inactive input-width padding or
+  input-index indirection alone
+- even when the packed path is exact and uses dense batched GEMM, forward does
+  not improve:
+  - `31.376 -> 32.061` for the best exact packed-input variant
+- this means the next `gp` mainline target should move deeper than pure input
+  packing:
+  - the remaining cost is more likely in the RFF feature width / downstream
+    projection structure and the dual-packed state/reward execution path
+
+Decision:
+
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED=0` as the default
+- do not commit/push; this is a recorded negative result
+
+Next GP directions:
+
+- first:
+  - profile and target the `gp` post-RFF/output projection path (`phi -> a`)
+    because input packing alone did not move forward wall time
+- second:
+  - if `gp` still needs a fused path, fuse a larger exact subgraph rather than
+    just repacking the input dimension
+
+## 2026-03-07 09:12: GP output projection and larger fused subgraph still negative
+
+Goal:
+
+- stay strictly on the `gp` mainline after the negative input-packing results
+- first target the `phi -> a` output projection directly
+- if that still failed, try a larger exact transition-only fused subgraph
+  without returning to input-packing variants
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED`
+  - added exact prefix-tiled `gp` output projection fastpath for `phi -> a`
+  - added `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH`
+  - added a larger exact `gp` transition-only fused subgraph path:
+    - state branch keeps dense `phi -> a`
+    - reward branch uses exact scalar head dot-product
+    - both branches are executed inside one transition core with preserved
+      dual-noise semantics
+- `ticl/train.py`
+  - startup log now prints:
+    - `Policy fused transition GP output projection fused`
+    - `Policy fused transition GP output subgraph fused`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added:
+    - `gp_output_projection_fused_transition_matches_legacy_dual_semantics`
+    - `gp_output_subgraph_fused_transition_matches_legacy_dual_semantics`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `gp_output_projection_fused_transition_matches_legacy_dual_semantics`
+  - `gp_output_subgraph_fused_transition_matches_legacy_dual_semantics`
+  - `gp_input_rff_fused_transition_matches_legacy_dual_semantics`
+  - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+  - `paired_transition_matches_legacy_dual_semantics`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=1`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- baseline:
+  - `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH=0`
+
+Logs:
+
+- baseline:
+  - `20260307_seeded_batch128_gpinputfused_off.log`
+- output projection fused:
+  - `20260307_seeded_batch128_gpoutputfused_on.log`
+- larger exact GP output subgraph:
+  - `20260307_seeded_batch128_gpoutputsubgraph_on.log`
+
+Metrics:
+
+- baseline:
+  - `batch_wall_excl_compile_s=118.801`
+  - `rollout_s=75.089`
+  - `backward_s=43.712`
+  - `rollout_forward_est_s=31.376`
+- output projection fused:
+  - `batch_wall_excl_compile_s=124.700`
+  - `rollout_s=78.247`
+  - `backward_s=46.453`
+  - `rollout_forward_est_s=31.794`
+- larger exact GP output subgraph:
+  - `batch_wall_excl_compile_s=129.859`
+  - `rollout_s=81.100`
+  - `backward_s=48.760`
+  - `rollout_forward_est_s=32.340`
+
+Outcome:
+
+- no new skyline
+- output projection fused regressed:
+  - `118.801 -> 124.700` (`+4.97%`)
+- larger exact GP output subgraph regressed even more:
+  - `118.801 -> 129.859` (`+9.31%`)
+
+Interpretation:
+
+- this round materially narrows the `gp` search space:
+  - pure input packing already failed
+  - direct `phi -> a` optimization also failed
+  - a larger exact transition-only fused subgraph also failed
+- all three results worsened `rollout_forward_est_s`, so the remaining `gp`
+  bottleneck is not just output padding or graph fragmentation in the output
+  head
+- the next `gp` mainline target should therefore move earlier:
+  - first projection / RFF generation (`x -> W,b -> cos`)
+  - or better observability that measures the first projection and second
+    projection separately under fixed seed
+
+Decision:
+
+- keep all new `gp` output-side flags default-off
+- do not commit/push; this is a recorded negative result
+
+## 2026-03-07 09:44: GP first projection / RFF timing fixed, exact fused path still not a skyline
+
+Goal:
+
+- stay strictly on the `gp` mainline after the negative input/output-side trials
+- target the earlier `x -> W,b -> cos` first projection / RFF generation path
+- improve observability first where needed, but do not return to input-packing or output-projection side paths
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED`
+  - added exact GP first-projection/RFF fused path inside `_build_gp_hetero_batch_fn`
+  - added GP projection stage timing counters (`first_projection_wall_s`, `second_projection_wall_s`)
+  - fixed mixed-family profiling by forcing GP transition groups onto the synchronous path only when
+    `TICL_PROFILE_GP_PROJECTION_TIMING=1`; default hot path is unchanged
+  - added observability counters:
+    - `transition_gp_profile_group_count`
+    - `transition_gp_profile_sync_group_count`
+- `ticl/train.py`
+  - startup log prints `Policy fused transition GP RFF fused`
+  - startup log prints `Policy GP projection timing profile`
+  - `pg-phase` now prints:
+    - `rollout_transition_gp_first_proj_ms`
+    - `rollout_transition_gp_second_proj_ms`
+    - `rollout_transition_gp_proj_calls`
+    - `rollout_transition_gp_rff_fused_calls`
+    - `rollout_transition_gp_profile_groups`
+    - `rollout_transition_gp_profile_sync_groups`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - added `mixed_family_gp_projection_profile_survives_async_rollout`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+
+Mixed-family diagnostic (`TICL_PROFILE_GP_PROJECTION_TIMING=1`):
+
+Log:
+
+- `20260307_seeded_batch128_gpprojtiming_diag_sync.log`
+
+Metrics:
+
+- `batch_wall_excl_compile_s=125.236`
+- `rollout_transition_gp_first_proj_ms=726.82`
+- `rollout_transition_gp_second_proj_ms=377.38`
+- `rollout_transition_gp_proj_calls=1984`
+- `rollout_transition_gp_profile_groups=1`
+- `rollout_transition_gp_profile_sync_groups=1`
+
+Interpretation:
+
+- the earlier missing GP stage timing in mixed-family training batches was an observability problem caused by the
+  async transition-launch path, not absence of GP work
+- under fixed seed, one of the two family groups is GP and only that group is forced synchronous in timing mode
+- on this batch, the GP first projection is the larger share of measured GP projection time:
+  - first projection: `65.8%`
+  - second projection: `34.2%`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=1`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0/1`
+
+Logs:
+
+- baseline, RFF fused disabled:
+  - `20260307_seeded_batch128_gprfffused_off.log`
+- RFF fused enabled, first run:
+  - `20260307_seeded_batch128_gprfffused_on.log`
+- RFF fused enabled, sequential confirm:
+  - `20260307_seeded_batch128_gprfffused_on_seq.log`
+
+Metrics:
+
+- baseline:
+  - `batch_wall_excl_compile_s=127.711`
+  - `rollout_s=80.235`
+  - `backward_s=47.476`
+  - `rollout_forward_est_s=32.759`
+- RFF fused enabled, first run:
+  - `batch_wall_excl_compile_s=124.877`
+  - `rollout_s=78.402`
+  - `backward_s=46.475`
+  - `rollout_forward_est_s=31.927`
+- RFF fused enabled, sequential confirm:
+  - `batch_wall_excl_compile_s=129.967`
+  - `rollout_s=81.318`
+  - `backward_s=48.650`
+  - `rollout_forward_est_s=32.668`
+
+Outcome:
+
+- no new skyline
+- the first `on` run looked positive (`-2.22%`), but the sequential confirm regressed (`+1.77%`)
+- mean of the two `on` runs is `127.422`, only `-0.23%` versus baseline, which is too small and unstable to count
+
+Interpretation:
+
+- the exact GP first-projection/RFF fused path is not yet a robust throughput win on the mixed-family training skyline
+- the new timing proves the `gp` mainline target was chosen correctly: the first projection is indeed heavier than the
+  second projection on the real batch
+- however, the contribution is still only one GP family group inside the mixed batch, so modest improvements are easy to
+  drown in normal end-to-end variance
+
+Decision:
+
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0` as the default
+- keep the new GP projection timing observability in tree
+- do not commit/push; no skyline was confirmed
+
+Next GP directions (ordered by importance):
+
+- highest priority:
+  - optimize inside the first projection itself (`x @ W + b` and cosine application), not broader GP-side graph reshaping
+- second:
+  - if a future exact kernel looks promising, validate it first with the GP timing profile enabled so the GP family share
+    is directly observable before relying on full mixed-batch wall time
+- third:
+  - if mixed-batch variance keeps masking small GP gains, use a fixed GP-only diagnostic to qualify the kernel before
+    returning to the full `rlpfn` skyline
+
+## 2026-03-07 10:06: GP first-projection cos-specific kernel attempt rejected by GP-only steady-state
+
+Goal:
+
+- stay strictly on the `gp` first-projection mainline (`x @ W + b + cos`)
+- do not expand to larger GP subgraphs
+- because mixed-family wall time can hide small GP effects, qualify the candidate with a fixed GP-only diagnostic first
+
+What was tried:
+
+- implemented a cos-specific first-projection fastpath for `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED`
+- the idea was to specialize the first projection kernel and reduce generic activation-path overhead
+- after GP-only steady-state measurement, this kernel was rejected and reverted; only the GP timing observability work remains in tree
+
+Validation:
+
+- after reverting the negative kernel, `py_compile` passed
+- targeted pytest passed:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+
+GP-only diagnostic method:
+
+- fixed `family=gp`
+- `batch_size=128`
+- `n_samples=64`
+- `num_features=432`
+- `TICL_PROFILE_GP_PROJECTION_TIMING=1`
+- same process warmup twice; only the second rollout is reported to avoid Triton first-compile pollution
+
+Logs:
+
+- baseline steady-state:
+  - `20260307_gp_only_rffdiag_off_warm2.txt`
+- candidate steady-state:
+  - `20260307_gp_only_rffdiag_on_warm2.txt`
+
+Metrics:
+
+- baseline steady-state:
+  - `wall_s=0.606313`
+  - `transition_wall_ms=108.141`
+  - `gp_first_proj_ms=9.110`
+  - `gp_second_proj_ms=5.969`
+  - `gp_proj_calls=64`
+- candidate steady-state:
+  - `wall_s=0.816237`
+  - `transition_wall_ms=315.255`
+  - `gp_first_proj_ms=237.004`
+  - `gp_second_proj_ms=6.706`
+  - `gp_proj_calls=64`
+
+Outcome:
+
+- rejected before full `rlpfn` A/B
+- GP-only steady-state already regressed badly:
+  - rollout wall: `0.606313 -> 0.816237` (`+34.62%`)
+  - transition wall: `108.141 -> 315.255` (`+191.53%`)
+  - first projection wall: `9.110 -> 237.004` (`+2501.47%`)
+- second projection stayed near baseline, confirming the regression is inside the attempted first-projection kernel itself
+
+Interpretation:
+
+- this was not a mixed-family masking problem; the candidate kernel is intrinsically worse even in GP-only steady-state
+- compile pollution was checked explicitly by warming inside the same process; the regression persisted
+- therefore there was no reason to spend another full fixed-seed `python -m ticl.fit_model rlpfn` run on this kernel
+
+Decision:
+
+- revert the cos-specific GP first-projection kernel attempt
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0` as the default
+- keep the GP projection timing observability changes, since they are now required to screen future GP kernels correctly
+
+Next GP directions:
+
+- first:
+  - keep using `TICL_PROFILE_GP_PROJECTION_TIMING=1` as the gate before any full `rlpfn` benchmark
+- second:
+  - target cheaper first-projection changes than a custom Triton rewrite, for example launch-shape tuning or better reuse inside the existing generic tiled kernel path
+- third:
+  - only return to full mixed-family skyline once GP-only steady-state shows a clear first-projection win
+
+## 2026-03-07 10:42: GP first-projection generic tiled launch-shape tuning rejected by GP-only steady-state
+
+Goal:
+
+- stay strictly on the `gp` first-projection mainline
+- do not add a new kernel family
+- only tune the existing generic tiled path used by `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED`
+- keep using `TICL_PROFILE_GP_PROJECTION_TIMING=1` as the gate before any full `rlpfn` run
+
+Code changes kept in tree:
+
+- the generic tiled autograd wrappers now accept runtime `block_o`, `block_k`, and `num_warps`
+- the `gp` RFF fused path now reads:
+  - `TICL_POLICY_GP_RFF_BLOCK_O`
+  - `TICL_POLICY_GP_RFF_BLOCK_K`
+  - `TICL_POLICY_GP_RFF_NUM_WARPS`
+- these only tune the existing generic tiled kernels; no new Triton algorithm was added
+- training startup now prints the active GP RFF tile config
+- the GPU-only GP RFF semantics test is now explicitly skipped on CPU-only machines
+
+Validation:
+
+- `py_compile` passed
+- targeted pytest passed in the current sandbox:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+  - both skipped cleanly without CUDA instead of failing spuriously
+
+Important observability correction:
+
+- a first GP-only sweep was invalid as a gate:
+  - `20260307_gp_only_rff_tile_sweep.jsonl`
+  - `20260307_gp_only_rff_tile_sweep_family.jsonl`
+- reason:
+  - passing `env_seeds_override` / `rollout_seeds_override` into `rollout_with_policy` causes
+    `EnvironmentPrior._sample_environment_family_coarse_batch(...)` to build per-sample generators
+  - that disables the fused `transition_generator` path entirely (`generators is not None`)
+  - symptom in the invalid logs:
+    - `gp_rff_fused_calls=0`
+    - `gp_proj_calls=0` or `gp_first_proj_ms=0`
+- decision:
+  - do not use strict seed overrides for this GP-only gate
+  - instead, fix the sampled `h_list` and reseed the process before each config so the fused path remains active
+
+Valid GP-only steady-state method:
+
+- `family=gp` only
+- `batch_size=128`
+- `n_samples=64`
+- `num_features=432`
+- fixed sampled `h_list` with 4 repeated GP structures
+- same process warmup twice; only the second rollout is reported
+- `TICL_PROFILE_ROLLOUT_TIMING=1`
+- `TICL_PROFILE_GP_PROJECTION_TIMING=1`
+- valid log:
+  - `20260307_gp_only_rff_tile_sweep_family_fused.jsonl`
+
+Representative sampled structures:
+
+- sample 1:
+  - `state_dim=311`
+  - `obs_dim=230`
+  - `action_dim=24`
+  - `noise_dim=24`
+  - `zero_pad_dim=353`
+  - `gp_rff_features=154`
+- sample 2:
+  - `state_dim=50`
+  - `obs_dim=209`
+  - `action_dim=11`
+  - `noise_dim=24`
+  - `zero_pad_dim=376`
+  - `gp_rff_features=79`
+- sample 3:
+  - `state_dim=31`
+  - `obs_dim=29`
+  - `action_dim=29`
+  - `noise_dim=39`
+  - `zero_pad_dim=95`
+  - `gp_rff_features=213`
+- sample 4:
+  - `state_dim=369`
+  - `obs_dim=69`
+  - `action_dim=22`
+  - `noise_dim=32`
+  - `zero_pad_dim=191`
+  - `gp_rff_features=186`
+
+Results:
+
+- baseline (`off`):
+  - `wall_s=0.501950`
+  - `transition_wall_ms=90.880`
+  - `gp_first_proj_ms=9.257`
+  - `gp_second_proj_ms=5.686`
+  - `gp_proj_calls=64`
+  - `gp_rff_fused_calls=0`
+  - `gp_profile_groups=1`
+- `block_o=32 block_k=32 num_warps=4`:
+  - `wall_s=0.533223`
+  - `transition_wall_ms=93.207`
+  - `gp_first_proj_ms=19.847`
+  - `gp_second_proj_ms=6.083`
+  - `gp_rff_fused_calls=64`
+- `block_o=32 block_k=32 num_warps=2`:
+  - `wall_s=0.533826`
+  - `transition_wall_ms=95.120`
+  - `gp_first_proj_ms=20.195`
+  - `gp_second_proj_ms=6.351`
+  - `gp_rff_fused_calls=64`
+- `block_o=64 block_k=32 num_warps=4`:
+  - `wall_s=0.532688`
+  - `transition_wall_ms=94.702`
+  - `gp_first_proj_ms=20.006`
+  - `gp_second_proj_ms=6.357`
+  - `gp_rff_fused_calls=64`
+
+Outcome:
+
+- no new skyline
+- all tested launch/tile settings regressed in the GP-only gate
+- best tuned candidate was still clearly negative:
+  - wall: `0.501950 -> 0.532688` (`+6.12%`)
+  - transition wall: `90.880 -> 94.702` (`+4.21%`)
+  - first projection wall: `9.257 -> 20.006` (`+116.13%`)
+- therefore there was no reason to spend a full fixed-seed `python -m ticl.fit_model rlpfn` run on these settings
+
+Interpretation:
+
+- the current generic tiled RFF path is not launch-shape limited in the way this sweep assumed
+- changing `BLOCK_O/BLOCK_K/num_warps` on the existing kernel made the first projection substantially slower even when the
+  rest of the GP transition path was held fixed
+- the gate itself is now trustworthy because:
+  - `gp_profile_groups=1`
+  - `gp_proj_calls=64`
+  - `gp_rff_fused_calls=64` on the candidate runs
+
+Decision:
+
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0` as the default
+- keep the GP RFF tile tuning hooks in tree for future controlled experiments
+- do not commit/push; no skyline was found
+
+Next directions:
+
+- first:
+  - do not continue blind tile/warp sweeps on the current generic tiled path
+- second:
+  - if GP stays on the mainline, the next worthwhile target is not wider tuning but a cheaper first-projection dataflow
+    inside the existing path, with the GP-only gate kept in front
+- third:
+  - always avoid `env_seeds_override` / `rollout_seeds_override` when using this GP-only fused-transition gate, because
+    they silently disable the fused transition builder
+
+## 2026-03-07 11:34: GP packed env-input first-projection dataflow rejected by GP-only steady-state
+
+Goal:
+
+- stay on the `gp` mainline
+- stop sweeping generic tiled launch shape
+- hit the first-projection dataflow itself by removing rollout-side `zero_pad` traffic before `x @ W + b`
+- gate everything with `TICL_PROFILE_GP_PROJECTION_TIMING=1` before any full `rlpfn` run
+
+Code kept in tree:
+
+- added `TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT`
+- GP transition builder now keeps two exact paths:
+  - natural env-input path
+  - packed rollout env-input path
+- packed-path observability added:
+  - `transition_packed_env_input_group_count`
+  - `transition_packed_env_input_call_count`
+- fixed the GP fused-transition semantics test so candidate flags no longer perturb `x/grad` sampling order:
+  - use a dedicated value generator after building the transition function
+
+Validation:
+
+- `py_compile` passed
+- targeted pytest passed:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+
+Important observability correction:
+
+- the first GP-only packed-input gate attempt was invalid even though it used `family=gp`
+- reason:
+  - it still left `batch_vectorized_grouping=structure`
+  - that kept the rollout off the family-coarse fused path
+- symptom in the invalid log:
+  - `transition_fused_groups=0`
+  - `gp_proj_calls=0`
+  - `packed_env_input_calls=0`
+- after fixing `batch_vectorized_grouping=family`, the gate became valid and hit the packed path
+
+Valid GP-only steady-state method:
+
+- `family=gp`
+- `batch_size=128`
+- `n_samples=64`
+- `num_features=432`
+- `batch_vectorized_grouping=family`
+- `TICL_PROFILE_ROLLOUT_TIMING=1`
+- `TICL_PROFILE_GP_PROJECTION_TIMING=1`
+- `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0`
+- same process warmup twice; only warm step 2 is compared
+- fixed repeated `h_list` with the same 4 heterogeneous GP structures used in the earlier valid GP gate
+
+Logs:
+
+- valid forward-order gate (`off -> on`):
+  - `20260307_gp_only_packed_env_input_family_fused.jsonl`
+- valid reverse-order gate (`on -> off`):
+  - `20260307_gp_only_packed_env_input_family_fused_rev.txt`
+
+Metrics:
+
+- forward-order steady-state baseline (`off`, warm 2):
+  - `wall_s=0.484033`
+  - `transition_wall_ms=67.366`
+  - `transition_env_pack_wall_ms=6.975`
+  - `gp_first_proj_ms=9.008`
+  - `gp_second_proj_ms=5.491`
+  - `gp_proj_calls=64`
+  - `transition_fused_groups=1`
+- forward-order steady-state candidate (`on`, warm 2):
+  - `wall_s=0.699474`
+  - `transition_wall_ms=74.263`
+  - `transition_env_pack_wall_ms=16.068`
+  - `gp_first_proj_ms=9.361`
+  - `gp_second_proj_ms=5.734`
+  - `gp_proj_calls=64`
+  - `transition_fused_groups=1`
+  - `packed_env_input_groups=1`
+  - `packed_env_input_calls=64`
+- reverse-order steady-state candidate (`on`, warm 2):
+  - `wall_s=0.638676`
+  - `transition_wall_ms=72.897`
+  - `transition_env_pack_wall_ms=16.282`
+  - `gp_first_proj_ms=9.313`
+  - `gp_second_proj_ms=5.655`
+  - `gp_proj_calls=64`
+  - `transition_fused_groups=1`
+  - `packed_env_input_groups=1`
+  - `packed_env_input_calls=64`
+- reverse-order steady-state baseline (`off`, warm 2):
+  - `wall_s=0.508286`
+  - `transition_wall_ms=69.725`
+  - `transition_env_pack_wall_ms=7.449`
+  - `gp_first_proj_ms=9.124`
+  - `gp_second_proj_ms=5.513`
+  - `gp_proj_calls=64`
+  - `transition_fused_groups=1`
+
+Outcome:
+
+- no new skyline
+- the packed env-input path definitely executed, but it did not reduce the first projection
+- forward-order comparison:
+  - wall: `0.484033 -> 0.699474` (`+44.51%`)
+  - transition wall: `67.366 -> 74.263` (`+10.24%`)
+  - first projection wall: `9.008 -> 9.361` (`+3.92%`)
+  - env-pack wall: `6.975 -> 16.068` (`+130.38%`)
+- reverse-order comparison confirms the same direction:
+  - wall: `0.508286 -> 0.638676` (`+25.65%`)
+  - transition wall: `69.725 -> 72.897` (`+4.55%`)
+  - first projection wall: `9.124 -> 9.313` (`+2.07%`)
+  - env-pack wall: `7.449 -> 16.282` (`+118.58%`)
+
+Interpretation:
+
+- this is not a launch-shape problem anymore; the packed path is spending more time in rollout-side packing than it saves inside the first projection
+- `zero_pad` traffic was not the dominating first-projection bottleneck in this GP path under the current family-coarse fused rollout
+- the observability added here is still useful because it cleanly separates:
+  - invalid gates where the fused path was never active
+  - valid gates where the packed path did run and still lost
+
+Decision:
+
+- do not run a full fixed-seed `python -m ticl.fit_model rlpfn` A/B for this candidate
+- do not commit/push; no skyline was found
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT=0` as the effective default path
+
+Next directions:
+
+- first:
+  - if GP stays on the mainline, stop attacking `zero_pad` packing on the rollout side
+- second:
+  - the next GP target should be inside the first projection compute/data reuse itself, not another input-layout rewrite
+- third:
+  - keep using `TICL_PROFILE_GP_PROJECTION_TIMING=1` and the new packed-path counters before any future full `rlpfn` benchmark
+
+## 2026-03-07 12:26: GP shared first-projection compute reuse lowers `gp_first_proj_ms` but still loses on GP-only wall
+
+Goal:
+
+- stay on the `gp` mainline
+- stop changing rollout-side input layout
+- target first-projection compute/data reuse directly inside the fused transition path
+- keep `TICL_PROFILE_GP_PROJECTION_TIMING=1` as the gate before any full `rlpfn` run
+
+Code kept in tree:
+
+- added `TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ`
+- new shared-input GP transition path:
+  - keeps legacy semantics for normal rollout input
+  - preserves legacy RNG consumption by rebuilding the shared path from the pre-legacy RNG state and then restoring the post-legacy RNG state
+  - falls back to legacy dual-path semantics for explicit `x_is_dual_packed=True`
+- second projection inside the shared path was also collapsed back to a single dual-output affine after the first version showed a clear second-projection regression
+- startup logging now prints the new flag
+- semantics coverage was extended inside `gp_rff_fused_transition_matches_legacy_dual_semantics`
+
+Validation:
+
+- `py_compile` passed
+- targeted pytest passed:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+
+Valid GP-only gate method:
+
+- same gate as the packed env-input experiment:
+  - `family=gp`
+  - `batch_size=128`
+  - `n_samples=64`
+  - `num_features=432`
+  - `batch_vectorized_grouping=family`
+  - `TICL_PROFILE_ROLLOUT_TIMING=1`
+  - `TICL_PROFILE_GP_PROJECTION_TIMING=1`
+- held fixed:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED=0`
+  - `TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT=0`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ=0/1`
+
+Logs:
+
+- forward-order gate (`off -> on`):
+  - `20260307_gp_only_shared_first_proj_family_fused.jsonl`
+- reverse-order gate (`on -> off`):
+  - `20260307_gp_only_shared_first_proj_family_fused_rev.txt`
+
+Metrics:
+
+- forward-order steady-state baseline (`off`, warm 2):
+  - `wall_s=0.471135`
+  - `transition_wall_ms=66.430`
+  - `gp_first_proj_ms=9.230`
+  - `gp_second_proj_ms=5.272`
+- forward-order steady-state candidate (`on`, warm 2):
+  - `wall_s=0.599431`
+  - `transition_wall_ms=66.536`
+  - `gp_first_proj_ms=7.894`
+  - `gp_second_proj_ms=5.316`
+- reverse-order steady-state candidate (`on`, warm 2):
+  - `wall_s=0.596048`
+  - `transition_wall_ms=66.614`
+  - `gp_first_proj_ms=7.480`
+  - `gp_second_proj_ms=5.211`
+- reverse-order steady-state baseline (`off`, warm 2):
+  - `wall_s=0.470394`
+  - `transition_wall_ms=66.572`
+  - `gp_first_proj_ms=8.924`
+  - `gp_second_proj_ms=5.342`
+
+Outcome:
+
+- no new skyline
+- the shared path consistently improves the measured first projection:
+  - forward order: `9.230 -> 7.894` (`-14.47%`)
+  - reverse order: `8.924 -> 7.480` (`-16.18%`)
+- after collapsing second projection back to a single affine, `gp_second_proj_ms` is effectively back at baseline
+- but the GP-only steady-state wall still regresses badly:
+  - forward order: `0.471135 -> 0.599431` (`+27.23%`)
+  - reverse order: `0.470394 -> 0.596048` (`+26.71%`)
+- `transition_wall_ms` is nearly flat in both directions, so the remaining regression is not explained by the current transition profile slices
+
+Interpretation:
+
+- this is the first GP mainline attempt that truly reduced `gp_first_proj_ms` under a valid GP-only gate
+- however, the candidate still loses on the real KPI because there is a larger unobserved overhead outside the currently exposed `transition_wall_ms / gp_first_proj_ms / gp_second_proj_ms` slices
+- the missing cost is now the dominant issue, not the first projection itself
+
+Decision:
+
+- do not run a full fixed-seed `python -m ticl.fit_model rlpfn` A/B for this candidate
+- do not commit/push; no skyline was found
+- keep `TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ=0` as the effective default path
+
+Next directions:
+
+- first:
+  - before any more GP kernel work, add finer observability around the shared transition path so the missing `wall_s` regression can be assigned to a real bucket
+- second:
+  - if that hidden cost turns out to be host-side launch/sync overhead, the next GP step should fuse more of the shared path into one launch instead of only lowering `gp_first_proj_ms`
+- third:
+  - if the hidden cost is outside transition entirely, stop on GP and return to the larger non-GP mainline bottleneck
+
+## 2026-03-07 13:01: shared-GP hidden wall regression is in setup/build, not in the transition loop
+
+Goal:
+
+- stay on the `gp` mainline only long enough to assign the remaining shared-path wall regression to a real bucket
+- do not change the kernel again
+- use the new shared-path observability to decide whether GP should continue
+
+Code kept in tree:
+
+- extended shared GP projection profiling with:
+  - `shared_total_wall_s`
+  - `shared_core_wall_s`
+  - `shared_noise_wall_s`
+  - `shared_checkpoint_wall_s`
+  - `shared_post_wall_s`
+  - `shared_call_count`
+- added rollout setup/build buckets:
+  - `transition_setup_wall_ms`
+  - `transition_family_build_wall_ms`
+  - `transition_generator_build_wall_ms`
+  - `transition_gp_shared_build_wall_ms`
+- fixed `_consume_gp_projection_profile()` propagation so the shared-path counters reach the top-level rollout profile
+
+Validation:
+
+- `py_compile` passed
+- targeted pytest passed:
+  - `gp_rff_fused_transition_matches_legacy_dual_semantics`
+  - `mixed_family_gp_projection_profile_survives_async_rollout`
+
+Diagnostic log:
+
+- rerun after the shared-profile propagation fix:
+  - `20260307_gp_shared_first_proj_observe_rerun.jsonl`
+
+Steady-state rows used for diagnosis:
+
+- forward-order baseline (`off`, warm 2):
+  - `wall_s=0.491454`
+  - `transition_wall_ms=69.771`
+  - `transition_setup_wall_ms=400.010`
+  - `transition_generator_build_wall_ms=148.791`
+  - `gp_first_proj_ms=9.382`
+- forward-order shared candidate (`on`, warm 2):
+  - `wall_s=0.613760`
+  - `transition_wall_ms=69.025`
+  - `transition_setup_wall_ms=523.039`
+  - `transition_generator_build_wall_ms=273.897`
+  - `gp_first_proj_ms=8.048`
+  - `gp_shared_total_wall_ms=35.762`
+- reverse-order baseline (`off_rev`, warm 2):
+  - `wall_s=0.467157`
+  - `transition_wall_ms=65.999`
+  - `transition_setup_wall_ms=380.532`
+  - `transition_generator_build_wall_ms=141.097`
+  - `gp_first_proj_ms=8.904`
+- reverse-order shared candidate (`on_rev`, warm 2):
+  - `wall_s=0.584543`
+  - `transition_wall_ms=66.387`
+  - `transition_setup_wall_ms=498.316`
+  - `transition_generator_build_wall_ms=257.802`
+  - `gp_first_proj_ms=7.432`
+  - `gp_shared_total_wall_ms=35.045`
+
+Outcome:
+
+- no new skyline
+- the shared path still lowers the real first-projection slice:
+  - forward: `9.382 -> 8.048` (`-14.21%`)
+  - reverse: `8.904 -> 7.432` (`-16.53%`)
+- but the GP-only steady-state wall still regresses:
+  - forward: `0.491454 -> 0.613760` (`+24.89%`)
+  - reverse: `0.467157 -> 0.584543` (`+25.13%`)
+- the regression is not in the transition loop:
+  - forward: `transition_wall_ms 69.771 -> 69.025` (`-0.746 ms`)
+  - reverse: `transition_wall_ms 65.999 -> 66.387` (`+0.387 ms`)
+- the regression is almost entirely in setup/build before the transition loop:
+  - forward: `transition_setup_wall_ms 400.010 -> 523.039` (`+123.029 ms`)
+  - reverse: `transition_setup_wall_ms 380.532 -> 498.316` (`+117.785 ms`)
+- that setup/build regression is itself dominated by transition-generator construction:
+  - forward: `transition_generator_build_wall_ms 148.791 -> 273.897` (`+125.105 ms`)
+  - reverse: `transition_generator_build_wall_ms 141.097 -> 257.802` (`+116.705 ms`)
+- the new shared-path transition counters are now live, but they are not the main regression source:
+  - `gp_shared_total_wall_ms` is only about `35 ms`
+  - `unprofiled_wall_ms` stays almost flat
+
+Interpretation:
+
+- this closes the GP observability gap
+- the candidate does improve the compute path that was targeted
+- however, the real KPI is lost earlier, in host-side/setup-side transition-generator build work
+- this is not a case where another GP transition kernel tweak should continue blindly
+
+Decision:
+
+- stop the current GP mainline here
+- do not run a full fixed-seed `python -m ticl.fit_model rlpfn` A/B for this candidate
+- do not commit/push; no skyline was found
+- return to the larger non-GP mainline bottleneck
+
+Next directions:
+
+- first:
+  - leave the GP shared-path observability in tree as a gate
+- second:
+  - move back to the larger non-GP bottleneck instead of continuing GP kernel work
+- third:
+  - only reopen GP if there is a concrete plan to remove transition-generator build cost itself rather than shaving another few milliseconds off `gp_first_proj_ms`
+
+## 2026-03-07 11:50: restored `TBPTT stream merge auto=0` default; finalize compile still rejected on the stable base
+
+Goal:
+
+- stop the `gp` mainline
+- return to the larger non-GP bottleneck
+- first restore the documented batch128 skyline base before evaluating any new policy-side candidate
+
+Observed regression:
+
+- the code default in `fit_model.py` had drifted to:
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=1`
+- but the maintained skyline notes already required:
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+- with current code and fixed-seed batch128 fail-fast, the drifted default now OOMs before a usable phase line:
+  - log: `20260307_seeded_batch128_finalizecompile_off_v2.log`
+
+Stability probe:
+
+- forcing `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0` restores the full batch128 line:
+  - log: `20260307_seeded_batch128_mergeauto0_probe.log`
+  - `batch_wall_excl_compile_s=125.318`
+  - `rollout_s=78.633`
+  - `backward_s=46.685`
+  - peak alloc/reserved `35.37 / 45.99 GiB`
+
+Decision on the default:
+
+- restore `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0` in `fit_model.py`
+- this is a skyline stability fix, not a new skyline
+
+Non-GP candidate tested on the restored stable base:
+
+- candidate:
+  - policy finalize-only compile
+  - `backend=inductor`
+  - `mode=max-autotune-no-cudagraphs`
+  - `fullgraph=True`
+  - `dynamic=False`
+- fixed base:
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - all GP fused flags forced back to `0`
+
+Logs:
+
+- stable eager base:
+  - `20260307_seeded_batch128_mergeauto0_probe.log`
+- finalize-compile first run:
+  - `20260307_seeded_batch128_finalizecompile_on_mergeauto0.log`
+- finalize-compile warm rerun:
+  - `20260307_seeded_batch128_finalizecompile_on_mergeauto0_warm.log`
+
+Metrics:
+
+- eager stable base:
+  - `batch_wall_excl_compile_s=125.318`
+- finalize compile, first run:
+  - `batch_wall_excl_compile_s=150.582`
+  - `batch_wall_incl_compile_s=180.283`
+  - `compile_warmup_s=29.701`
+  - `compile_counter_recompiles=0`
+  - `compile_counter_graph_breaks=0`
+  - `compile_counter_unique_graphs=2`
+- finalize compile, warm rerun:
+  - `batch_wall_excl_compile_s=136.543`
+  - `batch_wall_incl_compile_s=142.735`
+  - `compile_warmup_s=6.192`
+  - `compile_counter_recompiles=0`
+  - `compile_counter_graph_breaks=0`
+  - `compile_counter_unique_graphs=2`
+
+Outcome:
+
+- no new skyline
+- compile still loses badly even after cache warmup:
+  - first run: `125.318 -> 150.582` (`+20.16%`)
+  - warm rerun: `125.318 -> 136.543` (`+8.96%`)
+- this was not a recompile problem:
+  - `recompiles=0`
+  - `graph_breaks=0`
+- but it still carried heavy in-batch inductor autotune/benchmark activity:
+  - first run `delta_total_abs=1386`
+  - warm rerun `delta_total_abs=906`
+
+Interpretation:
+
+- the useful fix from this round is restoring the stable `merge_auto=0` base
+- the finalize-only compile path is not the right next step for this training workload
+- it is not enough to place compile on a small local function if the resulting inductor autotune cost still lands inside the measured batch
+
+Decision:
+
+- keep `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0` as the default again
+- do not enable finalize compile by default
+- do not commit/push; no new skyline was found
+
+Next directions:
+
+- first:
+  - continue on the non-GP policy mainline from the restored stable base
+- second:
+  - avoid further compile-side exploration unless the autotune work itself can be fully pre-eliminated before batch timing
+- third:
+  - return to eager hot-path work inside policy transformer finalize / FFN / out-proj
+
+## 2026-03-07 eager finalize 2D zero-dropout/post-norm GELU fastpath
+
+Scope:
+
+- stayed on the non-GP policy mainline
+- targeted eager `policy transformer finalize / FFN / out-proj`
+- implemented a strict-equivalence 2D finalize specialization for the dominant default setting:
+  - single-token finalize
+  - zero dropout
+  - post-norm
+  - GELU
+
+Code:
+
+- added the specialized eager path in `ticl/models/layer.py`
+- added an env gate:
+  - `TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH`
+- added a forward-policy-step output/grad equivalence test in:
+  - `ticl/tests/models/test_tabpfn_kv_cache.py`
+- added startup logging in `ticl/train.py`
+
+Important safety outcome:
+
+- the specialization is semantically correct under the dedicated test
+- but it is not safe to leave enabled by default on the current batch-128 skyline
+- default was therefore restored to `0` in:
+  - `ticl/models/layer.py`
+  - `ticl/fit_model.py`
+  - `ticl/train.py` startup print default
+
+Validation:
+
+- `py_compile` passed
+- `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "finalize_compile_preserves_semantics or finalize_default_eager_fastpath_preserves_semantics"` passed
+
+Logs:
+
+- `off`:
+  - `20260307_seeded_batch128_finalize2d_default_off.log`
+- `on`:
+  - `20260307_seeded_batch128_finalize2d_default_on.log`
+
+Observed results on the default `python -m ticl.fit_model rlpfn` path with fixed seed and `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`:
+
+- `off` produced three phase lines:
+  - batch 0: `batch_wall_excl_compile_s=104.716`
+  - batch 1: `batch_wall_excl_compile_s=95.273`
+  - batch 2: `batch_wall_excl_compile_s=98.748`
+  - mean over the observed three batches: `99.579`
+- `on` failed before the first phase line:
+  - fail-fast OOM in envgen `_batch_affine`
+  - attempted allocation: `80.00 MiB`
+  - free GPU memory at failure: `83.44 MiB`
+
+Interpretation:
+
+- this candidate is not a skyline
+- more importantly, it reduces memory headroom enough to break the current batch-128 fail-fast skyline before batch 0 completes
+- the eager finalize hot path can still be studied, but any further candidate must be screened for memory-headroom regression immediately, not just batch wall
+
+Decision:
+
+- keep the code and observability
+- keep the specialization default disabled
+- no commit/push; no new skyline was found
+
+Next directions:
+
+- return to the larger non-GP eager hotspot, but avoid candidates that increase activation/live-buffer pressure around the existing envgen memory limit
+- if finalize is revisited again, first measure memory headroom on batch 0 before spending time on wall-only A/B
+
+## 2026-03-07 finalize 2D profile split fix and attn->finalize 2D candidate
+
+Scope:
+
+- stayed on the non-GP mainline
+- first fixed a profile blind spot in the single-token 2D finalize path
+- then tested an `attn -> finalize` 2D fastpath candidate
+- removed the candidate after fixed-seed A/B proved it was a false positive
+
+Code kept:
+
+- 2D finalize profile split is now observable in `ticl/models/layer.py`
+  for single-token policy-step path:
+  - `finalize_attn_outproj_wall_s`
+  - `finalize_ffn_wall_s`
+- startup defaults remain unchanged for optimization flags:
+  - no new fastpath is enabled by default
+
+Validation:
+
+- `py_compile` passed
+- `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "finalize_compile_preserves_semantics or finalize_default_eager_fastpath_preserves_semantics"` passed
+
+New observability result:
+
+- after the profile split fix, the dominant eager policy-step transformer breakdown on the stable base is:
+  - `policy_step_transformer_share=0.926`
+  - `policy_step_tf_layer_attnff_share=0.736`
+  - `policy_step_tf_layer_finalize_share=0.510`
+  - `policy_step_tf_layer_finalize_attn_outproj_share=0.166`
+  - `policy_step_tf_layer_finalize_ffn_share=0.281`
+- so within the current single-token eager transformer path:
+  - FFN is heavier than finalize out-proj
+  - but out-proj is still a meaningful fraction of layer time
+
+Logs:
+
+- stable base profile gate:
+  - `20260307_seeded_batch128_attnff2d_profile_off.log`
+- candidate profile gate:
+  - `20260307_seeded_batch128_attnff2d_profile_on.log`
+- stable base fixed-seed batch-0 A/B:
+  - `20260307_seeded_batch128_attnff2d_off.log`
+- candidate fixed-seed batch-0 A/B:
+  - `20260307_seeded_batch128_attnff2d_on.log`
+
+Candidate tested:
+
+- single-token `attn -> finalize` 2D fastpath
+- goal:
+  - reduce per-layer python/dispatch overhead without changing math
+  - avoid the live-buffer increase that broke the previous finalize specialization
+
+Observed profile gate:
+
+- looked positive under profile instrumentation:
+  - `batch_wall_excl_compile_s: 110.471 -> 98.560` (`-10.8%`)
+
+Observed real fixed-seed A/B (`batch 0`, no profile):
+
+- stable base:
+  - `batch_wall_excl_compile_s=99.652`
+- candidate:
+  - `batch_wall_excl_compile_s=110.342`
+- real result:
+  - `99.652 -> 110.342` (`+10.7%`, worse)
+
+Interpretation:
+
+- this candidate was a profile-induced false positive
+- it improved the instrumented path, not the real training path
+- the useful outcome from this round is the repaired finalize substage observability, not the candidate itself
+
+Decision:
+
+- keep the finalize 2D observability fix
+- remove the `attn->finalize 2D` candidate path
+- no commit/push; no new skyline was found
+
+Next directions:
+
+- continue on the non-GP eager mainline with the new finalize substage observability available
+- do not trust profile-gate wins unless they survive a no-profile fixed-seed A/B
+- prioritize candidates that target the real FFN/out-proj dominant work, not just python-side instrumented overhead
+
+## 2026-03-07 finalize substage split and work-path gating
+
+Scope:
+
+- stayed on the non-GP mainline
+- continued to target the real eager `finalize_ffn_share` / `finalize_attn_outproj_share` hotspot
+- did not keep any profile-only fastpath candidate
+- added finer-grained 2D finalize observability before committing to a new kernel path
+
+Code kept:
+
+- `ticl/models/layer.py`
+  now records these single-token finalize substages:
+  - `finalize_attn_outproj_linear_wall_s`
+  - `finalize_attn_outproj_norm_wall_s`
+  - `finalize_ffn_linear1_act_wall_s`
+  - `finalize_ffn_linear2_residual_norm_wall_s`
+  - `finalize_ffn_linear2_wall_s`
+  - `finalize_ffn_residual_norm_wall_s`
+- `ticl/models/tabpfn.py`
+  propagates the new per-layer finalize substages through policy-step profiling
+- `ticl/train.py`
+  aggregates and prints the new `policy_step_tf_layer_finalize_*_share` fields on the phase line
+
+Validation:
+
+- `py_compile` passed
+- `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "finalize_compile_preserves_semantics or finalize_default_eager_fastpath_preserves_semantics"` passed
+
+Stable-base profile logs:
+
+- `20260307_seeded_batch128_finalize_subsplit_profile.log`
+- `20260307_seeded_batch128_finalize_subsplit_v2_profile.log`
+
+Observed stable-base batch-0 breakdown (`20260307_seeded_batch128_finalize_subsplit_v2_profile.log`):
+
+- `batch_wall_excl_compile_s=95.930`
+- `policy_step_tf_layer_finalize_share=0.506`
+- `policy_step_tf_layer_finalize_attn_outproj_share=0.182`
+- `policy_step_tf_layer_finalize_attn_outproj_linear_share=0.122`
+- `policy_step_tf_layer_finalize_attn_outproj_norm_share=0.060`
+- `policy_step_tf_layer_finalize_ffn_share=0.276`
+- `policy_step_tf_layer_finalize_ffn_linear1_act_share=0.124`
+- `policy_step_tf_layer_finalize_ffn_linear2_residual_norm_share=0.152`
+- `policy_step_tf_layer_finalize_ffn_linear2_share=0.068`
+- `policy_step_tf_layer_finalize_ffn_residual_norm_share=0.084`
+
+Interpretation:
+
+- inside the current eager single-token finalize path, the dominant substage is now clearly:
+  - `ffn linear2 + residual_norm` (`0.152` of transformer-layer total)
+- after splitting that block once more, the larger part is:
+  - `ffn residual_norm` (`0.084`)
+  over
+  - `ffn linear2` (`0.068`)
+- on the out-proj side, the larger part is:
+  - `attn out-proj linear` (`0.122`)
+  over
+  - `attn out-proj norm` (`0.060`)
+
+Work-path candidates explicitly gated out this round:
+
+- `addmm` residual fusion microbench:
+  - log: `20260307_finalize_addmm_microbench.txt`
+  - `base=0.0017034296`
+  - `addmm_residual=0.0023329711`
+  - result: slower, not worth integrating
+- Triton fused `add + layer_norm` prototype with torch backward:
+  - log: `20260307_finalize_fused_add_layernorm_microbench.txt`
+  - `base=0.0005358312`
+  - `fused=0.0015727561`
+  - result: much slower overall at `E=512`, not worth integrating in this form
+
+Decision:
+
+- keep the finer-grained finalize observability
+- do not introduce a new finalize kernel candidate from this round
+- no commit/push; no new skyline was found
+
+Next directions:
+
+- if finalize is continued on the mainline, the next real candidate should target:
+  - the `ffn residual_norm` block first
+  or
+  - a stricter fused MLP path that removes more than one kernel boundary at once
+- do not revisit `addmm` residual fusion or forward-only Triton add-norm prototypes unless the backward path is also fused and re-gated
+
+## 2026-03-07 high-level rollout/transition execution experiments: no new skyline
+
+Kept changes:
+- Added opt-in `TICL_POLICY_TRANSITION_ONLY_ENV_BUILD` to let family-coarse env build skip `x/y/policy` generators when fused transition is actually usable.
+- Added rollout observability for transition-only build hits:
+  - `rollout_transition_only_build_group_count`
+  - `rollout_transition_only_skipped_generator_count`
+- Added experimental `balancedK` transition inner grouping (`balanced2`, etc.): per-family sort by estimated transition work, then split into a small number of contiguous buckets.
+- Added `TICL_POLICY_TRANSITION_STREAM_FUSION_MAX_GROUPS` (default `2`) so multi-group bucketing does not explode into high-concurrency fake parallelism by default.
+- Restored safe default semantics for policy rollout: skipping unused `policy_generator` build is now behind explicit opt-in `TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD=1` instead of always-on, because it changes RNG-consumption order.
+
+A/B 1: transition-only env build
+- fixed-seed (`--seed-everything True`), `batch=128`, `tbptt=64`, `merge_auto=0`
+- off:
+  - `20260307_seeded_batch128_transitiononlybuild_off.log`
+  - `batch_wall_excl_compile_s=121.706`
+- on:
+  - `20260307_seeded_batch128_transitiononlybuild_on.log`
+  - `batch_wall_excl_compile_s=124.317`
+- result:
+  - `+2.15%` slower on true KPI
+- profile gate also agreed:
+  - off: `20260307_seeded_batch128_transitiononlybuild_profile_off.log`
+    - `rollout_transition_wall_ms=8777.56`
+    - `rollout_transition_only_build_groups=0`
+    - `rollout_transition_only_skipped_generators=2` (only explicit policy-generator skip in that experiment)
+  - on: `20260307_seeded_batch128_transitiononlybuild_profile_on.log`
+    - `rollout_transition_wall_ms=10551.79`
+    - `rollout_transition_only_build_groups=2`
+    - `rollout_transition_only_skipped_generators=6`
+- conclusion:
+  - removing those generator builds does not help this skyline; setup/build is not the dominant limiter in this form.
+
+A/B 2: balanced family transition bucketing
+- goal: raise `transition_work_fill_ratio` without exploding to dozens of groups like `structure`
+- candidate: `TICL_POLICY_TRANSITION_INNER_GROUPING=balanced2`
+- result:
+  - `20260307_seeded_batch128_transition_balanced2_on.log`
+  - `20260307_seeded_batch128_transition_balanced2_on_v2.log`
+  - `20260307_seeded_batch128_transition_balanced2_on_v3.log`
+  - all fail-fast OOM on batch 0 under the current `batch=128`, `tbptt=64` skyline
+- the OOM moved between:
+  - transition envgen (`_batch_affine` / SCM hidden path)
+  - policy paged-attn flash-prefix path (`tail_v.clone()`)
+- conclusion:
+  - the main issue is no longer just padding.
+  - changing transition grouping also perturbs the whole-batch execution mode and memory pressure seen by policy forward.
+  - this is a strong signal that batch order / transition order coupling is itself a high-level bottleneck and risk source.
+
+Current takeaways:
+- No new skyline in this round, so no commit/push.
+- `transition-only env build` stays opt-in and off by default.
+- `balanced2` stays experimental and off by default.
+- `transition stream fusion max groups=2` is kept as a safe guardrail for multi-group experiments; it does not affect the current default `family` path (which uses 2 groups).
+- The next serious execution-mode target should not be another micro-kernel. It should be one of:
+  - decoupling transition grouping order from policy batch order,
+  - or improving TBPTT multi-backward merge logic using the correct decision point and memory signal.
+
+## 2026-03-07 balanced2 clean rerun after killing stale fit_model process: new skyline
+
+Root cause correction:
+- A previously leaked `python -m ticl.fit_model rlpfn --seed-everything True` process (`pid=2551335`) was still holding about `12-26 GiB` of GPU memory during later experiments.
+- After killing that stale process and its parent shell, the earlier `balanced2` fail-fast OOM no longer reproduced.
+
+Clean fixed-seed A/B:
+- settings:
+  - `batch=128`
+  - `tbptt=64`
+  - `merge_auto=0`
+  - no profile
+- family clean reruns:
+  - `20260307_seeded_batch128_transition_family_clean.log`
+    - `batch_wall_excl_compile_s=124.671`
+  - `20260307_seeded_batch128_transition_family_clean_r2.log`
+    - `batch_wall_excl_compile_s=122.485`
+- balanced2 clean reruns:
+  - `20260307_seeded_batch128_transition_balanced2_clean.log`
+    - `batch_wall_excl_compile_s=118.934`
+  - `20260307_seeded_batch128_transition_balanced2_clean_r2.log`
+    - `batch_wall_excl_compile_s=121.498`
+
+Measured effect:
+- family mean:
+  - `(124.671 + 122.485) / 2 = 123.578`
+- balanced2 mean:
+  - `(118.934 + 121.498) / 2 = 120.216`
+- result:
+  - `-2.72%` batch wall on the true KPI after removing the leaked-process contamination
+
+Interpretation:
+- The earlier `balanced2` OOMs were not a real property of the candidate under the intended skyline conditions.
+- With clean GPU state, `balanced2` keeps the batch runnable and reduces rollout-side wall enough to beat the restored `family` baseline.
+- This is not a huge gain, but it is a real positive skyline on the current execution-mode mainline, so `TICL_POLICY_TRANSITION_INNER_GROUPING=balanced2` is now promoted to the default for `python -m ticl.fit_model rlpfn`.

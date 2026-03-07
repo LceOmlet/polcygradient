@@ -220,6 +220,294 @@ if triton is not None:
 if triton is not None:
 
     @triton.jit
+    def _ragged_tiled_affine_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        input_index_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        tile_batch_ptr,
+        tile_out_offset_ptr,
+        pre_out_ptr,
+        out_ptr,
+        k_cap,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_ib,
+        stride_ii,
+        stride_sb,
+        stride_ab,
+        stride_tb,
+        stride_to,
+        stride_pob,
+        stride_poo,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        o_start = tl.load(tile_out_offset_ptr + pid_t * stride_to).to(tl.int32)
+        offs_o = o_start + tl.arange(0, BLOCK_O)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        out_mask = offs_o < out_size
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        if HAS_BIAS:
+            bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+            acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        input_index_base = input_index_ptr + pid_b * stride_ib
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            input_idx = tl.load(input_index_base + offs_k * stride_ii, mask=k_mask, other=0).to(tl.int32)
+            x_vals = tl.load(x_base + input_idx * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + input_idx[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        pre_out_ptrs = pre_out_ptr + pid_b * stride_pob + offs_o * stride_poo
+        tl.store(pre_out_ptrs, acc, mask=out_mask)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        if activation_code == 0:
+            acc = tl_libdevice.tanh(acc)
+        elif activation_code == 1:
+            acc = tl.maximum(acc, 0.0)
+        elif activation_code == 3:
+            acc = tl_libdevice.cos(acc)
+        out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _ragged_tiled_affine_bwd_input_kernel(
+        grad_out_ptr,
+        w_ptr,
+        input_index_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        tile_batch_ptr,
+        tile_in_offset_ptr,
+        grad_x_ptr,
+        o_cap,
+        stride_gob,
+        stride_goi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_ib,
+        stride_ii,
+        stride_sb,
+        stride_tb,
+        stride_ti,
+        stride_gxb,
+        stride_gxi,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        k_start = tl.load(tile_in_offset_ptr + pid_t * stride_ti).to(tl.int32)
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        k_mask = offs_k < in_size
+        input_index_base = input_index_ptr + pid_b * stride_ib
+        input_idx = tl.load(input_index_base + offs_k * stride_ii, mask=k_mask, other=0).to(tl.int32)
+        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        grad_out_base = grad_out_ptr + pid_b * stride_gob
+        w_base = w_ptr + pid_b * stride_wb
+        for o_start in tl.range(0, out_size, BLOCK_O):
+            offs_o = o_start + tl.arange(0, BLOCK_O)
+            out_mask = offs_o < out_size
+            grad_vals = tl.load(grad_out_base + offs_o * stride_goi, mask=out_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + input_idx[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * grad_vals[None, :], axis=1)
+        grad_x_ptrs = grad_x_ptr + pid_b * stride_gxb + input_idx * stride_gxi
+        tl.store(grad_x_ptrs, acc, mask=k_mask)
+
+class _TiledRaggedBatchAffineFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        w,
+        b,
+        input_index,
+        in_sizes,
+        out_sizes,
+        activation_codes,
+        out_tile_batch,
+        out_tile_offsets,
+        in_tile_batch,
+        in_tile_offsets,
+        block_o,
+        block_k,
+        num_warps,
+    ):
+        if triton is None:
+            raise RuntimeError("tiled ragged affine Triton path requested but Triton is unavailable")
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        x_contig = x.contiguous()
+        w_contig = w.contiguous()
+        b_contig = None if b is None else b.contiguous()
+        input_index_i32 = input_index.to(dtype=torch.int32).contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        out_tile_batch_i32 = out_tile_batch.to(dtype=torch.int32).contiguous()
+        out_tile_offsets_i32 = out_tile_offsets.to(dtype=torch.int32).contiguous()
+        in_tile_batch_i32 = in_tile_batch.to(dtype=torch.int32).contiguous()
+        in_tile_offsets_i32 = in_tile_offsets.to(dtype=torch.int32).contiguous()
+        batch_size = int(x_contig.shape[0])
+        o_cap = int(w_contig.shape[2])
+        k_cap = int(input_index_i32.shape[1])
+        pre_out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
+        out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
+        if batch_size > 0 and o_cap > 0 and k_cap > 0 and int(out_tile_batch_i32.numel()) > 0:
+            grid = (int(out_tile_batch_i32.numel()),)
+            _ragged_tiled_affine_fwd_kernel[grid](
+                x_contig,
+                w_contig,
+                b_contig,
+                input_index_i32,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out_tile_batch_i32,
+                out_tile_offsets_i32,
+                pre_out,
+                out,
+                k_cap,
+                x_contig.stride(0),
+                x_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                0 if b_contig is None else b_contig.stride(0),
+                0 if b_contig is None else b_contig.stride(1),
+                input_index_i32.stride(0),
+                input_index_i32.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out_tile_batch_i32.stride(0),
+                out_tile_offsets_i32.stride(0),
+                pre_out.stride(0),
+                pre_out.stride(1),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
+                HAS_BIAS=bool(b_contig is not None),
+                num_warps=num_warps,
+            )
+        ctx.save_for_backward(
+            w_contig,
+            input_index_i32,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+            in_tile_batch_i32,
+            in_tile_offsets_i32,
+            pre_out,
+            out,
+        )
+        ctx.x_shape = tuple(x_contig.shape)
+        ctx.block_o = block_o
+        ctx.block_k = block_k
+        ctx.num_warps = num_warps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if triton is None:
+            raise RuntimeError("tiled ragged affine Triton backward requested but Triton is unavailable")
+        (
+            w_contig,
+            input_index_i32,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+            in_tile_batch_i32,
+            in_tile_offsets_i32,
+            pre_out,
+            out_saved,
+        ) = ctx.saved_tensors
+        grad_out_contig = grad_out.contiguous()
+        if int(activation_codes_i32.numel()) > 0:
+            activation_codes = activation_codes_i32.to(device=grad_out_contig.device)
+            no_activation_mask = activation_codes < 0
+            relu_mask = activation_codes == 1
+            tanh_mask = activation_codes == 0
+            cos_mask = activation_codes == 3
+            if bool(torch.any(relu_mask)):
+                grad_out_contig = torch.where(
+                    relu_mask.unsqueeze(1),
+                    grad_out_contig * (out_saved > 0).to(dtype=grad_out_contig.dtype),
+                    grad_out_contig,
+                )
+            if bool(torch.any(tanh_mask)):
+                grad_out_contig = torch.where(
+                    tanh_mask.unsqueeze(1),
+                    grad_out_contig * (1.0 - out_saved.square()),
+                    grad_out_contig,
+                )
+            if bool(torch.any(cos_mask)):
+                grad_out_contig = torch.where(
+                    cos_mask.unsqueeze(1),
+                    grad_out_contig * (-torch.sin(pre_out)),
+                    grad_out_contig,
+                )
+            if bool(torch.any(no_activation_mask)):
+                grad_out_contig = torch.where(no_activation_mask.unsqueeze(1), grad_out.contiguous(), grad_out_contig)
+        grad_x = torch.zeros(ctx.x_shape, device=grad_out_contig.device, dtype=grad_out_contig.dtype)
+        o_cap = int(w_contig.shape[2])
+        if int(grad_out_contig.shape[0]) > 0 and o_cap > 0 and int(in_tile_batch_i32.numel()) > 0:
+            grid = (int(in_tile_batch_i32.numel()),)
+            _ragged_tiled_affine_bwd_input_kernel[grid](
+                grad_out_contig,
+                w_contig,
+                input_index_i32,
+                in_sizes_i32,
+                out_sizes_i32,
+                in_tile_batch_i32,
+                in_tile_offsets_i32,
+                grad_x,
+                o_cap,
+                grad_out_contig.stride(0),
+                grad_out_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                input_index_i32.stride(0),
+                input_index_i32.stride(1),
+                in_sizes_i32.stride(0),
+                in_tile_batch_i32.stride(0),
+                in_tile_offsets_i32.stride(0),
+                grad_x.stride(0),
+                grad_x.stride(1),
+                BLOCK_O=int(ctx.block_o),
+                BLOCK_K=int(ctx.block_k),
+                num_warps=int(ctx.num_warps),
+            )
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None, None, None
+
+if triton is not None:
+
+    @triton.jit
     def _prefix_tiled_affine_fwd_kernel(
         x_ptr,
         w_ptr,
@@ -229,6 +517,7 @@ if triton is not None:
         activation_code_ptr,
         tile_batch_ptr,
         tile_out_offset_ptr,
+        pre_out_ptr,
         out_ptr,
         k_cap,
         stride_xb,
@@ -242,6 +531,8 @@ if triton is not None:
         stride_ab,
         stride_tb,
         stride_to,
+        stride_pob,
+        stride_poo,
         stride_ob,
         stride_oo,
         BLOCK_O: tl.constexpr,
@@ -268,11 +559,15 @@ if triton is not None:
             w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
             w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        pre_out_ptrs = pre_out_ptr + pid_b * stride_pob + offs_o * stride_poo
+        tl.store(pre_out_ptrs, acc, mask=out_mask)
         activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
         if activation_code == 0:
             acc = tl_libdevice.tanh(acc)
         elif activation_code == 1:
             acc = tl.maximum(acc, 0.0)
+        elif activation_code == 3:
+            acc = tl_libdevice.cos(acc)
         out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
         tl.store(out_ptrs, acc, mask=out_mask)
 
@@ -320,7 +615,6 @@ if triton is not None:
         grad_x_ptrs = grad_x_ptr + pid_b * stride_gxb + offs_k * stride_gxi
         tl.store(grad_x_ptrs, acc, mask=k_mask)
 
-
 class _PrefixTiledBatchAffineFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -335,9 +629,15 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
         out_tile_offsets,
         in_tile_batch,
         in_tile_offsets,
+        block_o,
+        block_k,
+        num_warps,
     ):
         if triton is None:
             raise RuntimeError("prefix tiled affine Triton path requested but Triton is unavailable")
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
         x_contig = x.contiguous()
         w_contig = w.contiguous()
         b_contig = None if b is None else b.contiguous()
@@ -351,6 +651,7 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
         batch_size = int(x_contig.shape[0])
         k_cap = int(w_contig.shape[1])
         o_cap = int(w_contig.shape[2])
+        pre_out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
         out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
         if batch_size > 0 and k_cap > 0 and o_cap > 0 and int(out_tile_batch_i32.numel()) > 0:
             grid = (int(out_tile_batch_i32.numel()),)
@@ -363,6 +664,7 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
                 activation_codes_i32,
                 out_tile_batch_i32,
                 out_tile_offsets_i32,
+                pre_out,
                 out,
                 k_cap,
                 x_contig.stride(0),
@@ -376,12 +678,14 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
                 activation_codes_i32.stride(0),
                 out_tile_batch_i32.stride(0),
                 out_tile_offsets_i32.stride(0),
+                pre_out.stride(0),
+                pre_out.stride(1),
                 out.stride(0),
                 out.stride(1),
-                BLOCK_O=32,
-                BLOCK_K=32,
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
                 HAS_BIAS=bool(b_contig is not None),
-                num_warps=4,
+                num_warps=num_warps,
             )
         ctx.save_for_backward(
             w_contig,
@@ -390,9 +694,13 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
             activation_codes_i32,
             in_tile_batch_i32,
             in_tile_offsets_i32,
+            pre_out,
             out,
         )
         ctx.x_shape = tuple(x_contig.shape)
+        ctx.block_o = block_o
+        ctx.block_k = block_k
+        ctx.num_warps = num_warps
         return out
 
     @staticmethod
@@ -406,6 +714,7 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
             activation_codes_i32,
             in_tile_batch_i32,
             in_tile_offsets_i32,
+            pre_out,
             out_saved,
         ) = ctx.saved_tensors
         grad_out_contig = grad_out.contiguous()
@@ -414,6 +723,7 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
             no_activation_mask = activation_codes < 0
             relu_mask = activation_codes == 1
             tanh_mask = activation_codes == 0
+            cos_mask = activation_codes == 3
             if bool(torch.any(relu_mask)):
                 grad_out_contig = torch.where(
                     relu_mask.unsqueeze(1),
@@ -424,6 +734,12 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
                 grad_out_contig = torch.where(
                     tanh_mask.unsqueeze(1),
                     grad_out_contig * (1.0 - out_saved.square()),
+                    grad_out_contig,
+                )
+            if bool(torch.any(cos_mask)):
+                grad_out_contig = torch.where(
+                    cos_mask.unsqueeze(1),
+                    grad_out_contig * (-torch.sin(pre_out)),
                     grad_out_contig,
                 )
             if bool(torch.any(no_activation_mask)):
@@ -451,12 +767,11 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
                 in_tile_offsets_i32.stride(0),
                 grad_x.stride(0),
                 grad_x.stride(1),
-                BLOCK_O=32,
-                BLOCK_K=32,
-                num_warps=4,
+                BLOCK_O=int(ctx.block_o),
+                BLOCK_K=int(ctx.block_k),
+                num_warps=int(ctx.num_warps),
             )
-        return grad_x, None, None, None, None, None, None, None, None, None
-
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None, None
 
 class EnvironmentPrior:
     """
@@ -672,6 +987,99 @@ class EnvironmentPrior:
             "no",
             "off",
         }
+        fused_transition_gp_input_fused_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED", "0")
+        ).strip().lower()
+        self.fused_transition_gp_input_fused = fused_transition_gp_input_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_gp_output_fused_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED", "0")
+        ).strip().lower()
+        self.fused_transition_gp_output_fused = fused_transition_gp_output_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_gp_output_subgraph_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH", "0")
+        ).strip().lower()
+        self.fused_transition_gp_output_subgraph = fused_transition_gp_output_subgraph_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_gp_rff_fused_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED", "0")
+        ).strip().lower()
+        self.fused_transition_gp_rff_fused = fused_transition_gp_rff_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_gp_packed_env_input_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT", "0")
+        ).strip().lower()
+        self.fused_transition_gp_packed_env_input = fused_transition_gp_packed_env_input_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_gp_shared_first_proj_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ", "0")
+        ).strip().lower()
+        self.fused_transition_gp_shared_first_proj = fused_transition_gp_shared_first_proj_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        transition_only_env_build_flag = str(
+            os.environ.get("TICL_POLICY_TRANSITION_ONLY_ENV_BUILD", "0")
+        ).strip().lower()
+        self.transition_only_env_build = transition_only_env_build_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        skip_unused_policy_generator_build_flag = str(
+            os.environ.get("TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD", "0")
+        ).strip().lower()
+        self.skip_unused_policy_generator_build = skip_unused_policy_generator_build_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.gp_rff_tiled_block_o = self._resolve_tiled_block_size(
+            os.environ.get("TICL_POLICY_GP_RFF_BLOCK_O", "32"),
+            default=32,
+        )
+        self.gp_rff_tiled_block_k = self._resolve_tiled_block_size(
+            os.environ.get("TICL_POLICY_GP_RFF_BLOCK_K", "32"),
+            default=32,
+        )
+        self.gp_rff_tiled_num_warps = self._resolve_tiled_num_warps(
+            os.environ.get("TICL_POLICY_GP_RFF_NUM_WARPS", "4"),
+            default=4,
+        )
+        profile_gp_projection_timing_flag = str(
+            os.environ.get("TICL_PROFILE_GP_PROJECTION_TIMING", "0")
+        ).strip().lower()
+        self.profile_gp_projection_timing = profile_gp_projection_timing_flag in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
         transition_inner_grouping = str(
             os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING", "family")
         ).strip().lower()
@@ -855,6 +1263,26 @@ class EnvironmentPrior:
             dtype=x.dtype,
         )
         return torch.cat([x, pad], dim=-1)
+
+    @staticmethod
+    def _resolve_tiled_block_size(v, default=32):
+        try:
+            v = int(v)
+        except Exception:
+            v = int(default)
+        if v not in {16, 32, 64, 128}:
+            v = int(default)
+        return int(v)
+
+    @staticmethod
+    def _resolve_tiled_num_warps(v, default=4):
+        try:
+            v = int(v)
+        except Exception:
+            v = int(default)
+        if v not in {1, 2, 4, 8}:
+            v = int(default)
+        return int(v)
 
     @staticmethod
     def _clamp_int(v, lo, hi):
@@ -2491,6 +2919,19 @@ class EnvironmentPrior:
         value = max(1, int(value))
         return 1 << (value - 1).bit_length()
 
+    @staticmethod
+    def _resolve_transition_balanced_bucket_count(grouping_mode):
+        mode = str(grouping_mode).strip().lower()
+        if not mode.startswith("balanced"):
+            return None
+        suffix = mode[len("balanced"):]
+        if suffix == "":
+            return 2
+        try:
+            return max(1, int(suffix))
+        except Exception:
+            return None
+
     def _environment_transition_bucket_signature(self, h, grouping_mode):
         grouping_mode = str(grouping_mode).strip().lower()
         family = self._normalize_family(h.get("family", "scm"))
@@ -2498,6 +2939,8 @@ class EnvironmentPrior:
             return (family,)
         if grouping_mode == "structure":
             return self._environment_transition_signature(h)
+        if self._resolve_transition_balanced_bucket_count(grouping_mode) is not None:
+            return (family,)
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
         total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
         if family == "scm":
@@ -2517,6 +2960,83 @@ class EnvironmentPrior:
             self._bucket_ceil_pow2(state_dim),
             self._bucket_ceil_pow2(max(8, int(h["gp_rff_features"]))),
         )
+
+    def _estimate_transition_sample_work(self, h):
+        family = self._normalize_family(h.get("family", "scm"))
+        state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
+        state_dim = int(state_dim)
+        if family == "scm":
+            hidden_dim = int(max(state_dim, int(h["prior_mlp_hidden_dim"])))
+            depth = int(max(2, int(h["num_layers"])))
+            hidden_layers = max(0, depth - 2)
+            return float(in_dim * hidden_dim + hidden_layers * hidden_dim * hidden_dim + hidden_dim * state_dim) + float(
+                in_dim * hidden_dim + hidden_layers * hidden_dim * hidden_dim + hidden_dim
+            )
+        rff_dim = int(max(8, int(h["gp_rff_features"])))
+        return float(2 * in_dim * rff_dim + rff_dim * (state_dim + 1))
+
+    def _transition_balanced_sort_key(self, h):
+        family = self._normalize_family(h.get("family", "scm"))
+        state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
+        if family == "scm":
+            hidden_dim = int(max(state_dim, int(h["prior_mlp_hidden_dim"])))
+            depth = int(max(2, int(h["num_layers"])))
+            act_name = self._activation_name(h["prior_mlp_activations"])
+            act_rank = {"identity": 0, "tanh": 1, "relu": 2}.get(act_name, 1)
+            return (
+                int(self._bucket_ceil_pow2(hidden_dim)),
+                int(self._bucket_ceil_pow2(in_dim)),
+                int(self._bucket_ceil_pow2(state_dim)),
+                int(depth),
+                int(act_rank),
+            )
+        rff_dim = int(max(8, int(h["gp_rff_features"])))
+        return (
+            int(self._bucket_ceil_pow2(rff_dim)),
+            int(self._bucket_ceil_pow2(in_dim)),
+            int(self._bucket_ceil_pow2(state_dim)),
+        )
+
+    def _build_balanced_transition_bucket_groups(self, family_group, bucket_count):
+        bucket_count = int(max(1, bucket_count))
+        if bucket_count <= 1 or len(family_group) <= 1:
+            family = self._normalize_family(family_group[0][1].get("family", "scm"))
+            return {(family, "__balanced__0"): list(family_group)}
+        sorted_group = sorted(
+            family_group,
+            key=lambda pair: (self._transition_balanced_sort_key(pair[1]), self._estimate_transition_sample_work(pair[1])),
+            reverse=True,
+        )
+        sample_work = [self._estimate_transition_sample_work(h) for _, h in sorted_group]
+        total_work = float(sum(sample_work))
+        if total_work <= 0.0:
+            total_work = float(len(sorted_group))
+            sample_work = [1.0] * len(sorted_group)
+        target_work = total_work / float(bucket_count)
+        family = self._normalize_family(sorted_group[0][1].get("family", "scm"))
+        groups = {}
+        start = 0
+        acc_work = 0.0
+        bucket_idx = 0
+        for idx, item_work in enumerate(sample_work):
+            remaining_items = len(sorted_group) - idx - 1
+            remaining_buckets = bucket_count - bucket_idx - 1
+            acc_work += float(item_work)
+            if remaining_buckets <= 0:
+                continue
+            if remaining_items < remaining_buckets:
+                continue
+            if acc_work < target_work:
+                continue
+            groups[(family, f"__balanced__{bucket_idx}")] = sorted_group[start: idx + 1]
+            start = idx + 1
+            acc_work = 0.0
+            bucket_idx += 1
+        if start < len(sorted_group):
+            groups[(family, f"__balanced__{bucket_idx}")] = sorted_group[start:]
+        return groups
 
     def _estimate_transition_group_work(self, h_list):
         if not h_list:
@@ -2808,11 +3328,30 @@ class EnvironmentPrior:
 
         return fn
 
-    def _build_gp_hetero_batch_fn(self, in_dims, out_dims, h_list, device, generators=None, input_mask=None):
+    def _build_gp_hetero_batch_fn(
+        self,
+        in_dims,
+        out_dims,
+        h_list,
+        device,
+        generators=None,
+        input_mask=None,
+        sample_in_dims=None,
+    ):
         batch_size = len(h_list)
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
         ragged_affine_enabled = bool(self.envgen_ragged_affine and device_obj.type == "cuda")
+        gp_input_fused_enabled = bool(self.fused_transition_gp_input_fused and device_obj.type == "cuda")
+        gp_output_fused_enabled = bool(self.fused_transition_gp_output_fused and device_obj.type == "cuda")
+        gp_rff_fused_enabled = bool(
+            self.fused_transition_gp_rff_fused and triton is not None and device_obj.type == "cuda"
+        )
+        gp_projection_timing_enabled = bool(self.profile_gp_projection_timing)
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if sample_in_dims is None:
+            sample_in_dims = in_dims
+        else:
+            sample_in_dims = torch.as_tensor(sample_in_dims, device=device, dtype=torch.long)
         out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
         if input_mask is not None:
             input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
@@ -2842,17 +3381,22 @@ class EnvironmentPrior:
         else:
             in_cap = int(in_dims.max().item())
             in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+        w_in_cap = int(max(1, int(in_dims.max().item()))) if gp_input_fused_enabled else int(in_cap)
         m_cap = int(m_dims.max().item())
         out_cap = int(out_dims.max().item())
-        w = torch.zeros((batch_size, in_cap, m_cap), device=device, dtype=torch.float32)
+        w = torch.zeros((batch_size, w_in_cap, m_cap), device=device, dtype=torch.float32)
         b = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
         a = torch.zeros((batch_size, m_cap, out_cap), device=device, dtype=torch.float32)
         m_mask = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
         out_mask = torch.zeros((batch_size, out_cap), device=device, dtype=torch.float32)
-        w_input_index = None
+        w_source_index = None
+        w_layout_index = None
         a_input_index = None
-        if ragged_affine_enabled:
-            w_input_index = torch.zeros((batch_size, in_cap), device=device, dtype=torch.long)
+        if gp_input_fused_enabled:
+            w_source_index = torch.zeros((batch_size, w_in_cap), device=device, dtype=torch.long)
+        elif ragged_affine_enabled or (gp_rff_fused_enabled and input_mask is not None):
+            w_layout_index = torch.zeros((batch_size, in_cap), device=device, dtype=torch.long)
+        if ragged_affine_enabled and not gp_output_fused_enabled:
             a_input_index = torch.zeros((batch_size, m_cap), device=device, dtype=torch.long)
 
         for bi in range(batch_size):
@@ -2862,48 +3406,156 @@ class EnvironmentPrior:
             else:
                 in_i = int(in_dims[bi].item())
                 active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            sample_in_i = int(sample_in_dims[bi].item())
             m_i = int(m_dims[bi].item())
             out_i = int(out_dims[bi].item())
             g = None if generators is None else generators[bi]
             if g is None:
-                w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+                w_b = torch.randn((sample_in_i, m_i), device=device, dtype=torch.float32)
                 b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
                 a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32)
             else:
-                w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32, generator=g)
+                w_b = torch.randn((sample_in_i, m_i), device=device, dtype=torch.float32, generator=g)
                 b_b = torch.rand((m_i,), device=device, dtype=torch.float32, generator=g)
                 a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32, generator=g)
             w_b = w_b / lengthscale[bi]
             w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            if sample_in_i != in_i:
+                w_b = w_b[:in_i]
             a_b = a_b / math.sqrt(max(1, m_i))
             a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
-            w[bi, active_idx, :m_i] = w_b
+            if gp_input_fused_enabled:
+                w[bi, :in_i, :m_i] = w_b
+            else:
+                w[bi, active_idx, :m_i] = w_b
             b[bi, :m_i] = 2.0 * math.pi * b_b
             a[bi, :m_i, :out_i] = a_b
             if input_mask is None:
                 in_mask[bi, :in_i] = 1.0
             m_mask[bi, :m_i] = 1.0
             out_mask[bi, :out_i] = 1.0
-            if w_input_index is not None and in_i > 0:
-                w_input_index[bi, :in_i] = active_idx
+            if gp_input_fused_enabled and in_i > 0:
+                w_source_index[bi, :in_i] = active_idx
+            elif w_layout_index is not None and in_i > 0:
+                w_layout_index[bi, :in_i] = active_idx
             if a_input_index is not None and m_i > 0:
                 a_input_index[bi, :m_i] = torch.arange(m_i, device=device, dtype=torch.long)
 
+        a_projection_activation_codes = None
+        a_out_tile_batch = None
+        a_out_tile_offsets = None
+        a_in_tile_batch = None
+        a_in_tile_offsets = None
+        if gp_output_fused_enabled:
+            a_projection_activation_codes = torch.full((batch_size,), -1, device=device, dtype=torch.long)
+            a_out_tile_batch, a_out_tile_offsets = self._build_active_tile_map(out_dims, 32)
+            a_in_tile_batch, a_in_tile_offsets = self._build_active_tile_map(m_dims, 32)
+        rff_activation_codes = None
+        rff_out_tile_batch = None
+        rff_out_tile_offsets = None
+        rff_in_tile_batch = None
+        rff_in_tile_offsets = None
+        rff_block_o = int(self.gp_rff_tiled_block_o)
+        rff_block_k = int(self.gp_rff_tiled_block_k)
+        rff_num_warps = int(self.gp_rff_tiled_num_warps)
+        if gp_rff_fused_enabled:
+            rff_activation_codes = torch.full((batch_size,), 3, device=device, dtype=torch.long)
+            rff_out_tile_batch, rff_out_tile_offsets = self._build_active_tile_map(m_dims, rff_block_o)
+            rff_in_tile_batch, rff_in_tile_offsets = self._build_active_tile_map(in_dims, rff_block_k)
+        gp_projection_profile = {
+            "first_projection_wall_s": 0.0,
+            "second_projection_wall_s": 0.0,
+            "call_count": 0,
+            "rff_fused_call_count": 0,
+            "shared_total_wall_s": 0.0,
+            "shared_core_wall_s": 0.0,
+            "shared_noise_wall_s": 0.0,
+            "shared_checkpoint_wall_s": 0.0,
+            "shared_post_wall_s": 0.0,
+            "shared_call_count": 0,
+        }
+
+        def _consume_gp_projection_profile():
+            stats = dict(gp_projection_profile)
+            for key in gp_projection_profile:
+                gp_projection_profile[key] = 0.0 if "wall_s" in key else 0
+            return stats
+
         def _core_fn(x):
             x_in = x[:, :in_cap]
-            if w_input_index is None:
+            first_proj_t0 = time.perf_counter() if gp_projection_timing_enabled else None
+            if gp_input_fused_enabled:
+                x_packed = torch.gather(x_in, 1, w_source_index)
+                phi_pre = self._batch_affine(x_packed[:, :w_in_cap], w, b)
+                phi = torch.cos(phi_pre) * m_mask
+            elif gp_rff_fused_enabled:
+                if w_layout_index is None:
+                    phi = self._batch_affine_prefix_tiled(
+                        x_in[:, :in_cap] * in_mask,
+                        w,
+                        b,
+                        in_sizes=in_dims,
+                        out_sizes=m_dims,
+                        activation_codes=rff_activation_codes,
+                        out_tile_batch=rff_out_tile_batch,
+                        out_tile_offsets=rff_out_tile_offsets,
+                        in_tile_batch=rff_in_tile_batch,
+                        in_tile_offsets=rff_in_tile_offsets,
+                        block_o=rff_block_o,
+                        block_k=rff_block_k,
+                        num_warps=rff_num_warps,
+                    )
+                else:
+                    phi = self._batch_affine_with_layout_tiled(
+                        x_in,
+                        w,
+                        b,
+                        input_index=w_layout_index,
+                        in_sizes=in_dims,
+                        out_sizes=m_dims,
+                        activation_codes=rff_activation_codes,
+                        out_tile_batch=rff_out_tile_batch,
+                        out_tile_offsets=rff_out_tile_offsets,
+                        in_tile_batch=rff_in_tile_batch,
+                        in_tile_offsets=rff_in_tile_offsets,
+                        block_o=rff_block_o,
+                        block_k=rff_block_k,
+                        num_warps=rff_num_warps,
+                    )
+                phi = phi * m_mask
+            elif w_layout_index is None:
                 phi_pre = self._batch_affine(x_in * in_mask, w, b)
+                phi = torch.cos(phi_pre) * m_mask
             else:
                 phi_pre = self._batch_affine_with_layout(
                     x_in,
                     w,
                     b,
-                    input_index=w_input_index,
+                    input_index=w_layout_index,
                     in_sizes=in_dims,
                     out_sizes=m_dims,
                 )
-            phi = torch.cos(phi_pre) * m_mask
-            if a_input_index is None:
+                phi = torch.cos(phi_pre) * m_mask
+            if first_proj_t0 is not None:
+                gp_projection_profile["first_projection_wall_s"] += (time.perf_counter() - first_proj_t0)
+                gp_projection_profile["call_count"] += 1
+                if gp_rff_fused_enabled:
+                    gp_projection_profile["rff_fused_call_count"] += 1
+            second_proj_t0 = time.perf_counter() if gp_projection_timing_enabled else None
+            if gp_output_fused_enabled:
+                y = outputscale[:, None] * self._batch_affine_prefix_tiled(
+                    phi[:, :m_cap],
+                    a,
+                    None,
+                    in_sizes=m_dims,
+                    out_sizes=out_dims,
+                    activation_codes=a_projection_activation_codes,
+                    out_tile_batch=a_out_tile_batch,
+                    out_tile_offsets=a_out_tile_offsets,
+                    in_tile_batch=a_in_tile_batch,
+                    in_tile_offsets=a_in_tile_offsets,
+                )
+            elif a_input_index is None:
                 y = outputscale[:, None] * self._batch_affine(phi, a, None)
             else:
                 y = outputscale[:, None] * self._batch_affine_with_layout(
@@ -2914,6 +3566,8 @@ class EnvironmentPrior:
                     in_sizes=m_dims,
                     out_sizes=out_dims,
                 )
+            if second_proj_t0 is not None:
+                gp_projection_profile["second_projection_wall_s"] += (time.perf_counter() - second_proj_t0)
             y = y * out_mask
             return y
 
@@ -2946,6 +3600,13 @@ class EnvironmentPrior:
         fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
         fn._noise_scale = noise
         fn._out_width = int(out_mask.shape[1])
+        fn._gp_input_rff_fused = bool(gp_input_fused_enabled)
+        fn._gp_output_projection_fused = bool(gp_output_fused_enabled)
+        fn._gp_rff_fused = bool(gp_rff_fused_enabled)
+        fn._gp_rff_block_o = int(rff_block_o)
+        fn._gp_rff_block_k = int(rff_block_k)
+        fn._gp_rff_num_warps = int(rff_num_warps)
+        fn._consume_gp_projection_profile = _consume_gp_projection_profile
 
         return fn
 
@@ -3334,6 +3995,174 @@ class EnvironmentPrior:
             _make_branch_fn(state_w, state_b, state_a, state_out_mask),
             _make_branch_fn(reward_w, reward_b, reward_a, reward_out_mask),
         )
+
+    def _build_gp_hetero_output_subgraph_transition_fn(self, in_dims, state_dims, h_list, device, input_mask=None):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return None
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        m_dims = torch.tensor([max(8, int(h["gp_rff_features"])) for h in h_list], device=device, dtype=torch.long)
+        lengthscale = torch.tensor(
+            [max(1e-6, float(h["lengthscale"])) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        outputscale = torch.tensor([float(h["outputscale"]) for h in h_list], device=device, dtype=torch.float32)
+        noise = torch.tensor([float(h["noise"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        outputscale_cap_values = []
+        for h in h_list:
+            w_cap = self._resolve_lipschitz_weight_cap(h)
+            s_cap = self._resolve_lipschitz_gp_outputscale_cap(h)
+            weight_cap_values.append(float(w_cap) if w_cap is not None else float("inf"))
+            outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
+        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+
+        if input_mask is not None:
+            in_cap = int(input_mask.shape[1])
+            in_mask = input_mask.clone()
+        else:
+            in_cap = int(in_dims.max().item())
+            in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+        m_cap = int(m_dims.max().item())
+        state_out_cap = int(state_dims.max().item())
+        state_w = torch.zeros((batch_size, in_cap, m_cap), device=device, dtype=torch.float32)
+        state_b = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        state_a = torch.zeros((batch_size, m_cap, state_out_cap), device=device, dtype=torch.float32)
+        reward_w = torch.zeros((batch_size, in_cap, m_cap), device=device, dtype=torch.float32)
+        reward_b = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        reward_a_vec = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        m_mask = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        state_out_mask = torch.zeros((batch_size, state_out_cap), device=device, dtype=torch.float32)
+        reward_dual_mask = torch.zeros((batch_size, state_out_cap), device=device, dtype=torch.float32)
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            m_i = int(m_dims[bi].item())
+            out_i = int(state_dims[bi].item())
+            w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+            b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
+            a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            state_w[bi, active_idx, :m_i] = w_b
+            state_b[bi, :m_i] = 2.0 * math.pi * b_b
+            state_a[bi, :m_i, :out_i] = a_b
+            if input_mask is None:
+                in_mask[bi, :in_i] = 1.0
+            m_mask[bi, :m_i] = 1.0
+            state_out_mask[bi, :out_i] = 1.0
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            m_i = int(m_dims[bi].item())
+            w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+            b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
+            a_b = torch.randn((m_i,), device=device, dtype=torch.float32)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b.unsqueeze(1), float(weight_cap[bi].item())).squeeze(1)
+            reward_w[bi, active_idx, :m_i] = w_b
+            reward_b[bi, :m_i] = 2.0 * math.pi * b_b
+            reward_a_vec[bi, :m_i] = a_b
+            reward_dual_mask[bi, :1] = 1.0
+
+        dual_out_mask = torch.cat([state_out_mask, reward_dual_mask], dim=0)
+        checkpoint_enabled = bool(self.envgen_checkpoint)
+
+        def _core_dual(x_state, x_reward):
+            state_in = x_state[:, :in_cap] * in_mask
+            reward_in = x_reward[:, :in_cap] * in_mask
+            state_phi = torch.cos(self._batch_affine(state_in, state_w, state_b)) * m_mask
+            reward_phi = torch.cos(self._batch_affine(reward_in, reward_w, reward_b)) * m_mask
+            state_y = outputscale[:, None] * self._batch_affine(state_phi, state_a, None)
+            reward_y = outputscale[:, None] * (reward_phi * reward_a_vec).sum(dim=1, keepdim=True)
+            out_dual = torch.zeros((2 * batch_size, state_out_cap), device=x_state.device, dtype=x_state.dtype)
+            out_dual[:batch_size] = state_y * state_out_mask
+            out_dual[batch_size:, :1] = reward_y
+            return out_dual
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            if bool(x_is_dual_packed):
+                x_state = x[:batch_size]
+                x_reward = x[batch_size: batch_size * 2]
+                state_input = x_state
+                reward_input = x_reward
+            else:
+                x_state = x
+                x_reward = x
+                state_input = x_state
+                reward_input = x_reward
+            if checkpoint_enabled and self._envgen_checkpoint_active(state_input):
+                if bool(x_is_dual_packed):
+                    checkpoint_state = state_input
+                    checkpoint_reward = reward_input
+                else:
+                    shared_input = state_input.clone()
+                    checkpoint_state = shared_input
+                    checkpoint_reward = shared_input
+                out_dual = checkpoint(
+                    _core_dual,
+                    checkpoint_state,
+                    checkpoint_reward,
+                    use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                    preserve_rng_state=False,
+                )
+            else:
+                out_dual = _core_dual(state_input, reward_input)
+            dual_noise = None
+            dual_scale = torch.cat([noise, noise], dim=0)
+            if generators_for_noise is not None:
+                generators_list = list(generators_for_noise)
+                if len(generators_list) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+                if bool(torch.any(dual_scale > 0)):
+                    dual_noise = self._sample_scaled_noise_batch(
+                        generators_list + generators_list,
+                        scale=dual_scale,
+                        width=state_out_cap,
+                        device=out_dual.device,
+                        dtype=out_dual.dtype,
+                    )
+            elif bool(torch.any(dual_scale > 0)):
+                dual_noise = self._sample_scaled_noise_batch(
+                    None,
+                    scale=dual_scale,
+                    width=state_out_cap,
+                    device=out_dual.device,
+                    dtype=out_dual.dtype,
+                )
+            if dual_noise is not None:
+                out_dual = out_dual + dual_noise
+            out_dual = torch.tanh(out_dual)
+            out_dual = out_dual * dual_out_mask
+            return out_dual[:batch_size, :state_out_cap], out_dual[batch_size:, :1]
+
+        transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
+        transition_fn._prefers_dual_packed_input = False
+        transition_fn._paired_specialized = False
+        transition_fn._gp_output_subgraph_fused = True
+        return transition_fn
 
     def _build_scm_hetero_hidden_fused_transition_fn(
         self,
@@ -3784,9 +4613,15 @@ class EnvironmentPrior:
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
 
-        transition_fn._envgen_checkpoint_enabled = bool(getattr(dual_fn, "_envgen_checkpoint_enabled", False))
         transition_fn._prefers_dual_packed_input = True
         transition_fn._paired_specialized = False
+        transition_fn._gp_input_rff_fused = bool(getattr(dual_fn, "_gp_input_rff_fused", False))
+        transition_fn._gp_output_projection_fused = bool(
+            getattr(dual_fn, "_gp_output_projection_fused", False)
+        )
+        transition_fn._gp_rff_fused = bool(getattr(dual_fn, "_gp_rff_fused", False))
+        if callable(getattr(dual_fn, "_consume_gp_projection_profile", None)):
+            transition_fn._consume_gp_projection_profile = dual_fn._consume_gp_projection_profile
 
         return transition_fn
 
@@ -3797,6 +4632,20 @@ class EnvironmentPrior:
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
         reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        gp_packed_env_input_enabled = bool(
+            self.fused_transition_gp_packed_env_input
+            and input_mask is not None
+            and device_obj.type == "cuda"
+        )
+        if bool(self.fused_transition_gp_output_subgraph):
+            return self._build_gp_hetero_output_subgraph_transition_fn(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                input_mask=input_mask,
+            )
         if bool(self.fused_transition_paired):
             state_fn, reward_fn = self._build_gp_hetero_paired_transition_fns(
                 in_dims=in_dims,
@@ -3815,11 +4664,22 @@ class EnvironmentPrior:
         dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
         dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
         input_mask_dual = None
+        packed_input_cap = int(max(1, int(in_dims.max().item())))
         if input_mask is not None:
             input_mask_t = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
             input_mask_dual = torch.cat([input_mask_t, input_mask_t], dim=0)
         h_list_dual = list(h_list) + list(h_list)
-        dual_fn = self._build_gp_hetero_batch_fn(
+        gp_shared_first_proj_enabled = bool(
+            self.fused_transition_gp_shared_first_proj
+            and device_obj.type == "cuda"
+            and not gp_packed_env_input_enabled
+        )
+        cpu_rng_state_pre_legacy = None
+        cuda_rng_state_pre_legacy = None
+        if gp_shared_first_proj_enabled:
+            cpu_rng_state_pre_legacy = torch.random.get_rng_state()
+            cuda_rng_state_pre_legacy = torch.cuda.get_rng_state(device=device_obj)
+        natural_dual_fn = self._build_gp_hetero_batch_fn(
             in_dims=dual_in_dims,
             out_dims=dual_out_dims,
             h_list=h_list_dual,
@@ -3827,17 +4687,36 @@ class EnvironmentPrior:
             generators=None,
             input_mask=input_mask_dual,
         )
+        packed_dual_fn = None
+        if gp_packed_env_input_enabled:
+            packed_in_dims = torch.tensor(
+                [sum(self._sample_dims(h)[:4]) for h in h_list],
+                device=device,
+                dtype=torch.long,
+            )
+            packed_input_cap = int(max(1, int(packed_in_dims.max().item())))
+            packed_dual_in_dims = torch.cat([packed_in_dims, packed_in_dims], dim=0)
+            packed_dual_fn = self._build_gp_hetero_batch_fn(
+                in_dims=packed_dual_in_dims,
+                out_dims=dual_out_dims,
+                h_list=h_list_dual,
+                device=device,
+                generators=None,
+                input_mask=None,
+                sample_in_dims=dual_in_dims,
+            )
         state_cap = int(state_dims.max().item())
 
-        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+        def legacy_transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
             x_dual = x if bool(x_is_dual_packed) else torch.cat([x, x], dim=0)
+            active_dual_fn = packed_dual_fn if (gp_packed_env_input_enabled and bool(x_input_is_packed)) else natural_dual_fn
             generators_dual = None
             if generators_for_noise is not None:
                 generators_list = list(generators_for_noise)
                 if len(generators_list) != batch_size:
                     raise ValueError("generators_for_noise must match batch size")
                 generators_dual = generators_list + generators_list
-            out_dual = dual_fn(
+            out_dual = active_dual_fn(
                 x_dual,
                 generators_for_noise=generators_dual,
                 stable_input=True,
@@ -3846,9 +4725,123 @@ class EnvironmentPrior:
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
 
-        transition_fn._envgen_checkpoint_enabled = bool(getattr(dual_fn, "_envgen_checkpoint_enabled", False))
-        transition_fn._prefers_dual_packed_input = True
+        shared_transition_fn = None
+        if gp_shared_first_proj_enabled:
+            cpu_rng_state_post_legacy = torch.random.get_rng_state()
+            cuda_rng_state_post_legacy = torch.cuda.get_rng_state(device=device_obj)
+            torch.random.set_rng_state(cpu_rng_state_pre_legacy)
+            torch.cuda.set_rng_state(cuda_rng_state_pre_legacy, device=device_obj)
+            shared_transition_fn = self._build_gp_hetero_shared_first_proj_transition_fn(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                input_mask=input_mask,
+            )
+            torch.random.set_rng_state(cpu_rng_state_post_legacy)
+            torch.cuda.set_rng_state(cuda_rng_state_post_legacy, device=device_obj)
+
+        if shared_transition_fn is None:
+            transition_fn = legacy_transition_fn
+        else:
+            def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+                if bool(x_is_dual_packed) or bool(x_input_is_packed):
+                    return legacy_transition_fn(
+                        x,
+                        generators_for_noise=generators_for_noise,
+                        x_is_dual_packed=x_is_dual_packed,
+                        x_input_is_packed=x_input_is_packed,
+                    )
+                return shared_transition_fn(
+                    x,
+                    generators_for_noise=generators_for_noise,
+                    stable_input=True,
+                )
+
+        transition_fn._prefers_dual_packed_input = bool(shared_transition_fn is None)
         transition_fn._paired_specialized = False
+        transition_fn._prefers_packed_env_input = bool((shared_transition_fn is None) and gp_packed_env_input_enabled)
+        transition_fn._packed_input_cap = int(packed_input_cap)
+        transition_fn._envgen_checkpoint_enabled = bool(
+            getattr(natural_dual_fn, "_envgen_checkpoint_enabled", False)
+            or getattr(packed_dual_fn, "_envgen_checkpoint_enabled", False)
+            or getattr(shared_transition_fn, "_envgen_checkpoint_enabled", False)
+        )
+        transition_fn._gp_input_rff_fused = bool(
+            getattr(natural_dual_fn, "_gp_input_rff_fused", False)
+            or getattr(packed_dual_fn, "_gp_input_rff_fused", False)
+        )
+        transition_fn._gp_output_projection_fused = bool(
+            getattr(natural_dual_fn, "_gp_output_projection_fused", False)
+            or getattr(packed_dual_fn, "_gp_output_projection_fused", False)
+        )
+        transition_fn._gp_rff_fused = bool(
+            getattr(natural_dual_fn, "_gp_rff_fused", False)
+            or getattr(packed_dual_fn, "_gp_rff_fused", False)
+        )
+        transition_fn._gp_shared_first_proj_fused = bool(shared_transition_fn is not None)
+        natural_profile_reader = getattr(natural_dual_fn, "_consume_gp_projection_profile", None)
+        packed_profile_reader = getattr(packed_dual_fn, "_consume_gp_projection_profile", None)
+        shared_profile_reader = getattr(shared_transition_fn, "_consume_gp_projection_profile", None)
+        if callable(natural_profile_reader) or callable(packed_profile_reader) or callable(shared_profile_reader):
+            def _consume_gp_projection_profile():
+                stats = {
+                    "first_projection_wall_s": 0.0,
+                    "second_projection_wall_s": 0.0,
+                    "call_count": 0,
+                    "rff_fused_call_count": 0,
+                    "shared_total_wall_s": 0.0,
+                    "shared_core_wall_s": 0.0,
+                    "shared_noise_wall_s": 0.0,
+                    "shared_checkpoint_wall_s": 0.0,
+                    "shared_post_wall_s": 0.0,
+                    "shared_call_count": 0,
+                }
+                if callable(natural_profile_reader):
+                    natural_stats = natural_profile_reader() or {}
+                    stats["first_projection_wall_s"] += float(natural_stats.get("first_projection_wall_s", 0.0) or 0.0)
+                    stats["second_projection_wall_s"] += float(natural_stats.get("second_projection_wall_s", 0.0) or 0.0)
+                    stats["call_count"] += int(natural_stats.get("call_count", 0) or 0)
+                    stats["rff_fused_call_count"] += int(natural_stats.get("rff_fused_call_count", 0) or 0)
+                    stats["shared_total_wall_s"] += float(natural_stats.get("shared_total_wall_s", 0.0) or 0.0)
+                    stats["shared_core_wall_s"] += float(natural_stats.get("shared_core_wall_s", 0.0) or 0.0)
+                    stats["shared_noise_wall_s"] += float(natural_stats.get("shared_noise_wall_s", 0.0) or 0.0)
+                    stats["shared_checkpoint_wall_s"] += float(
+                        natural_stats.get("shared_checkpoint_wall_s", 0.0) or 0.0
+                    )
+                    stats["shared_post_wall_s"] += float(natural_stats.get("shared_post_wall_s", 0.0) or 0.0)
+                    stats["shared_call_count"] += int(natural_stats.get("shared_call_count", 0) or 0)
+                if callable(packed_profile_reader):
+                    packed_stats = packed_profile_reader() or {}
+                    stats["first_projection_wall_s"] += float(packed_stats.get("first_projection_wall_s", 0.0) or 0.0)
+                    stats["second_projection_wall_s"] += float(packed_stats.get("second_projection_wall_s", 0.0) or 0.0)
+                    stats["call_count"] += int(packed_stats.get("call_count", 0) or 0)
+                    stats["rff_fused_call_count"] += int(packed_stats.get("rff_fused_call_count", 0) or 0)
+                    stats["shared_total_wall_s"] += float(packed_stats.get("shared_total_wall_s", 0.0) or 0.0)
+                    stats["shared_core_wall_s"] += float(packed_stats.get("shared_core_wall_s", 0.0) or 0.0)
+                    stats["shared_noise_wall_s"] += float(packed_stats.get("shared_noise_wall_s", 0.0) or 0.0)
+                    stats["shared_checkpoint_wall_s"] += float(
+                        packed_stats.get("shared_checkpoint_wall_s", 0.0) or 0.0
+                    )
+                    stats["shared_post_wall_s"] += float(packed_stats.get("shared_post_wall_s", 0.0) or 0.0)
+                    stats["shared_call_count"] += int(packed_stats.get("shared_call_count", 0) or 0)
+                if callable(shared_profile_reader):
+                    shared_stats = shared_profile_reader() or {}
+                    stats["first_projection_wall_s"] += float(shared_stats.get("first_projection_wall_s", 0.0) or 0.0)
+                    stats["second_projection_wall_s"] += float(shared_stats.get("second_projection_wall_s", 0.0) or 0.0)
+                    stats["call_count"] += int(shared_stats.get("call_count", 0) or 0)
+                    stats["rff_fused_call_count"] += int(shared_stats.get("rff_fused_call_count", 0) or 0)
+                    stats["shared_total_wall_s"] += float(shared_stats.get("shared_total_wall_s", 0.0) or 0.0)
+                    stats["shared_core_wall_s"] += float(shared_stats.get("shared_core_wall_s", 0.0) or 0.0)
+                    stats["shared_noise_wall_s"] += float(shared_stats.get("shared_noise_wall_s", 0.0) or 0.0)
+                    stats["shared_checkpoint_wall_s"] += float(
+                        shared_stats.get("shared_checkpoint_wall_s", 0.0) or 0.0
+                    )
+                    stats["shared_post_wall_s"] += float(shared_stats.get("shared_post_wall_s", 0.0) or 0.0)
+                    stats["shared_call_count"] += int(shared_stats.get("shared_call_count", 0) or 0)
+                return stats
+
+            transition_fn._consume_gp_projection_profile = _consume_gp_projection_profile
 
         return transition_fn
 
@@ -3929,7 +4922,221 @@ class EnvironmentPrior:
         transition_fn._paired_specialized = True
         return transition_fn
 
-    def _sample_environment_family_coarse_batch(self, h_list, device, rng_seeds=None):
+    def _build_gp_hetero_shared_first_proj_transition_fn(self, in_dims, state_dims, h_list, device, input_mask=None):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return None
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        m_dims = torch.tensor([max(8, int(h["gp_rff_features"])) for h in h_list], device=device, dtype=torch.long)
+        lengthscale = torch.tensor(
+            [max(1e-6, float(h["lengthscale"])) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        outputscale = torch.tensor([float(h["outputscale"]) for h in h_list], device=device, dtype=torch.float32)
+        noise = torch.tensor([float(h["noise"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        outputscale_cap_values = []
+        for h in h_list:
+            w_cap = self._resolve_lipschitz_weight_cap(h)
+            s_cap = self._resolve_lipschitz_gp_outputscale_cap(h)
+            weight_cap_values.append(float(w_cap) if w_cap is not None else float("inf"))
+            outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
+        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+
+        if input_mask is not None:
+            in_cap = int(input_mask.shape[1])
+            in_mask = input_mask.clone()
+        else:
+            in_cap = int(in_dims.max().item())
+            in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+        m_cap = int(m_dims.max().item())
+        dual_m_cap = int(2 * m_cap)
+        state_cap = int(state_dims.max().item())
+        dual_out_cap = int(state_cap + 1)
+        w_dual = torch.zeros((batch_size, in_cap, dual_m_cap), device=device, dtype=torch.float32)
+        b_dual = torch.zeros((batch_size, dual_m_cap), device=device, dtype=torch.float32)
+        dual_m_mask = torch.zeros((batch_size, dual_m_cap), device=device, dtype=torch.float32)
+        a_dual = torch.zeros((batch_size, dual_m_cap, dual_out_cap), device=device, dtype=torch.float32)
+        state_out_mask = torch.zeros((batch_size, state_cap), device=device, dtype=torch.float32)
+        reward_out_mask = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+
+        active_indices = []
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+                if in_i > 0:
+                    in_mask[bi, :in_i] = 1.0
+            active_indices.append((active_idx, in_i))
+
+        def _sample_branch_params(in_i, m_i, out_i):
+            w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+            b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
+            a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32)
+            return w_b, b_b, a_b
+
+        # Preserve legacy RNG order: state branch params for all samples, then reward branch params.
+        for bi in range(batch_size):
+            active_idx, in_i = active_indices[bi]
+            m_i = int(m_dims[bi].item())
+            out_i = int(state_dims[bi].item())
+            if in_i <= 0 or m_i <= 0 or out_i <= 0:
+                continue
+            w_b, b_b, a_b = _sample_branch_params(in_i, m_i, out_i)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            w_dual[bi, active_idx, :m_i] = w_b
+            b_dual[bi, :m_i] = 2.0 * math.pi * b_b
+            dual_m_mask[bi, :m_i] = 1.0
+            a_dual[bi, :m_i, :out_i] = a_b
+            state_out_mask[bi, :out_i] = 1.0
+
+        for bi in range(batch_size):
+            active_idx, in_i = active_indices[bi]
+            m_i = int(m_dims[bi].item())
+            out_i = int(reward_dims[bi].item())
+            if in_i <= 0 or m_i <= 0 or out_i <= 0:
+                continue
+            w_b, b_b, a_b = _sample_branch_params(in_i, m_i, out_i)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            w_dual[bi, active_idx, m_cap : m_cap + m_i] = w_b
+            b_dual[bi, m_cap : m_cap + m_i] = 2.0 * math.pi * b_b
+            dual_m_mask[bi, m_cap : m_cap + m_i] = 1.0
+            a_dual[bi, m_cap : m_cap + m_i, state_cap : state_cap + out_i] = a_b
+            reward_out_mask[bi, :out_i] = 1.0
+
+        gp_projection_profile = {
+            "first_projection_wall_s": 0.0,
+            "second_projection_wall_s": 0.0,
+            "call_count": 0,
+            "rff_fused_call_count": 0,
+            "shared_total_wall_s": 0.0,
+            "shared_core_wall_s": 0.0,
+            "shared_noise_wall_s": 0.0,
+            "shared_checkpoint_wall_s": 0.0,
+            "shared_post_wall_s": 0.0,
+            "shared_call_count": 0,
+        }
+
+        def _consume_gp_projection_profile():
+            stats = dict(gp_projection_profile)
+            for key in gp_projection_profile:
+                gp_projection_profile[key] = 0.0 if "wall_s" in key else 0
+            return stats
+
+        def _core_fn(x):
+            core_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            x_in = x[:, :in_cap] * in_mask
+            first_proj_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            phi_dual = torch.cos(self._batch_affine(x_in, w_dual, b_dual)) * dual_m_mask
+            if first_proj_t0 is not None:
+                gp_projection_profile["first_projection_wall_s"] += (time.perf_counter() - first_proj_t0)
+                gp_projection_profile["call_count"] += 1
+            second_proj_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            y_dual = outputscale[:, None] * self._batch_affine(phi_dual, a_dual, None)
+            if second_proj_t0 is not None:
+                gp_projection_profile["second_projection_wall_s"] += (time.perf_counter() - second_proj_t0)
+            if core_t0 is not None:
+                gp_projection_profile["shared_core_wall_s"] += (time.perf_counter() - core_t0)
+            state_y = y_dual[:, :state_cap]
+            reward_y = y_dual[:, state_cap : state_cap + 1]
+            return state_y * state_out_mask, reward_y * reward_out_mask
+
+        def _sample_noise_pair(generators_for_noise, *, dtype, device_obj):
+            if not bool(torch.any(noise > 0)):
+                return None, None
+            if generators_for_noise is None:
+                state_eps = torch.randn((batch_size, state_cap), device=device_obj, dtype=dtype) * noise[:, None]
+                reward_eps = torch.randn((batch_size, state_cap), device=device_obj, dtype=dtype) * noise[:, None]
+                return state_eps, reward_eps[:, :1]
+            generators_list = list(generators_for_noise)
+            if len(generators_list) != batch_size:
+                raise ValueError("generators_for_noise must match batch size")
+            state_eps = torch.zeros((batch_size, state_cap), device=device_obj, dtype=dtype)
+            reward_eps = torch.zeros((batch_size, 1), device=device_obj, dtype=dtype)
+            for bi in range(batch_size):
+                if float(noise[bi].item()) <= 0.0:
+                    continue
+                g = generators_list[bi]
+                if g is None:
+                    e_state = torch.randn((state_cap,), device=device_obj, dtype=dtype)
+                    e_reward_full = torch.randn((state_cap,), device=device_obj, dtype=dtype)
+                else:
+                    e_state = torch.randn((state_cap,), device=device_obj, dtype=dtype, generator=g)
+                    e_reward_full = torch.randn((state_cap,), device=device_obj, dtype=dtype, generator=g)
+                state_eps[bi] = e_state * noise[bi]
+                reward_eps[bi, 0] = e_reward_full[0] * noise[bi]
+            return state_eps, reward_eps
+
+        def fn(x, generators_for_noise=None, stable_input=False):
+            total_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            checkpoint_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            if self._envgen_checkpoint_active(x):
+                x_checkpoint = x if bool(stable_input) else x.clone()
+                state_y, reward_y = checkpoint(
+                    _core_fn,
+                    x_checkpoint,
+                    use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                    preserve_rng_state=False,
+                )
+            else:
+                state_y, reward_y = _core_fn(x)
+            if checkpoint_t0 is not None:
+                gp_projection_profile["shared_checkpoint_wall_s"] += (time.perf_counter() - checkpoint_t0)
+            noise_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            state_noise_eps, reward_noise_eps = _sample_noise_pair(
+                generators_for_noise,
+                dtype=state_y.dtype,
+                device_obj=state_y.device,
+            )
+            if state_noise_eps is not None:
+                state_y = state_y + state_noise_eps
+            if reward_noise_eps is not None:
+                reward_y = reward_y + reward_noise_eps
+            if noise_t0 is not None:
+                gp_projection_profile["shared_noise_wall_s"] += (time.perf_counter() - noise_t0)
+            post_t0 = time.perf_counter() if self.profile_gp_projection_timing else None
+            state_y = torch.tanh(state_y)
+            reward_y = torch.tanh(reward_y)
+            if post_t0 is not None:
+                gp_projection_profile["shared_post_wall_s"] += (time.perf_counter() - post_t0)
+            if total_t0 is not None:
+                gp_projection_profile["shared_total_wall_s"] += (time.perf_counter() - total_t0)
+                gp_projection_profile["shared_call_count"] += 1
+            return state_y * state_out_mask, reward_y * reward_out_mask
+
+        fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
+        fn._consume_gp_projection_profile = _consume_gp_projection_profile
+        fn._gp_shared_first_proj_fused = True
+        return fn
+
+    def _sample_environment_family_coarse_batch(
+        self,
+        h_list,
+        device,
+        rng_seeds=None,
+        *,
+        build_x_generator=True,
+        build_y_generator=True,
+        build_policy_generator=True,
+        prefer_transition_only=False,
+    ):
         if not h_list:
             raise ValueError("h_list must be non-empty")
         family = self._normalize_family(h_list[0].get("family", "scm"))
@@ -3947,6 +5154,10 @@ class EnvironmentPrior:
                 g = torch.Generator(device=device)
                 g.manual_seed(int(s))
                 generators.append(g)
+        family_build_wall_t0 = time.perf_counter()
+        generator_build_wall_s = 0.0
+        transition_generator_build_wall_s = 0.0
+        gp_shared_transition_build_wall_s = 0.0
 
         dims = [self._sample_dims(h) for h in h_list]
         state_dims = torch.tensor([d[0] for d in dims], device=device, dtype=torch.long)
@@ -3990,42 +5201,20 @@ class EnvironmentPrior:
             and device_obj.type == "cuda"
             and generators is None
         )
+        transition_only_build_enabled = bool(prefer_transition_only and enable_fused_transition)
+        build_x_generator = bool(build_x_generator) and not transition_only_build_enabled
+        build_y_generator = bool(build_y_generator) and not transition_only_build_enabled
+        build_policy_generator = bool(build_policy_generator) and not transition_only_build_enabled
         transition_generator = None
+        x_generator = None
+        y_generator = None
+        policy_generator = None
 
         if family == "scm":
             depth_values = [max(2, int(h["num_layers"])) for h in h_list]
             activation_values = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
-            x_generator = self._build_scm_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=state_dims,
-                h_list=h_list,
-                device=device,
-                depth_values=depth_values,
-                activation_names=activation_values,
-                generators=generators,
-                input_mask=input_mask,
-            )
-            y_generator = self._build_scm_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                h_list=h_list,
-                device=device,
-                depth_values=depth_values,
-                activation_names=activation_values,
-                generators=generators,
-                input_mask=input_mask,
-            )
-            policy_generator = self._build_scm_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=action_dims,
-                h_list=h_list,
-                device=device,
-                depth_values=depth_values,
-                activation_names=activation_values,
-                generators=generators,
-                input_mask=input_mask,
-            )
             if enable_fused_transition:
+                build_t0 = time.perf_counter()
                 transition_generator = self._build_scm_hetero_transition_batch_fn(
                     in_dims=in_dims,
                     state_dims=state_dims,
@@ -4035,16 +5224,49 @@ class EnvironmentPrior:
                     activation_names=activation_values,
                     input_mask=input_mask,
                 )
+                transition_generator_build_wall_s += (time.perf_counter() - build_t0)
+            if build_x_generator:
+                build_t0 = time.perf_counter()
+                x_generator = self._build_scm_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=state_dims,
+                    h_list=h_list,
+                    device=device,
+                    depth_values=depth_values,
+                    activation_names=activation_values,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
+            if build_y_generator:
+                build_t0 = time.perf_counter()
+                y_generator = self._build_scm_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
+                    h_list=h_list,
+                    device=device,
+                    depth_values=depth_values,
+                    activation_names=activation_values,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
+            if build_policy_generator:
+                build_t0 = time.perf_counter()
+                policy_generator = self._build_scm_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=action_dims,
+                    h_list=h_list,
+                    device=device,
+                    depth_values=depth_values,
+                    activation_names=activation_values,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
         else:
-            x_generator = self._build_gp_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=state_dims,
-                h_list=h_list,
-                device=device,
-                generators=generators,
-                input_mask=input_mask,
-            )
             if enable_fused_transition:
+                build_t0 = time.perf_counter()
                 transition_generator = self._build_gp_hetero_transition_batch_fn(
                     in_dims=in_dims,
                     state_dims=state_dims,
@@ -4052,22 +5274,43 @@ class EnvironmentPrior:
                     device=device,
                     input_mask=input_mask,
                 )
-            y_generator = self._build_gp_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                h_list=h_list,
-                device=device,
-                generators=generators,
-                input_mask=input_mask,
-            )
-            policy_generator = self._build_gp_hetero_batch_fn(
-                in_dims=in_dims,
-                out_dims=action_dims,
-                h_list=h_list,
-                device=device,
-                generators=generators,
-                input_mask=input_mask,
-            )
+                build_dt = (time.perf_counter() - build_t0)
+                transition_generator_build_wall_s += build_dt
+                if bool(getattr(transition_generator, "_gp_shared_first_proj_fused", False)):
+                    gp_shared_transition_build_wall_s += build_dt
+            if build_x_generator:
+                build_t0 = time.perf_counter()
+                x_generator = self._build_gp_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=state_dims,
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
+            if build_y_generator:
+                build_t0 = time.perf_counter()
+                y_generator = self._build_gp_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
+            if build_policy_generator:
+                build_t0 = time.perf_counter()
+                policy_generator = self._build_gp_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=action_dims,
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+                generator_build_wall_s += (time.perf_counter() - build_t0)
 
         alpha = torch.tensor(
             [float(max(1e-4, min(1.0, float(h["alpha"])))) for h in h_list],
@@ -4179,6 +5422,24 @@ class EnvironmentPrior:
             "y_generator": y_generator,
             "transition_generator": transition_generator,
             "policy_generator": policy_generator,
+            "_build_profile": {
+                "family_build_wall_s": float(time.perf_counter() - family_build_wall_t0),
+                "generator_build_wall_s": float(generator_build_wall_s),
+                "transition_generator_build_wall_s": float(transition_generator_build_wall_s),
+                "gp_shared_transition_build_wall_s": float(gp_shared_transition_build_wall_s),
+                "transition_only_build_enabled": int(transition_only_build_enabled),
+                "non_transition_generator_build_count": int(
+                    int(x_generator is not None)
+                    + int(y_generator is not None)
+                    + int(policy_generator is not None)
+                ),
+                "non_transition_generator_skip_count": int(
+                    3
+                    - int(x_generator is not None)
+                    - int(y_generator is not None)
+                    - int(policy_generator is not None)
+                ),
+            },
             "alpha": alpha,
             "init_state_std": init_state_std,
             "init_action_std": init_action_std,
@@ -4572,6 +5833,21 @@ class EnvironmentPrior:
             torch.tensor(offsets, device=sizes_tensor.device, dtype=torch.int32),
         )
 
+    @staticmethod
+    def _build_segment_write_map(start_offsets, sizes, width_cap):
+        sizes_t = torch.as_tensor(sizes, dtype=torch.long)
+        if int(sizes_t.numel()) <= 0 or int(width_cap) <= 0:
+            empty = torch.empty((0,), device=sizes_t.device, dtype=torch.long)
+            return empty, empty, empty
+        starts_t = torch.as_tensor(start_offsets, device=sizes_t.device, dtype=torch.long)
+        src_cols = torch.arange(int(width_cap), device=sizes_t.device, dtype=torch.long).unsqueeze(0)
+        valid = src_cols < sizes_t.unsqueeze(1)
+        if not bool(torch.any(valid)):
+            empty = torch.empty((0,), device=sizes_t.device, dtype=torch.long)
+            return empty, empty, empty
+        rows, src = torch.nonzero(valid, as_tuple=True)
+        dst = starts_t[rows] + src
+        return rows, dst, src
     def _batch_affine_prefix_tiled(
         self,
         x,
@@ -4584,6 +5860,9 @@ class EnvironmentPrior:
         out_tile_offsets=None,
         in_tile_batch=None,
         in_tile_offsets=None,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
     ):
         if not (
             triton is not None
@@ -4630,10 +5909,14 @@ class EnvironmentPrior:
                 activation_codes = activation_codes.to(device=out.device, dtype=torch.long)
                 relu_mask = activation_codes == 1
                 tanh_mask = activation_codes == 0
+                cos_mask = activation_codes == 3
                 if bool(torch.any(relu_mask)):
                     out = torch.where(relu_mask.unsqueeze(1), torch.relu(out), out)
                 if bool(torch.any(tanh_mask)):
                     out = torch.where(tanh_mask.unsqueeze(1), torch.tanh(out), out)
+                if bool(torch.any(cos_mask)):
+                    out = torch.where(cos_mask.unsqueeze(1), torch.cos(out), out)
+                    out = out * out_mask
             return out
         return _PrefixTiledBatchAffineFn.apply(
             x,
@@ -4646,6 +5929,100 @@ class EnvironmentPrior:
             out_tile_offsets,
             in_tile_batch,
             in_tile_offsets,
+            int(block_o),
+            int(block_k),
+            int(num_warps),
+        )
+
+    def _batch_affine_with_layout_tiled(
+        self,
+        x,
+        w,
+        b=None,
+        input_index=None,
+        in_sizes=None,
+        out_sizes=None,
+        activation_codes=None,
+        out_tile_batch=None,
+        out_tile_offsets=None,
+        in_tile_batch=None,
+        in_tile_offsets=None,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(x)
+            and torch.is_tensor(w)
+            and torch.is_tensor(input_index)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and torch.is_tensor(activation_codes)
+            and torch.is_tensor(out_tile_batch)
+            and torch.is_tensor(out_tile_offsets)
+            and torch.is_tensor(in_tile_batch)
+            and torch.is_tensor(in_tile_offsets)
+            and x.device.type == "cuda"
+            and w.device.type == "cuda"
+            and input_index.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and out_tile_batch.device.type == "cuda"
+            and out_tile_offsets.device.type == "cuda"
+            and in_tile_batch.device.type == "cuda"
+            and in_tile_offsets.device.type == "cuda"
+            and x.dtype == torch.float32
+            and w.dtype == torch.float32
+            and x.ndim == 2
+            and w.ndim == 3
+            and int(x.shape[0]) == int(w.shape[0])
+            and int(input_index.shape[0]) == int(x.shape[0])
+            and int(in_sizes.shape[0]) == int(x.shape[0])
+            and int(out_sizes.shape[0]) == int(x.shape[0])
+        ):
+            out = self._batch_affine_with_layout(
+                x,
+                w,
+                b,
+                input_index=input_index,
+                in_sizes=in_sizes,
+                out_sizes=out_sizes,
+            )
+            if torch.is_tensor(activation_codes) and int(activation_codes.numel()) == int(out.shape[0]):
+                activation_codes = activation_codes.to(device=out.device, dtype=torch.long)
+                tanh_mask = activation_codes == 0
+                relu_mask = activation_codes == 1
+                cos_mask = activation_codes == 3
+                if bool(torch.any(tanh_mask)):
+                    out = torch.where(tanh_mask.unsqueeze(1), torch.tanh(out), out)
+                if bool(torch.any(relu_mask)):
+                    out = torch.where(relu_mask.unsqueeze(1), torch.relu(out), out)
+                if bool(torch.any(cos_mask)):
+                    out = torch.where(cos_mask.unsqueeze(1), torch.cos(out), out)
+                if bool(torch.any(cos_mask)):
+                    out_mask = (
+                        torch.arange(int(out.shape[1]), device=out.device, dtype=torch.long).unsqueeze(0)
+                        < out_sizes.to(device=out.device, dtype=torch.long).unsqueeze(1)
+                    ).to(dtype=out.dtype)
+                    out = out * out_mask
+            return out
+        return _TiledRaggedBatchAffineFn.apply(
+            x,
+            w,
+            b,
+            input_index,
+            in_sizes,
+            out_sizes,
+            activation_codes,
+            out_tile_batch,
+            out_tile_offsets,
+            in_tile_batch,
+            in_tile_offsets,
+            int(block_o),
+            int(block_k),
+            int(num_warps),
         )
 
     def _batch_affine_with_layout(self, x, w, b=None, input_index=None, in_sizes=None, out_sizes=None):
@@ -5847,6 +7224,12 @@ class EnvironmentPrior:
             and torch.cuda.is_available()
             and rollout_generators is None
         )
+        try:
+            transition_stream_fusion_max_groups = int(
+                max(1, int(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION_MAX_GROUPS", "2")))
+            )
+        except Exception:
+            transition_stream_fusion_max_groups = 2
         async_group_commit_flag = str(
             os.environ.get("TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM", "auto")
         ).strip().lower()
@@ -5879,6 +7262,22 @@ class EnvironmentPrior:
         transition_noise_wall_s = 0.0
         transition_fused_wall_s = 0.0
         transition_fused_launch_wall_s = 0.0
+        transition_gp_first_projection_wall_s = 0.0
+        transition_gp_second_projection_wall_s = 0.0
+        transition_gp_projection_call_count = 0
+        transition_gp_rff_fused_call_count = 0
+        transition_gp_profile_group_count = 0
+        transition_gp_profile_sync_group_count = 0
+        transition_gp_shared_total_wall_s = 0.0
+        transition_gp_shared_core_wall_s = 0.0
+        transition_gp_shared_noise_wall_s = 0.0
+        transition_gp_shared_checkpoint_wall_s = 0.0
+        transition_gp_shared_post_wall_s = 0.0
+        transition_gp_shared_call_count = 0
+        transition_packed_env_input_group_count = 0
+        transition_packed_env_input_call_count = 0
+        transition_only_build_group_count = 0
+        transition_only_skipped_generator_count = 0
         transition_fused_call_count = 0
         transition_fused_group_count = 0
         transition_checkpoint_call_count = 0
@@ -5887,6 +7286,10 @@ class EnvironmentPrior:
         transition_group_work_actual = 0.0
         transition_group_work_padded = 0.0
         transition_group_max_batch = 0
+        transition_setup_wall_s = 0.0
+        transition_family_build_wall_s = 0.0
+        transition_generator_build_wall_s = 0.0
+        transition_gp_shared_build_wall_s = 0.0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -5920,7 +7323,25 @@ class EnvironmentPrior:
         transition_family_group_count = int(len(family_groups))
         for family_group in family_groups.values():
             transition_bucket_groups = {}
-            if transition_inner_grouping != "family":
+            balanced_bucket_count = self._resolve_transition_balanced_bucket_count(transition_inner_grouping)
+            if balanced_bucket_count is not None:
+                raw_transition_bucket_groups = self._build_balanced_transition_bucket_groups(
+                    family_group=family_group,
+                    bucket_count=balanced_bucket_count,
+                )
+                if transition_inner_min_bucket > 1:
+                    family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                    merged_family_bucket = []
+                    for sig, bucket_group in raw_transition_bucket_groups.items():
+                        if len(bucket_group) >= transition_inner_min_bucket:
+                            transition_bucket_groups[sig] = bucket_group
+                        else:
+                            merged_family_bucket.extend(bucket_group)
+                    if merged_family_bucket:
+                        transition_bucket_groups[(family, "__fallback__")] = merged_family_bucket
+                else:
+                    transition_bucket_groups = raw_transition_bucket_groups
+            elif transition_inner_grouping != "family":
                 raw_transition_bucket_groups = {}
                 for global_idx, h in family_group:
                     sig = self._environment_transition_bucket_signature(h, transition_inner_grouping)
@@ -5949,11 +7370,31 @@ class EnvironmentPrior:
                     if env_rng_seeds is not None
                     else None
                 )
+                setup_t0 = time.perf_counter() if profile_rollout_timing else None
                 env_batch = self._sample_environment_family_coarse_batch(
                     h_list=group_h_list,
                     device=device,
                     rng_seeds=group_env_seeds,
+                    build_policy_generator=(not self.skip_unused_policy_generator_build),
+                    prefer_transition_only=self.transition_only_env_build,
                 )
+                if setup_t0 is not None:
+                    transition_setup_wall_s += (time.perf_counter() - setup_t0)
+                build_profile = env_batch.get("_build_profile", None)
+                if isinstance(build_profile, dict):
+                    transition_family_build_wall_s += float(build_profile.get("family_build_wall_s", 0.0) or 0.0)
+                    transition_generator_build_wall_s += float(
+                        build_profile.get("transition_generator_build_wall_s", 0.0) or 0.0
+                    )
+                    transition_gp_shared_build_wall_s += float(
+                        build_profile.get("gp_shared_transition_build_wall_s", 0.0) or 0.0
+                    )
+                    transition_only_build_group_count += int(
+                        build_profile.get("transition_only_build_enabled", 0) or 0
+                    )
+                    transition_only_skipped_generator_count += int(
+                        build_profile.get("non_transition_generator_skip_count", 0) or 0
+                    )
                 group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
                 group_bs = int(group_idx.numel())
                 transition_group_max_batch = max(transition_group_max_batch, group_bs)
@@ -6025,7 +7466,56 @@ class EnvironmentPrior:
                 use_fused_transition = bool(callable(transition_generator))
                 if use_fused_transition:
                     transition_fused_group_count += 1
+                gp_projection_profile_capable = bool(
+                    callable(getattr(transition_generator, "_consume_gp_projection_profile", None))
+                )
                 group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
+                packed_input_enabled = bool(
+                    use_fused_transition and bool(getattr(transition_generator, "_prefers_packed_env_input", False))
+                )
+                packed_input_cap = int(
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                transition_generator,
+                                "_packed_input_cap",
+                                int((state_dims_group + obs_dims_group + action_dims_group + noise_dims_group).max().item()),
+                            )
+                        ),
+                    )
+                )
+                packed_state_mask = None
+                packed_obs_rows = None
+                packed_obs_dst_cols = None
+                packed_obs_src_cols = None
+                packed_action_rows = None
+                packed_action_dst_cols = None
+                packed_action_src_cols = None
+                packed_noise_rows = None
+                packed_noise_dst_cols = None
+                packed_noise_src_cols = None
+                packed_input_buf = None
+                if packed_input_enabled:
+                    transition_packed_env_input_group_count += 1
+                    state_cols = torch.arange(state_dim_g, device=device, dtype=torch.long).unsqueeze(0)
+                    packed_state_mask = (state_cols < state_dims_group.unsqueeze(1)).to(dtype=torch.float32)
+                    packed_obs_rows, packed_obs_dst_cols, packed_obs_src_cols = self._build_segment_write_map(
+                        state_dims_group,
+                        obs_dims_group,
+                        obs_dim_g,
+                    )
+                    packed_action_rows, packed_action_dst_cols, packed_action_src_cols = self._build_segment_write_map(
+                        state_dims_group + obs_dims_group,
+                        action_dims_group,
+                        action_dim_g,
+                    )
+                    packed_noise_rows, packed_noise_dst_cols, packed_noise_src_cols = self._build_segment_write_map(
+                        state_dims_group + obs_dims_group + action_dims_group,
+                        noise_dims_group,
+                        noise_dim_g,
+                    )
+                    packed_input_buf = torch.zeros((group_bs, packed_input_cap), device=device, dtype=torch.float32)
                 transition_checkpoint_enabled = int(
                     bool(getattr(transition_generator, "_envgen_checkpoint_enabled", False))
                 )
@@ -6041,7 +7531,7 @@ class EnvironmentPrior:
                 if use_stable_dual_input_slots:
                     transition_dual_input_slots = [
                         torch.zeros(
-                            (2 * group_bs, group_env_total_dim),
+                            (2 * group_bs, packed_input_cap if packed_input_enabled else group_env_total_dim),
                             device=device,
                             dtype=torch.float32,
                         )
@@ -6061,10 +7551,25 @@ class EnvironmentPrior:
                         "env_action_start": state_dim_g + obs_dim_g,
                         "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
                         "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
+                        "packed_input_enabled": packed_input_enabled,
+                        "packed_input_cap": packed_input_cap,
+                        "packed_input": packed_input_buf,
+                        "packed_state_mask": packed_state_mask,
+                        "packed_obs_rows": packed_obs_rows,
+                        "packed_obs_dst_cols": packed_obs_dst_cols,
+                        "packed_obs_src_cols": packed_obs_src_cols,
+                        "packed_action_rows": packed_action_rows,
+                        "packed_action_dst_cols": packed_action_dst_cols,
+                        "packed_action_src_cols": packed_action_src_cols,
+                        "packed_noise_rows": packed_noise_rows,
+                        "packed_noise_dst_cols": packed_noise_dst_cols,
+                        "packed_noise_src_cols": packed_noise_src_cols,
                         "transition_dual_input_slots": transition_dual_input_slots,
                         "transition_dual_input_cursor": 0,
                         "rollout_generators": group_rollout_generators,
                         "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
+                        "family": str(env_batch["family"]),
+                        "gp_projection_profile_capable": gp_projection_profile_capable,
                         "transition_generator": transition_generator,
                         "use_fused_transition": use_fused_transition,
                         "transition_checkpoint_enabled": transition_checkpoint_enabled,
@@ -6076,14 +7581,17 @@ class EnvironmentPrior:
 
         # Keep transition subgroups contiguous in memory to avoid per-step
         # index_select/scatter overhead in the rollout hot loop.
+        identity_perm = torch.arange(batch_size, device=device, dtype=torch.long)
         perm = torch.cat([g["indices"] for g in transition_groups], dim=0)
         if int(perm.numel()) != batch_size:
             raise RuntimeError("family-group rollout internal permutation size mismatch")
-        identity_perm = torch.arange(batch_size, device=device, dtype=torch.long)
-        needs_unpermute = not bool(torch.equal(perm, identity_perm))
-        inv_perm = torch.empty_like(perm)
-        inv_perm.scatter_(0, perm, identity_perm)
-        if needs_unpermute:
+        keep_policy_order = bool(len(transition_groups) > 2)
+        needs_unpermute = False
+        inv_perm = identity_perm
+        if (not keep_policy_order) and (not bool(torch.equal(perm, identity_perm))):
+            needs_unpermute = True
+            inv_perm = torch.empty_like(perm)
+            inv_perm.scatter_(0, perm, identity_perm)
             perm_cpu = perm.detach().cpu().tolist()
             state_dims = state_dims.index_select(0, perm)
             obs_dims = obs_dims.index_select(0, perm)
@@ -6119,14 +7627,19 @@ class EnvironmentPrior:
             group_bs = int(group["indices"].numel())
             group["start"] = int(group_cursor)
             group["end"] = int(group_cursor + group_bs)
-            if rollout_generators is not None:
+            if (not keep_policy_order) and rollout_generators is not None:
                 group["rollout_generators"] = rollout_generators[group_cursor: group_cursor + group_bs]
-            else:
+            elif (not keep_policy_order):
                 group["rollout_generators"] = None
             group_cursor += group_bs
         if group_cursor != batch_size:
             raise RuntimeError("family-group rollout internal subgroup cursor mismatch")
-        transition_stream_fusion = bool(base_transition_stream_fusion and len(transition_groups) > 1)
+        transition_stream_fusion = bool(
+            (not keep_policy_order)
+            and base_transition_stream_fusion
+            and len(transition_groups) > 1
+            and len(transition_groups) <= int(transition_stream_fusion_max_groups)
+        )
         if transition_stream_fusion:
             for group in transition_groups:
                 if bool(group.get("use_fused_transition", False)):
@@ -6141,12 +7654,17 @@ class EnvironmentPrior:
         max_noise_dim = int(noise_dims.max().item())
 
         for group in transition_groups:
-            start = int(group["start"])
-            end = int(group["end"])
             state_dim_g = int(group["state_dim"])
-            group["slice"] = slice(start, end)
-            group["reward_scale_view"] = reward_scale[start:end]
-            group["alpha_view"] = alpha[start:end].unsqueeze(1)
+            if keep_policy_order:
+                group["slice"] = None
+                group["reward_scale_view"] = reward_scale.index_select(0, group["indices"])
+                group["alpha_view"] = alpha.index_select(0, group["indices"]).unsqueeze(1)
+            else:
+                start = int(group["start"])
+                end = int(group["end"])
+                group["slice"] = slice(start, end)
+                group["reward_scale_view"] = reward_scale[start:end]
+                group["alpha_view"] = alpha[start:end].unsqueeze(1)
 
         state_idx = torch.arange(max_state_dim, device=device, dtype=torch.long)
         obs_idx = torch.arange(max_obs_dim, device=device, dtype=torch.long)
@@ -6423,6 +7941,39 @@ class EnvironmentPrior:
             if _REWARD_MASK_BUFFER_REUSE
             else None
         )
+
+        def _accumulate_gp_projection_profile(fn_obj):
+            nonlocal transition_gp_first_projection_wall_s
+            nonlocal transition_gp_second_projection_wall_s
+            nonlocal transition_gp_projection_call_count
+            nonlocal transition_gp_rff_fused_call_count
+            nonlocal transition_gp_shared_total_wall_s
+            nonlocal transition_gp_shared_core_wall_s
+            nonlocal transition_gp_shared_noise_wall_s
+            nonlocal transition_gp_shared_checkpoint_wall_s
+            nonlocal transition_gp_shared_post_wall_s
+            nonlocal transition_gp_shared_call_count
+            if not profile_rollout_timing:
+                return
+            reader = getattr(fn_obj, "_consume_gp_projection_profile", None)
+            if not callable(reader):
+                return
+            gp_stats = reader()
+            if not isinstance(gp_stats, dict):
+                return
+            transition_gp_first_projection_wall_s += float(gp_stats.get("first_projection_wall_s", 0.0) or 0.0)
+            transition_gp_second_projection_wall_s += float(gp_stats.get("second_projection_wall_s", 0.0) or 0.0)
+            transition_gp_projection_call_count += int(gp_stats.get("call_count", 0) or 0)
+            transition_gp_rff_fused_call_count += int(gp_stats.get("rff_fused_call_count", 0) or 0)
+            transition_gp_shared_total_wall_s += float(gp_stats.get("shared_total_wall_s", 0.0) or 0.0)
+            transition_gp_shared_core_wall_s += float(gp_stats.get("shared_core_wall_s", 0.0) or 0.0)
+            transition_gp_shared_noise_wall_s += float(gp_stats.get("shared_noise_wall_s", 0.0) or 0.0)
+            transition_gp_shared_checkpoint_wall_s += float(
+                gp_stats.get("shared_checkpoint_wall_s", 0.0) or 0.0
+            )
+            transition_gp_shared_post_wall_s += float(gp_stats.get("shared_post_wall_s", 0.0) or 0.0)
+            transition_gp_shared_call_count += int(gp_stats.get("shared_call_count", 0) or 0)
+
         for t in range(n_samples):
             obs_t = state_t[:, :max_obs_dim] * obs_mask
             if collect_x:
@@ -6602,6 +8153,7 @@ class EnvironmentPrior:
             for group in transition_groups:
                 group_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 group_slice = group["slice"]
+                group_indices = group["indices"]
                 env_g = group["env"]
                 group_bs = int(group.get("batch_size", 0) or 0)
                 state_dim_g = int(group["state_dim"])
@@ -6609,10 +8161,16 @@ class EnvironmentPrior:
                 action_dim_g = int(group["action_dim"])
                 noise_dim_g = int(group["noise_dim"])
                 pack_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                state_in = state_t[group_slice, :state_dim_g]
-                obs_in = obs_t[group_slice, :obs_dim_g]
-                action_in = action_next[group_slice, :action_dim_g]
-                noise_in = noise_t[group_slice, :noise_dim_g]
+                if group_slice is None:
+                    state_in = state_t.index_select(0, group_indices)[:, :state_dim_g]
+                    obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
+                    action_in = action_next.index_select(0, group_indices)[:, :action_dim_g]
+                    noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
+                else:
+                    state_in = state_t[group_slice, :state_dim_g]
+                    obs_in = obs_t[group_slice, :obs_dim_g]
+                    action_in = action_next[group_slice, :action_dim_g]
+                    noise_in = noise_t[group_slice, :noise_dim_g]
                 env_obs_start = int(group["env_obs_start"])
                 env_action_start = int(group["env_action_start"])
                 env_noise_start = int(group["env_noise_start"])
@@ -6632,27 +8190,76 @@ class EnvironmentPrior:
                 transition_input = None
                 transition_input_is_dual_packed = False
                 transition_dual_input_slots = group.get("transition_dual_input_slots", None)
+                gp_projection_profile_capable = bool(group.get("gp_projection_profile_capable", False))
+                if gp_projection_profile_capable and not bool(group.get("_gp_projection_profile_seen", False)):
+                    transition_gp_profile_group_count += 1
+                    group["_gp_projection_profile_seen"] = True
+                force_sync_gp_projection_profile = bool(
+                    profile_rollout_timing
+                    and self.profile_gp_projection_timing
+                    and gp_projection_profile_capable
+                )
+                if (
+                    force_sync_gp_projection_profile
+                    and (stream_transition is not None)
+                    and not bool(group.get("_gp_projection_profile_sync_seen", False))
+                ):
+                    transition_gp_profile_sync_group_count += 1
+                    group["_gp_projection_profile_sync_seen"] = True
+                if force_sync_gp_projection_profile and (stream_transition is not None):
+                    stream_transition = None
+                packed_transition_input_enabled = bool(group.get("packed_input_enabled", False))
+                packed_transition_input = None
+                if packed_transition_input_enabled:
+                    transition_packed_env_input_call_count += 1
+                    packed_transition_input = group["packed_input"]
+                    packed_transition_input.zero_()
+                    packed_transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
+                    packed_obs_rows = group.get("packed_obs_rows", None)
+                    if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
+                        packed_transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
+                            packed_obs_rows, group["packed_obs_src_cols"]
+                        ]
+                    packed_action_rows = group.get("packed_action_rows", None)
+                    if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
+                        packed_transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
+                            packed_action_rows, group["packed_action_src_cols"]
+                        ]
+                    packed_noise_rows = group.get("packed_noise_rows", None)
+                    if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
+                        packed_transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
+                            packed_noise_rows, group["packed_noise_src_cols"]
+                        ]
                 if use_fused_transition and (transition_dual_input_slots is not None):
                     dual_cursor = int(group.get("transition_dual_input_cursor", 0) or 0)
                     transition_input = transition_dual_input_slots[dual_cursor]
                     group["transition_dual_input_cursor"] = dual_cursor + 1
                     transition_input_is_dual_packed = True
-                    transition_input[:group_bs, :state_dim_g] = state_in
-                    transition_input[group_bs:, :state_dim_g] = state_in
-                    transition_input[:group_bs, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                    transition_input[group_bs:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                    transition_input[:group_bs, env_action_start: env_action_start + action_dim_g] = action_in
-                    transition_input[group_bs:, env_action_start: env_action_start + action_dim_g] = action_in
-                    transition_input[:group_bs, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                    transition_input[group_bs:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                    if packed_transition_input_enabled:
+                        packed_cap = int(group["packed_input_cap"])
+                        transition_input.zero_()
+                        transition_input[:group_bs, :packed_cap] = packed_transition_input
+                        transition_input[group_bs:, :packed_cap] = packed_transition_input
+                    else:
+                        transition_input[:group_bs, :state_dim_g] = state_in
+                        transition_input[group_bs:, :state_dim_g] = state_in
+                        transition_input[:group_bs, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                        transition_input[group_bs:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                        transition_input[:group_bs, env_action_start: env_action_start + action_dim_g] = action_in
+                        transition_input[group_bs:, env_action_start: env_action_start + action_dim_g] = action_in
+                        transition_input[:group_bs, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                        transition_input[group_bs:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
                     transition_stable_dual_input_call_count += 1
                 else:
-                    env_in = group["env_in"]
-                    env_in[:, :state_dim_g] = state_in
-                    env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                    env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
-                    env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                    transition_input = env_in
+                    if packed_transition_input_enabled:
+                        transition_input = packed_transition_input
+                    else:
+                        env_in = group["env_in"]
+                        env_in[:, :state_dim_g] = state_in
+                        env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                        env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                        env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                        transition_input = env_in
                 if profile_rollout_timing and pack_wall_t0 is not None:
                     transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
                 if use_fused_transition:
@@ -6661,11 +8268,19 @@ class EnvironmentPrior:
                     if stream_transition is not None:
                         launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                         with torch.cuda.stream(stream_transition):
-                            x_next_g, reward_next_raw_g = transition_generator_g(
-                                transition_input,
-                                generators_for_noise=group["rollout_generators"],
-                                x_is_dual_packed=transition_input_is_dual_packed,
-                            )
+                            if packed_transition_input_enabled:
+                                x_next_g, reward_next_raw_g = transition_generator_g(
+                                    transition_input,
+                                    generators_for_noise=group["rollout_generators"],
+                                    x_is_dual_packed=transition_input_is_dual_packed,
+                                    x_input_is_packed=True,
+                                )
+                            else:
+                                x_next_g, reward_next_raw_g = transition_generator_g(
+                                    transition_input,
+                                    generators_for_noise=group["rollout_generators"],
+                                    x_is_dual_packed=transition_input_is_dual_packed,
+                                )
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                             if async_group_commit_in_stream:
                                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
@@ -6688,18 +8303,31 @@ class EnvironmentPrior:
                             transition_fused_launch_wall_s += float(launch_dt)
                     else:
                         fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
-                        x_next_g, reward_next_raw_g = transition_generator_g(
-                            transition_input,
-                            generators_for_noise=group["rollout_generators"],
-                            x_is_dual_packed=transition_input_is_dual_packed,
-                        )
+                        if packed_transition_input_enabled:
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                                x_is_dual_packed=transition_input_is_dual_packed,
+                                x_input_is_packed=True,
+                            )
+                        else:
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                                x_is_dual_packed=transition_input_is_dual_packed,
+                            )
+                        _accumulate_gp_projection_profile(transition_generator_g)
                         reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                         if profile_rollout_timing and fused_wall_t0 is not None:
                             transition_fused_wall_s += (time.perf_counter() - fused_wall_t0)
                         transition_fused_call_count += 1
                         state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
-                        reward_next_raw[group_slice] = reward_next_raw_g
-                        state_next[group_slice, :state_dim_g] = state_next_g
+                        if group_slice is None:
+                            reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
+                            state_next[group_indices, :state_dim_g] = state_next_g
+                        else:
+                            reward_next_raw[group_slice] = reward_next_raw_g
+                            state_next[group_slice, :state_dim_g] = state_next_g
                 elif (stream_y is not None) and (stream_x is not None):
                     launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
@@ -6707,6 +8335,7 @@ class EnvironmentPrior:
                             transition_input,
                             generators_for_noise=group["rollout_generators"],
                         ).reshape(-1)
+                        _accumulate_gp_projection_profile(env_g["y_generator"])
                         if async_group_commit_in_stream:
                             reward_next_raw[group_slice] = reward_next_raw_g
                     with torch.cuda.stream(stream_x):
@@ -6714,6 +8343,7 @@ class EnvironmentPrior:
                             transition_input,
                             generators_for_noise=group["rollout_generators"],
                         )
+                        _accumulate_gp_projection_profile(env_g["x_generator"])
                         if async_group_commit_in_stream:
                             state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                             state_next[group_slice, :state_dim_g] = state_next_g
@@ -6735,6 +8365,7 @@ class EnvironmentPrior:
                         transition_input,
                         generators_for_noise=group["rollout_generators"],
                     ).reshape(-1)
+                    _accumulate_gp_projection_profile(env_g["y_generator"])
                     if profile_rollout_timing and y_wall_t0 is not None:
                         transition_y_wall_s += (time.perf_counter() - y_wall_t0)
                     x_wall_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -6742,11 +8373,16 @@ class EnvironmentPrior:
                         transition_input,
                         generators_for_noise=group["rollout_generators"],
                     )
+                    _accumulate_gp_projection_profile(env_g["x_generator"])
                     if profile_rollout_timing and x_wall_t0 is not None:
                         transition_x_wall_s += (time.perf_counter() - x_wall_t0)
                     state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
-                    reward_next_raw[group_slice] = reward_next_raw_g
-                    state_next[group_slice, :state_dim_g] = state_next_g
+                    if group_slice is None:
+                        reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
+                        state_next[group_indices, :state_dim_g] = state_next_g
+                    else:
+                        reward_next_raw[group_slice] = reward_next_raw_g
+                        state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and group_wall_t0 is not None:
                     transition_group_wall_s += (time.perf_counter() - group_wall_t0)
 
@@ -7030,6 +8666,60 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_wall_ms"] = float(transition_fused_wall_s * 1000.0)
                 rollout_profile["transition_fused_launch_wall_ms"] = float(
                     transition_fused_launch_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_first_projection_wall_ms"] = float(
+                    transition_gp_first_projection_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_second_projection_wall_ms"] = float(
+                    transition_gp_second_projection_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_projection_call_count"] = int(
+                    transition_gp_projection_call_count
+                )
+                rollout_profile["transition_gp_rff_fused_call_count"] = int(
+                    transition_gp_rff_fused_call_count
+                )
+                rollout_profile["transition_gp_profile_group_count"] = int(
+                    transition_gp_profile_group_count
+                )
+                rollout_profile["transition_gp_profile_sync_group_count"] = int(
+                    transition_gp_profile_sync_group_count
+                )
+                rollout_profile["transition_gp_shared_total_wall_ms"] = float(
+                    transition_gp_shared_total_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_core_wall_ms"] = float(
+                    transition_gp_shared_core_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_noise_wall_ms"] = float(
+                    transition_gp_shared_noise_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_checkpoint_wall_ms"] = float(
+                    transition_gp_shared_checkpoint_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_post_wall_ms"] = float(
+                    transition_gp_shared_post_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_call_count"] = int(transition_gp_shared_call_count)
+                rollout_profile["transition_packed_env_input_group_count"] = int(
+                    transition_packed_env_input_group_count
+                )
+                rollout_profile["transition_packed_env_input_call_count"] = int(
+                    transition_packed_env_input_call_count
+                )
+                rollout_profile["transition_only_build_group_count"] = int(
+                    transition_only_build_group_count
+                )
+                rollout_profile["transition_only_skipped_generator_count"] = int(
+                    transition_only_skipped_generator_count
+                )
+                rollout_profile["transition_setup_wall_ms"] = float(transition_setup_wall_s * 1000.0)
+                rollout_profile["transition_family_build_wall_ms"] = float(transition_family_build_wall_s * 1000.0)
+                rollout_profile["transition_generator_build_wall_ms"] = float(
+                    transition_generator_build_wall_s * 1000.0
+                )
+                rollout_profile["transition_gp_shared_build_wall_ms"] = float(
+                    transition_gp_shared_build_wall_s * 1000.0
                 )
                 rollout_profile["transition_fused_call_count"] = int(transition_fused_call_count)
                 rollout_profile["transition_fused_group_count"] = int(transition_fused_group_count)
@@ -8270,6 +9960,26 @@ class EnvironmentPrior:
                             "transition_noise_wall_ms": 0.0,
                             "transition_fused_wall_ms": 0.0,
                             "transition_fused_launch_wall_ms": 0.0,
+                            "transition_gp_first_projection_wall_ms": 0.0,
+                            "transition_gp_second_projection_wall_ms": 0.0,
+                            "transition_gp_projection_call_count": 0,
+                            "transition_gp_rff_fused_call_count": 0,
+                            "transition_gp_profile_group_count": 0,
+                            "transition_gp_profile_sync_group_count": 0,
+                            "transition_gp_shared_total_wall_ms": 0.0,
+                            "transition_gp_shared_core_wall_ms": 0.0,
+                            "transition_gp_shared_noise_wall_ms": 0.0,
+                            "transition_gp_shared_checkpoint_wall_ms": 0.0,
+                            "transition_gp_shared_post_wall_ms": 0.0,
+                            "transition_gp_shared_call_count": 0,
+                            "transition_packed_env_input_group_count": 0,
+                            "transition_packed_env_input_call_count": 0,
+                            "transition_only_build_group_count": 0,
+                            "transition_only_skipped_generator_count": 0,
+                            "transition_setup_wall_ms": 0.0,
+                            "transition_family_build_wall_ms": 0.0,
+                            "transition_generator_build_wall_ms": 0.0,
+                            "transition_gp_shared_build_wall_ms": 0.0,
                             "transition_fused_call_count": 0,
                             "transition_fused_group_count": 0,
                             "transition_fused_enabled": 0,
@@ -8317,6 +10027,66 @@ class EnvironmentPrior:
                     )
                     rollout_profile_acc["transition_fused_launch_wall_ms"] += float(
                         group_profile.get("transition_fused_launch_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_gp_first_projection_wall_ms"] += float(
+                        group_profile.get("transition_gp_first_projection_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_gp_second_projection_wall_ms"] += float(
+                        group_profile.get("transition_gp_second_projection_wall_ms", 0.0)
+                    )
+                    rollout_profile_acc["transition_gp_projection_call_count"] += int(
+                        group_profile.get("transition_gp_projection_call_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_gp_rff_fused_call_count"] += int(
+                        group_profile.get("transition_gp_rff_fused_call_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_gp_profile_group_count"] += int(
+                        group_profile.get("transition_gp_profile_group_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_gp_profile_sync_group_count"] += int(
+                        group_profile.get("transition_gp_profile_sync_group_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_gp_shared_total_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_total_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_core_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_core_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_noise_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_noise_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_checkpoint_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_checkpoint_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_post_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_post_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_call_count"] += int(
+                        group_profile.get("transition_gp_shared_call_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_packed_env_input_group_count"] += int(
+                        group_profile.get("transition_packed_env_input_group_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_packed_env_input_call_count"] += int(
+                        group_profile.get("transition_packed_env_input_call_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_only_build_group_count"] += int(
+                        group_profile.get("transition_only_build_group_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_only_skipped_generator_count"] += int(
+                        group_profile.get("transition_only_skipped_generator_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_setup_wall_ms"] += float(
+                        group_profile.get("transition_setup_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_family_build_wall_ms"] += float(
+                        group_profile.get("transition_family_build_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_generator_build_wall_ms"] += float(
+                        group_profile.get("transition_generator_build_wall_ms", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_gp_shared_build_wall_ms"] += float(
+                        group_profile.get("transition_gp_shared_build_wall_ms", 0.0) or 0.0
                     )
                     rollout_profile_acc["transition_fused_call_count"] += int(
                         group_profile.get("transition_fused_call_count", 0)
@@ -9034,6 +10804,66 @@ class EnvironmentPrior:
                 )
                 stats["rollout_transition_fused_launch_wall_ms"] = float(
                     rollout_profile.get("transition_fused_launch_wall_ms", 0.0)
+                )
+                stats["rollout_transition_gp_first_projection_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_first_projection_wall_ms", 0.0)
+                )
+                stats["rollout_transition_gp_second_projection_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_second_projection_wall_ms", 0.0)
+                )
+                stats["rollout_transition_gp_projection_call_count"] = int(
+                    rollout_profile.get("transition_gp_projection_call_count", 0) or 0
+                )
+                stats["rollout_transition_gp_rff_fused_call_count"] = int(
+                    rollout_profile.get("transition_gp_rff_fused_call_count", 0) or 0
+                )
+                stats["rollout_transition_gp_profile_group_count"] = int(
+                    rollout_profile.get("transition_gp_profile_group_count", 0) or 0
+                )
+                stats["rollout_transition_gp_profile_sync_group_count"] = int(
+                    rollout_profile.get("transition_gp_profile_sync_group_count", 0) or 0
+                )
+                stats["rollout_transition_gp_shared_total_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_total_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_core_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_core_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_noise_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_noise_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_checkpoint_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_checkpoint_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_post_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_post_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_call_count"] = int(
+                    rollout_profile.get("transition_gp_shared_call_count", 0) or 0
+                )
+                stats["rollout_transition_packed_env_input_group_count"] = int(
+                    rollout_profile.get("transition_packed_env_input_group_count", 0) or 0
+                )
+                stats["rollout_transition_packed_env_input_call_count"] = int(
+                    rollout_profile.get("transition_packed_env_input_call_count", 0) or 0
+                )
+                stats["rollout_transition_only_build_group_count"] = int(
+                    rollout_profile.get("transition_only_build_group_count", 0) or 0
+                )
+                stats["rollout_transition_only_skipped_generator_count"] = int(
+                    rollout_profile.get("transition_only_skipped_generator_count", 0) or 0
+                )
+                stats["rollout_transition_setup_wall_ms"] = float(
+                    rollout_profile.get("transition_setup_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_family_build_wall_ms"] = float(
+                    rollout_profile.get("transition_family_build_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_generator_build_wall_ms"] = float(
+                    rollout_profile.get("transition_generator_build_wall_ms", 0.0) or 0.0
+                )
+                stats["rollout_transition_gp_shared_build_wall_ms"] = float(
+                    rollout_profile.get("transition_gp_shared_build_wall_ms", 0.0) or 0.0
                 )
                 stats["rollout_transition_fused_call_count"] = int(
                     rollout_profile.get("transition_fused_call_count", 0) or 0
@@ -9995,6 +11825,66 @@ class EnvironmentPrior:
             )
             stats["rollout_transition_fused_launch_wall_ms"] = float(
                 rollout_profile.get("transition_fused_launch_wall_ms", 0.0)
+            )
+            stats["rollout_transition_gp_first_projection_wall_ms"] = float(
+                rollout_profile.get("transition_gp_first_projection_wall_ms", 0.0)
+            )
+            stats["rollout_transition_gp_second_projection_wall_ms"] = float(
+                rollout_profile.get("transition_gp_second_projection_wall_ms", 0.0)
+            )
+            stats["rollout_transition_gp_projection_call_count"] = int(
+                rollout_profile.get("transition_gp_projection_call_count", 0) or 0
+            )
+            stats["rollout_transition_gp_rff_fused_call_count"] = int(
+                rollout_profile.get("transition_gp_rff_fused_call_count", 0) or 0
+            )
+            stats["rollout_transition_gp_profile_group_count"] = int(
+                rollout_profile.get("transition_gp_profile_group_count", 0) or 0
+            )
+            stats["rollout_transition_gp_profile_sync_group_count"] = int(
+                rollout_profile.get("transition_gp_profile_sync_group_count", 0) or 0
+            )
+            stats["rollout_transition_gp_shared_total_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_total_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_core_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_core_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_noise_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_noise_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_checkpoint_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_checkpoint_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_post_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_post_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_call_count"] = int(
+                rollout_profile.get("transition_gp_shared_call_count", 0) or 0
+            )
+            stats["rollout_transition_packed_env_input_group_count"] = int(
+                rollout_profile.get("transition_packed_env_input_group_count", 0) or 0
+            )
+            stats["rollout_transition_packed_env_input_call_count"] = int(
+                rollout_profile.get("transition_packed_env_input_call_count", 0) or 0
+            )
+            stats["rollout_transition_only_build_group_count"] = int(
+                rollout_profile.get("transition_only_build_group_count", 0) or 0
+            )
+            stats["rollout_transition_only_skipped_generator_count"] = int(
+                rollout_profile.get("transition_only_skipped_generator_count", 0) or 0
+            )
+            stats["rollout_transition_setup_wall_ms"] = float(
+                rollout_profile.get("transition_setup_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_family_build_wall_ms"] = float(
+                rollout_profile.get("transition_family_build_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_generator_build_wall_ms"] = float(
+                rollout_profile.get("transition_generator_build_wall_ms", 0.0) or 0.0
+            )
+            stats["rollout_transition_gp_shared_build_wall_ms"] = float(
+                rollout_profile.get("transition_gp_shared_build_wall_ms", 0.0) or 0.0
             )
             stats["rollout_transition_fused_call_count"] = int(
                 rollout_profile.get("transition_fused_call_count", 0) or 0

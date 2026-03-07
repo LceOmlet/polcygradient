@@ -703,6 +703,742 @@ def test_environment_prior_scm_hidden_fused_transition_matches_legacy_dual_seman
                 os.environ[key] = value
 
 
+def test_environment_prior_gp_input_rff_fused_transition_matches_legacy_dual_semantics():
+    _seed_everything(20260307)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    env_backup = {
+        "TICL_POLICY_ENVGEN_CHECKPOINT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT"),
+        "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"),
+        "TICL_POLICY_ENVGEN_RAGGED_AFFINE": os.environ.get("TICL_POLICY_ENVGEN_RAGGED_AFFINE"),
+    }
+
+    def _build_input_mask(sampled, device):
+        state_dims = [int(h["state_dim"]) for h in sampled]
+        obs_dims = [int(h["obs_dim"]) for h in sampled]
+        action_dims = [int(h["action_dim"]) for h in sampled]
+        noise_dims = [int(h["noise_dim"]) for h in sampled]
+        zero_dims = [int(h["zero_pad_dim"]) for h in sampled]
+        max_state = max(state_dims)
+        max_obs = max(obs_dims)
+        max_action = max(action_dims)
+        max_noise = max(noise_dims)
+        max_zero = max(zero_dims)
+        in_cap = max_state + max_obs + max_action + max_noise + max_zero
+        input_mask = torch.zeros((len(sampled), in_cap), device=device, dtype=torch.float32)
+        obs_start = max_state
+        action_start = max_state + max_obs
+        noise_start = action_start + max_action
+        zero_start = noise_start + max_noise
+        for bi, h in enumerate(sampled):
+            state_dim = int(h["state_dim"])
+            obs_dim = int(h["obs_dim"])
+            action_dim = int(h["action_dim"])
+            noise_dim = int(h["noise_dim"])
+            zero_dim = int(h["zero_pad_dim"])
+            input_mask[bi, :state_dim] = 1.0
+            input_mask[bi, obs_start: obs_start + obs_dim] = 1.0
+            input_mask[bi, action_start: action_start + action_dim] = 1.0
+            input_mask[bi, noise_start: noise_start + noise_dim] = 1.0
+            input_mask[bi, zero_start: zero_start + zero_dim] = 1.0
+        return input_mask
+
+    def _make_generators(base_seed, batch_size):
+        generators = []
+        for idx in range(batch_size):
+            g = torch.Generator(device=device)
+            g.manual_seed(int(base_seed + idx))
+            generators.append(g)
+        return generators
+
+    def _run(input_fused_enabled, dual_packed):
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT"] = "1"
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"] = "1" if input_fused_enabled else "0"
+        os.environ["TICL_POLICY_ENVGEN_RAGGED_AFFINE"] = "0"
+        _seed_everything(20260307)
+        prior = EnvironmentPrior(env_cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="gp",
+                state_dim=6,
+                obs_dim=4,
+                action_dim=3,
+                noise_dim=5,
+                zero_pad_dim=2,
+                num_layers=4,
+                gp_rff_features=32,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                num_layers=3,
+                gp_rff_features=24,
+            ),
+        ]
+        for h in sampled:
+            h["noise"] = 0.01
+        input_mask = _build_input_mask(sampled, device=device)
+        in_dims = input_mask.sum(dim=1).to(dtype=torch.long)
+        state_dims = torch.tensor([int(h["state_dim"]) for h in sampled], device=device, dtype=torch.long)
+        transition_fn = prior._build_gp_hetero_transition_batch_fn(
+            in_dims=in_dims,
+            state_dims=state_dims,
+            h_list=sampled,
+            device=device,
+            input_mask=input_mask,
+        )
+        batch_size = len(sampled)
+        in_cap = int(input_mask.shape[1])
+        value_gen = torch.Generator(device=device)
+        value_gen.manual_seed(2026030701)
+        if dual_packed:
+            x_input = torch.randn(
+                (2 * batch_size, in_cap),
+                device=device,
+                dtype=torch.float32,
+                generator=value_gen,
+                requires_grad=True,
+            )
+        else:
+            x_input = torch.randn(
+                (batch_size, in_cap),
+                device=device,
+                dtype=torch.float32,
+                generator=value_gen,
+                requires_grad=True,
+            )
+        grad_state = torch.randn(
+            (batch_size, int(state_dims.max().item())),
+            device=device,
+            dtype=torch.float32,
+            generator=value_gen,
+        )
+        grad_reward = torch.randn((batch_size, 1), device=device, dtype=torch.float32, generator=value_gen)
+        generators = _make_generators(10100, batch_size)
+        state_out, reward_out = transition_fn(
+            x_input,
+            generators_for_noise=generators,
+            x_is_dual_packed=dual_packed,
+        )
+        loss = (state_out * grad_state).sum() + (reward_out * grad_reward).sum()
+        loss.backward()
+        return {
+            "state": state_out.detach().cpu(),
+            "reward": reward_out.detach().cpu(),
+            "grad": x_input.grad.detach().cpu(),
+            "gp_input_fused": bool(getattr(transition_fn, "_gp_input_rff_fused", False)),
+        }
+
+    try:
+        baseline = _run(False, False)
+        fused = _run(True, False)
+        assert fused["gp_input_fused"]
+        assert torch.allclose(baseline["state"], fused["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], fused["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], fused["grad"], atol=1e-6, rtol=1e-6)
+
+        baseline_dual = _run(False, True)
+        fused_dual = _run(True, True)
+        assert fused_dual["gp_input_fused"]
+        assert torch.allclose(baseline_dual["state"], fused_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], fused_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], fused_dual["grad"], atol=1e-6, rtol=1e-6)
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_environment_prior_gp_output_projection_fused_transition_matches_legacy_dual_semantics():
+    _seed_everything(20260307)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    env_backup = {
+        "TICL_POLICY_ENVGEN_CHECKPOINT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT"),
+        "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"),
+        "TICL_POLICY_ENVGEN_RAGGED_AFFINE": os.environ.get("TICL_POLICY_ENVGEN_RAGGED_AFFINE"),
+    }
+
+    def _build_input_mask(sampled, device):
+        state_dims = [int(h["state_dim"]) for h in sampled]
+        obs_dims = [int(h["obs_dim"]) for h in sampled]
+        action_dims = [int(h["action_dim"]) for h in sampled]
+        noise_dims = [int(h["noise_dim"]) for h in sampled]
+        zero_dims = [int(h["zero_pad_dim"]) for h in sampled]
+        max_state = max(state_dims)
+        max_obs = max(obs_dims)
+        max_action = max(action_dims)
+        max_noise = max(noise_dims)
+        max_zero = max(zero_dims)
+        in_cap = max_state + max_obs + max_action + max_noise + max_zero
+        input_mask = torch.zeros((len(sampled), in_cap), device=device, dtype=torch.float32)
+        obs_start = max_state
+        action_start = max_state + max_obs
+        noise_start = action_start + max_action
+        zero_start = noise_start + max_noise
+        for bi, h in enumerate(sampled):
+            state_dim = int(h["state_dim"])
+            obs_dim = int(h["obs_dim"])
+            action_dim = int(h["action_dim"])
+            noise_dim = int(h["noise_dim"])
+            zero_dim = int(h["zero_pad_dim"])
+            input_mask[bi, :state_dim] = 1.0
+            input_mask[bi, obs_start: obs_start + obs_dim] = 1.0
+            input_mask[bi, action_start: action_start + action_dim] = 1.0
+            input_mask[bi, noise_start: noise_start + noise_dim] = 1.0
+            input_mask[bi, zero_start: zero_start + zero_dim] = 1.0
+        return input_mask
+
+    def _make_generators(base_seed, batch_size):
+        generators = []
+        for idx in range(batch_size):
+            g = torch.Generator(device=device)
+            g.manual_seed(int(base_seed + idx))
+            generators.append(g)
+        return generators
+
+    def _run(output_fused_enabled, dual_packed):
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT"] = "1"
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"] = "1" if output_fused_enabled else "0"
+        os.environ["TICL_POLICY_ENVGEN_RAGGED_AFFINE"] = "0"
+        _seed_everything(20260307)
+        prior = EnvironmentPrior(env_cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="gp",
+                state_dim=6,
+                obs_dim=4,
+                action_dim=3,
+                noise_dim=5,
+                zero_pad_dim=2,
+                num_layers=4,
+                gp_rff_features=32,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                num_layers=3,
+                gp_rff_features=24,
+            ),
+        ]
+        for h in sampled:
+            h["noise"] = 0.01
+        input_mask = _build_input_mask(sampled, device=device)
+        in_dims = input_mask.sum(dim=1).to(dtype=torch.long)
+        state_dims = torch.tensor([int(h["state_dim"]) for h in sampled], device=device, dtype=torch.long)
+        transition_fn = prior._build_gp_hetero_transition_batch_fn(
+            in_dims=in_dims,
+            state_dims=state_dims,
+            h_list=sampled,
+            device=device,
+            input_mask=input_mask,
+        )
+        batch_size = len(sampled)
+        in_cap = int(input_mask.shape[1])
+        if dual_packed:
+            x_input = torch.randn((2 * batch_size, in_cap), device=device, dtype=torch.float32, requires_grad=True)
+        else:
+            x_input = torch.randn((batch_size, in_cap), device=device, dtype=torch.float32, requires_grad=True)
+        grad_state = torch.randn((batch_size, int(state_dims.max().item())), device=device, dtype=torch.float32)
+        grad_reward = torch.randn((batch_size, 1), device=device, dtype=torch.float32)
+        generators = _make_generators(10100, batch_size)
+        state_out, reward_out = transition_fn(
+            x_input,
+            generators_for_noise=generators,
+            x_is_dual_packed=dual_packed,
+        )
+        loss = (state_out * grad_state).sum() + (reward_out * grad_reward).sum()
+        loss.backward()
+        return {
+            "state": state_out.detach().cpu(),
+            "reward": reward_out.detach().cpu(),
+            "grad": x_input.grad.detach().cpu(),
+            "gp_output_fused": bool(getattr(transition_fn, "_gp_output_projection_fused", False)),
+        }
+
+    try:
+        baseline = _run(False, False)
+        fused = _run(True, False)
+        assert fused["gp_output_fused"]
+        assert torch.allclose(baseline["state"], fused["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], fused["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], fused["grad"], atol=1e-6, rtol=1e-6)
+
+        baseline_dual = _run(False, True)
+        fused_dual = _run(True, True)
+        assert fused_dual["gp_output_fused"]
+        assert torch.allclose(baseline_dual["state"], fused_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], fused_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], fused_dual["grad"], atol=1e-6, rtol=1e-6)
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_environment_prior_gp_output_subgraph_fused_transition_matches_legacy_dual_semantics():
+    _seed_everything(20260307)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    env_backup = {
+        "TICL_POLICY_ENVGEN_CHECKPOINT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT"),
+        "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"),
+        "TICL_POLICY_ENVGEN_RAGGED_AFFINE": os.environ.get("TICL_POLICY_ENVGEN_RAGGED_AFFINE"),
+    }
+
+    def _build_input_mask(sampled, device):
+        state_dims = [int(h["state_dim"]) for h in sampled]
+        obs_dims = [int(h["obs_dim"]) for h in sampled]
+        action_dims = [int(h["action_dim"]) for h in sampled]
+        noise_dims = [int(h["noise_dim"]) for h in sampled]
+        zero_dims = [int(h["zero_pad_dim"]) for h in sampled]
+        max_state = max(state_dims)
+        max_obs = max(obs_dims)
+        max_action = max(action_dims)
+        max_noise = max(noise_dims)
+        max_zero = max(zero_dims)
+        in_cap = max_state + max_obs + max_action + max_noise + max_zero
+        input_mask = torch.zeros((len(sampled), in_cap), device=device, dtype=torch.float32)
+        obs_start = max_state
+        action_start = max_state + max_obs
+        noise_start = action_start + max_action
+        zero_start = noise_start + max_noise
+        for bi, h in enumerate(sampled):
+            state_dim = int(h["state_dim"])
+            obs_dim = int(h["obs_dim"])
+            action_dim = int(h["action_dim"])
+            noise_dim = int(h["noise_dim"])
+            zero_dim = int(h["zero_pad_dim"])
+            input_mask[bi, :state_dim] = 1.0
+            input_mask[bi, obs_start: obs_start + obs_dim] = 1.0
+            input_mask[bi, action_start: action_start + action_dim] = 1.0
+            input_mask[bi, noise_start: noise_start + noise_dim] = 1.0
+            input_mask[bi, zero_start: zero_start + zero_dim] = 1.0
+        return input_mask
+
+    def _make_generators(base_seed, batch_size):
+        generators = []
+        for idx in range(batch_size):
+            g = torch.Generator(device=device)
+            g.manual_seed(int(base_seed + idx))
+            generators.append(g)
+        return generators
+
+    def _run(subgraph_fused_enabled, dual_packed):
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT"] = "1"
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"] = "1" if subgraph_fused_enabled else "0"
+        os.environ["TICL_POLICY_ENVGEN_RAGGED_AFFINE"] = "0"
+        _seed_everything(20260307)
+        prior = EnvironmentPrior(env_cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="gp",
+                state_dim=6,
+                obs_dim=4,
+                action_dim=3,
+                noise_dim=5,
+                zero_pad_dim=2,
+                num_layers=4,
+                gp_rff_features=32,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                num_layers=3,
+                gp_rff_features=24,
+            ),
+        ]
+        for h in sampled:
+            h["noise"] = 0.01
+        input_mask = _build_input_mask(sampled, device=device)
+        in_dims = input_mask.sum(dim=1).to(dtype=torch.long)
+        state_dims = torch.tensor([int(h["state_dim"]) for h in sampled], device=device, dtype=torch.long)
+        transition_fn = prior._build_gp_hetero_transition_batch_fn(
+            in_dims=in_dims,
+            state_dims=state_dims,
+            h_list=sampled,
+            device=device,
+            input_mask=input_mask,
+        )
+        batch_size = len(sampled)
+        in_cap = int(input_mask.shape[1])
+        if dual_packed:
+            x_input = torch.randn((2 * batch_size, in_cap), device=device, dtype=torch.float32, requires_grad=True)
+        else:
+            x_input = torch.randn((batch_size, in_cap), device=device, dtype=torch.float32, requires_grad=True)
+        grad_state = torch.randn((batch_size, int(state_dims.max().item())), device=device, dtype=torch.float32)
+        grad_reward = torch.randn((batch_size, 1), device=device, dtype=torch.float32)
+        generators = _make_generators(10100, batch_size)
+        state_out, reward_out = transition_fn(
+            x_input,
+            generators_for_noise=generators,
+            x_is_dual_packed=dual_packed,
+        )
+        loss = (state_out * grad_state).sum() + (reward_out * grad_reward).sum()
+        loss.backward()
+        return {
+            "state": state_out.detach().cpu(),
+            "reward": reward_out.detach().cpu(),
+            "grad": x_input.grad.detach().cpu(),
+            "gp_output_subgraph_fused": bool(getattr(transition_fn, "_gp_output_subgraph_fused", False)),
+        }
+
+    try:
+        baseline = _run(False, False)
+        fused = _run(True, False)
+        assert fused["gp_output_subgraph_fused"]
+        assert torch.allclose(baseline["state"], fused["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], fused["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], fused["grad"], atol=1e-6, rtol=1e-6)
+
+        baseline_dual = _run(False, True)
+        fused_dual = _run(True, True)
+        assert fused_dual["gp_output_subgraph_fused"]
+        assert torch.allclose(baseline_dual["state"], fused_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], fused_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], fused_dual["grad"], atol=1e-6, rtol=1e-6)
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GP RFF fused transition semantics")
+def test_environment_prior_gp_rff_fused_transition_matches_legacy_dual_semantics():
+    _seed_everything(20260307)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    env_backup = {
+        "TICL_POLICY_ENVGEN_CHECKPOINT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT"),
+        "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT": os.environ.get(
+            "TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT"
+        ),
+        "TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ": os.environ.get(
+            "TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ"
+        ),
+        "TICL_POLICY_ENVGEN_RAGGED_AFFINE": os.environ.get("TICL_POLICY_ENVGEN_RAGGED_AFFINE"),
+    }
+
+    def _build_input_mask(sampled, device):
+        state_dims = [int(h["state_dim"]) for h in sampled]
+        obs_dims = [int(h["obs_dim"]) for h in sampled]
+        action_dims = [int(h["action_dim"]) for h in sampled]
+        noise_dims = [int(h["noise_dim"]) for h in sampled]
+        zero_dims = [int(h["zero_pad_dim"]) for h in sampled]
+        max_state = max(state_dims)
+        max_obs = max(obs_dims)
+        max_action = max(action_dims)
+        max_noise = max(noise_dims)
+        max_zero = max(zero_dims)
+        in_cap = max_state + max_obs + max_action + max_noise + max_zero
+        input_mask = torch.zeros((len(sampled), in_cap), device=device, dtype=torch.float32)
+        obs_start = max_state
+        action_start = max_state + max_obs
+        noise_start = action_start + max_action
+        zero_start = noise_start + max_noise
+        for bi, h in enumerate(sampled):
+            state_dim = int(h["state_dim"])
+            obs_dim = int(h["obs_dim"])
+            action_dim = int(h["action_dim"])
+            noise_dim = int(h["noise_dim"])
+            zero_dim = int(h["zero_pad_dim"])
+            input_mask[bi, :state_dim] = 1.0
+            input_mask[bi, obs_start: obs_start + obs_dim] = 1.0
+            input_mask[bi, action_start: action_start + action_dim] = 1.0
+            input_mask[bi, noise_start: noise_start + noise_dim] = 1.0
+            input_mask[bi, zero_start: zero_start + zero_dim] = 1.0
+        return input_mask
+
+    def _make_generators(base_seed, batch_size):
+        generators = []
+        for idx in range(batch_size):
+            g = torch.Generator(device=device)
+            g.manual_seed(int(base_seed + idx))
+            generators.append(g)
+        return generators
+
+    def _run(rff_fused_enabled, dual_packed, packed_env_input_enabled=False, shared_first_proj_enabled=False):
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT"] = "1"
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED"] = "1" if rff_fused_enabled else "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_PACKED_ENV_INPUT"] = "1" if packed_env_input_enabled else "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ"] = "1" if shared_first_proj_enabled else "0"
+        os.environ["TICL_POLICY_ENVGEN_RAGGED_AFFINE"] = "0"
+        _seed_everything(20260307)
+        prior = EnvironmentPrior(env_cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="gp",
+                state_dim=6,
+                obs_dim=4,
+                action_dim=3,
+                noise_dim=5,
+                zero_pad_dim=2,
+                num_layers=4,
+                gp_rff_features=32,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                num_layers=3,
+                gp_rff_features=24,
+            ),
+        ]
+        for h in sampled:
+            h["noise"] = 0.01
+        input_mask = _build_input_mask(sampled, device=device)
+        in_dims = input_mask.sum(dim=1).to(dtype=torch.long)
+        state_dims = torch.tensor([int(h["state_dim"]) for h in sampled], device=device, dtype=torch.long)
+        transition_fn = prior._build_gp_hetero_transition_batch_fn(
+            in_dims=in_dims,
+            state_dims=state_dims,
+            h_list=sampled,
+            device=device,
+            input_mask=input_mask,
+        )
+        batch_size = len(sampled)
+        in_cap = int(input_mask.shape[1])
+        value_gen = torch.Generator(device=device)
+        value_gen.manual_seed(2026030701)
+        if dual_packed:
+            x_input = torch.randn(
+                (2 * batch_size, in_cap),
+                device=device,
+                dtype=torch.float32,
+                generator=value_gen,
+                requires_grad=True,
+            )
+        else:
+            x_input = torch.randn(
+                (batch_size, in_cap),
+                device=device,
+                dtype=torch.float32,
+                generator=value_gen,
+                requires_grad=True,
+            )
+        grad_state = torch.randn(
+            (batch_size, int(state_dims.max().item())),
+            device=device,
+            dtype=torch.float32,
+            generator=value_gen,
+        )
+        grad_reward = torch.randn((batch_size, 1), device=device, dtype=torch.float32, generator=value_gen)
+        generators = _make_generators(10100, batch_size)
+        state_out, reward_out = transition_fn(
+            x_input,
+            generators_for_noise=generators,
+            x_is_dual_packed=dual_packed,
+        )
+        loss = (state_out * grad_state).sum() + (reward_out * grad_reward).sum()
+        loss.backward()
+        return {
+            "state": state_out.detach().cpu(),
+            "reward": reward_out.detach().cpu(),
+            "grad": x_input.grad.detach().cpu(),
+            "gp_rff_fused": bool(getattr(transition_fn, "_gp_rff_fused", False)),
+            "gp_packed_env_input": bool(getattr(transition_fn, "_prefers_packed_env_input", False)),
+            "gp_shared_first_proj_fused": bool(getattr(transition_fn, "_gp_shared_first_proj_fused", False)),
+        }
+
+    try:
+        baseline = _run(False, False)
+        fused = _run(True, False)
+        assert fused["gp_rff_fused"]
+        assert torch.allclose(baseline["state"], fused["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], fused["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], fused["grad"], atol=1e-6, rtol=1e-6)
+
+        baseline_dual = _run(False, True)
+        fused_dual = _run(True, True)
+        assert fused_dual["gp_rff_fused"]
+        assert torch.allclose(baseline_dual["state"], fused_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], fused_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], fused_dual["grad"], atol=1e-6, rtol=1e-6)
+
+        packed = _run(False, False, True)
+        assert packed["gp_packed_env_input"]
+        assert torch.allclose(baseline["state"], packed["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], packed["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], packed["grad"], atol=1e-6, rtol=1e-6)
+
+        shared = _run(False, False, False, True)
+        assert shared["gp_shared_first_proj_fused"]
+        assert torch.allclose(baseline["state"], shared["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["reward"], shared["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline["grad"], shared["grad"], atol=1e-6, rtol=1e-6)
+
+        shared_dual = _run(False, True, False, True)
+        assert shared_dual["gp_shared_first_proj_fused"]
+        assert torch.allclose(baseline_dual["state"], shared_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], shared_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], shared_dual["grad"], atol=1e-6, rtol=1e-6)
+
+        packed_dual = _run(False, True, True)
+        assert packed_dual["gp_packed_env_input"]
+        assert torch.allclose(baseline_dual["state"], packed_dual["state"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["reward"], packed_dual["reward"], atol=1e-6, rtol=1e-6)
+        assert torch.allclose(baseline_dual["grad"], packed_dual["grad"], atol=1e-6, rtol=1e-6)
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for GP projection timing profile")
+def test_environment_prior_mixed_family_gp_projection_profile_survives_async_rollout():
+    _seed_everything(20260307)
+    env_backup = {
+        "TICL_POLICY_ENVGEN_CHECKPOINT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT"),
+        "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"),
+        "TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED": os.environ.get(
+            "TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED"
+        ),
+        "TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"),
+        "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH": os.environ.get(
+            "TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"
+        ),
+        "TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED": os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED"),
+        "TICL_PROFILE_GP_PROJECTION_TIMING": os.environ.get("TICL_PROFILE_GP_PROJECTION_TIMING"),
+        "TICL_PROFILE_ROLLOUT_TIMING": os.environ.get("TICL_PROFILE_ROLLOUT_TIMING"),
+        "TICL_POLICY_TRANSITION_INNER_GROUPING": os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING"),
+        "TICL_POLICY_TRANSITION_INNER_MIN_BUCKET": os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET"),
+    }
+
+    try:
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT"] = "1"
+        os.environ["TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED"] = "1"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_INPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_FUSED"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_OUTPUT_SUBGRAPH"] = "0"
+        os.environ["TICL_POLICY_FUSED_TRANSITION_GP_RFF_FUSED"] = "0"
+        os.environ["TICL_PROFILE_GP_PROJECTION_TIMING"] = "1"
+        os.environ["TICL_PROFILE_ROLLOUT_TIMING"] = "1"
+        os.environ["TICL_POLICY_TRANSITION_INNER_GROUPING"] = "family"
+        os.environ["TICL_POLICY_TRANSITION_INNER_MIN_BUCKET"] = "0"
+
+        cfg = dict(get_prior_config()["prior"]["environment"])
+        cfg["batch_parallel_backend"] = "torch_vectorized"
+        cfg["batch_shared_environment"] = False
+        cfg["batch_vectorized_grouping"] = "family"
+        prior = EnvironmentPrior(cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="scm",
+                state_dim=8,
+                obs_dim=6,
+                action_dim=4,
+                noise_dim=3,
+                zero_pad_dim=0,
+                num_layers=4,
+            ),
+            _manual_sampled_h(
+                family="scm",
+                state_dim=7,
+                obs_dim=5,
+                action_dim=3,
+                noise_dim=2,
+                zero_pad_dim=1,
+                num_layers=3,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=6,
+                obs_dim=4,
+                action_dim=3,
+                noise_dim=5,
+                zero_pad_dim=2,
+                gp_rff_features=48,
+            ),
+            _manual_sampled_h(
+                family="gp",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                gp_rff_features=32,
+            ),
+        ]
+
+        class ZeroPolicy(nn.Module):
+            def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+                del obs_t, reward_t, cache, step_idx, env_info
+                return torch.zeros_like(action_t)
+
+        prior.rollout_with_policy(
+            policy_step_fn=ZeroPolicy().step,
+            batch_size=len(sampled),
+            n_samples=12,
+            num_features=64,
+            device="cuda",
+            single_eval_pos=6,
+            collect_x=False,
+            h_list_override=sampled,
+        )
+        rollout_profile = prior.last_rollout_profile
+        assert isinstance(rollout_profile, dict)
+        assert int(rollout_profile.get("transition_gp_profile_group_count", 0)) > 0
+        assert int(rollout_profile.get("transition_gp_profile_sync_group_count", 0)) > 0
+        assert int(rollout_profile.get("transition_gp_projection_call_count", 0)) > 0
+        assert float(rollout_profile.get("transition_gp_first_projection_wall_ms", 0.0)) > 0.0
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
 def test_environment_prior_ragged_affine_matches_dense_hetero_batch_semantics():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for ragged affine test")
@@ -2168,9 +2904,9 @@ def test_environment_prior_rollout_with_policy_family_grouping_uses_coarse_subgr
         prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
         orig_coarse = prior._sample_environment_family_coarse_batch
 
-        def _count_coarse(h_list, device, rng_seeds=None):
+        def _count_coarse(h_list, device, rng_seeds=None, **kwargs):
             call_sizes.append(len(h_list))
-            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds)
+            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds, **kwargs)
 
         prior._sample_environment_family_coarse_batch = _count_coarse
         rollout = prior.rollout_with_policy(
@@ -2252,9 +2988,9 @@ def test_environment_prior_rollout_with_policy_family_grouping_uses_transition_s
         prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
         orig_coarse = prior._sample_environment_family_coarse_batch
 
-        def _count_coarse(h_list, device, rng_seeds=None):
+        def _count_coarse(h_list, device, rng_seeds=None, **kwargs):
             call_sizes.append(len(h_list))
-            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds)
+            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds, **kwargs)
 
         prior._sample_environment_family_coarse_batch = _count_coarse
         rollout = prior.rollout_with_policy(
@@ -2429,9 +3165,9 @@ def test_environment_prior_transition_min_bucket_merges_small_buckets_back_to_fa
         prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
         orig_coarse = prior._sample_environment_family_coarse_batch
 
-        def _count_coarse(h_list, device, rng_seeds=None):
+        def _count_coarse(h_list, device, rng_seeds=None, **kwargs):
             call_sizes.append(len(h_list))
-            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds)
+            return orig_coarse(h_list=h_list, device=device, rng_seeds=rng_seeds, **kwargs)
 
         prior._sample_environment_family_coarse_batch = _count_coarse
         rollout = prior.rollout_with_policy(
@@ -2452,6 +3188,143 @@ def test_environment_prior_transition_min_bucket_merges_small_buckets_back_to_fa
 
     assert rollout["rewards"].shape == (8, 4)
     assert sorted(call_sizes) == [1, 3]
+
+
+def test_environment_prior_balanced_transition_bucket_groups_split_family_into_few_buckets():
+    sampled = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=9,
+            obs_dim=6,
+            action_dim=3,
+            noise_dim=4,
+            zero_pad_dim=2,
+            num_layers=2,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=15,
+            obs_dim=10,
+            action_dim=3,
+            noise_dim=4,
+            zero_pad_dim=2,
+            num_layers=4,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=8,
+            obs_dim=5,
+            action_dim=3,
+            noise_dim=4,
+            zero_pad_dim=2,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=18,
+            obs_dim=11,
+            action_dim=3,
+            noise_dim=4,
+            zero_pad_dim=2,
+            num_layers=5,
+        ),
+    ]
+    prior = EnvironmentPrior(dict(get_prior_config()["prior"]["environment"]))
+    family_group = list(enumerate(sampled))
+    groups = prior._build_balanced_transition_bucket_groups(
+        family_group=family_group,
+        bucket_count=2,
+    )
+    group_sizes = sorted(len(group) for group in groups.values())
+    assert sum(group_sizes) == len(sampled)
+    assert len(group_sizes) == 2
+    assert max(group_sizes) <= 3
+    assert min(group_sizes) >= 1
+
+
+def test_environment_prior_family_coarse_batch_transition_only_build_falls_back_without_fused_transition():
+    _seed_everything(20260307)
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    sampled = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=6,
+            obs_dim=4,
+            action_dim=3,
+            noise_dim=5,
+            zero_pad_dim=2,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=5,
+            obs_dim=3,
+            action_dim=2,
+            noise_dim=4,
+            zero_pad_dim=1,
+            num_layers=2,
+        ),
+    ]
+    prior = EnvironmentPrior(cfg)
+    env_batch = prior._sample_environment_family_coarse_batch(
+        h_list=sampled,
+        device="cpu",
+        prefer_transition_only=True,
+        build_policy_generator=False,
+    )
+    assert callable(env_batch["x_generator"])
+    assert callable(env_batch["y_generator"])
+    assert env_batch["policy_generator"] is None
+    assert env_batch["transition_generator"] is None
+    build_profile = env_batch["_build_profile"]
+    assert int(build_profile["transition_only_build_enabled"]) == 0
+    assert int(build_profile["non_transition_generator_build_count"]) == 2
+    assert int(build_profile["non_transition_generator_skip_count"]) == 1
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for transition-only env build")
+def test_environment_prior_family_coarse_batch_transition_only_build_skips_non_transition_generators_on_cuda():
+    _seed_everything(20260307)
+    torch.cuda.empty_cache()
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    sampled = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=6,
+            obs_dim=4,
+            action_dim=3,
+            noise_dim=5,
+            zero_pad_dim=2,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=5,
+            obs_dim=3,
+            action_dim=2,
+            noise_dim=4,
+            zero_pad_dim=1,
+            num_layers=2,
+        ),
+    ]
+    prior = EnvironmentPrior(cfg)
+    try:
+        env_batch = prior._sample_environment_family_coarse_batch(
+            h_list=sampled,
+            device="cuda",
+            prefer_transition_only=True,
+            build_policy_generator=False,
+        )
+    except (torch.OutOfMemoryError, torch.AcceleratorError):
+        pytest.skip("CUDA OOM while probing transition-only env build")
+    assert env_batch["x_generator"] is None
+    assert env_batch["y_generator"] is None
+    assert env_batch["policy_generator"] is None
+    assert callable(env_batch["transition_generator"])
+    build_profile = env_batch["_build_profile"]
+    assert int(build_profile["transition_only_build_enabled"]) == 1
+    assert int(build_profile["non_transition_generator_build_count"]) == 0
+    assert int(build_profile["non_transition_generator_skip_count"]) == 3
 
 
 def test_environment_prior_lipschitz_scm_keeps_rollout_grads_finite_under_extreme_init():
