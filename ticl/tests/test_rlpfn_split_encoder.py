@@ -27,7 +27,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
     assert cfg["optimizer"]["learning_rate"] == 3e-4
-    assert cfg["dataloader"]["batch_size"] == 256
+    assert cfg["dataloader"]["batch_size"] == 512
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False

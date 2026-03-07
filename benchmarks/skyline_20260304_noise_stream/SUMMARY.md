@@ -4283,3 +4283,140 @@ Interpretation:
 - removing the falsified `paired/stable-slots` runtime branches reduces later
   profiling noise while keeping the batch-256 mainline on the same performance
   and VRAM regime
+
+## 2026-03-07 batch-256 memory safety: root-cause env-build elision with RNG preservation
+
+Goal:
+
+- re-check whether the maintained `batch=256 / TBPTT=64` mainline is safe on
+  host RAM and VRAM for development
+- compress VRAM further without enabling the old probe-only memory knobs
+  (`transition-only env build`, `skip unused policy-generator build`)
+- keep semantics stable by preserving RNG-consumption order while eliding unused
+  environment-generator materialization
+
+Root cause found:
+
+- in family-group policy rollout, the maintained CUDA mainline already uses the
+  fused `transition_generator`, but environment build still materialized
+  `x_generator`, `y_generator`, and `policy_generator`
+- those closures were not needed on the hot path, but they remained resident on
+  CUDA and accounted for a large chunk of env-build memory
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added RNG-preserving init-consumption helpers for SCM and GP heterogeneous
+    batch generators
+  - family-group policy rollout now auto-elides `x/y/policy` generator builds
+    whenever fused transition is actually usable, instead of depending on the
+    old env toggles
+  - skipped generator builds now preserve RNG progression explicitly, so the
+    rollout path does not change stochastic order just to save memory
+  - removed the now-obsolete runtime env plumbing for:
+    - `TICL_POLICY_TRANSITION_ONLY_ENV_BUILD`
+    - `TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD`
+- `ticl/fit_model.py`
+  - removed skyline guard pins for those obsolete env knobs
+- `ticl/train.py`
+  - removed startup logging for those obsolete env knobs
+- `ticl/tests/priors/test_environment_prior.py`
+  - added CPU/CUDA tests that compare RNG state after full build vs skipped
+    build and verify the fused-transition path elides the unused generators
+
+Validation:
+
+- `python -m py_compile ticl/priors/environment_prior.py ticl/fit_model.py ticl/train.py ticl/tests/priors/test_environment_prior.py`
+  passed
+- targeted semantics tests passed:
+  - `conda run -n rlpfn python -m pytest -q ticl/tests/priors/test_environment_prior.py -k "transition_only_build_falls_back_without_fused_transition or transition_only_build_skips_non_transition_generators_on_cuda or skipped_generators_preserve_cpu_rng_state or auto_elision_preserves_cuda_rng_state or fused_transition_dual_packed_matches_cat_semantics or scm_hidden_fused_transition_matches_legacy_dual_semantics or envgen_checkpoint_preserves_rollout_semantics or ragged_affine_matches_dense_hetero_batch_semantics or mixed_family_gp_projection_profile_survives_async_rollout"`
+- env-build-only CUDA diagnostic:
+  - full build: active/reserved delta `3.799 / 3.854 GiB`
+  - auto-elide: active/reserved delta `2.217 / 2.266 GiB`
+  - savings: about `1.58 GiB` active and `1.59 GiB` reserved during family-group
+    env construction
+- fixed-seed batch-256 mainline rerun:
+  - old reference: `20260307_seeded_batch256_lr10x_cleanup.log`
+    - `batch_wall_excl_compile_s=125.739`
+    - `batch_wall_excl_compile_per_batch_item_s=0.491167`
+    - `peak gpu mem alloc/reserved 24.32 / 29.41 GiB`
+  - new run: `20260307_seeded_batch256_mem_rootcause_elision.log`
+    - `batch_wall_excl_compile_s=126.039`
+    - `batch_wall_excl_compile_per_batch_item_s=0.492339`
+    - `peak gpu mem alloc/reserved 20.71 / 25.78 GiB`
+    - `host_rss_gib=1.88`, `host_avail_gib=42.16`
+  - `/usr/bin/time -v` host RSS:
+    - old `20260307_seeded_batch256_mem_safety_timev.time`: `2143360 kB`
+    - new `20260307_seeded_batch256_mem_rootcause_elision.time`: `2146176 kB`
+
+Interpretation:
+
+- the maintained batch-256 mainline is safe on this machine:
+  - host RSS remains about `2.0 GiB` with about `42 GiB` available RAM
+  - GPU peak reserved falls to `25.78 GiB` on a `49.14 GiB` 4090, leaving
+    roughly `23 GiB` headroom
+- this is a real root-cause VRAM reduction, not a knob flip:
+  - training peak alloc drops `24.32 -> 20.71 GiB` (`-14.8%`)
+  - training peak reserved drops `29.41 -> 25.78 GiB` (`-12.3%`)
+- throughput cost is negligible in the current fixed-seed single-batch test:
+  - `batch_wall_excl_compile_per_batch_item_s` changes only `+0.24%`
+- the old knob-based env-build elision paths are no longer needed on the
+  maintained mainline and were removed from the runtime surface to reduce
+  future profiling interference
+
+## 2026-03-07 reset mainline to env-build root-cause elision and move default batch to 512
+
+Goal:
+
+- discard the later unverified mutable-tail experiments and return the working
+  tree to the last documented real VRAM win
+- make `batch_size=512` the maintained starting point for the next memory-safety
+  pass, instead of continuing from the batch-256 line
+
+Code:
+
+- `ticl/model_configs.py`
+  - `get_rlpfn_default_config()` now sets `dataloader.batch_size = 512`
+- retained the documented env-build root-cause elision changes in:
+  - `ticl/priors/environment_prior.py`
+  - `ticl/fit_model.py`
+  - `ticl/train.py`
+  - `ticl/tests/priors/test_environment_prior.py`
+- discarded the later local mutable-tail experiment line by restoring:
+  - `ticl/models/layer.py`
+  - `ticl/tests/models/test_tabpfn_kv_cache.py`
+  to the remote skyline code
+
+Validation:
+
+- `python -m py_compile ticl/model_configs.py ticl/fit_model.py ticl/train.py ticl/priors/environment_prior.py ticl/tests/priors/test_environment_prior.py ticl/tests/test_rlpfn_split_encoder.py`
+  passed
+- semantics/config tests passed:
+  - `conda run -n rlpfn python -m pytest -q ticl/tests/priors/test_environment_prior.py -k "transition_only_build_falls_back_without_fused_transition or transition_only_build_skips_non_transition_generators_on_cuda or skipped_generators_preserve_cpu_rng_state or auto_elision_preserves_cuda_rng_state or fused_transition_dual_packed_matches_cat_semantics or scm_hidden_fused_transition_matches_legacy_dual_semantics or envgen_checkpoint_preserves_rollout_semantics or ragged_affine_matches_dense_hetero_batch_semantics or mixed_family_gp_projection_profile_survives_async_rollout"`
+  - `conda run -n rlpfn python -m pytest -q ticl/tests/test_rlpfn_split_encoder.py`
+- fixed-seed batch-512 baseline on this reset line:
+  - log: `20260307_seeded_batch512_mem_rootcause_base.log`
+  - phase line:
+    - `batch_wall_excl_compile_s=135.506`
+    - `batch_wall_excl_compile_per_batch_item_s=0.264660`
+    - `rollout_s=85.764`
+    - `backward_s=49.742`
+  - peak gpu mem alloc/reserved:
+    - `40.96 / 45.32 GiB`
+  - host memory:
+    - `host_rss_gib=1.88`
+    - `host_avail_gib=41.48`
+    - `/usr/bin/time -v` max RSS: `2136956 kB`
+
+Interpretation:
+
+- this reset does what it should:
+  - the codebase is back on the last documented real VRAM win
+  - `batch_size=512` is now the explicit maintained baseline for the next pass
+- `batch=512` is runnable on this machine without fallback:
+  - the fixed-seed run completed under `pg_oom_fail_fast=True`
+  - host RAM remains safe at about `1.9-2.1 GiB` RSS
+- but GPU headroom is still tight:
+  - `45.32 GiB` reserved on a `49.14 GiB` 4090 leaves only about `3.8 GiB`
+  - so this is not yet the final “memory-safe” skyline, only the correct new
+    starting baseline

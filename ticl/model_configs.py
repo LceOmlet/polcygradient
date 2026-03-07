@@ -536,8 +536,9 @@ def get_rlpfn_default_config():
     # Physical batch has moved to 256 on the maintained mainline; scale the
     # default step size up with it instead of keeping the legacy tiny batch LR.
     config['optimizer']['learning_rate'] = 3e-4
-    # Documented throughput mainline now uses physical batch 256.
-    config['dataloader']['batch_size'] = 256
+    # Current maintained memory-efficiency mainline should benchmark from
+    # physical batch 512.
+    config['dataloader']['batch_size'] = 512
     return config
 
 

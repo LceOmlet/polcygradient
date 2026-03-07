@@ -5689,20 +5689,6 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 "Policy fused transition GP packed env input:",
                 bool(fused_transition_gp_packed_env_input_env not in {"0", "false", "no", "off"}),
             )
-            transition_only_env_build_env = str(
-                os.environ.get("TICL_POLICY_TRANSITION_ONLY_ENV_BUILD", "0")
-            ).strip().lower()
-            print(
-                "Policy transition-only env build:",
-                bool(transition_only_env_build_env not in {"0", "false", "no", "off"}),
-            )
-            skip_unused_policy_generator_env = str(
-                os.environ.get("TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD", "0")
-            ).strip().lower()
-            print(
-                "Policy skip unused policy-generator build:",
-                bool(skip_unused_policy_generator_env not in {"0", "false", "no", "off"}),
-            )
             fused_transition_gp_shared_first_proj_env = str(
                 os.environ.get("TICL_POLICY_FUSED_TRANSITION_GP_SHARED_FIRST_PROJ", "0")
             ).strip().lower()

@@ -3130,6 +3130,89 @@ def test_environment_prior_family_coarse_batch_transition_only_build_falls_back_
     assert int(build_profile["non_transition_generator_skip_count"]) == 1
 
 
+def test_environment_prior_family_coarse_batch_skipped_generators_preserve_cpu_rng_state():
+    _seed_everything(20260307)
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    sampled = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=6,
+            obs_dim=4,
+            action_dim=3,
+            noise_dim=5,
+            zero_pad_dim=2,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="gp",
+            state_dim=5,
+            obs_dim=3,
+            action_dim=2,
+            noise_dim=4,
+            zero_pad_dim=1,
+        ),
+    ]
+    prior = EnvironmentPrior(cfg)
+
+    torch.manual_seed(20260307)
+    cpu_rng_before = torch.random.get_rng_state()
+    env_full = prior._sample_environment_family_coarse_batch(
+        h_list=[sampled[0]],
+        device="cpu",
+        build_policy_generator=True,
+        preserve_skipped_generator_rng=True,
+    )
+    cpu_rng_after_full = torch.random.get_rng_state()
+
+    torch.random.set_rng_state(cpu_rng_before.clone())
+    env_skip = prior._sample_environment_family_coarse_batch(
+        h_list=[sampled[0]],
+        device="cpu",
+        build_x_generator=False,
+        build_y_generator=False,
+        build_policy_generator=False,
+        preserve_skipped_generator_rng=True,
+    )
+    cpu_rng_after_skip = torch.random.get_rng_state()
+
+    assert callable(env_full["x_generator"])
+    assert callable(env_full["y_generator"])
+    assert callable(env_full["policy_generator"])
+    assert env_skip["x_generator"] is None
+    assert env_skip["y_generator"] is None
+    assert env_skip["policy_generator"] is None
+    assert env_skip["transition_generator"] is None
+    assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
+    build_profile = env_skip["_build_profile"]
+    assert int(build_profile["transition_only_build_enabled"]) == 0
+    assert int(build_profile["skipped_non_transition_generator_count"]) == 3
+    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 3
+    assert int(build_profile["non_transition_generator_build_count"]) == 0
+    assert int(build_profile["non_transition_generator_skip_count"]) == 3
+
+    # Also probe the GP path because its init consumes mixed rand/randn draws.
+    torch.manual_seed(20260308)
+    cpu_rng_before = torch.random.get_rng_state()
+    prior._sample_environment_family_coarse_batch(
+        h_list=[sampled[1]],
+        device="cpu",
+        build_policy_generator=True,
+        preserve_skipped_generator_rng=True,
+    )
+    cpu_rng_after_full = torch.random.get_rng_state()
+    torch.random.set_rng_state(cpu_rng_before.clone())
+    prior._sample_environment_family_coarse_batch(
+        h_list=[sampled[1]],
+        device="cpu",
+        build_x_generator=False,
+        build_y_generator=False,
+        build_policy_generator=False,
+        preserve_skipped_generator_rng=True,
+    )
+    cpu_rng_after_skip = torch.random.get_rng_state()
+    assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for transition-only env build")
 def test_environment_prior_family_coarse_batch_transition_only_build_skips_non_transition_generators_on_cuda():
     _seed_everything(20260307)
@@ -3171,6 +3254,81 @@ def test_environment_prior_family_coarse_batch_transition_only_build_skips_non_t
     assert callable(env_batch["transition_generator"])
     build_profile = env_batch["_build_profile"]
     assert int(build_profile["transition_only_build_enabled"]) == 1
+    assert int(build_profile["non_transition_generator_build_count"]) == 0
+    assert int(build_profile["non_transition_generator_skip_count"]) == 3
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused-transition env build")
+def test_environment_prior_family_coarse_batch_auto_elision_preserves_cuda_rng_state():
+    _seed_everything(20260307)
+    torch.cuda.empty_cache()
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    sampled = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=6,
+            obs_dim=4,
+            action_dim=3,
+            noise_dim=5,
+            zero_pad_dim=2,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=5,
+            obs_dim=3,
+            action_dim=2,
+            noise_dim=4,
+            zero_pad_dim=1,
+            num_layers=2,
+        ),
+    ]
+    prior = EnvironmentPrior(cfg)
+    device = torch.device("cuda")
+
+    torch.manual_seed(20260307)
+    torch.cuda.manual_seed_all(20260307)
+    cpu_rng_before = torch.random.get_rng_state()
+    cuda_rng_before = torch.cuda.get_rng_state(device=device)
+    try:
+        env_full = prior._sample_environment_family_coarse_batch(
+            h_list=sampled,
+            device=device,
+            build_policy_generator=True,
+            preserve_skipped_generator_rng=True,
+        )
+    except (torch.OutOfMemoryError, torch.AcceleratorError):
+        pytest.skip("CUDA OOM while probing full family env build")
+    cpu_rng_after_full = torch.random.get_rng_state()
+    cuda_rng_after_full = torch.cuda.get_rng_state(device=device)
+
+    torch.random.set_rng_state(cpu_rng_before.clone())
+    torch.cuda.set_rng_state(cuda_rng_before.clone(), device=device)
+    try:
+        env_skip = prior._sample_environment_family_coarse_batch(
+            h_list=sampled,
+            device=device,
+            build_x_generator=False,
+            build_y_generator=False,
+            build_policy_generator=False,
+            preserve_skipped_generator_rng=True,
+        )
+    except (torch.OutOfMemoryError, torch.AcceleratorError):
+        pytest.skip("CUDA OOM while probing elided family env build")
+    cpu_rng_after_skip = torch.random.get_rng_state()
+    cuda_rng_after_skip = torch.cuda.get_rng_state(device=device)
+
+    assert callable(env_full["transition_generator"])
+    assert callable(env_skip["transition_generator"])
+    assert env_skip["x_generator"] is None
+    assert env_skip["y_generator"] is None
+    assert env_skip["policy_generator"] is None
+    assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
+    assert torch.equal(cuda_rng_after_full, cuda_rng_after_skip)
+    build_profile = env_skip["_build_profile"]
+    assert int(build_profile["transition_only_build_enabled"]) == 0
+    assert int(build_profile["skipped_non_transition_generator_count"]) == 3
+    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 3
     assert int(build_profile["non_transition_generator_build_count"]) == 0
     assert int(build_profile["non_transition_generator_skip_count"]) == 3
 

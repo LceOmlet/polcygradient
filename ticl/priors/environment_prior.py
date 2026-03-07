@@ -1004,24 +1004,6 @@ class EnvironmentPrior:
             "no",
             "off",
         }
-        transition_only_env_build_flag = str(
-            os.environ.get("TICL_POLICY_TRANSITION_ONLY_ENV_BUILD", "0")
-        ).strip().lower()
-        self.transition_only_env_build = transition_only_env_build_flag not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        skip_unused_policy_generator_build_flag = str(
-            os.environ.get("TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD", "0")
-        ).strip().lower()
-        self.skip_unused_policy_generator_build = skip_unused_policy_generator_build_flag not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
         self.gp_rff_tiled_block_o = self._resolve_tiled_block_size(
             os.environ.get("TICL_POLICY_GP_RFF_BLOCK_O", "32"),
             default=32,
@@ -3285,6 +3267,116 @@ class EnvironmentPrior:
 
         return fn
 
+    @staticmethod
+    def _consume_init_random_tensor(shape, device, *, generator=None, uniform=False):
+        if uniform:
+            if generator is None:
+                torch.rand(shape, device=device, dtype=torch.float32)
+            else:
+                torch.rand(shape, device=device, dtype=torch.float32, generator=generator)
+        else:
+            if generator is None:
+                torch.randn(shape, device=device, dtype=torch.float32)
+            else:
+                torch.randn(shape, device=device, dtype=torch.float32, generator=generator)
+
+    def _consume_scm_hetero_batch_init_rng(
+        self,
+        in_dims,
+        out_dims,
+        h_list,
+        device,
+        depth_values,
+        generators=None,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return
+        if torch.is_tensor(depth_values):
+            depth_per_sample = depth_values.to(device=device, dtype=torch.long)
+        elif isinstance(depth_values, (list, tuple)):
+            depth_per_sample = torch.tensor(
+                [max(2, int(d)) for d in depth_values],
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            depth_per_sample = torch.full(
+                (batch_size,),
+                int(max(2, int(depth_values))),
+                device=device,
+                dtype=torch.long,
+            )
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        hidden_dims = torch.tensor(
+            [max(int(out_dims[bi].item()), int(h["prior_mlp_hidden_dim"])) for bi, h in enumerate(h_list)],
+            device=device,
+            dtype=torch.long,
+        )
+        depth = int(depth_per_sample.max().item())
+        for layer_idx in range(depth):
+            hidden_active = layer_idx < (depth_per_sample - 1)
+            if layer_idx == 0:
+                in_layer = in_dims
+            else:
+                in_layer = torch.where(
+                    layer_idx <= (depth_per_sample - 1),
+                    hidden_dims,
+                    out_dims,
+                )
+            out_layer = torch.where(hidden_active, hidden_dims, out_dims)
+            for bi in range(batch_size):
+                in_i = int(in_layer[bi].item())
+                out_i = int(out_layer[bi].item())
+                if in_i <= 0 or out_i <= 0:
+                    continue
+                if layer_idx > int(depth_per_sample[bi].item() - 1):
+                    continue
+                g = None if generators is None else generators[bi]
+                self._consume_init_random_tensor((in_i, out_i), device, generator=g, uniform=False)
+                self._consume_init_random_tensor((out_i,), device, generator=g, uniform=False)
+
+    def _consume_gp_hetero_batch_init_rng(
+        self,
+        in_dims,
+        out_dims,
+        h_list,
+        device,
+        generators=None,
+        input_mask=None,
+        sample_in_dims=None,
+    ):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if sample_in_dims is None:
+            sample_in_dims = in_dims
+        else:
+            sample_in_dims = torch.as_tensor(sample_in_dims, device=device, dtype=torch.long)
+        out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        m_dims = torch.tensor(
+            [max(8, int(h["gp_rff_features"])) for h in h_list],
+            device=device,
+            dtype=torch.long,
+        )
+        for bi in range(batch_size):
+            sample_in_i = int(sample_in_dims[bi].item())
+            m_i = int(m_dims[bi].item())
+            out_i = int(out_dims[bi].item())
+            g = None if generators is None else generators[bi]
+            self._consume_init_random_tensor((sample_in_i, m_i), device, generator=g, uniform=False)
+            self._consume_init_random_tensor((m_i,), device, generator=g, uniform=True)
+            self._consume_init_random_tensor((m_i, out_i), device, generator=g, uniform=False)
+
     def _build_gp_hetero_batch_fn(
         self,
         in_dims,
@@ -5051,6 +5143,7 @@ class EnvironmentPrior:
         build_y_generator=True,
         build_policy_generator=True,
         prefer_transition_only=False,
+        preserve_skipped_generator_rng=True,
     ):
         if not h_list:
             raise ValueError("h_list must be non-empty")
@@ -5120,10 +5213,42 @@ class EnvironmentPrior:
         build_x_generator = bool(build_x_generator) and not transition_only_build_enabled
         build_y_generator = bool(build_y_generator) and not transition_only_build_enabled
         build_policy_generator = bool(build_policy_generator) and not transition_only_build_enabled
+        preserve_skipped_generator_rng = bool(preserve_skipped_generator_rng)
         transition_generator = None
         x_generator = None
         y_generator = None
         policy_generator = None
+        skipped_non_transition_generator_count = 0
+        skipped_non_transition_rng_preserve_count = 0
+
+        def _preserve_skipped_rng(build_needed, out_dims):
+            nonlocal skipped_non_transition_generator_count
+            nonlocal skipped_non_transition_rng_preserve_count
+            if bool(build_needed):
+                return
+            skipped_non_transition_generator_count += 1
+            if not preserve_skipped_generator_rng:
+                return
+            skipped_non_transition_rng_preserve_count += 1
+            if family == "scm":
+                self._consume_scm_hetero_batch_init_rng(
+                    in_dims=in_dims,
+                    out_dims=out_dims,
+                    h_list=h_list,
+                    device=device,
+                    depth_values=depth_values,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+            else:
+                self._consume_gp_hetero_batch_init_rng(
+                    in_dims=in_dims,
+                    out_dims=out_dims,
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
 
         if family == "scm":
             depth_values = [max(2, int(h["num_layers"])) for h in h_list]
@@ -5153,6 +5278,8 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(build_x_generator, state_dims)
             if build_y_generator:
                 build_t0 = time.perf_counter()
                 y_generator = self._build_scm_hetero_batch_fn(
@@ -5166,6 +5293,11 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(
+                    build_y_generator,
+                    torch.ones((batch_size,), device=device, dtype=torch.long),
+                )
             if build_policy_generator:
                 build_t0 = time.perf_counter()
                 policy_generator = self._build_scm_hetero_batch_fn(
@@ -5179,6 +5311,8 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(build_policy_generator, action_dims)
         else:
             if enable_fused_transition:
                 build_t0 = time.perf_counter()
@@ -5204,6 +5338,8 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(build_x_generator, state_dims)
             if build_y_generator:
                 build_t0 = time.perf_counter()
                 y_generator = self._build_gp_hetero_batch_fn(
@@ -5215,6 +5351,11 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(
+                    build_y_generator,
+                    torch.ones((batch_size,), device=device, dtype=torch.long),
+                )
             if build_policy_generator:
                 build_t0 = time.perf_counter()
                 policy_generator = self._build_gp_hetero_batch_fn(
@@ -5226,6 +5367,8 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
                 generator_build_wall_s += (time.perf_counter() - build_t0)
+            else:
+                _preserve_skipped_rng(build_policy_generator, action_dims)
 
         alpha = torch.tensor(
             [float(max(1e-4, min(1.0, float(h["alpha"])))) for h in h_list],
@@ -5343,6 +5486,10 @@ class EnvironmentPrior:
                 "transition_generator_build_wall_s": float(transition_generator_build_wall_s),
                 "gp_shared_transition_build_wall_s": float(gp_shared_transition_build_wall_s),
                 "transition_only_build_enabled": int(transition_only_build_enabled),
+                "skipped_non_transition_generator_count": int(skipped_non_transition_generator_count),
+                "skipped_non_transition_rng_preserve_count": int(
+                    skipped_non_transition_rng_preserve_count
+                ),
                 "non_transition_generator_build_count": int(
                     int(x_generator is not None)
                     + int(y_generator is not None)
@@ -6312,11 +6459,11 @@ class EnvironmentPrior:
                         k_pages = detached.get("k_pages", None)
                         v_pages = detached.get("v_pages", None)
                         if len(k_pages) > 1:
+                            full_k_pages = k_pages[:-1]
+                            full_v_pages = v_pages[:-1]
                             k_prefix = detached.get("k_prefix", None)
                             v_prefix = detached.get("v_prefix", None)
                             if (k_prefix is None) or (v_prefix is None):
-                                full_k_pages = k_pages[:-1]
-                                full_v_pages = v_pages[:-1]
                                 if len(full_k_pages) == 1:
                                     k_prefix = full_k_pages[0]
                                     v_prefix = full_v_pages[0]
@@ -6337,6 +6484,49 @@ class EnvironmentPrior:
                             detached["prefix_base_len"] = (
                                 int(k_prefix.shape[2]) if torch.is_tensor(k_prefix) else 0
                             )
+                    k_pages = detached.get("k_pages", None)
+                    v_pages = detached.get("v_pages", None)
+                    if isinstance(k_pages, list) and isinstance(v_pages, list) and len(k_pages) > 0:
+                        try:
+                            valid_len = int(detached.get("valid_len", 0))
+                        except Exception:
+                            valid_len = 0
+                        k_prefix = detached.get("k_prefix", None)
+                        v_prefix = detached.get("v_prefix", None)
+                        try:
+                            prefix_base_len = int(detached.get("prefix_base_len", 0))
+                        except Exception:
+                            prefix_base_len = 0
+                        prefix_covered_len = int(prefix_base_len)
+                        if torch.is_tensor(k_prefix) and torch.is_tensor(v_prefix):
+                            prefix_covered_len = int(min(int(valid_len), int(k_prefix.shape[2])))
+                        try:
+                            prefix_pages = int(detached.get("prefix_pages", 0))
+                        except Exception:
+                            prefix_pages = 0
+                        prefix_pages = int(max(0, min(int(prefix_pages), int(len(k_pages)))))
+                        tail_valid_len = int(max(0, valid_len - prefix_covered_len))
+                        if tail_valid_len > 0:
+                            trimmed_k_pages = []
+                            trimmed_v_pages = []
+                            if prefix_pages > 0:
+                                trimmed_k_pages.extend(k_pages[:prefix_pages])
+                                trimmed_v_pages.extend(v_pages[:prefix_pages])
+                            remaining = int(tail_valid_len)
+                            for k_page, v_page in zip(k_pages[prefix_pages:], v_pages[prefix_pages:]):
+                                if remaining <= 0:
+                                    break
+                                take = min(int(k_page.shape[2]), remaining)
+                                trimmed_k_pages.append(k_page[:, :, :take, :])
+                                trimmed_v_pages.append(v_page[:, :, :take, :])
+                                remaining -= take
+                            if trimmed_k_pages and trimmed_v_pages:
+                                detached["k_pages"] = trimmed_k_pages
+                                detached["v_pages"] = trimmed_v_pages
+                                detached["paged_packed"] = bool(
+                                    sum(int(page.shape[2]) for page in trimmed_k_pages[prefix_pages:])
+                                    == int(tail_valid_len)
+                                )
                     detached["tail_frozen"] = True
             return detached
         return cache
@@ -7265,13 +7455,21 @@ class EnvironmentPrior:
                     if env_rng_seeds is not None
                     else None
                 )
+                auto_elide_non_transition_generators = bool(
+                    self.fused_transition_generator
+                    and device_obj.type == "cuda"
+                    and group_env_seeds is None
+                )
                 setup_t0 = time.perf_counter() if profile_rollout_timing else None
                 env_batch = self._sample_environment_family_coarse_batch(
                     h_list=group_h_list,
                     device=device,
                     rng_seeds=group_env_seeds,
-                    build_policy_generator=(not self.skip_unused_policy_generator_build),
-                    prefer_transition_only=self.transition_only_env_build,
+                    build_x_generator=(not auto_elide_non_transition_generators),
+                    build_y_generator=(not auto_elide_non_transition_generators),
+                    build_policy_generator=False,
+                    prefer_transition_only=False,
+                    preserve_skipped_generator_rng=True,
                 )
                 if setup_t0 is not None:
                     transition_setup_wall_s += (time.perf_counter() - setup_t0)
