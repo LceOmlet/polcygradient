@@ -238,7 +238,7 @@ class TransformerEncoderLayer(Module):
         # to cut flash-prefix dual-dispatch launch overhead.
         self.flash_prefix_tail_dense_max_tokens = int(max(0, flash_prefix_tail_dense_tokens_env))
         inplace_flash_prefix_env = str(
-            os.environ.get("TICL_POLICY_INPLACE_FLASH_PREFIX", "1")
+            os.environ.get("TICL_POLICY_INPLACE_FLASH_PREFIX", "0")
         ).strip().lower()
         self.inplace_flash_prefix = inplace_flash_prefix_env in {"1", "true", "yes", "on"}
         inplace_clone_prefix_env = str(

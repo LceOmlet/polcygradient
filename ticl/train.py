@@ -24,9 +24,6 @@ from ticl.profiling import TrainProfiler, TrainProfilerConfig
 from ticl.gpu_observer import GPUProcessObserver
 from ticl.kernel_profiling import TrainKernelProfiler, TrainKernelProfilerConfig
 
-import pdb
-
-
 def _has_nonfinite_gradients(model, device):
     has_nonfinite = torch.zeros((), dtype=torch.bool, device=device)
     for p in model.parameters():
@@ -34,6 +31,10 @@ def _has_nonfinite_gradients(model, device):
         if g is not None:
             has_nonfinite = has_nonfinite | (~torch.isfinite(g).all())
     return bool(has_nonfinite.item())
+
+
+def _env_flag_enabled(name, default="0"):
+    return str(os.environ.get(name, default)).strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _get_host_memory_snapshot():
@@ -5348,17 +5349,16 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         and ("cuda" in str(device))
         and torch.cuda.is_available()
     ):
-        tf32_flag = str(os.environ.get("TICL_POLICY_TF32", "1")).strip().lower()
-        policy_tf32_enabled = tf32_flag not in {"0", "false", "no", "off"}
+        policy_tf32_prev = bool(torch.backends.cuda.matmul.allow_tf32)
+        policy_tf32_enabled = _env_flag_enabled("TICL_POLICY_TF32", "1")
         if policy_tf32_enabled:
-            policy_tf32_prev = bool(torch.backends.cuda.matmul.allow_tf32)
             torch.backends.cuda.matmul.allow_tf32 = True
-            if rank == 0 and verbose:
-                print(
-                    "Policy TF32 matmul:",
-                    bool(torch.backends.cuda.matmul.allow_tf32),
-                    f"(prev={policy_tf32_prev})",
-                )
+        if rank == 0 and verbose:
+            print(
+                "Policy TF32 matmul:",
+                bool(policy_tf32_enabled),
+                f"(prev={policy_tf32_prev})",
+            )
 
     env_prior = None
     train_profiler = None
@@ -5895,46 +5895,36 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             except Exception:
                 sdpa_api_available = False
             print("Policy runtime torch:", str(torch.__version__), f"(sdpa_kernel_api={sdpa_api_available})")
-            finalize_fastpath_env = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
-            finalize_fastpath_on = finalize_fastpath_env not in {"0", "false", "no", "off"}
+            finalize_fastpath_on = _env_flag_enabled("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")
             print("Policy finalize 2D fastpath:", bool(finalize_fastpath_on))
-            finalize_default_fastpath_env = str(
-                os.environ.get("TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH", "0")
-            ).strip().lower()
-            finalize_default_fastpath_on = finalize_default_fastpath_env not in {"0", "false", "no", "off"}
+            finalize_default_fastpath_on = _env_flag_enabled(
+                "TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH",
+                "0",
+            )
             print(
                 "Policy finalize 2D zero-dropout/post-norm GELU fastpath:",
                 bool(finalize_default_fastpath_on),
             )
-            step_proj_2d_env = str(os.environ.get("TICL_POLICY_STEP_PROJ_2D", "1")).strip().lower()
-            step_proj_2d_on = step_proj_2d_env not in {"0", "false", "no", "off"}
+            step_proj_2d_on = _env_flag_enabled("TICL_POLICY_STEP_PROJ_2D", "1")
             print("Policy step projection 2D fastpath:", bool(step_proj_2d_on))
-            step_layer_2d_env = str(os.environ.get("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")).strip().lower()
-            step_layer_2d_on = step_layer_2d_env not in {"0", "false", "no", "off"}
+            step_layer_2d_on = _env_flag_enabled("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")
             print("Policy step layer 2D loop:", bool(step_layer_2d_on))
-            inplace_flash_prefix_env = str(os.environ.get("TICL_POLICY_INPLACE_FLASH_PREFIX", "1")).strip().lower()
-            inplace_flash_prefix_on = inplace_flash_prefix_env not in {"0", "false", "no", "off"}
+            inplace_flash_prefix_on = _env_flag_enabled("TICL_POLICY_INPLACE_FLASH_PREFIX", "0")
             print("Policy inplace flash-prefix:", bool(inplace_flash_prefix_on))
             try:
                 inplace_paged_page_size_print = int(max(0, int(os.environ.get("TICL_POLICY_INPLACE_PAGED_PAGE_SIZE", "0"))))
             except Exception:
                 inplace_paged_page_size_print = 0
             print("Policy inplace paged page size override:", int(inplace_paged_page_size_print))
-            token_alloc_opt_env = str(os.environ.get("TICL_POLICY_STEP_TOKEN_ALLOC_OPT", "1")).strip().lower()
-            token_alloc_opt_on = token_alloc_opt_env not in {"0", "false", "no", "off"}
+            token_alloc_opt_on = _env_flag_enabled("TICL_POLICY_STEP_TOKEN_ALLOC_OPT", "1")
             print("Policy step token alloc fastpath:", bool(token_alloc_opt_on))
-            token_layout_prepack_env = str(os.environ.get("TICL_POLICY_TOKEN_LAYOUT_PREPACK", "1")).strip().lower()
-            token_layout_prepack_on = token_layout_prepack_env not in {"0", "false", "no", "off"}
+            token_layout_prepack_on = _env_flag_enabled("TICL_POLICY_TOKEN_LAYOUT_PREPACK", "1")
             print("Policy token layout prepack:", bool(token_layout_prepack_on))
-            state_postprocess_inplace_env = str(
-                os.environ.get("TICL_POLICY_STATE_POSTPROCESS_INPLACE", "0")
-            ).strip().lower()
-            state_postprocess_inplace_on = state_postprocess_inplace_env not in {"0", "false", "no", "off"}
+            cache_container_reuse_on = _env_flag_enabled("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")
+            print("Policy cache container reuse:", bool(cache_container_reuse_on))
+            state_postprocess_inplace_on = _env_flag_enabled("TICL_POLICY_STATE_POSTPROCESS_INPLACE", "0")
             print("Policy state postprocess inplace:", bool(state_postprocess_inplace_on))
-            reward_mask_buf_reuse_env = str(
-                os.environ.get("TICL_POLICY_REWARD_MASK_BUFFER_REUSE", "0")
-            ).strip().lower()
-            reward_mask_buf_reuse_on = reward_mask_buf_reuse_env not in {"0", "false", "no", "off"}
+            reward_mask_buf_reuse_on = _env_flag_enabled("TICL_POLICY_REWARD_MASK_BUFFER_REUSE", "0")
             print("Policy reward-mask buffer reuse:", bool(reward_mask_buf_reuse_on))
             policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
             if policy_autocast_dtype is not None:

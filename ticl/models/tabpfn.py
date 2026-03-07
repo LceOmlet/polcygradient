@@ -510,7 +510,7 @@ class TabPFN(nn.Module):
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
 
-        assume_finite_policy_inputs_env = str(os.environ.get("TICL_POLICY_ASSUME_FINITE_INPUTS", "1")).strip().lower()
+        assume_finite_policy_inputs_env = str(os.environ.get("TICL_POLICY_ASSUME_FINITE_INPUTS", "0")).strip().lower()
         assume_finite_policy_inputs = assume_finite_policy_inputs_env not in {"0", "false", "no", "off"}
         if assume_finite_policy_inputs:
             obs_src = obs_t

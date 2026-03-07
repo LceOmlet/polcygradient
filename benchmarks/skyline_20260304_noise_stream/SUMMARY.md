@@ -3886,3 +3886,254 @@ Interpretation:
 - The earlier `balanced2` OOMs were not a real property of the candidate under the intended skyline conditions.
 - With clean GPU state, `balanced2` keeps the batch runnable and reduces rollout-side wall enough to beat the restored `family` baseline.
 - This is not a huge gain, but it is a real positive skyline on the current execution-mode mainline, so `TICL_POLICY_TRANSITION_INNER_GROUPING=balanced2` is now promoted to the default for `python -m ticl.fit_model rlpfn`.
+
+## 2026-03-07 documented-only default cleanup: removed hidden non-summary defaults
+
+Goal:
+
+- stop relying on performance-affecting defaults that were never promoted into
+  the maintained skyline notes
+- keep `python -m ticl.fit_model rlpfn` aligned with documented mainline knobs
+  only, even if an undocumented path happened to benchmark slightly better in
+  an ad hoc local probe
+
+Code:
+
+- `ticl/fit_model.py`
+  - removed undocumented default pinning for:
+    - `TICL_POLICY_INPLACE_FLASH_PREFIX`
+    - `TICL_POLICY_FORCE_FLASH_SINGLE_PAGE`
+- `ticl/models/layer.py`
+  - restored `TICL_POLICY_INPLACE_FLASH_PREFIX` implicit default from `1` to
+    `0`
+- `ticl/train.py`
+  - restored startup print default for `Policy inplace flash-prefix` to `False`
+- `ticl/models/tabpfn.py`
+  - restored `TICL_POLICY_ASSUME_FINITE_INPUTS` implicit default from `1` to
+    `0`
+
+Rationale:
+
+- these knobs had no maintained skyline entry in `SUMMARY.md`
+- leaving them enabled by implicit code default would make later A/B results
+  depend on non-documented behavior, which is incompatible with maintaining a
+  real skyline
+
+Validation:
+
+- `python -m py_compile ticl/fit_model.py ticl/models/layer.py ticl/models/tabpfn.py ticl/train.py`
+  passed
+- targeted semantics regression checks passed:
+  - `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "tbptt_detach_prefix_compaction_preserves_paged_cache_semantics or forward_policy_step_finalize_default_eager_fastpath_preserves_semantics"`
+- fixed-seed batch-128 baseline with documented defaults only:
+  - log: `20260307_seeded_batch128_doc_only_defaults.log`
+  - startup confirms:
+    - `Policy inplace flash-prefix: False`
+    - `Policy transition inner grouping: balanced2`
+    - `Policy transition async commit in-stream: True (mode=auto)`
+    - `Policy KV cache in-place append: False`
+  - phase line:
+    - `batch_wall_excl_compile_s=119.660`
+    - `batch_wall_excl_compile_per_batch_item_s=0.934841`
+    - `rollout_s=74.581`
+    - `backward_s=45.079`
+
+Notes:
+
+- this is a skyline hygiene fix, not a new throughput skyline
+- run status was still `grad_norm_nonfinite`, but this pass intentionally
+  judged only throughput under identical fixed-seed single-batch conditions
+- future throughput work should compare against this documented-only base, not
+  against hidden defaults that were never accepted into the maintained notes
+
+## 2026-03-07 batch128 follow-up: TF32 and cache-container-reuse remain non-pinned on the documented base
+
+Goal:
+
+- continue on the documented `batch=128`, `tbptt=64` base
+- check whether any already-implemented low-level positives should be promoted
+  from implicit code defaults into explicit skyline defaults
+- avoid pinning small/noisy candidates that would only add more default drift
+
+Validation runs (same fixed-seed command, no profile):
+
+- documented base rerun:
+  - `20260307_seeded_batch128_doc_only_defaults_r2.log`
+  - `batch_wall_excl_compile_s=123.057`
+  - `batch_wall_excl_compile_per_batch_item_s=0.961380`
+- `TICL_POLICY_TF32=0`:
+  - `20260307_seeded_batch128_tf32_off_docbase.log`
+  - `batch_wall_excl_compile_s=122.704`
+  - `batch_wall_excl_compile_per_batch_item_s=0.958624`
+- `TICL_POLICY_CACHE_CONTAINER_REUSE=0`:
+  - `20260307_seeded_batch128_cachereuse_off_docbase.log`
+  - `batch_wall_excl_compile_s=120.704`
+  - `batch_wall_excl_compile_per_batch_item_s=0.943003`
+- all three runs kept the same observed peak alloc/reserved:
+  - `12.27 / 13.49 GiB`
+
+Interpretation:
+
+- current single-batch variance on this machine is large enough that these two
+  candidates are not strong enough to promote as new explicit skyline pins on
+  the batch-128 base
+- `TF32` remains acceptable as a documented code-default optimization, but this
+  pass did not produce a batch-128-specific hard A/B strong enough to add a new
+  `fit_model.py` default pin
+- `cache_container_reuse` remains even less conclusive on the current base, so
+  it also stays unpinned
+
+Code-quality/observability follow-up:
+
+- `ticl/train.py`
+  - startup now always prints `Policy TF32 matmul: ...`
+  - startup now prints `Policy cache container reuse: ...`
+- this prevents future A/B logs from silently depending on hidden code defaults
+  for these two knobs
+
+Decision:
+
+- no new throughput skyline in this round
+- keep the documented batch-128 base unchanged
+- use the new startup observability to decide later whether `TF32` or
+  `cache_container_reuse` should be explicitly pinned or explicitly removed
+
+## 2026-03-07 documented positive-default closure: explicitly pin TF32 and cache-container-reuse for `rlpfn`
+
+Goal:
+
+- finish the default audit in descending documented-gain order
+- remove the last two documented positive paths that were still relying on
+  implicit code defaults instead of explicit `rlpfn` skyline pinning
+
+Context:
+
+- after the larger documented gains had already been pinned into
+  `ticl/fit_model.py`, the remaining implemented/documented positives not yet
+  explicitly pinned were:
+  - `TICL_POLICY_TF32=1`
+  - `TICL_POLICY_CACHE_CONTAINER_REUSE=1`
+
+Fixed-seed checks on the documented batch-128 base:
+
+- `TF32=0`:
+  - `20260307_seeded_batch128_tf32_off_docbase.log`
+  - `batch_wall_excl_compile_s=122.704`
+- `CACHE_CONTAINER_REUSE=0`:
+  - `20260307_seeded_batch128_cachereuse_off_docbase.log`
+  - `batch_wall_excl_compile_s=120.704`
+- `TF32=0 + CACHE_CONTAINER_REUSE=0`:
+  - `20260307_seeded_batch128_tf32off_cachereuseoff_docbase.log`
+  - `batch_wall_excl_compile_s=123.114`
+  - startup confirms:
+    - `Policy TF32 matmul: False`
+    - `Policy cache container reuse: False`
+
+Interpretation:
+
+- disabling both together does not improve the documented batch-128 base
+- neither flag produced strong enough batch-128 evidence to claim a new skyline
+  by itself, but there is also no fixed-seed evidence that they should now be
+  removed from the maintained path
+- the remaining issue was therefore code-quality / reproducibility, not raw
+  kernel throughput
+
+Code:
+
+- `ticl/fit_model.py`
+  - explicitly pins for `python -m ticl.fit_model rlpfn`:
+    - `TICL_POLICY_TF32=1`
+    - `TICL_POLICY_CACHE_CONTAINER_REUSE=1`
+
+Decision:
+
+- this is a default-closure / anti-drift fix, not a new throughput skyline
+- the documented batch-128 mainline now no longer depends on hidden code
+  defaults for these two retained positive paths
+
+## 2026-03-07 code-quality cleanup: remove dead debug/comment code and dedupe env-flag parsing
+
+Goal:
+
+- improve code structure without changing semantics, throughput, or memory
+- remove obviously dead code that had accumulated around the skyline work
+- reduce duplicated env-flag parsing in startup observability so future default
+  changes are less likely to drift
+
+Code:
+
+- `ticl/fit_model.py`
+  - removed stale commented-out allocator/debug lines
+  - removed unused `root_dir`, `pandas`, and `pdb`
+  - removed a long dead commented-out wandb run-dedup block
+- `ticl/train.py`
+  - removed unused `pdb`
+  - added `_env_flag_enabled(...)` and used it for TF32 / startup policy-flag
+    observability instead of repeated ad hoc string parsing
+
+Validation:
+
+- `python -m py_compile ticl/fit_model.py ticl/train.py` passed
+- targeted semantics regression checks passed:
+  - `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "tbptt_detach_prefix_compaction_preserves_paged_cache_semantics or forward_policy_step_finalize_default_eager_fastpath_preserves_semantics"`
+- fixed-seed batch-128 cleanup baseline:
+  - `20260307_seeded_batch128_cleanup_baseline.log`
+  - startup confirms:
+    - `Policy TF32 matmul: True`
+    - `Policy cache container reuse: True`
+  - phase line:
+    - `batch_wall_excl_compile_s=119.698`
+    - `batch_wall_excl_compile_per_batch_item_s=0.935144`
+  - peak alloc/reserved:
+    - `12.27 / 13.49 GiB`
+
+Interpretation:
+
+- the cleanup pass does not introduce a visible throughput or memory regression
+  relative to the documented batch-128 baseline
+- this pass is purely code-quality / anti-drift work, not a new skyline
+
+## 2026-03-07 batch-256 throughput scaling check on the documented mainline
+
+Goal:
+
+- test whether the current documented mainline remains runnable at
+  `batch_size=256` with `TBPTT=64`
+- record normalized throughput (`wall / batch_size`) and memory usage on the
+  same fixed-seed single-batch benchmark
+
+Command notes:
+
+- fixed seed
+- `batch_size=256`
+- `pg_tbptt_window=64`
+- `pg_env_replay_steps=1`
+- fail-fast enabled
+- no profiler / GPU observer
+
+Result:
+
+- log:
+  - `20260307_seeded_batch256_mainline.log`
+- startup confirms:
+  - `Policy TF32 matmul: True`
+  - `Policy cache container reuse: True`
+- phase line:
+  - `batch_wall_excl_compile_s=126.545`
+  - `batch_wall_excl_compile_per_batch_item_s=0.494318`
+  - `rollout_s=79.453`
+  - `backward_s=47.092`
+- epoch wallclock:
+  - `79.60s`
+  - normalized `79.60 / 256 = 0.310938 s`
+- peak alloc/reserved:
+  - `24.32 / 29.41 GiB`
+
+Interpretation:
+
+- the current documented mainline is stable at `batch=256` under this
+  throughput-only benchmark (no fail-fast OOM)
+- normalized throughput improves materially versus the documented `batch=128`
+  mainline regime
+- this is a scaling observation, not a replacement of the maintained batch-128
+  skyline

@@ -1,6 +1,3 @@
-# import os
-# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
-
 import socket
 import sys
 import time
@@ -9,7 +6,6 @@ import mlflow
 
 import torch
 import os
-root_dir = os.path.dirname(os.path.abspath(__file__))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -18,42 +14,72 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from git import Repo
 
-# Performance-first defaults for `python -m ticl.fit_model rlpfn`.
-# Use `setdefault` so explicit user/env overrides still take precedence.
-_POSITIVE_POLICY_OPT_DEFAULTS = {
+def _argv_targets_rlpfn(argv):
+    return bool(argv) and str(argv[0]).strip().lower() == "rlpfn"
+
+
+# Import-time env pinning is required here because several hot-path flags are
+# read while importing model/layer modules. Keep this scoped to the `rlpfn`
+# entrypoint so other model types do not inherit rollout-specific defaults.
+_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS = {
     "TICL_POLICY_CAT_FUSION": "1",
     "TICL_POLICY_SPLIT_ENCODE_FUSION": "1",
     "TICL_POLICY_FINALIZE_2D_FASTPATH": "1",
-    "TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH": "0",
     "TICL_POLICY_STEP_PROJ_2D": "1",
     "TICL_POLICY_STEP_LAYER_2D_LOOP": "1",
     "TICL_POLICY_STEP_TOKEN_ALLOC_OPT": "1",
     "TICL_POLICY_TOKEN_LAYOUT_PREPACK": "1",
-    "TICL_POLICY_ASSUME_FINITE_INPUTS": "1",
+    "TICL_POLICY_TF32": "1",
+    "TICL_POLICY_CACHE_CONTAINER_REUSE": "1",
     "TICL_POLICY_FUSED_TRANSITION_GENERATOR": "1",
-    "TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS": "0",
     "TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED": "1",
     "TICL_POLICY_TRANSITION_INNER_GROUPING": "balanced2",
     "TICL_POLICY_TRANSITION_STREAM_FUSION": "1",
-    "TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM": "1",
     "TICL_POLICY_ROLLOUT_NOISE_STREAM": "1",
     "TICL_POLICY_ENVGEN_BMM": "1",
     "TICL_POLICY_ENVGEN_CHECKPOINT": "1",
     "TICL_POLICY_TAIL_FREEZE": "1",
-    "TICL_POLICY_TAIL_FREEZE_CLONE_APPEND": "1",
-    "TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_GUARD": "1",
-    "TICL_POLICY_STATE_POSTPROCESS_INPLACE": "1",
-    "TICL_POLICY_REWARD_MASK_BUFFER_REUSE": "1",
+    "TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH": "1",
     "TICL_POLICY_FLASH_PREFIX_ASYNC": "1",
     "TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH": "1",
-    "TICL_POLICY_INPLACE_FLASH_PREFIX": "1",
-    "TICL_POLICY_FORCE_FLASH_SINGLE_PAGE": "1",
-    "TICL_POLICY_INPLACE_PAGED_KV": "1",
-    "TICL_POLICY_TBPTT_STREAM_MERGE_AUTO": "0",
     "TICL_POLICY_OOM_FAIL_FAST": "1",
 }
-for _k, _v in _POSITIVE_POLICY_OPT_DEFAULTS.items():
-    os.environ.setdefault(_k, _v)
+
+# Pin probe-only or falsified paths back to the retained skyline settings so
+# `python -m ticl.fit_model rlpfn` is reproducible and does not silently drift
+# with stale shell env or earlier exploratory defaults.
+_RLPFN_SKYLINE_GUARD_ENV_DEFAULTS = {
+    "TICL_POLICY_PAGED_ATTN_TRAIN_MODE": "auto",
+    "TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS": "64",
+    "TICL_POLICY_FLASH_PREFIX_TAIL_DENSE_MAX_TOKENS": "0",
+    "TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH": "0",
+    "TICL_POLICY_TRANSITION_STREAM_FUSION_MAX_GROUPS": "2",
+    "TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM": "auto",
+    "TICL_POLICY_TRANSITION_INNER_MIN_BUCKET": "0",
+    "TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS": "1",
+    "TICL_POLICY_TBPTT_STREAM_MERGE_AUTO": "0",
+    "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": "0",
+    "TICL_POLICY_ENVGEN_RAGGED_AFFINE": "0",
+    "TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS": "0",
+    "TICL_POLICY_FUSED_TRANSITION_PAIRED": "0",
+    "TICL_POLICY_TRANSITION_ONLY_ENV_BUILD": "0",
+    "TICL_POLICY_SKIP_UNUSED_POLICY_GENERATOR_BUILD": "0",
+    "TICL_POLICY_STATE_POSTPROCESS_INPLACE": "0",
+    "TICL_POLICY_REWARD_MASK_BUFFER_REUSE": "0",
+    "TICL_POLICY_INPLACE_PAGED_KV": "0",
+}
+
+
+def _apply_rlpfn_skyline_env_defaults(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not _argv_targets_rlpfn(argv):
+        return
+    for env_map in (_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS, _RLPFN_SKYLINE_GUARD_ENV_DEFAULTS):
+        for key, value in env_map.items():
+            os.environ.setdefault(key, value)
+
+
+_apply_rlpfn_skyline_env_defaults()
 
 from ticl.model_builder import get_model
 from ticl.utils import (
@@ -67,9 +93,6 @@ from ticl.config_utils import compare_dicts, flatten_dict, update_config
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.model_configs import get_model_default_config
 from argparse import Namespace
-
-import pandas as pd
-import pdb
 
 
 def _merge_missing_keys(dst, src):
@@ -340,41 +363,6 @@ def main(argv, extra_config=None):
         from ticl.environment import WANDB_INFO
         wandb_data, flatten_key_dict = flatten_dict(config, track_keys=True)
         wandb_config = {k: v for k, v in wandb_data.items() if k not in ['wallclock_times', 'losses', 'learning_rates']}
-        # check_keys = pd.read_csv(f"{root_dir}/configs/{args.model_type}_configs.csv").columns
-        # flatten_check_keys = [flatten_key_dict[k] for k in check_keys] + ['model_type']
-
-        # api = wandb.Api(timeout=300)
-        # runs = api.runs(f"{WANDB_INFO['entity']}/{WANDB_INFO['project']}")
-        # find_existing_run = None
-        # for run in runs:
-        #     run_config_list = {k: v for k,v in run.config.items() if not k.startswith('_')}
-        #     this_run = True
-        #     for key in flatten_check_keys:
-        #         if key not in wandb_config or key not in run_config_list:
-        #             this_run = False
-        #             break
-        #         if (run_config_list[key] != wandb_config[key]):
-        #             # check whether they are numbers 
-        #             this_run = False
-        #             if (isinstance(run_config_list[key], (int, float))) and (isinstance(wandb_config[key], (int, float))):
-        #                 # check whether the numbers are close
-        #                 if abs(run_config_list[key] - wandb_config[key]) <= 1e-5:
-        #                     this_run = True
-        #             if not this_run: break
-        #     if this_run:
-
-        #         print("########"*3)
-        #         print(f"Find existing run in wandb: {run.name}")
-        #         print("########"*3)
-
-        #         if not orchestration.wandb_overwrite: 
-        #             find_existing_run = run
-        #             print(f'wandb_overwrite is set to {orchestration.wandb_overwrite}, exiting...')
-        #             exit(0)
-                
-            
-        # # initialize wandb
-        # if find_existing_run is None:
         wandb.init(
             dir=WANDB_INFO['dir'],
             project=WANDB_INFO['project'],
