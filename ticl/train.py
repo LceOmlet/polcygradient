@@ -2092,8 +2092,6 @@ def train_epoch_policy_gradient(
                     batch_rollout_transition_fused_enabled = 0
                     batch_rollout_transition_checkpoint_enabled = 0
                     batch_rollout_transition_checkpoint_call_count = 0
-                    batch_rollout_transition_stable_dual_input_enabled = 0
-                    batch_rollout_transition_stable_dual_input_call_count = 0
                     batch_rollout_transition_group_count = 0
                     batch_rollout_transition_family_group_count = 0
                     batch_rollout_transition_inner_grouping_structure_enabled = 0
@@ -3254,29 +3252,6 @@ def train_epoch_policy_gradient(
                                 )
                             except Exception:
                                 pass
-                        transition_stable_dual_input_enabled = pg_stats_chunk.get(
-                            "rollout_transition_stable_dual_input_enabled", None
-                        )
-                        if transition_stable_dual_input_enabled is not None:
-                            try:
-                                batch_rollout_transition_stable_dual_input_enabled = int(
-                                    max(
-                                        int(batch_rollout_transition_stable_dual_input_enabled),
-                                        int(transition_stable_dual_input_enabled),
-                                    )
-                                )
-                            except Exception:
-                                pass
-                        transition_stable_dual_input_call_count = pg_stats_chunk.get(
-                            "rollout_transition_stable_dual_input_call_count", None
-                        )
-                        if transition_stable_dual_input_call_count is not None:
-                            try:
-                                batch_rollout_transition_stable_dual_input_call_count += int(
-                                    transition_stable_dual_input_call_count
-                                )
-                            except Exception:
-                                pass
                         transition_group_count = pg_stats_chunk.get("rollout_transition_group_count", None)
                         if transition_group_count is not None:
                             try:
@@ -3769,16 +3744,6 @@ def train_epoch_policy_gradient(
                             f" rollout_transition_checkpoint_calls="
                             f"{int(batch_rollout_transition_checkpoint_call_count)}"
                         )
-                    if (
-                        int(batch_rollout_transition_stable_dual_input_enabled) > 0
-                        or int(batch_rollout_transition_stable_dual_input_call_count) > 0
-                    ):
-                        rollout_breakdown_suffix += (
-                            f" rollout_transition_stable_dual_input_enabled="
-                            f"{int(batch_rollout_transition_stable_dual_input_enabled)}"
-                            f" rollout_transition_stable_dual_input_calls="
-                            f"{int(batch_rollout_transition_stable_dual_input_call_count)}"
-                        )
                     if not transition_async_mode:
                         transition_y_share = float(
                             batch_rollout_transition_y_wall_ms / max(1e-9, batch_rollout_transition_wall_ms)
@@ -4213,16 +4178,6 @@ def train_epoch_policy_gradient(
                                 stage_extra["rollout_transition_checkpoint_calls"] = int(
                                     batch_rollout_transition_checkpoint_call_count
                                 )
-                            if (
-                                int(batch_rollout_transition_stable_dual_input_enabled) > 0
-                                or int(batch_rollout_transition_stable_dual_input_call_count) > 0
-                            ):
-                                stage_extra["rollout_transition_stable_dual_input_enabled"] = int(
-                                    batch_rollout_transition_stable_dual_input_enabled
-                                )
-                                stage_extra["rollout_transition_stable_dual_input_calls"] = int(
-                                    batch_rollout_transition_stable_dual_input_call_count
-                                )
                             stage_extra["rollout_transition_group_count"] = int(batch_rollout_transition_group_count)
                             stage_extra["rollout_transition_family_group_count"] = int(
                                 batch_rollout_transition_family_group_count
@@ -4468,16 +4423,6 @@ def train_epoch_policy_gradient(
                                     )
                                     wandb_payload["pg_gpu/rollout_transition_checkpoint_calls"] = int(
                                         batch_rollout_transition_checkpoint_call_count
-                                    )
-                                if (
-                                    int(batch_rollout_transition_stable_dual_input_enabled) > 0
-                                    or int(batch_rollout_transition_stable_dual_input_call_count) > 0
-                                ):
-                                    wandb_payload["pg_gpu/rollout_transition_stable_dual_input_enabled"] = int(
-                                        batch_rollout_transition_stable_dual_input_enabled
-                                    )
-                                    wandb_payload["pg_gpu/rollout_transition_stable_dual_input_calls"] = int(
-                                        batch_rollout_transition_stable_dual_input_call_count
                                     )
                                 wandb_payload["pg_gpu/rollout_transition_group_count"] = int(
                                     batch_rollout_transition_group_count
@@ -5701,20 +5646,6 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print(
                 "Policy envgen ragged affine:",
                 bool(envgen_ragged_affine_env not in {"0", "false", "no", "off"}),
-            )
-            fused_transition_stable_slots_env = str(
-                os.environ.get("TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS", "0")
-            ).strip().lower()
-            print(
-                "Policy fused transition stable-input slots:",
-                bool(fused_transition_stable_slots_env not in {"0", "false", "no", "off"}),
-            )
-            fused_transition_paired_env = str(
-                os.environ.get("TICL_POLICY_FUSED_TRANSITION_PAIRED", "0")
-            ).strip().lower()
-            print(
-                "Policy fused transition paired-specialized:",
-                bool(fused_transition_paired_env not in {"0", "false", "no", "off"}),
             )
             fused_transition_scm_hidden_fused_env = str(
                 os.environ.get("TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED", "0")

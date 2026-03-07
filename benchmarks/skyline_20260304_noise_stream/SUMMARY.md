@@ -4201,3 +4201,85 @@ Interpretation:
   same regime as the earlier batch-256 scaling check
 - this pass improves code quality and reduces future profiling noise without
   introducing a new negative memory or throughput symptom
+
+## 2026-03-07 batch-256 mainline hygiene: learning-rate x10 + falsified transition-runtime cleanup
+
+Goal:
+
+- keep the maintained `batch=256 / TBPTT=64 / replay_step=1 / fail-fast`
+  mainline
+- reflect the much larger maintained physical batch in the default optimizer
+  step size instead of inheriting the tiny legacy LR
+- remove already-falsified transition runtime branches that no longer belong on
+  the maintained path
+- confirm that throughput and VRAM stay on the same skyline regime after the
+  cleanup
+
+Audit result before code changes:
+
+- no additional documented positive environment/kernel knobs remained to be
+  enabled for `python -m ticl.fit_model rlpfn`; the retained positive set was
+  already fully pinned in `ticl/fit_model.py`
+- the remaining cleanup opportunity was therefore code-quality/runtime-branch
+  reduction, not another new optimization flag
+
+Code:
+
+- `ticl/model_configs.py`
+  - `get_rlpfn_default_config()` now sets:
+    - `optimizer.learning_rate = 3e-4` (10x over the previous `3e-5`)
+- `ticl/priors/environment_prior.py`
+  - removed the runtime flag plumbing for:
+    - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS`
+    - `TICL_POLICY_FUSED_TRANSITION_PAIRED`
+  - removed the rollout hot-path stable-dual-slot branch and its dead stats
+    propagation
+  - removed the live transition-builder selection branches for paired
+    transition specialization
+  - removed now-unused transition metadata fields that existed only for those
+    branches
+- `ticl/train.py`
+  - removed startup logging and batch/stage/wandb aggregation for the deleted
+    stable-dual-slot counters
+- `ticl/fit_model.py`
+  - removed the no-longer-valid skyline guard env pins for the deleted flags
+- `ticl/tests/priors/test_environment_prior.py`
+  - removed the paired-transition regression that only exercised the deleted
+    runtime branch
+- `ticl/tests/test_rlpfn_split_encoder.py`
+  - now asserts the maintained `rlpfn` default learning rate is `3e-4`
+
+Validation:
+
+- `python -m py_compile ticl/model_configs.py ticl/fit_model.py ticl/train.py ticl/priors/environment_prior.py ticl/tests/priors/test_environment_prior.py ticl/tests/test_rlpfn_split_encoder.py`
+  passed
+- targeted semantics tests passed:
+  - `conda run -n rlpfn python -m pytest -q ticl/tests/priors/test_environment_prior.py -k "fused_transition_dual_packed_matches_cat_semantics or scm_hidden_fused_transition_matches_legacy_dual_semantics or envgen_checkpoint_preserves_rollout_semantics or ragged_affine_matches_dense_hetero_batch_semantics or mixed_family_gp_projection_profile_survives_async_rollout"`
+  - `conda run -n rlpfn python -m pytest -q ticl/tests/test_rlpfn_split_encoder.py`
+- fixed-seed batch-256 mainline check:
+  - log: `20260307_seeded_batch256_lr10x_cleanup.log`
+  - startup confirms:
+    - `Policy TBPTT window: 64`
+    - `Policy env replay steps: 1`
+    - `Policy transition inner grouping: balanced2`
+    - `Policy fused transition SCM hidden-fused: True`
+    - `Policy cache container reuse: True`
+  - warmup note confirms new default LR:
+    - `base_lr=3.000e-04`
+  - phase line:
+    - `batch_wall_excl_compile_s=125.739`
+    - `batch_wall_excl_compile_per_batch_item_s=0.491167`
+    - `rollout_s=79.403`
+    - `backward_s=46.336`
+  - peak alloc/reserved:
+    - `24.32 / 29.41 GiB`
+
+Interpretation:
+
+- this pass does not introduce a new kernel skyline knob; the documented
+  positive-default audit for batch-256 is effectively closed
+- raising the maintained default LR to `3e-4` does not perturb the throughput or
+  memory skyline under the fixed-seed single-batch benchmark
+- removing the falsified `paired/stable-slots` runtime branches reduces later
+  profiling noise while keeping the batch-256 mainline on the same performance
+  and VRAM regime

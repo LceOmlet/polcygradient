@@ -533,6 +533,9 @@ def get_rlpfn_default_config():
     # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
     config['optimizer']['pg_oom_fail_fast'] = True
+    # Physical batch has moved to 256 on the maintained mainline; scale the
+    # default step size up with it instead of keeping the legacy tiny batch LR.
+    config['optimizer']['learning_rate'] = 3e-4
     # Documented throughput mainline now uses physical batch 256.
     config['dataloader']['batch_size'] = 256
     return config

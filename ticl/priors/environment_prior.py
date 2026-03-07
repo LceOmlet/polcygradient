@@ -941,24 +941,6 @@ class EnvironmentPrior:
             "yes",
             "on",
         }
-        fused_transition_stable_slots_flag = str(
-            os.environ.get("TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS", "0")
-        ).strip().lower()
-        self.fused_transition_stable_input_slots = fused_transition_stable_slots_flag not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
-        fused_transition_paired_flag = str(
-            os.environ.get("TICL_POLICY_FUSED_TRANSITION_PAIRED", "0")
-        ).strip().lower()
-        self.fused_transition_paired = fused_transition_paired_flag not in {
-            "0",
-            "false",
-            "no",
-            "off",
-        }
         fused_transition_scm_hidden_fused_flag = str(
             os.environ.get("TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED", "0")
         ).strip().lower()
@@ -4134,8 +4116,6 @@ class EnvironmentPrior:
             return out_dual[:batch_size, :state_out_cap], out_dual[batch_size:, :1]
 
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
-        transition_fn._prefers_dual_packed_input = False
-        transition_fn._paired_specialized = False
         transition_fn._gp_output_subgraph_fused = True
         return transition_fn
 
@@ -4483,8 +4463,6 @@ class EnvironmentPrior:
             return state_out, reward_out
 
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
-        transition_fn._prefers_dual_packed_input = False
-        transition_fn._paired_specialized = False
         transition_fn._scm_hidden_fused_specialized = True
         return transition_fn
 
@@ -4514,23 +4492,6 @@ class EnvironmentPrior:
                 input_mask=input_mask,
             )
         reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
-        if bool(self.fused_transition_paired):
-            state_fn, reward_fn = self._build_scm_hetero_paired_transition_fns(
-                in_dims=in_dims,
-                state_dims=state_dims,
-                h_list=h_list,
-                device=device,
-                depth_values=depth_values,
-                activation_names=activation_names,
-                input_mask=input_mask,
-            )
-            return self._build_paired_transition_fn(
-                state_fn=state_fn,
-                reward_fn=reward_fn,
-                batch_size=batch_size,
-                state_cap=int(state_dims.max().item()),
-            )
-
         dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
         dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
         if torch.is_tensor(depth_values):
@@ -4588,8 +4549,6 @@ class EnvironmentPrior:
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
 
-        transition_fn._prefers_dual_packed_input = True
-        transition_fn._paired_specialized = False
         transition_fn._gp_input_rff_fused = bool(getattr(dual_fn, "_gp_input_rff_fused", False))
         transition_fn._gp_output_projection_fused = bool(
             getattr(dual_fn, "_gp_output_projection_fused", False)
@@ -4621,21 +4580,6 @@ class EnvironmentPrior:
                 device=device,
                 input_mask=input_mask,
             )
-        if bool(self.fused_transition_paired):
-            state_fn, reward_fn = self._build_gp_hetero_paired_transition_fns(
-                in_dims=in_dims,
-                state_dims=state_dims,
-                h_list=h_list,
-                device=device,
-                input_mask=input_mask,
-            )
-            return self._build_paired_transition_fn(
-                state_fn=state_fn,
-                reward_fn=reward_fn,
-                batch_size=batch_size,
-                state_cap=int(state_dims.max().item()),
-            )
-
         dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
         dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
         input_mask_dual = None
@@ -4733,8 +4677,6 @@ class EnvironmentPrior:
                     stable_input=True,
                 )
 
-        transition_fn._prefers_dual_packed_input = bool(shared_transition_fn is None)
-        transition_fn._paired_specialized = False
         transition_fn._prefers_packed_env_input = bool((shared_transition_fn is None) and gp_packed_env_input_enabled)
         transition_fn._packed_input_cap = int(packed_input_cap)
         transition_fn._envgen_checkpoint_enabled = bool(
@@ -4893,8 +4835,6 @@ class EnvironmentPrior:
             return x_next[:, :state_cap], reward_next[:, :1]
 
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
-        transition_fn._prefers_dual_packed_input = False
-        transition_fn._paired_specialized = True
         return transition_fn
 
     def _build_gp_hetero_shared_first_proj_transition_fn(self, in_dims, state_dims, h_list, device, input_mask=None):
@@ -7238,8 +7178,6 @@ class EnvironmentPrior:
         transition_fused_call_count = 0
         transition_fused_group_count = 0
         transition_checkpoint_call_count = 0
-        transition_stable_dual_input_enabled = 0
-        transition_stable_dual_input_call_count = 0
         transition_group_work_actual = 0.0
         transition_group_work_padded = 0.0
         transition_group_max_batch = 0
@@ -7476,25 +7414,6 @@ class EnvironmentPrior:
                 transition_checkpoint_enabled = int(
                     bool(getattr(transition_generator, "_envgen_checkpoint_enabled", False))
                 )
-                use_stable_dual_input_slots = bool(
-                    self.fused_transition_stable_input_slots
-                    and use_fused_transition
-                    and bool(transition_checkpoint_enabled)
-                    and tbptt_window_active
-                    and (tbptt_window_size > 0)
-                    and bool(getattr(transition_generator, "_prefers_dual_packed_input", True))
-                )
-                transition_dual_input_slots = None
-                if use_stable_dual_input_slots:
-                    transition_dual_input_slots = [
-                        torch.zeros(
-                            (2 * group_bs, packed_input_cap if packed_input_enabled else group_env_total_dim),
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        for _ in range(tbptt_window_size)
-                    ]
-                    transition_stable_dual_input_enabled = 1
                 transition_groups.append(
                     {
                         "indices": group_idx,
@@ -7521,8 +7440,6 @@ class EnvironmentPrior:
                         "packed_noise_rows": packed_noise_rows,
                         "packed_noise_dst_cols": packed_noise_dst_cols,
                         "packed_noise_src_cols": packed_noise_src_cols,
-                        "transition_dual_input_slots": transition_dual_input_slots,
-                        "transition_dual_input_cursor": 0,
                         "rollout_generators": group_rollout_generators,
                         "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
                         "family": str(env_batch["family"]),
@@ -8136,8 +8053,6 @@ class EnvironmentPrior:
                 reward_next_raw_g = None
                 x_next_g = None
                 transition_input = None
-                transition_input_is_dual_packed = False
-                transition_dual_input_slots = group.get("transition_dual_input_slots", None)
                 gp_projection_profile_capable = bool(group.get("gp_projection_profile_capable", False))
                 if gp_projection_profile_capable and not bool(group.get("_gp_projection_profile_seen", False)):
                     transition_gp_profile_group_count += 1
@@ -8178,36 +8093,15 @@ class EnvironmentPrior:
                         packed_transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
                             packed_noise_rows, group["packed_noise_src_cols"]
                         ]
-                if use_fused_transition and (transition_dual_input_slots is not None):
-                    dual_cursor = int(group.get("transition_dual_input_cursor", 0) or 0)
-                    transition_input = transition_dual_input_slots[dual_cursor]
-                    group["transition_dual_input_cursor"] = dual_cursor + 1
-                    transition_input_is_dual_packed = True
-                    if packed_transition_input_enabled:
-                        packed_cap = int(group["packed_input_cap"])
-                        transition_input.zero_()
-                        transition_input[:group_bs, :packed_cap] = packed_transition_input
-                        transition_input[group_bs:, :packed_cap] = packed_transition_input
-                    else:
-                        transition_input[:group_bs, :state_dim_g] = state_in
-                        transition_input[group_bs:, :state_dim_g] = state_in
-                        transition_input[:group_bs, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                        transition_input[group_bs:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                        transition_input[:group_bs, env_action_start: env_action_start + action_dim_g] = action_in
-                        transition_input[group_bs:, env_action_start: env_action_start + action_dim_g] = action_in
-                        transition_input[:group_bs, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                        transition_input[group_bs:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                    transition_stable_dual_input_call_count += 1
+                if packed_transition_input_enabled:
+                    transition_input = packed_transition_input
                 else:
-                    if packed_transition_input_enabled:
-                        transition_input = packed_transition_input
-                    else:
-                        env_in = group["env_in"]
-                        env_in[:, :state_dim_g] = state_in
-                        env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                        env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
-                        env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                        transition_input = env_in
+                    env_in = group["env_in"]
+                    env_in[:, :state_dim_g] = state_in
+                    env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                    env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                    env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                    transition_input = env_in
                 if profile_rollout_timing and pack_wall_t0 is not None:
                     transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
                 if use_fused_transition:
@@ -8220,14 +8114,14 @@ class EnvironmentPrior:
                                 x_next_g, reward_next_raw_g = transition_generator_g(
                                     transition_input,
                                     generators_for_noise=group["rollout_generators"],
-                                    x_is_dual_packed=transition_input_is_dual_packed,
+                                    x_is_dual_packed=False,
                                     x_input_is_packed=True,
                                 )
                             else:
                                 x_next_g, reward_next_raw_g = transition_generator_g(
                                     transition_input,
                                     generators_for_noise=group["rollout_generators"],
-                                    x_is_dual_packed=transition_input_is_dual_packed,
+                                    x_is_dual_packed=False,
                                 )
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                             if async_group_commit_in_stream:
@@ -8255,14 +8149,14 @@ class EnvironmentPrior:
                             x_next_g, reward_next_raw_g = transition_generator_g(
                                 transition_input,
                                 generators_for_noise=group["rollout_generators"],
-                                x_is_dual_packed=transition_input_is_dual_packed,
+                                x_is_dual_packed=False,
                                 x_input_is_packed=True,
                             )
                         else:
                             x_next_g, reward_next_raw_g = transition_generator_g(
                                 transition_input,
                                 generators_for_noise=group["rollout_generators"],
-                                x_is_dual_packed=transition_input_is_dual_packed,
+                                x_is_dual_packed=False,
                             )
                         _accumulate_gp_projection_profile(transition_generator_g)
                         reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
@@ -8457,10 +8351,6 @@ class EnvironmentPrior:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         for group in transition_groups:
                             group["env_in"] = group["env_in"].detach()
-                            dual_slots = group.get("transition_dual_input_slots", None)
-                            if dual_slots is not None:
-                                group["transition_dual_input_slots"] = [slot.detach() for slot in dual_slots]
-                                group["transition_dual_input_cursor"] = 0
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
                         if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
@@ -8674,10 +8564,6 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
                 rollout_profile["transition_checkpoint_enabled"] = int(bool(self.envgen_checkpoint))
                 rollout_profile["transition_checkpoint_call_count"] = int(transition_checkpoint_call_count)
-                rollout_profile["transition_stable_dual_input_enabled"] = int(transition_stable_dual_input_enabled)
-                rollout_profile["transition_stable_dual_input_call_count"] = int(
-                    transition_stable_dual_input_call_count
-                )
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
                 rollout_profile["transition_family_group_count"] = int(transition_family_group_count)
                 rollout_profile["transition_inner_grouping_structure_enabled"] = int(
@@ -10819,12 +10705,6 @@ class EnvironmentPrior:
                 stats["rollout_transition_checkpoint_call_count"] = int(
                     rollout_profile.get("transition_checkpoint_call_count", 0) or 0
                 )
-                stats["rollout_transition_stable_dual_input_enabled"] = int(
-                    rollout_profile.get("transition_stable_dual_input_enabled", 0) or 0
-                )
-                stats["rollout_transition_stable_dual_input_call_count"] = int(
-                    rollout_profile.get("transition_stable_dual_input_call_count", 0) or 0
-                )
                 stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
                 stats["rollout_transition_family_group_count"] = int(
                     rollout_profile.get("transition_family_group_count", 0) or 0
@@ -11839,12 +11719,6 @@ class EnvironmentPrior:
             )
             stats["rollout_transition_checkpoint_call_count"] = int(
                 rollout_profile.get("transition_checkpoint_call_count", 0) or 0
-            )
-            stats["rollout_transition_stable_dual_input_enabled"] = int(
-                rollout_profile.get("transition_stable_dual_input_enabled", 0) or 0
-            )
-            stats["rollout_transition_stable_dual_input_call_count"] = int(
-                rollout_profile.get("transition_stable_dual_input_call_count", 0) or 0
             )
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
             stats["rollout_transition_family_group_count"] = int(
