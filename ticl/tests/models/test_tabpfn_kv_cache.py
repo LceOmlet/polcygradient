@@ -3,6 +3,7 @@ from torch.utils.checkpoint import checkpoint
 
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
+from ticl.priors.environment_prior import EnvironmentPrior
 
 
 def _build_model(recompute_attn=False):
@@ -36,9 +37,20 @@ def _materialize_kv_from_layer_cache(layer_cache):
         raise AssertionError("Expected dense k/v tensors or paged k_pages/v_pages in layer cache.")
 
     valid_len = int(layer_cache.get("valid_len", 0))
+    k_prefix = layer_cache.get("k_prefix", None)
+    v_prefix = layer_cache.get("v_prefix", None)
+    prefix_len = 0
+    if k_prefix is not None and v_prefix is not None:
+        prefix_len = int(k_prefix.shape[2])
+        if prefix_len > valid_len:
+            prefix_len = valid_len
     remaining = int(max(0, valid_len))
     k_chunks = []
     v_chunks = []
+    if prefix_len > 0:
+        k_chunks.append(k_prefix[:, :, :prefix_len, :])
+        v_chunks.append(v_prefix[:, :, :prefix_len, :])
+        remaining -= prefix_len
     for k_page, v_page in zip(k_pages, v_pages):
         if remaining <= 0:
             break
@@ -221,6 +233,116 @@ def test_tabpfn_forward_policy_step_paged_cache_matches_legacy_no_grad():
                 legacy_k, legacy_v = _materialize_kv_from_layer_cache(layer_legacy)
                 assert torch.allclose(paged_k, legacy_k, atol=1e-5, rtol=1e-4)
                 assert torch.allclose(paged_v, legacy_v, atol=1e-5, rtol=1e-4)
+
+
+def test_tbptt_detach_prefix_compaction_preserves_paged_cache_semantics():
+    torch.manual_seed(41)
+    model_base = _build_model()
+    model_compact = _build_model()
+    model_compact.load_state_dict(model_base.state_dict())
+    model_base.train()
+    model_compact.train()
+
+    steps = 7
+    x_tokens = torch.randn(steps, 2, 12)
+    y_tokens = torch.randn(steps, 2)
+
+    cache_base = None
+    cache_compact = None
+    detach_after = 6
+    with torch.enable_grad():
+        for t in range(steps):
+            out_base, cache_base = model_base.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_base,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=3,
+                allow_grad_mutable_cache=True,
+            )
+            out_compact, cache_compact = model_compact.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_compact,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=3,
+                allow_grad_mutable_cache=True,
+            )
+            assert torch.allclose(out_base, out_compact, atol=1e-5, rtol=1e-4)
+            if t == (detach_after - 1):
+                orig_page_counts = [len(layer_cache["k_pages"]) for layer_cache in cache_compact]
+                cache_base = EnvironmentPrior._detach_policy_cache(cache_base, clone_tensors=False)
+                cache_compact = EnvironmentPrior._detach_policy_cache(cache_compact, clone_tensors=False)
+                for orig_pages, layer_cache in zip(orig_page_counts, cache_compact):
+                    assert layer_cache["cache_mode"] == "paged"
+                    assert isinstance(layer_cache["k_pages"], list)
+                    assert len(layer_cache["k_pages"]) <= int(orig_pages)
+                    assert len(layer_cache["v_pages"]) <= int(orig_pages)
+                    if int(orig_pages) > 1:
+                        assert int(layer_cache.get("prefix_base_len", 0)) > 0
+                        assert len(layer_cache["k_pages"]) == 1
+                        assert len(layer_cache["v_pages"]) == 1
+
+        for layer_base, layer_compact in zip(cache_base, cache_compact):
+            base_k, base_v = _materialize_kv_from_layer_cache(layer_base)
+            compact_k, compact_v = _materialize_kv_from_layer_cache(layer_compact)
+            assert torch.allclose(base_k, compact_k, atol=1e-5, rtol=1e-4)
+            assert torch.allclose(base_v, compact_v, atol=1e-5, rtol=1e-4)
+
+
+def test_forward_policy_step_finalize_compile_preserves_semantics(monkeypatch):
+    if not callable(getattr(torch, "compile", None)):
+        return
+
+    torch.manual_seed(43)
+    model_base = _build_model()
+    monkeypatch.setenv("TICL_POLICY_FINALIZE_TORCH_COMPILE", "1")
+    model_compiled = _build_model()
+    model_compiled.load_state_dict(model_base.state_dict())
+    model_base.train()
+    model_compiled.train()
+
+    steps = 4
+    x_tokens = torch.randn(steps, 2, 12)
+    y_tokens = torch.randn(steps, 2)
+
+    cache_base = None
+    cache_compiled = None
+    outs_base = []
+    outs_compiled = []
+    with torch.enable_grad():
+        for t in range(steps):
+            out_base, cache_base = model_base.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_base,
+            )
+            out_compiled, cache_compiled = model_compiled.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_compiled,
+            )
+            outs_base.append(out_base)
+            outs_compiled.append(out_compiled)
+
+    out_base_all = torch.cat(outs_base, dim=0)
+    out_compiled_all = torch.cat(outs_compiled, dim=0)
+    assert torch.allclose(out_base_all, out_compiled_all, atol=1e-5, rtol=1e-4)
+
+    model_base.zero_grad(set_to_none=True)
+    model_compiled.zero_grad(set_to_none=True)
+    loss_base = out_base_all.square().mean()
+    loss_compiled = out_compiled_all.square().mean()
+    loss_base.backward()
+    loss_compiled.backward()
+
+    grads_base = [p.grad.detach().clone() for p in model_base.parameters() if p.grad is not None]
+    grads_compiled = [p.grad.detach().clone() for p in model_compiled.parameters() if p.grad is not None]
+    assert len(grads_base) == len(grads_compiled)
+    for grad_base, grad_compiled in zip(grads_base, grads_compiled):
+        assert torch.allclose(grad_base, grad_compiled, atol=1e-5, rtol=1e-4)
 
 
 def test_tabpfn_forward_policy_step_with_max_cache_len_matches_legacy_backward():

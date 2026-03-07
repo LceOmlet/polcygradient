@@ -102,6 +102,7 @@ class TabPFN(nn.Module):
             "transformer_layer_finalize_wall_s": 0.0,
             "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
             "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_finalize_compiled_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
             "transformer_layer_paged_path_flash_prefix_zero_fastpath": 0,
@@ -139,6 +140,7 @@ class TabPFN(nn.Module):
             "transformer_layer_finalize_wall_s": 0.0,
             "transformer_layer_finalize_attn_outproj_wall_s": 0.0,
             "transformer_layer_finalize_ffn_wall_s": 0.0,
+            "transformer_layer_finalize_compiled_wall_s": 0.0,
             "transformer_layer_paged_path_single_page": 0,
             "transformer_layer_paged_path_flash_prefix": 0,
             "transformer_layer_paged_path_flash_prefix_zero_fastpath": 0,
@@ -166,6 +168,25 @@ class TabPFN(nn.Module):
         x_enc = self.encoder(x_src)
         y_enc = self.y_encoder(y_src.unsqueeze(-1) if len(y_src.shape) < len(x_enc.shape) else y_src)
         return x_enc, y_enc
+
+    def policy_fastpath_compile_active(self):
+        fn = getattr(self.transformer_encoder, "step_fastpath_compile_active", None)
+        return bool(fn()) if callable(fn) else False
+
+    def get_policy_fastpath_compile_config(self):
+        fn = getattr(self.transformer_encoder, "step_fastpath_compile_config", None)
+        if callable(fn):
+            cfg = fn()
+            if isinstance(cfg, dict):
+                return cfg
+        return {"finalize_torch_compile": False}
+
+    def warmup_policy_fastpaths(self, batch_size: int):
+        warmup_fn = getattr(self.transformer_encoder, "warmup_step_fastpaths", None)
+        warmed = bool(warmup_fn(batch_size=batch_size)) if callable(warmup_fn) else False
+        if warmed:
+            self.zero_grad(set_to_none=True)
+        return warmed
 
     def init_weights(self):
         if self.init_method is not None:
@@ -349,6 +370,9 @@ class TabPFN(nn.Module):
                 )
                 stats["transformer_layer_finalize_ffn_wall_s"] += float(
                     transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_compiled_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_compiled_wall_s", 0.0) or 0.0
                 )
                 stats["transformer_layer_paged_path_single_page"] += int(
                     transformer_layer_profile.get("paged_path_single_page", 0) or 0
@@ -582,6 +606,9 @@ class TabPFN(nn.Module):
                 )
                 stats["transformer_layer_finalize_ffn_wall_s"] += float(
                     transformer_layer_profile.get("finalize_ffn_wall_s", 0.0) or 0.0
+                )
+                stats["transformer_layer_finalize_compiled_wall_s"] += float(
+                    transformer_layer_profile.get("finalize_compiled_wall_s", 0.0) or 0.0
                 )
                 stats["transformer_layer_paged_path_single_page"] += int(
                     transformer_layer_profile.get("paged_path_single_page", 0) or 0

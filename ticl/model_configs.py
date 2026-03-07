@@ -324,7 +324,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
     prior['classification'] = classsification_prior
 
     dataloader = {
-        "batch_size": 8 * 8,
+        "batch_size": 8 * 16,
         "num_steps": 8 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,

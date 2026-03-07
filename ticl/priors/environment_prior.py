@@ -7,6 +7,15 @@ import numpy as np
 import torch
 from torch import nn
 import torch.nn.functional as F
+from torch.utils.checkpoint import checkpoint
+try:
+    import triton
+    import triton.language as tl
+    import triton.language.extra.cuda.libdevice as tl_libdevice
+except Exception:  # pragma: no cover - optional CUDA path
+    triton = None
+    tl = None
+    tl_libdevice = None
 
 from ticl.distributions import parse_distributions, sample_distributions
 from ticl.utils import default_device
@@ -29,6 +38,424 @@ _REWARD_MASK_BUFFER_REUSE = _REWARD_MASK_BUFFER_REUSE_ENV not in {
     "no",
     "off",
 }
+
+
+if triton is not None:
+
+    @triton.jit
+    def _ragged_affine_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        input_index_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        out_ptr,
+        k_cap,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_ib,
+        stride_ii,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_o = tl.program_id(1)
+        offs_o = pid_o * BLOCK_O + tl.arange(0, BLOCK_O)
+        out_size = tl.load(out_sizes_ptr + pid_b)
+        out_mask = offs_o < out_size
+        in_size = tl.load(in_sizes_ptr + pid_b)
+        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        if HAS_BIAS:
+            bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+            acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        input_index_base = input_index_ptr + pid_b * stride_ib
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            input_idx = tl.load(input_index_base + offs_k * stride_ii, mask=k_mask, other=0).to(tl.int32)
+            x_vals = tl.load(x_base + input_idx * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + input_idx[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _ragged_affine_bwd_input_kernel(
+        grad_out_ptr,
+        w_ptr,
+        input_index_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        grad_x_ptr,
+        o_cap,
+        stride_gob,
+        stride_goi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_ib,
+        stride_ii,
+        stride_gxb,
+        stride_gxi,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        pid_k = tl.program_id(1)
+        offs_k = pid_k * BLOCK_K + tl.arange(0, BLOCK_K)
+        in_size = tl.load(in_sizes_ptr + pid_b)
+        k_mask = offs_k < in_size
+        input_index_base = input_index_ptr + pid_b * stride_ib
+        input_idx = tl.load(input_index_base + offs_k * stride_ii, mask=k_mask, other=0).to(tl.int32)
+        out_size = tl.load(out_sizes_ptr + pid_b)
+        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        grad_out_base = grad_out_ptr + pid_b * stride_gob
+        w_base = w_ptr + pid_b * stride_wb
+        for o_start in tl.range(0, out_size, BLOCK_O):
+            offs_o = o_start + tl.arange(0, BLOCK_O)
+            out_mask = offs_o < out_size
+            grad_vals = tl.load(grad_out_base + offs_o * stride_goi, mask=out_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + input_idx[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * grad_vals[None, :], axis=1)
+        grad_x_ptrs = grad_x_ptr + pid_b * stride_gxb + input_idx * stride_gxi
+        tl.store(grad_x_ptrs, acc, mask=k_mask)
+
+
+    class _RaggedBatchAffineFn(torch.autograd.Function):
+        @staticmethod
+        def forward(ctx, x, w, b, input_index, in_sizes, out_sizes):
+            if triton is None:
+                raise RuntimeError("ragged affine Triton path requested but Triton is unavailable")
+            x_contig = x.contiguous()
+            w_contig = w.contiguous()
+            b_contig = None if b is None else b.contiguous()
+            input_index_i32 = input_index.to(dtype=torch.int32).contiguous()
+            in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+            out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+            batch_size = int(x_contig.shape[0])
+            o_cap = int(w_contig.shape[2])
+            k_cap = int(input_index_i32.shape[1])
+            out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
+            if batch_size > 0 and o_cap > 0 and k_cap > 0:
+                grid = (batch_size, triton.cdiv(o_cap, 32))
+                _ragged_affine_fwd_kernel[grid](
+                    x_contig,
+                    w_contig,
+                    b_contig,
+                    input_index_i32,
+                    in_sizes_i32,
+                    out_sizes_i32,
+                    out,
+                    k_cap,
+                    x_contig.stride(0),
+                    x_contig.stride(1),
+                    w_contig.stride(0),
+                    w_contig.stride(1),
+                    w_contig.stride(2),
+                    0 if b_contig is None else b_contig.stride(0),
+                    0 if b_contig is None else b_contig.stride(1),
+                    input_index_i32.stride(0),
+                    input_index_i32.stride(1),
+                    out.stride(0),
+                    out.stride(1),
+                    BLOCK_O=32,
+                    BLOCK_K=32,
+                    HAS_BIAS=bool(b_contig is not None),
+                    num_warps=4,
+                )
+            ctx.save_for_backward(w_contig, input_index_i32, in_sizes_i32, out_sizes_i32)
+            ctx.x_shape = tuple(x_contig.shape)
+            return out
+
+        @staticmethod
+        def backward(ctx, grad_out):
+            if triton is None:
+                raise RuntimeError("ragged affine Triton backward requested but Triton is unavailable")
+            w_contig, input_index_i32, in_sizes_i32, out_sizes_i32 = ctx.saved_tensors
+            grad_out_contig = grad_out.contiguous()
+            grad_x = torch.zeros(ctx.x_shape, device=grad_out_contig.device, dtype=grad_out_contig.dtype)
+            batch_size = int(grad_out_contig.shape[0])
+            o_cap = int(grad_out_contig.shape[1])
+            k_cap = int(input_index_i32.shape[1])
+            if batch_size > 0 and o_cap > 0 and k_cap > 0:
+                grid = (batch_size, triton.cdiv(k_cap, 32))
+                _ragged_affine_bwd_input_kernel[grid](
+                    grad_out_contig,
+                    w_contig,
+                    input_index_i32,
+                    in_sizes_i32,
+                    out_sizes_i32,
+                    grad_x,
+                    o_cap,
+                    grad_out_contig.stride(0),
+                    grad_out_contig.stride(1),
+                    w_contig.stride(0),
+                    w_contig.stride(1),
+                    w_contig.stride(2),
+                    input_index_i32.stride(0),
+                    input_index_i32.stride(1),
+                    grad_x.stride(0),
+                    grad_x.stride(1),
+                    BLOCK_O=32,
+                    BLOCK_K=32,
+                    num_warps=4,
+                )
+            return grad_x, None, None, None, None, None
+
+
+if triton is not None:
+
+    @triton.jit
+    def _prefix_tiled_affine_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        tile_batch_ptr,
+        tile_out_offset_ptr,
+        out_ptr,
+        k_cap,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_sb,
+        stride_ab,
+        stride_tb,
+        stride_to,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        o_start = tl.load(tile_out_offset_ptr + pid_t * stride_to).to(tl.int32)
+        offs_o = o_start + tl.arange(0, BLOCK_O)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        out_mask = offs_o < out_size
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        if HAS_BIAS:
+            bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+            acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            x_vals = tl.load(x_base + offs_k * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        if activation_code == 0:
+            acc = tl_libdevice.tanh(acc)
+        elif activation_code == 1:
+            acc = tl.maximum(acc, 0.0)
+        out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _prefix_tiled_affine_bwd_input_kernel(
+        grad_out_ptr,
+        w_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        tile_batch_ptr,
+        tile_in_offset_ptr,
+        grad_x_ptr,
+        o_cap,
+        stride_gob,
+        stride_goi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_sb,
+        stride_tb,
+        stride_ti,
+        stride_gxb,
+        stride_gxi,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        k_start = tl.load(tile_in_offset_ptr + pid_t * stride_ti).to(tl.int32)
+        offs_k = k_start + tl.arange(0, BLOCK_K)
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        k_mask = offs_k < in_size
+        acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+        grad_out_base = grad_out_ptr + pid_b * stride_gob
+        w_base = w_ptr + pid_b * stride_wb
+        for o_start in tl.range(0, out_size, BLOCK_O):
+            offs_o = o_start + tl.arange(0, BLOCK_O)
+            out_mask = offs_o < out_size
+            grad_vals = tl.load(grad_out_base + offs_o * stride_goi, mask=out_mask, other=0.0).to(tl.float32)
+            w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * grad_vals[None, :], axis=1)
+        grad_x_ptrs = grad_x_ptr + pid_b * stride_gxb + offs_k * stride_gxi
+        tl.store(grad_x_ptrs, acc, mask=k_mask)
+
+
+class _PrefixTiledBatchAffineFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        x,
+        w,
+        b,
+        in_sizes,
+        out_sizes,
+        activation_codes,
+        out_tile_batch,
+        out_tile_offsets,
+        in_tile_batch,
+        in_tile_offsets,
+    ):
+        if triton is None:
+            raise RuntimeError("prefix tiled affine Triton path requested but Triton is unavailable")
+        x_contig = x.contiguous()
+        w_contig = w.contiguous()
+        b_contig = None if b is None else b.contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        out_tile_batch_i32 = out_tile_batch.to(dtype=torch.int32).contiguous()
+        out_tile_offsets_i32 = out_tile_offsets.to(dtype=torch.int32).contiguous()
+        in_tile_batch_i32 = in_tile_batch.to(dtype=torch.int32).contiguous()
+        in_tile_offsets_i32 = in_tile_offsets.to(dtype=torch.int32).contiguous()
+        batch_size = int(x_contig.shape[0])
+        k_cap = int(w_contig.shape[1])
+        o_cap = int(w_contig.shape[2])
+        out = torch.zeros((batch_size, o_cap), device=x_contig.device, dtype=x_contig.dtype)
+        if batch_size > 0 and k_cap > 0 and o_cap > 0 and int(out_tile_batch_i32.numel()) > 0:
+            grid = (int(out_tile_batch_i32.numel()),)
+            _prefix_tiled_affine_fwd_kernel[grid](
+                x_contig,
+                w_contig,
+                b_contig,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out_tile_batch_i32,
+                out_tile_offsets_i32,
+                out,
+                k_cap,
+                x_contig.stride(0),
+                x_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                0 if b_contig is None else b_contig.stride(0),
+                0 if b_contig is None else b_contig.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out_tile_batch_i32.stride(0),
+                out_tile_offsets_i32.stride(0),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=32,
+                BLOCK_K=32,
+                HAS_BIAS=bool(b_contig is not None),
+                num_warps=4,
+            )
+        ctx.save_for_backward(
+            w_contig,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+            in_tile_batch_i32,
+            in_tile_offsets_i32,
+            out,
+        )
+        ctx.x_shape = tuple(x_contig.shape)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if triton is None:
+            raise RuntimeError("prefix tiled affine Triton backward requested but Triton is unavailable")
+        (
+            w_contig,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+            in_tile_batch_i32,
+            in_tile_offsets_i32,
+            out_saved,
+        ) = ctx.saved_tensors
+        grad_out_contig = grad_out.contiguous()
+        if int(activation_codes_i32.numel()) > 0:
+            activation_codes = activation_codes_i32.to(device=grad_out_contig.device)
+            no_activation_mask = activation_codes < 0
+            relu_mask = activation_codes == 1
+            tanh_mask = activation_codes == 0
+            if bool(torch.any(relu_mask)):
+                grad_out_contig = torch.where(
+                    relu_mask.unsqueeze(1),
+                    grad_out_contig * (out_saved > 0).to(dtype=grad_out_contig.dtype),
+                    grad_out_contig,
+                )
+            if bool(torch.any(tanh_mask)):
+                grad_out_contig = torch.where(
+                    tanh_mask.unsqueeze(1),
+                    grad_out_contig * (1.0 - out_saved.square()),
+                    grad_out_contig,
+                )
+            if bool(torch.any(no_activation_mask)):
+                grad_out_contig = torch.where(no_activation_mask.unsqueeze(1), grad_out.contiguous(), grad_out_contig)
+        grad_x = torch.zeros(ctx.x_shape, device=grad_out_contig.device, dtype=grad_out_contig.dtype)
+        o_cap = int(w_contig.shape[2])
+        if int(grad_out_contig.shape[0]) > 0 and o_cap > 0 and int(in_tile_batch_i32.numel()) > 0:
+            grid = (int(in_tile_batch_i32.numel()),)
+            _prefix_tiled_affine_bwd_input_kernel[grid](
+                grad_out_contig,
+                w_contig,
+                in_sizes_i32,
+                out_sizes_i32,
+                in_tile_batch_i32,
+                in_tile_offsets_i32,
+                grad_x,
+                o_cap,
+                grad_out_contig.stride(0),
+                grad_out_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                in_sizes_i32.stride(0),
+                in_tile_batch_i32.stride(0),
+                in_tile_offsets_i32.stride(0),
+                grad_x.stride(0),
+                grad_x.stride(1),
+                BLOCK_O=32,
+                BLOCK_K=32,
+                num_warps=4,
+            )
+        return grad_x, None, None, None, None, None, None, None, None, None
 
 
 class EnvironmentPrior:
@@ -194,10 +621,72 @@ class EnvironmentPrior:
         self._rollout_executor_workers = 0
         envgen_bmm_flag = str(os.environ.get("TICL_POLICY_ENVGEN_BMM", "1")).strip().lower()
         self.envgen_bmm = envgen_bmm_flag not in {"0", "false", "no", "off"}
+        envgen_ragged_affine_flag = str(
+            os.environ.get("TICL_POLICY_ENVGEN_RAGGED_AFFINE", "0")
+        ).strip().lower()
+        self.envgen_ragged_affine = (
+            envgen_ragged_affine_flag not in {"0", "false", "no", "off"}
+            and (triton is not None)
+        )
         fused_transition_flag = str(
             os.environ.get("TICL_POLICY_FUSED_TRANSITION_GENERATOR", "1")
         ).strip().lower()
         self.fused_transition_generator = fused_transition_flag not in {"0", "false", "no", "off"}
+        envgen_checkpoint_flag = str(
+            os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT", "0")
+        ).strip().lower()
+        self.envgen_checkpoint = envgen_checkpoint_flag not in {"0", "false", "no", "off"}
+        envgen_checkpoint_reentrant_flag = str(
+            os.environ.get("TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT", "0")
+        ).strip().lower()
+        self.envgen_checkpoint_reentrant = envgen_checkpoint_reentrant_flag in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        fused_transition_stable_slots_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS", "0")
+        ).strip().lower()
+        self.fused_transition_stable_input_slots = fused_transition_stable_slots_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_paired_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_PAIRED", "0")
+        ).strip().lower()
+        self.fused_transition_paired = fused_transition_paired_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        fused_transition_scm_hidden_fused_flag = str(
+            os.environ.get("TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED", "0")
+        ).strip().lower()
+        self.fused_transition_scm_hidden_fused = fused_transition_scm_hidden_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        transition_inner_grouping = str(
+            os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING", "family")
+        ).strip().lower()
+        if transition_inner_grouping in {"", "1", "true", "yes", "on"}:
+            transition_inner_grouping = "structure"
+        if transition_inner_grouping in {"0", "false", "no", "off"}:
+            transition_inner_grouping = "family"
+        if transition_inner_grouping not in {"family", "structure", "pow2", "pow2_no_depth"}:
+            transition_inner_grouping = "family"
+        self.transition_inner_grouping = transition_inner_grouping
+        try:
+            transition_inner_min_bucket = int(os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET", "0"))
+        except Exception:
+            transition_inner_min_bucket = 0
+        self.transition_inner_min_bucket = max(0, transition_inner_min_bucket)
 
     def __del__(self):
         executor = getattr(self, "_rollout_executor", None)
@@ -1976,6 +2465,96 @@ class EnvironmentPrior:
             signature += (int(h["gp_rff_features"]),)
         return signature
 
+    def _environment_transition_signature(self, h):
+        family = self._normalize_family(h.get("family", "scm"))
+        state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        signature = (
+            family,
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+        )
+        if family == "scm":
+            signature += (
+                int(max(2, int(h["num_layers"]))),
+                int(max(state_dim, int(h["prior_mlp_hidden_dim"]))),
+                self._activation_name(h["prior_mlp_activations"]),
+            )
+        else:
+            signature += (int(max(8, int(h["gp_rff_features"]))),)
+        return signature
+
+    @staticmethod
+    def _bucket_ceil_pow2(value):
+        value = max(1, int(value))
+        return 1 << (value - 1).bit_length()
+
+    def _environment_transition_bucket_signature(self, h, grouping_mode):
+        grouping_mode = str(grouping_mode).strip().lower()
+        family = self._normalize_family(h.get("family", "scm"))
+        if grouping_mode == "family":
+            return (family,)
+        if grouping_mode == "structure":
+            return self._environment_transition_signature(h)
+        state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
+        if family == "scm":
+            signature = (
+                family,
+                self._bucket_ceil_pow2(total_dim),
+                self._bucket_ceil_pow2(state_dim),
+                self._bucket_ceil_pow2(max(state_dim, int(h["prior_mlp_hidden_dim"]))),
+                self._activation_name(h["prior_mlp_activations"]),
+            )
+            if grouping_mode == "pow2":
+                signature += (int(min(8, max(2, int(h["num_layers"])))),)
+            return signature
+        return (
+            family,
+            self._bucket_ceil_pow2(total_dim),
+            self._bucket_ceil_pow2(state_dim),
+            self._bucket_ceil_pow2(max(8, int(h["gp_rff_features"]))),
+        )
+
+    def _estimate_transition_group_work(self, h_list):
+        if not h_list:
+            return 0.0, 0.0
+        family = self._normalize_family(h_list[0].get("family", "scm"))
+        dims = [self._sample_dims(h) for h in h_list]
+        in_dims = [int(s + o + a + n + z) for s, o, a, n, z in dims]
+        state_dims = [int(s) for s, _, _, _, _ in dims]
+        batch_size = int(len(h_list))
+        if family == "scm":
+            hidden_dims = [
+                int(max(state_dims[idx], int(h["prior_mlp_hidden_dim"])))
+                for idx, h in enumerate(h_list)
+            ]
+            depths = [int(max(2, int(h["num_layers"]))) for h in h_list]
+            in_cap = max(in_dims)
+            hidden_cap = max(hidden_dims)
+            depth_cap = max(depths)
+            state_cap = max(state_dims)
+            actual = 0.0
+            for in_i, state_i, hidden_i, depth_i in zip(in_dims, state_dims, hidden_dims, depths):
+                hidden_layers = max(0, depth_i - 2)
+                actual += float(in_i * hidden_i + hidden_layers * hidden_i * hidden_i + hidden_i * state_i)
+                actual += float(in_i * hidden_i + hidden_layers * hidden_i * hidden_i + hidden_i)
+            padded = float(
+                2 * batch_size * (in_cap * hidden_cap + max(0, depth_cap - 2) * hidden_cap * hidden_cap + hidden_cap * state_cap)
+            )
+            return actual, padded
+        m_dims = [int(max(8, int(h["gp_rff_features"]))) for h in h_list]
+        in_cap = max(in_dims)
+        m_cap = max(m_dims)
+        state_cap = max(state_dims)
+        actual = 0.0
+        for in_i, state_i, m_i in zip(in_dims, state_dims, m_dims):
+            actual += float(2 * in_i * m_i + m_i * (state_i + 1))
+        padded = float(2 * batch_size * (in_cap * m_cap + m_cap * state_cap))
+        return actual, padded
+
     @staticmethod
     def _normalize_family(family_value):
         family = str(family_value).lower()
@@ -2027,6 +2606,8 @@ class EnvironmentPrior:
         input_mask=None,
     ):
         batch_size = len(h_list)
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        ragged_affine_enabled = bool(self.envgen_ragged_affine and device_obj.type == "cuda")
         if torch.is_tensor(depth_values):
             depth_per_sample = depth_values.to(device=device, dtype=torch.long)
         elif isinstance(depth_values, (list, tuple)):
@@ -2108,6 +2689,9 @@ class EnvironmentPrior:
             w = torch.zeros((batch_size, in_cap, out_cap), device=device, dtype=torch.float32)
             b = torch.zeros((batch_size, out_cap), device=device, dtype=torch.float32)
             out_mask = torch.zeros((batch_size, out_cap), device=device, dtype=torch.float32)
+            ragged_input_index = None
+            if ragged_affine_enabled:
+                ragged_input_index = torch.zeros((batch_size, in_cap), device=device, dtype=torch.long)
             for bi in range(batch_size):
                 if layer_idx == 0 and input_mask is not None:
                     active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
@@ -2139,6 +2723,8 @@ class EnvironmentPrior:
                 if layer_idx > 0 or input_mask is None:
                     in_mask[bi, :in_i] = 1.0
                 out_mask[bi, :out_i] = 1.0
+                if ragged_input_index is not None and in_i > 0:
+                    ragged_input_index[bi, :in_i] = active_idx
             layers.append(
                 {
                     "w": w,
@@ -2147,16 +2733,29 @@ class EnvironmentPrior:
                     "out_mask": out_mask,
                     "in_cap": in_cap,
                     "activation_mask": hidden_active,
+                    "ragged_input_index": ragged_input_index,
+                    "ragged_in_sizes": in_layer.clone() if ragged_affine_enabled else None,
+                    "ragged_out_sizes": out_layer.clone() if ragged_affine_enabled else None,
                 }
             )
 
         final_out_mask = layers[-1]["out_mask"]
 
-        def fn(x, generators_for_noise=None):
+        def _core_fn(x):
             z = x
             for li, layer in enumerate(layers):
-                z_in = z[:, :layer["in_cap"]] * layer["in_mask"]
-                z = self._batch_affine(z_in, layer["w"], layer["b"])
+                z_in = z[:, :layer["in_cap"]]
+                if layer["ragged_input_index"] is None:
+                    z = self._batch_affine(z_in * layer["in_mask"], layer["w"], layer["b"])
+                else:
+                    z = self._batch_affine_with_layout(
+                        z_in,
+                        layer["w"],
+                        layer["b"],
+                        input_index=layer["ragged_input_index"],
+                        in_sizes=layer["ragged_in_sizes"],
+                        out_sizes=layer["ragged_out_sizes"],
+                    )
                 z = z * layer["out_mask"]
                 if li < (len(layers) - 1):
                     activation_mask = layer["activation_mask"].unsqueeze(1)
@@ -2175,28 +2774,44 @@ class EnvironmentPrior:
                             z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
                             z_act = torch.where(activation_identity_mask, z_linear, z_act)
                         z = torch.where(activation_mask, z_act, z)
-            if torch.any(noise_std > 0):
-                if generators_for_noise is None:
-                    z = z + torch.randn_like(z) * noise_std[:, None]
-                else:
-                    eps = torch.zeros_like(z)
-                    for bi in range(batch_size):
-                        if float(noise_std[bi]) <= 0.0:
-                            continue
-                        g = generators_for_noise[bi]
-                        if g is None:
-                            e_b = torch.randn((z.shape[1],), device=z.device, dtype=z.dtype)
-                        else:
-                            e_b = torch.randn((z.shape[1],), device=z.device, dtype=z.dtype, generator=g)
-                        eps[bi] = e_b * noise_std[bi]
-                    z = z + eps
+            return z
+
+        def fn(x, generators_for_noise=None, noise_eps=None, stable_input=False):
+            if self._envgen_checkpoint_active(x):
+                # Rollout reuses the env-input buffer across timesteps; checkpoint
+                # needs a stable snapshot for backward recompute.
+                x_checkpoint = x if bool(stable_input) else x.clone()
+                z = checkpoint(
+                    _core_fn,
+                    x_checkpoint,
+                    use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                    preserve_rng_state=False,
+                )
+            else:
+                z = _core_fn(x)
+            if (noise_eps is None) and torch.any(noise_std > 0):
+                noise_eps = self._sample_scaled_noise_batch(
+                    generators_for_noise,
+                    scale=noise_std,
+                    width=z.shape[1],
+                    device=z.device,
+                    dtype=z.dtype,
+                )
+            if noise_eps is not None:
+                z = z + noise_eps
             z = torch.tanh(z)
             return z * final_out_mask
+
+        fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
+        fn._noise_scale = noise_std
+        fn._out_width = int(final_out_mask.shape[1])
 
         return fn
 
     def _build_gp_hetero_batch_fn(self, in_dims, out_dims, h_list, device, generators=None, input_mask=None):
         batch_size = len(h_list)
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        ragged_affine_enabled = bool(self.envgen_ragged_affine and device_obj.type == "cuda")
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
         if input_mask is not None:
@@ -2234,6 +2849,11 @@ class EnvironmentPrior:
         a = torch.zeros((batch_size, m_cap, out_cap), device=device, dtype=torch.float32)
         m_mask = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
         out_mask = torch.zeros((batch_size, out_cap), device=device, dtype=torch.float32)
+        w_input_index = None
+        a_input_index = None
+        if ragged_affine_enabled:
+            w_input_index = torch.zeros((batch_size, in_cap), device=device, dtype=torch.long)
+            a_input_index = torch.zeros((batch_size, m_cap), device=device, dtype=torch.long)
 
         for bi in range(batch_size):
             if input_mask is not None:
@@ -2264,31 +2884,805 @@ class EnvironmentPrior:
                 in_mask[bi, :in_i] = 1.0
             m_mask[bi, :m_i] = 1.0
             out_mask[bi, :out_i] = 1.0
+            if w_input_index is not None and in_i > 0:
+                w_input_index[bi, :in_i] = active_idx
+            if a_input_index is not None and m_i > 0:
+                a_input_index[bi, :m_i] = torch.arange(m_i, device=device, dtype=torch.long)
 
-        def fn(x, generators_for_noise=None):
-            x_in = x[:, :in_cap] * in_mask
-            phi = torch.cos(self._batch_affine(x_in, w, b)) * m_mask
-            y = outputscale[:, None] * self._batch_affine(phi, a, None)
+        def _core_fn(x):
+            x_in = x[:, :in_cap]
+            if w_input_index is None:
+                phi_pre = self._batch_affine(x_in * in_mask, w, b)
+            else:
+                phi_pre = self._batch_affine_with_layout(
+                    x_in,
+                    w,
+                    b,
+                    input_index=w_input_index,
+                    in_sizes=in_dims,
+                    out_sizes=m_dims,
+                )
+            phi = torch.cos(phi_pre) * m_mask
+            if a_input_index is None:
+                y = outputscale[:, None] * self._batch_affine(phi, a, None)
+            else:
+                y = outputscale[:, None] * self._batch_affine_with_layout(
+                    phi,
+                    a,
+                    None,
+                    input_index=a_input_index,
+                    in_sizes=m_dims,
+                    out_sizes=out_dims,
+                )
             y = y * out_mask
-            if torch.any(noise > 0):
-                if generators_for_noise is None:
-                    y = y + torch.randn_like(y) * noise[:, None]
-                else:
-                    eps = torch.zeros_like(y)
-                    for bi in range(batch_size):
-                        if float(noise[bi]) <= 0.0:
-                            continue
-                        g = generators_for_noise[bi]
-                        if g is None:
-                            e_b = torch.randn((y.shape[1],), device=y.device, dtype=y.dtype)
-                        else:
-                            e_b = torch.randn((y.shape[1],), device=y.device, dtype=y.dtype, generator=g)
-                        eps[bi] = e_b * noise[bi]
-                    y = y + eps
+            return y
+
+        def fn(x, generators_for_noise=None, noise_eps=None, stable_input=False):
+            if self._envgen_checkpoint_active(x):
+                # Rollout reuses the env-input buffer across timesteps; checkpoint
+                # needs a stable snapshot for backward recompute.
+                x_checkpoint = x if bool(stable_input) else x.clone()
+                y = checkpoint(
+                    _core_fn,
+                    x_checkpoint,
+                    use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                    preserve_rng_state=False,
+                )
+            else:
+                y = _core_fn(x)
+            if (noise_eps is None) and torch.any(noise > 0):
+                noise_eps = self._sample_scaled_noise_batch(
+                    generators_for_noise,
+                    scale=noise,
+                    width=y.shape[1],
+                    device=y.device,
+                    dtype=y.dtype,
+                )
+            if noise_eps is not None:
+                y = y + noise_eps
             y = torch.tanh(y)
             return y * out_mask
 
+        fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
+        fn._noise_scale = noise
+        fn._out_width = int(out_mask.shape[1])
+
         return fn
+
+    def _build_scm_hetero_paired_transition_fns(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        depth_values,
+        activation_names,
+        input_mask=None,
+    ):
+        batch_size = len(h_list)
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        if torch.is_tensor(depth_values):
+            depth_per_sample = depth_values.to(device=device, dtype=torch.long)
+        elif isinstance(depth_values, (list, tuple)):
+            depth_per_sample = torch.tensor(
+                [max(2, int(d)) for d in depth_values],
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            depth_per_sample = torch.full(
+                (batch_size,),
+                int(max(2, int(depth_values))),
+                device=device,
+                dtype=torch.long,
+            )
+        if int(depth_per_sample.numel()) != batch_size:
+            raise ValueError("depth_values must match h_list length")
+        depth = int(depth_per_sample.max().item())
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        hidden_state_dims = torch.tensor(
+            [max(int(state_dims[bi].item()), int(h["prior_mlp_hidden_dim"])) for bi, h in enumerate(h_list)],
+            device=device,
+            dtype=torch.long,
+        )
+        hidden_reward_dims = torch.tensor(
+            [max(1, int(h["prior_mlp_hidden_dim"])) for h in h_list],
+            device=device,
+            dtype=torch.long,
+        )
+        init_std = torch.tensor([float(h["init_std"]) for h in h_list], device=device, dtype=torch.float32)
+        noise_std = torch.tensor([float(h["noise_std"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap = torch.tensor(
+            [
+                float(self._resolve_lipschitz_weight_cap(h))
+                if self._resolve_lipschitz_weight_cap(h) is not None
+                else float("inf")
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        if isinstance(activation_names, str):
+            activation_values = [self._activation_name(activation_names)] * batch_size
+        else:
+            activation_values = [self._activation_name(v) for v in activation_names]
+        if len(activation_values) != batch_size:
+            raise ValueError("activation_names must match h_list length")
+        activation_codes = []
+        for name in activation_values:
+            if name == "relu":
+                activation_codes.append(1)
+            elif name == "identity":
+                activation_codes.append(2)
+            else:
+                activation_codes.append(0)
+        activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
+        activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
+        activation_relu_mask = (activation_codes == 1).unsqueeze(1)
+        activation_identity_mask = (activation_codes == 2).unsqueeze(1)
+        activation_single = int(activation_codes[0].item())
+
+        state_layers = []
+        reward_layers = []
+        for layer_idx in range(depth):
+            hidden_active = layer_idx < (depth_per_sample - 1)
+            if layer_idx == 0:
+                if input_mask is None:
+                    state_in_layer = in_dims
+                    reward_in_layer = in_dims
+                    state_in_cap = int(state_in_layer.max().item())
+                    reward_in_cap = int(reward_in_layer.max().item())
+                    state_in_mask = torch.zeros((batch_size, state_in_cap), device=device, dtype=torch.float32)
+                    reward_in_mask = torch.zeros((batch_size, reward_in_cap), device=device, dtype=torch.float32)
+                else:
+                    state_in_layer = in_dims
+                    reward_in_layer = in_dims
+                    state_in_cap = int(input_mask.shape[1])
+                    reward_in_cap = int(input_mask.shape[1])
+                    state_in_mask = input_mask.clone()
+                    reward_in_mask = input_mask.clone()
+            else:
+                state_in_layer = torch.where(layer_idx <= (depth_per_sample - 1), hidden_state_dims, state_dims)
+                reward_in_layer = torch.where(layer_idx <= (depth_per_sample - 1), hidden_reward_dims, reward_dims)
+                state_in_cap = int(state_in_layer.max().item())
+                reward_in_cap = int(reward_in_layer.max().item())
+                state_in_mask = torch.zeros((batch_size, state_in_cap), device=device, dtype=torch.float32)
+                reward_in_mask = torch.zeros((batch_size, reward_in_cap), device=device, dtype=torch.float32)
+
+            state_out_layer = torch.where(hidden_active, hidden_state_dims, state_dims)
+            reward_out_layer = torch.where(hidden_active, hidden_reward_dims, reward_dims)
+            state_out_cap = int(state_out_layer.max().item())
+            reward_out_cap = int(reward_out_layer.max().item())
+
+            state_w = torch.zeros((batch_size, state_in_cap, state_out_cap), device=device, dtype=torch.float32)
+            state_b = torch.zeros((batch_size, state_out_cap), device=device, dtype=torch.float32)
+            state_out_mask = torch.zeros((batch_size, state_out_cap), device=device, dtype=torch.float32)
+            reward_w = torch.zeros((batch_size, reward_in_cap, reward_out_cap), device=device, dtype=torch.float32)
+            reward_b = torch.zeros((batch_size, reward_out_cap), device=device, dtype=torch.float32)
+            reward_out_mask = torch.zeros((batch_size, reward_out_cap), device=device, dtype=torch.float32)
+
+            for bi in range(batch_size):
+                if layer_idx == 0 and input_mask is not None:
+                    active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                    state_in_i = int(active_idx.numel())
+                else:
+                    state_in_i = int(state_in_layer[bi].item())
+                    active_idx = torch.arange(state_in_i, device=device, dtype=torch.long)
+                state_out_i = int(state_out_layer[bi].item())
+                if state_in_i > 0 and state_out_i > 0:
+                    post_layer = layer_idx > int(depth_per_sample[bi].item() - 1)
+                    if post_layer:
+                        d = min(state_in_i, state_out_i)
+                        if d > 0:
+                            eye_idx = torch.arange(d, device=device, dtype=torch.long)
+                            state_w[bi, active_idx[:d], eye_idx] = 1.0
+                    else:
+                        w_b = torch.randn((state_in_i, state_out_i), device=device, dtype=torch.float32)
+                        b_b = torch.randn((state_out_i,), device=device, dtype=torch.float32)
+                        w_b = w_b * (init_std[bi] / math.sqrt(max(1, state_in_i)))
+                        w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+                        state_w[bi, active_idx, :state_out_i] = w_b
+                        state_b[bi, :state_out_i] = b_b * (init_std[bi] * 0.1)
+                    if layer_idx > 0 or input_mask is None:
+                        state_in_mask[bi, :state_in_i] = 1.0
+                    state_out_mask[bi, :state_out_i] = 1.0
+
+            for bi in range(batch_size):
+                if layer_idx == 0 and input_mask is not None:
+                    active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                    reward_in_i = int(active_idx.numel())
+                else:
+                    reward_in_i = int(reward_in_layer[bi].item())
+                    active_idx = torch.arange(reward_in_i, device=device, dtype=torch.long)
+                reward_out_i = int(reward_out_layer[bi].item())
+                if reward_in_i > 0 and reward_out_i > 0:
+                    post_layer = layer_idx > int(depth_per_sample[bi].item() - 1)
+                    if post_layer:
+                        d = min(reward_in_i, reward_out_i)
+                        if d > 0:
+                            eye_idx = torch.arange(d, device=device, dtype=torch.long)
+                            reward_w[bi, active_idx[:d], eye_idx] = 1.0
+                    else:
+                        w_b = torch.randn((reward_in_i, reward_out_i), device=device, dtype=torch.float32)
+                        b_b = torch.randn((reward_out_i,), device=device, dtype=torch.float32)
+                        w_b = w_b * (init_std[bi] / math.sqrt(max(1, reward_in_i)))
+                        w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+                        reward_w[bi, active_idx, :reward_out_i] = w_b
+                        reward_b[bi, :reward_out_i] = b_b * (init_std[bi] * 0.1)
+                    if layer_idx > 0 or input_mask is None:
+                        reward_in_mask[bi, :reward_in_i] = 1.0
+                    reward_out_mask[bi, :reward_out_i] = 1.0
+
+            state_layers.append(
+                {
+                    "w": state_w,
+                    "b": state_b,
+                    "in_mask": state_in_mask,
+                    "out_mask": state_out_mask,
+                    "in_cap": state_in_cap,
+                    "activation_mask": hidden_active,
+                }
+            )
+            reward_layers.append(
+                {
+                    "w": reward_w,
+                    "b": reward_b,
+                    "in_mask": reward_in_mask,
+                    "out_mask": reward_out_mask,
+                    "in_cap": reward_in_cap,
+                    "activation_mask": hidden_active,
+                }
+            )
+
+        def _apply_layers(x, layers, final_out_mask):
+            z = x
+            for li, layer in enumerate(layers):
+                z_in = z[:, :layer["in_cap"]] * layer["in_mask"]
+                z = self._batch_affine(z_in, layer["w"], layer["b"])
+                z = z * layer["out_mask"]
+                if li < (len(layers) - 1):
+                    activation_mask = layer["activation_mask"].unsqueeze(1)
+                    if torch.any(activation_mask):
+                        if not activation_mixed:
+                            if activation_single == 1:
+                                z_act = torch.relu(z)
+                            elif activation_single == 2:
+                                z_act = z
+                            else:
+                                z_act = torch.tanh(z)
+                        else:
+                            z_linear = z
+                            z_tanh = torch.tanh(z_linear)
+                            z_relu = torch.relu(z_linear)
+                            z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
+                            z_act = torch.where(activation_identity_mask, z_linear, z_act)
+                        z = torch.where(activation_mask, z_act, z)
+            return z * final_out_mask
+
+        state_final_out_mask = state_layers[-1]["out_mask"]
+        reward_final_out_mask = reward_layers[-1]["out_mask"]
+
+        def _make_branch_fn(layers, final_out_mask):
+            def _core_fn(x):
+                return _apply_layers(x, layers, final_out_mask)
+
+            def fn(x, generators_for_noise=None, noise_eps=None, stable_input=False):
+                if self._envgen_checkpoint_active(x):
+                    x_checkpoint = x if bool(stable_input) else x.clone()
+                    z = checkpoint(
+                        _core_fn,
+                        x_checkpoint,
+                        use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                        preserve_rng_state=False,
+                    )
+                else:
+                    z = _core_fn(x)
+                if (noise_eps is None) and torch.any(noise_std > 0):
+                    noise_eps = self._sample_scaled_noise_batch(
+                        generators_for_noise,
+                        scale=noise_std,
+                        width=z.shape[1],
+                        device=z.device,
+                        dtype=z.dtype,
+                    )
+                if noise_eps is not None:
+                    z = z + noise_eps
+                z = torch.tanh(z)
+                return z * final_out_mask
+
+            fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
+            fn._noise_scale = noise_std
+            fn._out_width = int(final_out_mask.shape[1])
+            return fn
+
+        return (
+            _make_branch_fn(state_layers, state_final_out_mask),
+            _make_branch_fn(reward_layers, reward_final_out_mask),
+        )
+
+    def _build_gp_hetero_paired_transition_fns(self, in_dims, state_dims, h_list, device, input_mask=None):
+        batch_size = len(h_list)
+        reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        m_dims = torch.tensor([max(8, int(h["gp_rff_features"])) for h in h_list], device=device, dtype=torch.long)
+        lengthscale = torch.tensor(
+            [max(1e-6, float(h["lengthscale"])) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        outputscale = torch.tensor([float(h["outputscale"]) for h in h_list], device=device, dtype=torch.float32)
+        noise = torch.tensor([float(h["noise"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        outputscale_cap_values = []
+        for h in h_list:
+            w_cap = self._resolve_lipschitz_weight_cap(h)
+            s_cap = self._resolve_lipschitz_gp_outputscale_cap(h)
+            weight_cap_values.append(float(w_cap) if w_cap is not None else float("inf"))
+            outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
+        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+
+        if input_mask is not None:
+            in_cap = int(input_mask.shape[1])
+            in_mask = input_mask.clone()
+        else:
+            in_cap = int(in_dims.max().item())
+            in_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+        m_cap = int(m_dims.max().item())
+        state_out_cap = int(state_dims.max().item())
+        reward_out_cap = 1
+        state_w = torch.zeros((batch_size, in_cap, m_cap), device=device, dtype=torch.float32)
+        state_b = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        state_a = torch.zeros((batch_size, m_cap, state_out_cap), device=device, dtype=torch.float32)
+        reward_w = torch.zeros((batch_size, in_cap, m_cap), device=device, dtype=torch.float32)
+        reward_b = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        reward_a = torch.zeros((batch_size, m_cap, reward_out_cap), device=device, dtype=torch.float32)
+        m_mask = torch.zeros((batch_size, m_cap), device=device, dtype=torch.float32)
+        state_out_mask = torch.zeros((batch_size, state_out_cap), device=device, dtype=torch.float32)
+        reward_out_mask = torch.zeros((batch_size, reward_out_cap), device=device, dtype=torch.float32)
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            m_i = int(m_dims[bi].item())
+            out_i = int(state_dims[bi].item())
+            w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+            b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
+            a_b = torch.randn((m_i, out_i), device=device, dtype=torch.float32)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            state_w[bi, active_idx, :m_i] = w_b
+            state_b[bi, :m_i] = 2.0 * math.pi * b_b
+            state_a[bi, :m_i, :out_i] = a_b
+            if input_mask is None:
+                in_mask[bi, :in_i] = 1.0
+            m_mask[bi, :m_i] = 1.0
+            state_out_mask[bi, :out_i] = 1.0
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            m_i = int(m_dims[bi].item())
+            w_b = torch.randn((in_i, m_i), device=device, dtype=torch.float32)
+            b_b = torch.rand((m_i,), device=device, dtype=torch.float32)
+            a_b = torch.randn((m_i, 1), device=device, dtype=torch.float32)
+            w_b = w_b / lengthscale[bi]
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            a_b = a_b / math.sqrt(max(1, m_i))
+            a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
+            reward_w[bi, active_idx, :m_i] = w_b
+            reward_b[bi, :m_i] = 2.0 * math.pi * b_b
+            reward_a[bi, :m_i, :1] = a_b
+            reward_out_mask[bi, :1] = 1.0
+
+        def _make_branch_fn(w, b, a, out_mask):
+            def _core_fn(x):
+                x_in = x[:, :in_cap] * in_mask
+                phi = torch.cos(self._batch_affine(x_in, w, b)) * m_mask
+                y = outputscale[:, None] * self._batch_affine(phi, a, None)
+                return y * out_mask
+
+            def fn(x, generators_for_noise=None, noise_eps=None, stable_input=False):
+                if self._envgen_checkpoint_active(x):
+                    x_checkpoint = x if bool(stable_input) else x.clone()
+                    y = checkpoint(
+                        _core_fn,
+                        x_checkpoint,
+                        use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                        preserve_rng_state=False,
+                    )
+                else:
+                    y = _core_fn(x)
+                if (noise_eps is None) and torch.any(noise > 0):
+                    noise_eps = self._sample_scaled_noise_batch(
+                        generators_for_noise,
+                        scale=noise,
+                        width=y.shape[1],
+                        device=y.device,
+                        dtype=y.dtype,
+                    )
+                if noise_eps is not None:
+                    y = y + noise_eps
+                y = torch.tanh(y)
+                return y * out_mask
+
+            fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
+            fn._noise_scale = noise
+            fn._out_width = int(out_mask.shape[1])
+            return fn
+
+        return (
+            _make_branch_fn(state_w, state_b, state_a, state_out_mask),
+            _make_branch_fn(reward_w, reward_b, reward_a, reward_out_mask),
+        )
+
+    def _build_scm_hetero_hidden_fused_transition_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        depth_values,
+        activation_names,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return None
+        if torch.is_tensor(depth_values):
+            depth_per_sample = depth_values.to(device=device, dtype=torch.long)
+        elif isinstance(depth_values, (list, tuple)):
+            depth_per_sample = torch.tensor(
+                [max(2, int(d)) for d in depth_values],
+                device=device,
+                dtype=torch.long,
+            )
+        else:
+            depth_per_sample = torch.full(
+                (batch_size,),
+                int(max(2, int(depth_values))),
+                device=device,
+                dtype=torch.long,
+            )
+        if int(depth_per_sample.numel()) != batch_size:
+            raise ValueError("depth_values must match h_list length")
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if input_mask is not None:
+            input_mask = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_dims = input_mask.to(dtype=torch.long).sum(dim=1)
+        hidden_state_dims = torch.tensor(
+            [max(int(state_dims[bi].item()), int(h["prior_mlp_hidden_dim"])) for bi, h in enumerate(h_list)],
+            device=device,
+            dtype=torch.long,
+        )
+        hidden_reward_dims = torch.tensor(
+            [max(1, int(h["prior_mlp_hidden_dim"])) for h in h_list],
+            device=device,
+            dtype=torch.long,
+        )
+        init_std = torch.tensor([float(h["init_std"]) for h in h_list], device=device, dtype=torch.float32)
+        noise_std = torch.tensor([float(h["noise_std"]) for h in h_list], device=device, dtype=torch.float32)
+        weight_cap_values = []
+        for h in h_list:
+            cap = self._resolve_lipschitz_weight_cap(h)
+            weight_cap_values.append(float(cap) if cap is not None else float("inf"))
+        weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
+        if isinstance(activation_names, str):
+            activation_values = [self._activation_name(activation_names)] * batch_size
+        else:
+            activation_values = [self._activation_name(v) for v in activation_names]
+        if len(activation_values) != batch_size:
+            raise ValueError("activation_names must match h_list length")
+        activation_codes = []
+        for name in activation_values:
+            if name == "relu":
+                activation_codes.append(1)
+            elif name == "identity":
+                activation_codes.append(2)
+            else:
+                activation_codes.append(0)
+        activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
+        activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
+        activation_relu_mask = (activation_codes == 1).unsqueeze(1)
+        activation_identity_mask = (activation_codes == 2).unsqueeze(1)
+        activation_single = int(activation_codes[0].item())
+
+        input_cap = int(input_mask.shape[1]) if input_mask is not None else int(in_dims.max().item())
+        state_hidden_cap = int(hidden_state_dims.max().item())
+        reward_hidden_cap = int(hidden_reward_dims.max().item())
+        packed_branch_cap = int(max(state_hidden_cap, reward_hidden_cap, int(state_dims.max().item()), 1))
+        state_cap = int(state_dims.max().item())
+        packed_batch_size = int(batch_size * 2)
+
+        first_in_mask = (
+            input_mask.clone()
+            if input_mask is not None
+            else torch.zeros((batch_size, input_cap), device=device, dtype=torch.float32)
+        )
+        first_input_index = torch.zeros((batch_size, input_cap), device=device, dtype=torch.long)
+        first_state_w = torch.zeros((batch_size, input_cap, state_hidden_cap), device=device, dtype=torch.float32)
+        first_state_b = torch.zeros((batch_size, state_hidden_cap), device=device, dtype=torch.float32)
+        first_reward_w = torch.zeros((batch_size, input_cap, reward_hidden_cap), device=device, dtype=torch.float32)
+        first_reward_b = torch.zeros((batch_size, reward_hidden_cap), device=device, dtype=torch.float32)
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+                first_in_mask[bi, :in_i] = 1.0
+            if in_i > 0:
+                first_input_index[bi, :in_i] = active_idx
+            out_i = int(hidden_state_dims[bi].item())
+            if in_i <= 0 or out_i <= 0:
+                continue
+            w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
+            b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
+            w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            first_state_w[bi, active_idx, :out_i] = w_b
+            first_state_b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
+
+        for bi in range(batch_size):
+            if input_mask is not None:
+                active_idx = torch.nonzero(input_mask[bi] > 0, as_tuple=False).squeeze(1)
+                in_i = int(active_idx.numel())
+            else:
+                in_i = int(in_dims[bi].item())
+                active_idx = torch.arange(in_i, device=device, dtype=torch.long)
+            out_i = int(hidden_reward_dims[bi].item())
+            if in_i <= 0 or out_i <= 0:
+                continue
+            w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
+            b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
+            w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+            w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+            first_reward_w[bi, active_idx, :out_i] = w_b
+            first_reward_b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
+
+        packed_activation_codes = torch.cat([activation_codes, activation_codes], dim=0)
+        packed_activation_mixed = not bool(torch.all(packed_activation_codes == packed_activation_codes[0]))
+        packed_activation_relu_mask = (packed_activation_codes == 1).unsqueeze(1)
+        packed_activation_identity_mask = (packed_activation_codes == 2).unsqueeze(1)
+        packed_activation_single = int(packed_activation_codes[0].item())
+
+        packed_layers = []
+        max_depth = int(depth_per_sample.max().item())
+        for layer_idx in range(1, max_depth):
+            layer_in_sizes = torch.zeros((packed_batch_size,), device=device, dtype=torch.long)
+            layer_out_sizes = torch.zeros((packed_batch_size,), device=device, dtype=torch.long)
+            layer_activation_codes = torch.full((packed_batch_size,), -1, device=device, dtype=torch.long)
+
+            for bi in range(batch_size):
+                depth_i = int(depth_per_sample[bi].item())
+                state_i = int(state_dims[bi].item())
+                state_hidden_i = int(hidden_state_dims[bi].item())
+                reward_hidden_i = int(hidden_reward_dims[bi].item())
+                hidden_out = layer_idx < (depth_i - 1)
+                state_in_i = state_hidden_i if layer_idx <= (depth_i - 1) else state_i
+                reward_in_i = reward_hidden_i if layer_idx <= (depth_i - 1) else 1
+                state_out_i = state_hidden_i if hidden_out else state_i
+                reward_out_i = reward_hidden_i if hidden_out else 1
+                layer_in_sizes[bi] = state_in_i
+                layer_out_sizes[bi] = state_out_i
+                layer_in_sizes[batch_size + bi] = reward_in_i
+                layer_out_sizes[batch_size + bi] = reward_out_i
+                if bool(hidden_out):
+                    layer_activation_codes[bi] = packed_activation_codes[bi]
+                    layer_activation_codes[batch_size + bi] = packed_activation_codes[batch_size + bi]
+
+            layer_in_cap = int(max(1, int(layer_in_sizes.max().item())))
+            layer_out_cap = int(max(1, int(layer_out_sizes.max().item())))
+            layer_w = torch.zeros((packed_batch_size, layer_in_cap, layer_out_cap), device=device, dtype=torch.float32)
+            layer_b = torch.zeros((packed_batch_size, layer_out_cap), device=device, dtype=torch.float32)
+
+            for bi in range(batch_size):
+                depth_i = int(depth_per_sample[bi].item())
+                state_row = bi
+                state_in_i = int(layer_in_sizes[state_row].item())
+                state_out_i = int(layer_out_sizes[state_row].item())
+                post_layer = layer_idx > (depth_i - 1)
+                if state_in_i <= 0 or state_out_i <= 0:
+                    continue
+                if post_layer:
+                    d = min(state_in_i, state_out_i)
+                    if d > 0:
+                        eye_idx = torch.arange(d, device=device, dtype=torch.long)
+                        layer_w[state_row, eye_idx, eye_idx] = 1.0
+                    continue
+                w_b = torch.randn((state_in_i, state_out_i), device=device, dtype=torch.float32)
+                b_b = torch.randn((state_out_i,), device=device, dtype=torch.float32)
+                w_b = w_b * (init_std[bi] / math.sqrt(max(1, state_in_i)))
+                w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+                layer_w[state_row, :state_in_i, :state_out_i] = w_b
+                layer_b[state_row, :state_out_i] = b_b * (init_std[bi] * 0.1)
+
+            for bi in range(batch_size):
+                depth_i = int(depth_per_sample[bi].item())
+                reward_row = batch_size + bi
+                reward_in_i = int(layer_in_sizes[reward_row].item())
+                reward_out_i = int(layer_out_sizes[reward_row].item())
+                post_layer = layer_idx > (depth_i - 1)
+                if reward_in_i <= 0 or reward_out_i <= 0:
+                    continue
+                if post_layer:
+                    d = min(reward_in_i, reward_out_i)
+                    if d > 0:
+                        eye_idx = torch.arange(d, device=device, dtype=torch.long)
+                        layer_w[reward_row, eye_idx, eye_idx] = 1.0
+                    continue
+                w_b = torch.randn((reward_in_i, reward_out_i), device=device, dtype=torch.float32)
+                b_b = torch.randn((reward_out_i,), device=device, dtype=torch.float32)
+                w_b = w_b * (init_std[bi] / math.sqrt(max(1, reward_in_i)))
+                w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
+                layer_w[reward_row, :reward_in_i, :reward_out_i] = w_b
+                layer_b[reward_row, :reward_out_i] = b_b * (init_std[bi] * 0.1)
+
+            out_tile_batch, out_tile_offsets = self._build_active_tile_map(layer_out_sizes, 32)
+            in_tile_batch, in_tile_offsets = self._build_active_tile_map(layer_in_sizes, 32)
+            packed_layers.append(
+                {
+                    "w": layer_w,
+                    "b": layer_b,
+                    "in_sizes": layer_in_sizes,
+                    "out_sizes": layer_out_sizes,
+                    "in_cap": layer_in_cap,
+                    "out_cap": layer_out_cap,
+                    "out_tile_batch": out_tile_batch,
+                    "out_tile_offsets": out_tile_offsets,
+                    "in_tile_batch": in_tile_batch,
+                    "in_tile_offsets": in_tile_offsets,
+                    "activation_codes": layer_activation_codes,
+                }
+            )
+
+        state_final_mask = torch.zeros((batch_size, state_cap), device=device, dtype=torch.float32)
+        for bi in range(batch_size):
+            state_final_mask[bi, :int(state_dims[bi].item())] = 1.0
+        reward_final_mask = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
+
+        def _apply_activation(z, mask):
+            if not bool(torch.any(mask)):
+                return z
+            mask = mask.unsqueeze(1)
+            if not packed_activation_mixed:
+                if packed_activation_single == 1:
+                    z_act = torch.relu(z)
+                elif packed_activation_single == 2:
+                    z_act = z
+                else:
+                    z_act = torch.tanh(z)
+            else:
+                z_linear = z
+                z_tanh = torch.tanh(z_linear)
+                z_relu = torch.relu(z_linear)
+                z_act = torch.where(packed_activation_relu_mask, z_relu, z_tanh)
+                z_act = torch.where(packed_activation_identity_mask, z_linear, z_act)
+            return torch.where(mask, z_act, z)
+
+        def _core_fn(x_state, x_reward):
+            state_hidden = self._batch_affine_with_layout(
+                x_state[:, :input_cap] * first_in_mask,
+                first_state_w,
+                first_state_b,
+                input_index=first_input_index,
+                in_sizes=in_dims,
+                out_sizes=hidden_state_dims,
+            )
+            reward_hidden = self._batch_affine_with_layout(
+                x_reward[:, :input_cap] * first_in_mask,
+                first_reward_w,
+                first_reward_b,
+                input_index=first_input_index,
+                in_sizes=in_dims,
+                out_sizes=hidden_reward_dims,
+            )
+            z = torch.zeros((packed_batch_size, packed_branch_cap), device=x_state.device, dtype=x_state.dtype)
+            z[:batch_size, :state_hidden_cap] = state_hidden
+            z[batch_size:, :reward_hidden_cap] = reward_hidden
+            z = _apply_activation(z, torch.ones((packed_batch_size,), device=z.device, dtype=torch.bool))
+            for layer in packed_layers:
+                z = self._batch_affine_prefix_tiled(
+                    z[:, :layer["in_cap"]],
+                    layer["w"],
+                    layer["b"],
+                    in_sizes=layer["in_sizes"],
+                    out_sizes=layer["out_sizes"],
+                    activation_codes=layer["activation_codes"],
+                    out_tile_batch=layer["out_tile_batch"],
+                    out_tile_offsets=layer["out_tile_offsets"],
+                    in_tile_batch=layer["in_tile_batch"],
+                    in_tile_offsets=layer["in_tile_offsets"],
+                )
+            return z
+
+        checkpoint_enabled = bool(self.envgen_checkpoint)
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            if bool(x_is_dual_packed):
+                x_state_src = x[:batch_size]
+                x_reward_src = x[batch_size: batch_size * 2]
+            else:
+                x_state_src = x
+                x_reward_src = x
+            if checkpoint_enabled and self._envgen_checkpoint_active(x_state_src):
+                if bool(x_is_dual_packed):
+                    x_state = x_state_src.clone()
+                    x_reward = x_reward_src.clone()
+                else:
+                    shared_input = x_state_src.clone()
+                    x_state = shared_input
+                    x_reward = shared_input
+                z = checkpoint(
+                    _core_fn,
+                    x_state,
+                    x_reward,
+                    use_reentrant=bool(self.envgen_checkpoint_reentrant),
+                    preserve_rng_state=False,
+                )
+            else:
+                z = _core_fn(x_state_src, x_reward_src)
+
+            state_pre = z[:batch_size, :state_cap]
+            reward_pre = z[batch_size:, :1]
+            if torch.any(noise_std > 0):
+                dual_noise = None
+                if generators_for_noise is None:
+                    dual_scale = torch.cat([noise_std, noise_std], dim=0)
+                    dual_noise = self._sample_scaled_noise_batch(
+                        None,
+                        scale=dual_scale,
+                        width=state_cap,
+                        device=z.device,
+                        dtype=z.dtype,
+                    )
+                else:
+                    generators_list = list(generators_for_noise)
+                    if len(generators_list) != batch_size:
+                        raise ValueError("generators_for_noise must match batch size")
+                    dual_scale = torch.cat([noise_std, noise_std], dim=0)
+                    dual_noise = self._sample_scaled_noise_batch(
+                        generators_list + generators_list,
+                        scale=dual_scale,
+                        width=state_cap,
+                        device=z.device,
+                        dtype=z.dtype,
+                    )
+                if dual_noise is not None:
+                    state_pre = state_pre + dual_noise[:batch_size, :state_cap]
+                    reward_pre = reward_pre + dual_noise[batch_size:, :1]
+
+            state_out = torch.tanh(state_pre) * state_final_mask
+            reward_out = torch.tanh(reward_pre) * reward_final_mask
+            return state_out, reward_out
+
+        transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
+        transition_fn._prefers_dual_packed_input = False
+        transition_fn._paired_specialized = False
+        transition_fn._scm_hidden_fused_specialized = True
+        return transition_fn
 
     def _build_scm_hetero_transition_batch_fn(
         self,
@@ -2305,7 +3699,34 @@ class EnvironmentPrior:
             return None
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        if bool(self.fused_transition_scm_hidden_fused):
+            return self._build_scm_hetero_hidden_fused_transition_fn(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                depth_values=depth_values,
+                activation_names=activation_names,
+                input_mask=input_mask,
+            )
         reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        if bool(self.fused_transition_paired):
+            state_fn, reward_fn = self._build_scm_hetero_paired_transition_fns(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                depth_values=depth_values,
+                activation_names=activation_names,
+                input_mask=input_mask,
+            )
+            return self._build_paired_transition_fn(
+                state_fn=state_fn,
+                reward_fn=reward_fn,
+                batch_size=batch_size,
+                state_cap=int(state_dims.max().item()),
+            )
+
         dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
         dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
         if torch.is_tensor(depth_values):
@@ -2346,18 +3767,26 @@ class EnvironmentPrior:
         )
         state_cap = int(state_dims.max().item())
 
-        def transition_fn(x, generators_for_noise=None):
-            x_dual = torch.cat([x, x], dim=0)
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            x_dual = x if bool(x_is_dual_packed) else torch.cat([x, x], dim=0)
             generators_dual = None
             if generators_for_noise is not None:
                 generators_list = list(generators_for_noise)
                 if len(generators_list) != batch_size:
                     raise ValueError("generators_for_noise must match batch size")
                 generators_dual = generators_list + generators_list
-            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+            out_dual = dual_fn(
+                x_dual,
+                generators_for_noise=generators_dual,
+                stable_input=True,
+            )
             x_next = out_dual[:batch_size, :state_cap]
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
+
+        transition_fn._envgen_checkpoint_enabled = bool(getattr(dual_fn, "_envgen_checkpoint_enabled", False))
+        transition_fn._prefers_dual_packed_input = True
+        transition_fn._paired_specialized = False
 
         return transition_fn
 
@@ -2368,6 +3797,21 @@ class EnvironmentPrior:
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
         reward_dims = torch.ones((batch_size,), device=device, dtype=torch.long)
+        if bool(self.fused_transition_paired):
+            state_fn, reward_fn = self._build_gp_hetero_paired_transition_fns(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                input_mask=input_mask,
+            )
+            return self._build_paired_transition_fn(
+                state_fn=state_fn,
+                reward_fn=reward_fn,
+                batch_size=batch_size,
+                state_cap=int(state_dims.max().item()),
+            )
+
         dual_in_dims = torch.cat([in_dims, in_dims], dim=0)
         dual_out_dims = torch.cat([state_dims, reward_dims], dim=0)
         input_mask_dual = None
@@ -2385,19 +3829,104 @@ class EnvironmentPrior:
         )
         state_cap = int(state_dims.max().item())
 
-        def transition_fn(x, generators_for_noise=None):
-            x_dual = torch.cat([x, x], dim=0)
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            x_dual = x if bool(x_is_dual_packed) else torch.cat([x, x], dim=0)
             generators_dual = None
             if generators_for_noise is not None:
                 generators_list = list(generators_for_noise)
                 if len(generators_list) != batch_size:
                     raise ValueError("generators_for_noise must match batch size")
                 generators_dual = generators_list + generators_list
-            out_dual = dual_fn(x_dual, generators_for_noise=generators_dual)
+            out_dual = dual_fn(
+                x_dual,
+                generators_for_noise=generators_dual,
+                stable_input=True,
+            )
             x_next = out_dual[:batch_size, :state_cap]
             reward_next = out_dual[batch_size:, :1]
             return x_next, reward_next
 
+        transition_fn._envgen_checkpoint_enabled = bool(getattr(dual_fn, "_envgen_checkpoint_enabled", False))
+        transition_fn._prefers_dual_packed_input = True
+        transition_fn._paired_specialized = False
+
+        return transition_fn
+
+    def _build_paired_transition_fn(self, state_fn, reward_fn, batch_size, state_cap):
+        batch_size = int(batch_size)
+        state_cap = int(max(1, state_cap))
+        state_out_width = int(max(1, int(getattr(state_fn, "_out_width", state_cap))))
+        reward_out_width = int(max(1, int(getattr(reward_fn, "_out_width", 1))))
+        state_noise_scale = getattr(state_fn, "_noise_scale", None)
+        reward_noise_scale = getattr(reward_fn, "_noise_scale", None)
+        checkpoint_enabled = bool(
+            getattr(state_fn, "_envgen_checkpoint_enabled", False)
+            or getattr(reward_fn, "_envgen_checkpoint_enabled", False)
+        )
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            if bool(x_is_dual_packed):
+                x_state = x[:batch_size]
+                x_reward = x[batch_size: batch_size * 2]
+                state_input = x_state
+                reward_input = x_reward
+                state_stable_input = True
+                reward_stable_input = True
+            else:
+                x_state = x
+                x_reward = x
+                if checkpoint_enabled and self._envgen_checkpoint_active(x_state):
+                    shared_input = x_state.clone()
+                    state_input = shared_input
+                    reward_input = shared_input
+                    state_stable_input = True
+                    reward_stable_input = True
+                else:
+                    state_input = x_state
+                    reward_input = x_reward
+                    state_stable_input = False
+                    reward_stable_input = False
+            state_noise_eps = None
+            reward_noise_eps = None
+            state_generators = generators_for_noise
+            reward_generators = generators_for_noise
+            if generators_for_noise is not None:
+                generators_list = list(generators_for_noise)
+                if len(generators_list) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+                dual_scale = None
+                if torch.is_tensor(state_noise_scale) and torch.is_tensor(reward_noise_scale):
+                    dual_scale = torch.cat([state_noise_scale, reward_noise_scale], dim=0)
+                if dual_scale is not None and bool(torch.any(dual_scale > 0)):
+                    dual_noise = self._sample_scaled_noise_batch(
+                        generators_list + generators_list,
+                        scale=dual_scale,
+                        width=state_cap,
+                        device=x_state.device,
+                        dtype=x_state.dtype,
+                    )
+                    if dual_noise is not None:
+                        state_noise_eps = dual_noise[:batch_size, :state_out_width]
+                        reward_noise_eps = dual_noise[batch_size:, :reward_out_width]
+                        state_generators = None
+                        reward_generators = None
+            x_next = state_fn(
+                state_input,
+                generators_for_noise=state_generators,
+                noise_eps=state_noise_eps,
+                stable_input=state_stable_input,
+            )
+            reward_next = reward_fn(
+                reward_input,
+                generators_for_noise=reward_generators,
+                noise_eps=reward_noise_eps,
+                stable_input=reward_stable_input,
+            )
+            return x_next[:, :state_cap], reward_next[:, :1]
+
+        transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
+        transition_fn._prefers_dual_packed_input = False
+        transition_fn._paired_specialized = True
         return transition_fn
 
     def _sample_environment_family_coarse_batch(self, h_list, device, rng_seeds=None):
@@ -2992,6 +4521,159 @@ class EnvironmentPrior:
         ]
         return torch.stack(cols, dim=0)
 
+    @staticmethod
+    def _sample_scaled_noise_batch(generators, scale, width, device, dtype):
+        scale = torch.as_tensor(scale, device=device, dtype=dtype)
+        batch_size = int(scale.shape[0])
+        width = int(width)
+        if batch_size <= 0 or width <= 0 or (not bool(torch.any(scale > 0))):
+            return None
+        if generators is None:
+            return torch.randn((batch_size, width), device=device, dtype=dtype) * scale[:, None]
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        generators_list = list(generators)
+        for bi in range(batch_size):
+            if float(scale[bi]) <= 0.0:
+                continue
+            g = generators_list[bi] if bi < len(generators_list) else None
+            if g is None:
+                e_b = torch.randn((width,), device=device, dtype=dtype)
+            else:
+                e_b = torch.randn((width,), device=device, dtype=dtype, generator=g)
+            eps[bi] = e_b * scale[bi]
+        return eps
+
+    def _envgen_checkpoint_active(self, x):
+        return bool(
+            self.envgen_checkpoint
+            and torch.is_grad_enabled()
+            and torch.is_tensor(x)
+            and bool(x.requires_grad)
+        )
+
+    @staticmethod
+    def _build_active_tile_map(sizes, block):
+        sizes_tensor = torch.as_tensor(sizes, dtype=torch.long)
+        if int(sizes_tensor.numel()) <= 0:
+            empty = torch.empty((0,), device=sizes_tensor.device, dtype=torch.int32)
+            return empty, empty
+        block = int(max(1, int(block)))
+        batch_index = []
+        offsets = []
+        for bi, size_i in enumerate(sizes_tensor.detach().to(device="cpu", dtype=torch.long).tolist()):
+            for start in range(0, max(0, int(size_i)), block):
+                batch_index.append(int(bi))
+                offsets.append(int(start))
+        if not batch_index:
+            empty = torch.empty((0,), device=sizes_tensor.device, dtype=torch.int32)
+            return empty, empty
+        return (
+            torch.tensor(batch_index, device=sizes_tensor.device, dtype=torch.int32),
+            torch.tensor(offsets, device=sizes_tensor.device, dtype=torch.int32),
+        )
+
+    def _batch_affine_prefix_tiled(
+        self,
+        x,
+        w,
+        b=None,
+        in_sizes=None,
+        out_sizes=None,
+        activation_codes=None,
+        out_tile_batch=None,
+        out_tile_offsets=None,
+        in_tile_batch=None,
+        in_tile_offsets=None,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(x)
+            and torch.is_tensor(w)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and torch.is_tensor(activation_codes)
+            and torch.is_tensor(out_tile_batch)
+            and torch.is_tensor(out_tile_offsets)
+            and torch.is_tensor(in_tile_batch)
+            and torch.is_tensor(in_tile_offsets)
+            and x.device.type == "cuda"
+            and w.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and out_tile_batch.device.type == "cuda"
+            and out_tile_offsets.device.type == "cuda"
+            and in_tile_batch.device.type == "cuda"
+            and in_tile_offsets.device.type == "cuda"
+            and x.dtype == torch.float32
+            and w.dtype == torch.float32
+            and x.ndim == 2
+            and w.ndim == 3
+            and int(x.shape[0]) == int(w.shape[0])
+            and int(in_sizes.shape[0]) == int(x.shape[0])
+            and int(out_sizes.shape[0]) == int(x.shape[0])
+        ):
+            in_cap = int(w.shape[1])
+            out_cap = int(w.shape[2])
+            x_in = x[:, :in_cap]
+            in_mask = (
+                torch.arange(in_cap, device=x.device, dtype=torch.long).unsqueeze(0)
+                < in_sizes.to(device=x.device, dtype=torch.long).unsqueeze(1)
+            ).to(dtype=x.dtype)
+            out = self._batch_affine(x_in * in_mask, w, b)
+            out_mask = (
+                torch.arange(out_cap, device=out.device, dtype=torch.long).unsqueeze(0)
+                < out_sizes.to(device=out.device, dtype=torch.long).unsqueeze(1)
+            ).to(dtype=out.dtype)
+            out = out * out_mask
+            if torch.is_tensor(activation_codes) and int(activation_codes.numel()) == int(out.shape[0]):
+                activation_codes = activation_codes.to(device=out.device, dtype=torch.long)
+                relu_mask = activation_codes == 1
+                tanh_mask = activation_codes == 0
+                if bool(torch.any(relu_mask)):
+                    out = torch.where(relu_mask.unsqueeze(1), torch.relu(out), out)
+                if bool(torch.any(tanh_mask)):
+                    out = torch.where(tanh_mask.unsqueeze(1), torch.tanh(out), out)
+            return out
+        return _PrefixTiledBatchAffineFn.apply(
+            x,
+            w,
+            b,
+            in_sizes,
+            out_sizes,
+            activation_codes,
+            out_tile_batch,
+            out_tile_offsets,
+            in_tile_batch,
+            in_tile_offsets,
+        )
+
+    def _batch_affine_with_layout(self, x, w, b=None, input_index=None, in_sizes=None, out_sizes=None):
+        if not bool(
+            self.envgen_ragged_affine
+            and triton is not None
+            and torch.is_tensor(x)
+            and torch.is_tensor(w)
+            and torch.is_tensor(input_index)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and x.device.type == "cuda"
+            and w.device.type == "cuda"
+            and input_index.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and x.dtype == torch.float32
+            and w.dtype == torch.float32
+            and x.ndim == 2
+            and w.ndim == 3
+            and x.shape[0] == w.shape[0]
+            and int(input_index.shape[0]) == int(x.shape[0])
+            and int(in_sizes.shape[0]) == int(x.shape[0])
+            and int(out_sizes.shape[0]) == int(x.shape[0])
+        ):
+            return self._batch_affine(x, w, b)
+        return _RaggedBatchAffineFn.apply(x, w, b, input_index, in_sizes, out_sizes)
+
     def _batch_affine(self, x, w, b=None):
         """
         Batched affine map for per-sample weights.
@@ -3339,6 +5021,39 @@ class EnvironmentPrior:
                 if isinstance(detached.get("k_pages", None), list) and isinstance(
                     detached.get("v_pages", None), list
                 ):
+                    compact_prefix_env = str(
+                        os.environ.get("TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH", "1")
+                    ).strip().lower()
+                    compact_prefix_enabled = compact_prefix_env not in {"0", "false", "no", "off"}
+                    if compact_prefix_enabled:
+                        k_pages = detached.get("k_pages", None)
+                        v_pages = detached.get("v_pages", None)
+                        if len(k_pages) > 1:
+                            k_prefix = detached.get("k_prefix", None)
+                            v_prefix = detached.get("v_prefix", None)
+                            if (k_prefix is None) or (v_prefix is None):
+                                full_k_pages = k_pages[:-1]
+                                full_v_pages = v_pages[:-1]
+                                if len(full_k_pages) == 1:
+                                    k_prefix = full_k_pages[0]
+                                    v_prefix = full_v_pages[0]
+                                elif len(full_k_pages) > 1:
+                                    k_prefix = torch.cat(full_k_pages, dim=2)
+                                    v_prefix = torch.cat(full_v_pages, dim=2)
+                            detached["k_prefix"] = k_prefix
+                            detached["v_prefix"] = v_prefix
+                            detached["prefix_base_len"] = (
+                                int(k_prefix.shape[2]) if torch.is_tensor(k_prefix) else 0
+                            )
+                            detached["prefix_pages"] = 0
+                            detached["k_pages"] = [k_pages[-1]]
+                            detached["v_pages"] = [v_pages[-1]]
+                            detached["paged_packed"] = False
+                        elif "prefix_base_len" not in detached:
+                            k_prefix = detached.get("k_prefix", None)
+                            detached["prefix_base_len"] = (
+                                int(k_prefix.shape[2]) if torch.is_tensor(k_prefix) else 0
+                            )
                     detached["tail_frozen"] = True
             return detached
         return cache
@@ -4104,11 +5819,15 @@ class EnvironmentPrior:
                 h_eff["reward_dropout_ratio"] = sampled_ratio
             h_list_effective.append(h_eff)
 
-        structure_groups = {}
+        family_groups = {}
+        transition_inner_grouping = str(getattr(self, "transition_inner_grouping", "family")).strip().lower()
+        if transition_inner_grouping not in {"family", "structure", "pow2", "pow2_no_depth"}:
+            transition_inner_grouping = "family"
+        transition_inner_min_bucket = int(max(0, int(getattr(self, "transition_inner_min_bucket", 0) or 0)))
         for bi, h in enumerate(h_list_effective):
             family = self._normalize_family(h.get("family", "scm"))
             sig = (family,)
-            structure_groups.setdefault(sig, []).append((bi, h))
+            family_groups.setdefault(sig, []).append((bi, h))
 
         rollout_generators = self._make_generators_from_seeds(rollout_rng_seeds, batch_size, device)
         profile_rollout_breakdown_flag = str(os.environ.get("TICL_PROFILE_ROLLOUT_BREAKDOWN", "")).strip().lower()
@@ -4122,12 +5841,11 @@ class EnvironmentPrior:
             and torch.cuda.is_available()
         )
         transition_stream_fusion_flag = str(os.environ.get("TICL_POLICY_TRANSITION_STREAM_FUSION", "1")).strip().lower()
-        transition_stream_fusion = bool(
+        base_transition_stream_fusion = bool(
             transition_stream_fusion_flag in {"1", "true", "yes", "on"}
             and device_obj.type == "cuda"
             and torch.cuda.is_available()
             and rollout_generators is None
-            and len(structure_groups) > 1
         )
         async_group_commit_flag = str(
             os.environ.get("TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM", "auto")
@@ -4139,7 +5857,14 @@ class EnvironmentPrior:
         else:
             # Auto: when transition-group stream fusion is active, commit each
             # group update in its stream and only synchronize once per step.
-            async_group_commit_in_stream = bool(transition_stream_fusion)
+            async_group_commit_in_stream = bool(base_transition_stream_fusion)
+        tbptt_window_active = False
+        tbptt_window_size = n_samples
+        if tbptt_window is not None:
+            w = int(tbptt_window)
+            if 0 < w < n_samples:
+                tbptt_window_active = True
+                tbptt_window_size = w
         policy_cuda_pairs = []
         transition_cuda_pairs = []
         policy_wall_s = 0.0
@@ -4156,6 +5881,12 @@ class EnvironmentPrior:
         transition_fused_launch_wall_s = 0.0
         transition_fused_call_count = 0
         transition_fused_group_count = 0
+        transition_checkpoint_call_count = 0
+        transition_stable_dual_input_enabled = 0
+        transition_stable_dual_input_call_count = 0
+        transition_group_work_actual = 0.0
+        transition_group_work_padded = 0.0
+        transition_group_max_batch = 0
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -4186,120 +5917,162 @@ class EnvironmentPrior:
         family_list = [None] * batch_size
 
         transition_groups = []
-        for group in structure_groups.values():
-            group_indices = [idx for idx, _ in group]
-            group_h_list = [h for _, h in group]
-            group_env_seeds = (
-                [env_rng_seeds[idx] for idx in group_indices]
-                if env_rng_seeds is not None
-                else None
-            )
-            env_batch = self._sample_environment_family_coarse_batch(
-                h_list=group_h_list,
-                device=device,
-                rng_seeds=group_env_seeds,
-            )
-            group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
-            group_bs = int(group_idx.numel())
+        transition_family_group_count = int(len(family_groups))
+        for family_group in family_groups.values():
+            transition_bucket_groups = {}
+            if transition_inner_grouping != "family":
+                raw_transition_bucket_groups = {}
+                for global_idx, h in family_group:
+                    sig = self._environment_transition_bucket_signature(h, transition_inner_grouping)
+                    raw_transition_bucket_groups.setdefault(sig, []).append((global_idx, h))
+                if transition_inner_min_bucket > 1:
+                    family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                    merged_family_bucket = []
+                    for sig, bucket_group in raw_transition_bucket_groups.items():
+                        if len(bucket_group) >= transition_inner_min_bucket:
+                            transition_bucket_groups[sig] = bucket_group
+                        else:
+                            merged_family_bucket.extend(bucket_group)
+                    if merged_family_bucket:
+                        transition_bucket_groups[(family, "__fallback__")] = merged_family_bucket
+                else:
+                    transition_bucket_groups = raw_transition_bucket_groups
+            else:
+                family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                transition_bucket_groups[(family,)] = list(family_group)
 
-            state_dims_group = env_batch.get("state_dim_per_sample", None)
-            obs_dims_group = env_batch.get("obs_dim_per_sample", None)
-            action_dims_group = env_batch.get("action_dim_per_sample", None)
-            noise_dims_group = env_batch.get("noise_dim_per_sample", None)
-            zero_pad_dims_group = env_batch.get("zero_pad_dim_per_sample", None)
-            obs_slot_dims_group = env_batch.get("obs_slot_dim_per_sample", None)
-            action_slot_dims_group = env_batch.get("action_slot_dim_per_sample", None)
-            if state_dims_group is None:
-                state_dims_group = torch.full((group_bs,), int(env_batch["state_dim"]), device=device, dtype=torch.long)
-            if obs_dims_group is None:
-                obs_dims_group = torch.full((group_bs,), int(env_batch["obs_dim"]), device=device, dtype=torch.long)
-            if action_dims_group is None:
-                action_dims_group = torch.full((group_bs,), int(env_batch["action_dim"]), device=device, dtype=torch.long)
-            if noise_dims_group is None:
-                noise_dims_group = torch.full((group_bs,), int(env_batch["noise_dim"]), device=device, dtype=torch.long)
-            if zero_pad_dims_group is None:
-                zero_pad_dims_group = torch.full((group_bs,), int(env_batch["zero_pad_dim"]), device=device, dtype=torch.long)
-            if obs_slot_dims_group is None:
-                obs_slot_dims_group = torch.full((group_bs,), int(env_batch["obs_slot_dim"]), device=device, dtype=torch.long)
-            if action_slot_dims_group is None:
-                action_slot_dims_group = torch.full((group_bs,), int(env_batch["action_slot_dim"]), device=device, dtype=torch.long)
+            for group in transition_bucket_groups.values():
+                group_indices = [idx for idx, _ in group]
+                group_h_list = [h for _, h in group]
+                group_env_seeds = (
+                    [env_rng_seeds[idx] for idx in group_indices]
+                    if env_rng_seeds is not None
+                    else None
+                )
+                env_batch = self._sample_environment_family_coarse_batch(
+                    h_list=group_h_list,
+                    device=device,
+                    rng_seeds=group_env_seeds,
+                )
+                group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
+                group_bs = int(group_idx.numel())
+                transition_group_max_batch = max(transition_group_max_batch, group_bs)
+                work_actual, work_padded = self._estimate_transition_group_work(group_h_list)
+                transition_group_work_actual += float(work_actual)
+                transition_group_work_padded += float(max(work_actual, work_padded))
 
-            state_dim_g = int(state_dims_group.max().item())
-            obs_dim_g = int(obs_dims_group.max().item())
-            action_dim_g = int(action_dims_group.max().item())
-            noise_dim_g = int(noise_dims_group.max().item())
-            zero_pad_dim_g = int(zero_pad_dims_group.max().item())
+                state_dims_group = env_batch.get("state_dim_per_sample", None)
+                obs_dims_group = env_batch.get("obs_dim_per_sample", None)
+                action_dims_group = env_batch.get("action_dim_per_sample", None)
+                noise_dims_group = env_batch.get("noise_dim_per_sample", None)
+                zero_pad_dims_group = env_batch.get("zero_pad_dim_per_sample", None)
+                obs_slot_dims_group = env_batch.get("obs_slot_dim_per_sample", None)
+                action_slot_dims_group = env_batch.get("action_slot_dim_per_sample", None)
+                if state_dims_group is None:
+                    state_dims_group = torch.full((group_bs,), int(env_batch["state_dim"]), device=device, dtype=torch.long)
+                if obs_dims_group is None:
+                    obs_dims_group = torch.full((group_bs,), int(env_batch["obs_dim"]), device=device, dtype=torch.long)
+                if action_dims_group is None:
+                    action_dims_group = torch.full((group_bs,), int(env_batch["action_dim"]), device=device, dtype=torch.long)
+                if noise_dims_group is None:
+                    noise_dims_group = torch.full((group_bs,), int(env_batch["noise_dim"]), device=device, dtype=torch.long)
+                if zero_pad_dims_group is None:
+                    zero_pad_dims_group = torch.full((group_bs,), int(env_batch["zero_pad_dim"]), device=device, dtype=torch.long)
+                if obs_slot_dims_group is None:
+                    obs_slot_dims_group = torch.full((group_bs,), int(env_batch["obs_slot_dim"]), device=device, dtype=torch.long)
+                if action_slot_dims_group is None:
+                    action_slot_dims_group = torch.full((group_bs,), int(env_batch["action_slot_dim"]), device=device, dtype=torch.long)
 
-            state_dims[group_idx] = state_dims_group
-            obs_dims[group_idx] = obs_dims_group
-            action_dims[group_idx] = action_dims_group
-            noise_dims[group_idx] = noise_dims_group
-            zero_pad_dims[group_idx] = zero_pad_dims_group
-            obs_slot_dims[group_idx] = obs_slot_dims_group
-            action_slot_dims[group_idx] = action_slot_dims_group
+                state_dim_g = int(state_dims_group.max().item())
+                obs_dim_g = int(obs_dims_group.max().item())
+                action_dim_g = int(action_dims_group.max().item())
+                noise_dim_g = int(noise_dims_group.max().item())
+                zero_pad_dim_g = int(zero_pad_dims_group.max().item())
 
-            init_state_std[group_idx] = env_batch["init_state_std"]
-            init_action_std[group_idx] = env_batch["init_action_std"]
-            state_noise_std[group_idx] = env_batch["state_noise_std"]
-            action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
-            action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
-            reward_scale[group_idx] = env_batch["reward_scale"]
-            reward_clip[group_idx] = env_batch["reward_clip"]
-            alpha[group_idx] = env_batch["alpha"]
-            state_clip[group_idx] = env_batch["state_clip"]
-            state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
-            state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
-            aev4_enabled[group_idx] = env_batch.get("aev4_enabled", False)
-            aev4_highway_ratio[group_idx] = env_batch.get("aev4_highway_ratio", 0.25)
-            aev4_update_scale[group_idx] = env_batch.get("aev4_update_scale", 0.12)
-            aev4_update_clip[group_idx] = env_batch.get("aev4_update_clip", 0.0)
-            reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
-            reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
-            reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
-            for global_idx in group_indices:
-                family_list[global_idx] = str(env_batch["family"])
+                state_dims[group_idx] = state_dims_group
+                obs_dims[group_idx] = obs_dims_group
+                action_dims[group_idx] = action_dims_group
+                noise_dims[group_idx] = noise_dims_group
+                zero_pad_dims[group_idx] = zero_pad_dims_group
+                obs_slot_dims[group_idx] = obs_slot_dims_group
+                action_slot_dims[group_idx] = action_slot_dims_group
 
-            group_rollout_generators = None
-            if rollout_generators is not None:
-                group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
-            transition_generator = env_batch.get("transition_generator", None)
-            use_fused_transition = bool(callable(transition_generator))
-            if use_fused_transition:
-                transition_fused_group_count += 1
-            group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
-            transition_groups.append(
-                {
-                    "indices": group_idx,
-                    "env": env_batch,
-                    "state_dim": state_dim_g,
-                    "obs_dim": obs_dim_g,
-                    "action_dim": action_dim_g,
-                    "noise_dim": noise_dim_g,
-                    "env_obs_start": state_dim_g,
-                    "env_action_start": state_dim_g + obs_dim_g,
-                    "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
-                    "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
-                    "rollout_generators": group_rollout_generators,
-                    "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
-                    "transition_generator": transition_generator,
-                    "use_fused_transition": use_fused_transition,
-                    "stream_transition": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and use_fused_transition)
-                        else None
-                    ),
-                    "stream_y": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and (not use_fused_transition))
-                        else None
-                    ),
-                    "stream_x": (
-                        torch.cuda.Stream(device=device_obj)
-                        if (transition_stream_fusion and (not use_fused_transition))
-                        else None
-                    ),
-                }
-            )
+                init_state_std[group_idx] = env_batch["init_state_std"]
+                init_action_std[group_idx] = env_batch["init_action_std"]
+                state_noise_std[group_idx] = env_batch["state_noise_std"]
+                action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
+                action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
+                reward_scale[group_idx] = env_batch["reward_scale"]
+                reward_clip[group_idx] = env_batch["reward_clip"]
+                alpha[group_idx] = env_batch["alpha"]
+                state_clip[group_idx] = env_batch["state_clip"]
+                state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
+                state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
+                aev4_enabled[group_idx] = env_batch.get("aev4_enabled", False)
+                aev4_highway_ratio[group_idx] = env_batch.get("aev4_highway_ratio", 0.25)
+                aev4_update_scale[group_idx] = env_batch.get("aev4_update_scale", 0.12)
+                aev4_update_clip[group_idx] = env_batch.get("aev4_update_clip", 0.0)
+                reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
+                reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
+                reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
+                for global_idx in group_indices:
+                    family_list[global_idx] = str(env_batch["family"])
+
+                group_rollout_generators = None
+                if rollout_generators is not None:
+                    group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
+                transition_generator = env_batch.get("transition_generator", None)
+                use_fused_transition = bool(callable(transition_generator))
+                if use_fused_transition:
+                    transition_fused_group_count += 1
+                group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
+                transition_checkpoint_enabled = int(
+                    bool(getattr(transition_generator, "_envgen_checkpoint_enabled", False))
+                )
+                use_stable_dual_input_slots = bool(
+                    self.fused_transition_stable_input_slots
+                    and use_fused_transition
+                    and bool(transition_checkpoint_enabled)
+                    and tbptt_window_active
+                    and (tbptt_window_size > 0)
+                    and bool(getattr(transition_generator, "_prefers_dual_packed_input", True))
+                )
+                transition_dual_input_slots = None
+                if use_stable_dual_input_slots:
+                    transition_dual_input_slots = [
+                        torch.zeros(
+                            (2 * group_bs, group_env_total_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        for _ in range(tbptt_window_size)
+                    ]
+                    transition_stable_dual_input_enabled = 1
+                transition_groups.append(
+                    {
+                        "indices": group_idx,
+                        "env": env_batch,
+                        "batch_size": group_bs,
+                        "state_dim": state_dim_g,
+                        "obs_dim": obs_dim_g,
+                        "action_dim": action_dim_g,
+                        "noise_dim": noise_dim_g,
+                        "env_obs_start": state_dim_g,
+                        "env_action_start": state_dim_g + obs_dim_g,
+                        "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
+                        "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
+                        "transition_dual_input_slots": transition_dual_input_slots,
+                        "transition_dual_input_cursor": 0,
+                        "rollout_generators": group_rollout_generators,
+                        "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
+                        "transition_generator": transition_generator,
+                        "use_fused_transition": use_fused_transition,
+                        "transition_checkpoint_enabled": transition_checkpoint_enabled,
+                        "stream_transition": None,
+                        "stream_y": None,
+                        "stream_x": None,
+                    }
+                )
 
         # Keep transition subgroups contiguous in memory to avoid per-step
         # index_select/scatter overhead in the rollout hot loop.
@@ -4353,6 +6126,14 @@ class EnvironmentPrior:
             group_cursor += group_bs
         if group_cursor != batch_size:
             raise RuntimeError("family-group rollout internal subgroup cursor mismatch")
+        transition_stream_fusion = bool(base_transition_stream_fusion and len(transition_groups) > 1)
+        if transition_stream_fusion:
+            for group in transition_groups:
+                if bool(group.get("use_fused_transition", False)):
+                    group["stream_transition"] = torch.cuda.Stream(device=device_obj)
+                else:
+                    group["stream_y"] = torch.cuda.Stream(device=device_obj)
+                    group["stream_x"] = torch.cuda.Stream(device=device_obj)
 
         max_state_dim = int(state_dims.max().item())
         max_obs_dim = int(obs_dims.max().item())
@@ -4423,13 +6204,6 @@ class EnvironmentPrior:
             else None
         )
 
-        tbptt_window_active = False
-        tbptt_window_size = n_samples
-        if tbptt_window is not None:
-            w = int(tbptt_window)
-            if 0 < w < n_samples:
-                tbptt_window_active = True
-                tbptt_window_size = w
         tbptt_reward_buffer = [] if tbptt_window_active else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
@@ -4829,6 +6603,7 @@ class EnvironmentPrior:
                 group_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 group_slice = group["slice"]
                 env_g = group["env"]
+                group_bs = int(group.get("batch_size", 0) or 0)
                 state_dim_g = int(group["state_dim"])
                 obs_dim_g = int(group["obs_dim"])
                 action_dim_g = int(group["action_dim"])
@@ -4838,17 +6613,9 @@ class EnvironmentPrior:
                 obs_in = obs_t[group_slice, :obs_dim_g]
                 action_in = action_next[group_slice, :action_dim_g]
                 noise_in = noise_t[group_slice, :noise_dim_g]
-
-                env_in = group["env_in"]
                 env_obs_start = int(group["env_obs_start"])
                 env_action_start = int(group["env_action_start"])
                 env_noise_start = int(group["env_noise_start"])
-                env_in[:, :state_dim_g] = state_in
-                env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
-                env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                if profile_rollout_timing and pack_wall_t0 is not None:
-                    transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
 
                 reward_scale_g = group["reward_scale_view"]
                 alpha_g = group["alpha_view"]
@@ -4859,15 +6626,45 @@ class EnvironmentPrior:
                 stream_transition = group.get("stream_transition", None)
                 stream_y = group.get("stream_y", None)
                 stream_x = group.get("stream_x", None)
+                transition_checkpoint_enabled = bool(group.get("transition_checkpoint_enabled", 0))
                 reward_next_raw_g = None
                 x_next_g = None
+                transition_input = None
+                transition_input_is_dual_packed = False
+                transition_dual_input_slots = group.get("transition_dual_input_slots", None)
+                if use_fused_transition and (transition_dual_input_slots is not None):
+                    dual_cursor = int(group.get("transition_dual_input_cursor", 0) or 0)
+                    transition_input = transition_dual_input_slots[dual_cursor]
+                    group["transition_dual_input_cursor"] = dual_cursor + 1
+                    transition_input_is_dual_packed = True
+                    transition_input[:group_bs, :state_dim_g] = state_in
+                    transition_input[group_bs:, :state_dim_g] = state_in
+                    transition_input[:group_bs, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                    transition_input[group_bs:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                    transition_input[:group_bs, env_action_start: env_action_start + action_dim_g] = action_in
+                    transition_input[group_bs:, env_action_start: env_action_start + action_dim_g] = action_in
+                    transition_input[:group_bs, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                    transition_input[group_bs:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                    transition_stable_dual_input_call_count += 1
+                else:
+                    env_in = group["env_in"]
+                    env_in[:, :state_dim_g] = state_in
+                    env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                    env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                    env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                    transition_input = env_in
+                if profile_rollout_timing and pack_wall_t0 is not None:
+                    transition_env_pack_wall_s += (time.perf_counter() - pack_wall_t0)
                 if use_fused_transition:
+                    if transition_checkpoint_enabled and bool(transition_input.requires_grad):
+                        transition_checkpoint_call_count += 1
                     if stream_transition is not None:
                         launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                         with torch.cuda.stream(stream_transition):
                             x_next_g, reward_next_raw_g = transition_generator_g(
-                                env_in,
+                                transition_input,
                                 generators_for_noise=group["rollout_generators"],
+                                x_is_dual_packed=transition_input_is_dual_packed,
                             )
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                             if async_group_commit_in_stream:
@@ -4892,8 +6689,9 @@ class EnvironmentPrior:
                     else:
                         fused_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                         x_next_g, reward_next_raw_g = transition_generator_g(
-                            env_in,
+                            transition_input,
                             generators_for_noise=group["rollout_generators"],
+                            x_is_dual_packed=transition_input_is_dual_packed,
                         )
                         reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
                         if profile_rollout_timing and fused_wall_t0 is not None:
@@ -4906,14 +6704,14 @@ class EnvironmentPrior:
                     launch_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     with torch.cuda.stream(stream_y):
                         reward_next_raw_g = reward_scale_g * env_g["y_generator"](
-                            env_in,
+                            transition_input,
                             generators_for_noise=group["rollout_generators"],
                         ).reshape(-1)
                         if async_group_commit_in_stream:
                             reward_next_raw[group_slice] = reward_next_raw_g
                     with torch.cuda.stream(stream_x):
                         x_next_g = env_g["x_generator"](
-                            env_in,
+                            transition_input,
                             generators_for_noise=group["rollout_generators"],
                         )
                         if async_group_commit_in_stream:
@@ -4934,14 +6732,14 @@ class EnvironmentPrior:
                 else:
                     y_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     reward_next_raw_g = reward_scale_g * env_g["y_generator"](
-                        env_in,
+                        transition_input,
                         generators_for_noise=group["rollout_generators"],
                     ).reshape(-1)
                     if profile_rollout_timing and y_wall_t0 is not None:
                         transition_y_wall_s += (time.perf_counter() - y_wall_t0)
                     x_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                     x_next_g = env_g["x_generator"](
-                        env_in,
+                        transition_input,
                         generators_for_noise=group["rollout_generators"],
                     )
                     if profile_rollout_timing and x_wall_t0 is not None:
@@ -5075,6 +6873,10 @@ class EnvironmentPrior:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         for group in transition_groups:
                             group["env_in"] = group["env_in"].detach()
+                            dual_slots = group.get("transition_dual_input_slots", None)
+                            if dual_slots is not None:
+                                group["transition_dual_input_slots"] = [slot.detach() for slot in dual_slots]
+                                group["transition_dual_input_cursor"] = 0
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
                         if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
@@ -5232,7 +7034,27 @@ class EnvironmentPrior:
                 rollout_profile["transition_fused_call_count"] = int(transition_fused_call_count)
                 rollout_profile["transition_fused_group_count"] = int(transition_fused_group_count)
                 rollout_profile["transition_fused_enabled"] = int(transition_fused_group_count > 0)
+                rollout_profile["transition_checkpoint_enabled"] = int(bool(self.envgen_checkpoint))
+                rollout_profile["transition_checkpoint_call_count"] = int(transition_checkpoint_call_count)
+                rollout_profile["transition_stable_dual_input_enabled"] = int(transition_stable_dual_input_enabled)
+                rollout_profile["transition_stable_dual_input_call_count"] = int(
+                    transition_stable_dual_input_call_count
+                )
                 rollout_profile["transition_group_count"] = int(len(transition_groups))
+                rollout_profile["transition_family_group_count"] = int(transition_family_group_count)
+                rollout_profile["transition_inner_grouping_structure_enabled"] = int(
+                    transition_inner_grouping == "structure"
+                )
+                rollout_profile["transition_inner_min_bucket"] = int(transition_inner_min_bucket)
+                rollout_profile["transition_bucket_max_batch"] = int(transition_group_max_batch)
+                rollout_profile["transition_bucket_mean_batch"] = float(
+                    batch_size / max(1, len(transition_groups))
+                )
+                rollout_profile["transition_work_actual_est"] = float(transition_group_work_actual)
+                rollout_profile["transition_work_padded_est"] = float(transition_group_work_padded)
+                rollout_profile["transition_work_fill_ratio"] = float(
+                    transition_group_work_actual / max(1e-9, transition_group_work_padded)
+                )
                 rollout_profile["transition_async_enabled"] = int(bool(transition_stream_fusion))
                 rollout_profile["transition_async_commit_in_stream"] = int(
                     bool(transition_stream_fusion and async_group_commit_in_stream)
@@ -6451,7 +8273,15 @@ class EnvironmentPrior:
                             "transition_fused_call_count": 0,
                             "transition_fused_group_count": 0,
                             "transition_fused_enabled": 0,
+                            "transition_checkpoint_enabled": 0,
+                            "transition_checkpoint_call_count": 0,
                             "transition_group_count": 0,
+                            "transition_family_group_count": 0,
+                            "transition_inner_grouping_structure_enabled": 0,
+                            "transition_inner_min_bucket": 0,
+                            "transition_bucket_max_batch": 0,
+                            "transition_work_actual_est": 0.0,
+                            "transition_work_padded_est": 0.0,
                             "transition_async_enabled": 0,
                             "noise_mode": None,
                             "noise_block_size": 0,
@@ -6500,7 +8330,43 @@ class EnvironmentPrior:
                             int(group_profile.get("transition_fused_enabled", 0) or 0),
                         )
                     )
+                    rollout_profile_acc["transition_checkpoint_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_checkpoint_enabled", 0) or 0),
+                            int(group_profile.get("transition_checkpoint_enabled", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_checkpoint_call_count"] += int(
+                        group_profile.get("transition_checkpoint_call_count", 0) or 0
+                    )
                     rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
+                    rollout_profile_acc["transition_family_group_count"] += int(
+                        group_profile.get("transition_family_group_count", 0) or 0
+                    )
+                    rollout_profile_acc["transition_inner_grouping_structure_enabled"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_inner_grouping_structure_enabled", 0) or 0),
+                            int(group_profile.get("transition_inner_grouping_structure_enabled", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_inner_min_bucket"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_inner_min_bucket", 0) or 0),
+                            int(group_profile.get("transition_inner_min_bucket", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_bucket_max_batch"] = int(
+                        max(
+                            int(rollout_profile_acc.get("transition_bucket_max_batch", 0) or 0),
+                            int(group_profile.get("transition_bucket_max_batch", 0) or 0),
+                        )
+                    )
+                    rollout_profile_acc["transition_work_actual_est"] += float(
+                        group_profile.get("transition_work_actual_est", 0.0) or 0.0
+                    )
+                    rollout_profile_acc["transition_work_padded_est"] += float(
+                        group_profile.get("transition_work_padded_est", 0.0) or 0.0
+                    )
                     rollout_profile_acc["transition_async_enabled"] = int(
                         max(
                             int(rollout_profile_acc.get("transition_async_enabled", 0) or 0),
@@ -6521,6 +8387,14 @@ class EnvironmentPrior:
                         group_noise_block_size = 0
                     if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
                         rollout_profile_acc["noise_block_size"] = group_noise_block_size
+            if rollout_profile_acc is not None:
+                rollout_profile_acc["transition_bucket_mean_batch"] = float(
+                    batch_size / max(1, int(rollout_profile_acc.get("transition_group_count", 0) or 0))
+                )
+                rollout_profile_acc["transition_work_fill_ratio"] = float(
+                    float(rollout_profile_acc.get("transition_work_actual_est", 0.0) or 0.0)
+                    / max(1e-9, float(rollout_profile_acc.get("transition_work_padded_est", 0.0) or 0.0))
+                )
             self.last_rollout_profile = rollout_profile_acc
             self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
                 rollout_v2_acc,
@@ -7170,7 +9044,43 @@ class EnvironmentPrior:
                 stats["rollout_transition_fused_enabled"] = int(
                     rollout_profile.get("transition_fused_enabled", 0) or 0
                 )
+                stats["rollout_transition_checkpoint_enabled"] = int(
+                    rollout_profile.get("transition_checkpoint_enabled", 0) or 0
+                )
+                stats["rollout_transition_checkpoint_call_count"] = int(
+                    rollout_profile.get("transition_checkpoint_call_count", 0) or 0
+                )
+                stats["rollout_transition_stable_dual_input_enabled"] = int(
+                    rollout_profile.get("transition_stable_dual_input_enabled", 0) or 0
+                )
+                stats["rollout_transition_stable_dual_input_call_count"] = int(
+                    rollout_profile.get("transition_stable_dual_input_call_count", 0) or 0
+                )
                 stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
+                stats["rollout_transition_family_group_count"] = int(
+                    rollout_profile.get("transition_family_group_count", 0) or 0
+                )
+                stats["rollout_transition_inner_grouping_structure_enabled"] = int(
+                    rollout_profile.get("transition_inner_grouping_structure_enabled", 0) or 0
+                )
+                stats["rollout_transition_inner_min_bucket"] = int(
+                    rollout_profile.get("transition_inner_min_bucket", 0) or 0
+                )
+                stats["rollout_transition_bucket_max_batch"] = int(
+                    rollout_profile.get("transition_bucket_max_batch", 0) or 0
+                )
+                stats["rollout_transition_bucket_mean_batch"] = float(
+                    rollout_profile.get("transition_bucket_mean_batch", 0.0) or 0.0
+                )
+                stats["rollout_transition_work_actual_est"] = float(
+                    rollout_profile.get("transition_work_actual_est", 0.0) or 0.0
+                )
+                stats["rollout_transition_work_padded_est"] = float(
+                    rollout_profile.get("transition_work_padded_est", 0.0) or 0.0
+                )
+                stats["rollout_transition_work_fill_ratio"] = float(
+                    rollout_profile.get("transition_work_fill_ratio", 0.0) or 0.0
+                )
                 stats["rollout_transition_async_enabled"] = int(
                     rollout_profile.get("transition_async_enabled", 0) or 0
                 )
@@ -8095,7 +10005,43 @@ class EnvironmentPrior:
             stats["rollout_transition_fused_enabled"] = int(
                 rollout_profile.get("transition_fused_enabled", 0) or 0
             )
+            stats["rollout_transition_checkpoint_enabled"] = int(
+                rollout_profile.get("transition_checkpoint_enabled", 0) or 0
+            )
+            stats["rollout_transition_checkpoint_call_count"] = int(
+                rollout_profile.get("transition_checkpoint_call_count", 0) or 0
+            )
+            stats["rollout_transition_stable_dual_input_enabled"] = int(
+                rollout_profile.get("transition_stable_dual_input_enabled", 0) or 0
+            )
+            stats["rollout_transition_stable_dual_input_call_count"] = int(
+                rollout_profile.get("transition_stable_dual_input_call_count", 0) or 0
+            )
             stats["rollout_transition_group_count"] = int(rollout_profile.get("transition_group_count", 0))
+            stats["rollout_transition_family_group_count"] = int(
+                rollout_profile.get("transition_family_group_count", 0) or 0
+            )
+            stats["rollout_transition_inner_grouping_structure_enabled"] = int(
+                rollout_profile.get("transition_inner_grouping_structure_enabled", 0) or 0
+            )
+            stats["rollout_transition_inner_min_bucket"] = int(
+                rollout_profile.get("transition_inner_min_bucket", 0) or 0
+            )
+            stats["rollout_transition_bucket_max_batch"] = int(
+                rollout_profile.get("transition_bucket_max_batch", 0) or 0
+            )
+            stats["rollout_transition_bucket_mean_batch"] = float(
+                rollout_profile.get("transition_bucket_mean_batch", 0.0) or 0.0
+            )
+            stats["rollout_transition_work_actual_est"] = float(
+                rollout_profile.get("transition_work_actual_est", 0.0) or 0.0
+            )
+            stats["rollout_transition_work_padded_est"] = float(
+                rollout_profile.get("transition_work_padded_est", 0.0) or 0.0
+            )
+            stats["rollout_transition_work_fill_ratio"] = float(
+                rollout_profile.get("transition_work_fill_ratio", 0.0) or 0.0
+            )
             stats["rollout_transition_async_enabled"] = int(
                 rollout_profile.get("transition_async_enabled", 0) or 0
             )

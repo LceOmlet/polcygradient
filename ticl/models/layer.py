@@ -255,6 +255,28 @@ class TransformerEncoderLayer(Module):
         self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
         finalize_2d_flag = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
         self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
+        finalize_compile_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE", "0")
+        ).strip().lower()
+        self.finalize_torch_compile = finalize_compile_flag in {"1", "true", "yes", "on"}
+        finalize_compile_backend = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_BACKEND", "inductor")
+        ).strip()
+        self.finalize_torch_compile_backend = finalize_compile_backend or "inductor"
+        finalize_compile_mode = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_MODE", "reduce-overhead")
+        ).strip()
+        self.finalize_torch_compile_mode = finalize_compile_mode or "reduce-overhead"
+        finalize_compile_fullgraph_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_FULLGRAPH", "0")
+        ).strip().lower()
+        self.finalize_torch_compile_fullgraph = finalize_compile_fullgraph_flag in {"1", "true", "yes", "on"}
+        finalize_compile_dynamic_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_DYNAMIC", "0")
+        ).strip().lower()
+        self.finalize_torch_compile_dynamic = finalize_compile_dynamic_flag in {"1", "true", "yes", "on"}
+        self._finalize_2d_compiled = None
+        self._finalize_2d_compile_failed = False
         cache_reuse_flag = str(os.environ.get("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")).strip().lower()
         self.cache_container_reuse = cache_reuse_flag not in {"0", "false", "no", "off"}
         step_proj_2d_flag = str(os.environ.get("TICL_POLICY_STEP_PROJ_2D", "1")).strip().lower()
@@ -268,6 +290,7 @@ class TransformerEncoderLayer(Module):
             "finalize_wall_s": 0.0,
             "finalize_attn_outproj_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
             "paged_path_flash_prefix_zero_fastpath": 0,
@@ -301,6 +324,7 @@ class TransformerEncoderLayer(Module):
             "finalize_wall_s": 0.0,
             "finalize_attn_outproj_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
             "paged_path_flash_prefix_zero_fastpath": 0,
@@ -362,6 +386,94 @@ class TransformerEncoderLayer(Module):
         bsz, n_heads, seq_len, head_dim = x_bhld.shape
         return x_bhld.transpose(1, 2).contiguous().view(bsz, seq_len, n_heads * head_dim)
 
+    def finalize_compile_active(self):
+        return bool(self.finalize_torch_compile) and callable(getattr(torch, "compile", None))
+
+    def _resolve_finalize_2d_callable(self):
+        eager_fn = self._finalize_forward_step_2d_eager
+        if (not self.finalize_compile_active()) or self._finalize_2d_compile_failed or _is_torch_compiling():
+            return eager_fn, False
+        compiled_fn = self._finalize_2d_compiled
+        if compiled_fn is None:
+            try:
+                compiled_fn = torch.compile(
+                    eager_fn,
+                    backend=str(self.finalize_torch_compile_backend),
+                    mode=str(self.finalize_torch_compile_mode),
+                    fullgraph=bool(self.finalize_torch_compile_fullgraph),
+                    dynamic=bool(self.finalize_torch_compile_dynamic),
+                )
+            except Exception:
+                self._finalize_2d_compile_failed = True
+                compiled_fn = None
+            self._finalize_2d_compiled = compiled_fn
+        if compiled_fn is None:
+            return eager_fn, False
+        return compiled_fn, True
+
+    def warmup_finalize_compile(self, batch_size: int):
+        finalize_fn, compiled_active = self._resolve_finalize_2d_callable()
+        if not bool(compiled_active):
+            return False
+        batch_size = int(max(1, int(batch_size)))
+        device = self.self_attn.out_proj.weight.device
+        dtype = self.self_attn.out_proj.weight.dtype
+        src_step_2d = torch.zeros(
+            (batch_size, int(self.self_attn.embed_dim)),
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        attn_step_2d = torch.zeros_like(src_step_2d, requires_grad=True)
+        out = finalize_fn(src_step_2d, attn_step_2d)
+        out.square().mean().backward()
+        return True
+
+    def _finalize_forward_step_2d_eager(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        attn_step_2d = F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        if self.training and float(self.dropout1.p) > 0.0:
+            attn_step_2d = F.dropout(attn_step_2d, p=float(self.dropout1.p), training=True)
+        src = src_step_2d + attn_step_2d
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm1.normalized_shape,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        if self.pre_norm:
+            src_ff = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        else:
+            src_ff = src
+        src2_ff = F.linear(src_ff, self.linear1.weight, self.linear1.bias)
+        src2_ff = self.activation(src2_ff)
+        if self.training and float(self.dropout.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        if self.training and float(self.dropout2.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+        src = src + src2_ff
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        return src
+
     def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
         profile_enabled = self._step_profile_enabled_now()
         outproj_t0 = time.perf_counter() if profile_enabled else None
@@ -377,10 +489,13 @@ class TransformerEncoderLayer(Module):
             # forward_step hot path uses single-token query (L=1); keep
             # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
             attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
-            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)  # (B, E)
-            if self.training and float(self.dropout1.p) > 0.0:
-                attn_bld = F.dropout(attn_bld, p=float(self.dropout1.p), training=True)
-            src = src_step_2d + attn_bld  # (B, E)
+            finalize_2d_fn, finalize_2d_compiled = self._resolve_finalize_2d_callable()
+            compiled_t0 = time.perf_counter() if (profile_enabled and bool(finalize_2d_compiled)) else None
+            src = finalize_2d_fn(src_step_2d, attn_bld)
+            compiled_dt = (time.perf_counter() - compiled_t0) if compiled_t0 is not None else 0.0
+            if profile_enabled and bool(finalize_2d_compiled):
+                self._layer_step_profile_stats["finalize_compiled_wall_s"] += float(compiled_dt)
+            return src.unsqueeze(0) if input_was_3d else src
         else:
             attn_bld = self._merge_heads(attn_bhld)
             attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
@@ -429,8 +544,6 @@ class TransformerEncoderLayer(Module):
             stats = self._layer_step_profile_stats
             stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
             stats["finalize_ffn_wall_s"] += float(ffn_dt)
-        if use_2d_fastpath:
-            return src.unsqueeze(0) if input_was_3d else src
         return src if input_was_3d else src.squeeze(0)
 
     def _forward_step_attn_ff(self, src_step: Tensor, q_bhld: Tensor, k_all: Tensor, v_all: Tensor):
@@ -1050,6 +1163,35 @@ class TransformerEncoderLayer(Module):
         return TransformerEncoderLayer._concat_dim2(k_chunks), TransformerEncoderLayer._concat_dim2(v_chunks)
 
     @staticmethod
+    def _combine_prefix_with_paged_tail(
+        prefix_k: Optional[Tensor],
+        prefix_v: Optional[Tensor],
+        k_pages,
+        v_pages,
+        valid_len: int,
+    ):
+        valid_len = int(valid_len)
+        prefix_len = 0
+        if prefix_k is not None and prefix_v is not None:
+            prefix_len = int(prefix_k.shape[2])
+        if prefix_len >= valid_len:
+            if prefix_k is None or prefix_v is None:
+                raise ValueError("prefix tensors are required when prefix_len >= valid_len")
+            return prefix_k[:, :, :valid_len, :], prefix_v[:, :, :valid_len, :]
+        tail_len = int(valid_len - prefix_len)
+        if tail_len <= 0:
+            if prefix_k is None or prefix_v is None:
+                raise ValueError("prefix tensors are required when tail_len <= 0")
+            return prefix_k[:, :, :valid_len, :], prefix_v[:, :, :valid_len, :]
+        tail_k, tail_v = TransformerEncoderLayer._build_paged_views(k_pages, v_pages, tail_len)
+        if prefix_len <= 0:
+            return tail_k, tail_v
+        return (
+            TransformerEncoderLayer._concat_dim2([prefix_k, tail_k]),
+            TransformerEncoderLayer._concat_dim2([prefix_v, tail_v]),
+        )
+
+    @staticmethod
     def _append_to_kv_pages(
         k_pages,
         v_pages,
@@ -1387,6 +1529,7 @@ class TransformerEncoderLayer(Module):
 
         cache_t0 = time.perf_counter() if profile_enabled else None
         paged_packed = False
+        prefix_base_len = 0
         if kv_cache is None:
             if not append_to_cache:
                 raise ValueError("predict-only step requires a non-empty kv_cache.")
@@ -1449,6 +1592,10 @@ class TransformerEncoderLayer(Module):
                 prefix_pages = int(kv_cache.get("prefix_pages", 0))
             except Exception:
                 prefix_pages = 0
+            try:
+                prefix_base_len = int(kv_cache.get("prefix_base_len", 0))
+            except Exception:
+                prefix_base_len = 0
             if k_prev is None:
                 valid_len = int(kv_cache.get("valid_len", 0))
             else:
@@ -1577,25 +1724,22 @@ class TransformerEncoderLayer(Module):
             # consume [prefix + tail] instead of rebuilding all-page cat views.
             full_pages = int(max(0, len(k_pages) - 1))
             if full_pages <= 0:
-                k_prefix = None
-                v_prefix = None
+                if int(prefix_base_len) <= 0:
+                    k_prefix = None
+                    v_prefix = None
                 prefix_pages = 0
             else:
                 rebuild_prefix = (
                     (k_prefix is None)
                     or (v_prefix is None)
-                    or (prefix_pages <= 0)
                     or (full_pages < prefix_pages)
                 )
                 if rebuild_prefix:
-                    if full_pages == 1:
-                        k_prefix = k_pages[0]
-                        v_prefix = v_pages[0]
-                    else:
-                        k_prefix = self._concat_dim2(k_pages[:full_pages])
-                        v_prefix = self._concat_dim2(v_pages[:full_pages])
-                    prefix_pages = full_pages
-                elif full_pages > prefix_pages:
+                    if int(prefix_base_len) <= 0:
+                        k_prefix = None
+                        v_prefix = None
+                    prefix_pages = 0
+                if full_pages > prefix_pages:
                     for idx in range(prefix_pages, full_pages):
                         k_full = k_pages[idx]
                         v_full = v_pages[idx]
@@ -1610,6 +1754,7 @@ class TransformerEncoderLayer(Module):
             k_prefix = None
             v_prefix = None
             prefix_pages = 0
+            prefix_base_len = 0
 
         cache_dt = (time.perf_counter() - cache_t0) if cache_t0 is not None else 0.0
         attnff_t0 = time.perf_counter() if profile_enabled else None
@@ -1664,6 +1809,7 @@ class TransformerEncoderLayer(Module):
             new_cache["k_prefix"] = k_prefix
             new_cache["v_prefix"] = v_prefix
             new_cache["prefix_pages"] = int(prefix_pages)
+            new_cache["prefix_base_len"] = int(prefix_base_len)
             new_cache["allow_grad_mutable_cache"] = bool(allow_grad_mutable_cache)
             new_cache["allow_grad_inplace_paged_cache"] = bool(allow_grad_inplace_paged_cache)
             new_cache["tail_frozen"] = bool(tail_frozen) if cache_mode == "paged" else False
@@ -1683,6 +1829,7 @@ class TransformerEncoderLayer(Module):
                 "k_prefix": k_prefix,
                 "v_prefix": v_prefix,
                 "prefix_pages": int(prefix_pages),
+                "prefix_base_len": int(prefix_base_len),
                 "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
                 "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
                 "tail_frozen": bool(tail_frozen) if cache_mode == "paged" else False,
@@ -1774,7 +1921,15 @@ class TransformerEncoderLayer(Module):
         v_pages = kv_cache.get("v_pages", None)
         if (k_pages is not None) and (v_pages is not None):
             valid_len = int(kv_cache.get("valid_len", 0))
-            k_bhld, v_bhld = self._build_paged_views(k_pages, v_pages, valid_len)
+            k_prefix = kv_cache.get("k_prefix", None)
+            v_prefix = kv_cache.get("v_prefix", None)
+            k_bhld, v_bhld = self._combine_prefix_with_paged_tail(
+                k_prefix,
+                v_prefix,
+                k_pages,
+                v_pages,
+                valid_len,
+            )
         else:
             k_bhld = kv_cache["k"]
             v_bhld = kv_cache["v"]
@@ -1934,6 +2089,34 @@ class TransformerEncoderSimple(Module):
         step_layer_2d_flag = str(os.environ.get("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")).strip().lower()
         self.step_layer_2d_loop = step_layer_2d_flag not in {"0", "false", "no", "off"}
 
+    def step_fastpath_compile_active(self):
+        for layer in self.layers:
+            active_fn = getattr(layer, "finalize_compile_active", None)
+            if callable(active_fn) and bool(active_fn()):
+                return True
+        return False
+
+    def step_fastpath_compile_config(self):
+        for layer in self.layers:
+            active_fn = getattr(layer, "finalize_compile_active", None)
+            if callable(active_fn) and bool(active_fn()):
+                return {
+                    "finalize_torch_compile": True,
+                    "backend": str(getattr(layer, "finalize_torch_compile_backend", "inductor")),
+                    "mode": str(getattr(layer, "finalize_torch_compile_mode", "reduce-overhead")),
+                    "fullgraph": bool(getattr(layer, "finalize_torch_compile_fullgraph", False)),
+                    "dynamic": bool(getattr(layer, "finalize_torch_compile_dynamic", False)),
+                }
+        return {"finalize_torch_compile": False}
+
+    def warmup_step_fastpaths(self, batch_size: int):
+        warmed = False
+        for layer in self.layers:
+            warmup_fn = getattr(layer, "warmup_finalize_compile", None)
+            if callable(warmup_fn):
+                warmed = bool(warmup_fn(batch_size=batch_size)) or bool(warmed)
+        return bool(warmed)
+
     def consume_step_profile(self):
         calls = 0
         proj_wall_s = 0.0
@@ -1943,6 +2126,7 @@ class TransformerEncoderSimple(Module):
         finalize_wall_s = 0.0
         finalize_attn_outproj_wall_s = 0.0
         finalize_ffn_wall_s = 0.0
+        finalize_compiled_wall_s = 0.0
         paged_path_single_page = 0
         paged_path_flash_prefix = 0
         paged_path_flash_prefix_zero_fastpath = 0
@@ -1978,6 +2162,7 @@ class TransformerEncoderSimple(Module):
                 layer_stats.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
             )
             finalize_ffn_wall_s += float(layer_stats.get("finalize_ffn_wall_s", 0.0) or 0.0)
+            finalize_compiled_wall_s += float(layer_stats.get("finalize_compiled_wall_s", 0.0) or 0.0)
             paged_path_single_page += int(layer_stats.get("paged_path_single_page", 0) or 0)
             paged_path_flash_prefix += int(layer_stats.get("paged_path_flash_prefix", 0) or 0)
             paged_path_flash_prefix_zero_fastpath += int(
@@ -2007,6 +2192,7 @@ class TransformerEncoderSimple(Module):
             "finalize_wall_s": float(finalize_wall_s),
             "finalize_attn_outproj_wall_s": float(finalize_attn_outproj_wall_s),
             "finalize_ffn_wall_s": float(finalize_ffn_wall_s),
+            "finalize_compiled_wall_s": float(finalize_compiled_wall_s),
             "paged_path_single_page": int(paged_path_single_page),
             "paged_path_flash_prefix": int(paged_path_flash_prefix),
             "paged_path_flash_prefix_zero_fastpath": int(paged_path_flash_prefix_zero_fastpath),

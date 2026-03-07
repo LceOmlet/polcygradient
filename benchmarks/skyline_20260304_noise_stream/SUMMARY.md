@@ -1502,3 +1502,970 @@ Default-path confirmation (no async env override):
   - `batch_wall_excl_compile_s: 84.038 -> 83.032` (`-1.20%`, positive but secondary).
 - `TICL_POLICY_INPLACE_PAGED_KV=1`:
   - rejected (`batch_wall_excl_compile_s: 83.032 -> 86.849`, peak reserved `31.68 -> 43.88 GiB`).
+
+## Continuation pass (2026-03-06): TBPTT prefix compaction + envgen checkpoint (memory win, throughput reject)
+
+Goal:
+
+- attack the first-window memory wall before TBPTT detach, which was blocking
+  clean fixed-seed benchmarking with fail-fast enabled
+- reduce prefix-history duplication after TBPTT detach
+- preserve observability so low-VRAM and throughput modes can be separated
+
+### Code changes
+
+- `ticl/models/layer.py`
+  - paged KV cache now carries `prefix_base_len` so detached dense prefix and
+    mutable tail pages can coexist without semantic drift.
+  - query path now materializes `k_prefix/v_prefix + tail pages` correctly.
+- `ticl/priors/environment_prior.py`
+  - TBPTT detach now optionally compacts full detached paged-prefix pages into
+    dense `k_prefix/v_prefix` (`TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH`, default on).
+  - added opt-in env-transition activation checkpoint:
+    - `TICL_POLICY_ENVGEN_CHECKPOINT`
+    - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT`
+  - envgen checkpoint externalizes sampled noise from the recomputed core and
+    clones the reused rollout input buffer to keep backward recompute safe.
+  - added rollout observability:
+    - `rollout_transition_checkpoint_enabled`
+    - `rollout_transition_checkpoint_calls`
+- `ticl/train.py`
+  - startup prints for prefix compaction + envgen checkpoint mode.
+- tests:
+  - paged-TBPTT detach compaction semantic regression test
+  - envgen checkpoint semantic equivalence test (loss / rollout / grad)
+
+### Fixed-seed observations
+
+Early fail-fast probe on the raw default line:
+
+- previous code path: immediate first-window OOM before any authoritative
+  `batch_wall_excl_compile_s`
+- with envgen checkpoint on:
+  - log: `20260306_seeded_envgen_checkpoint_on_merge1.log`
+  - first window becomes measurable instead of OOM
+  - `batch_wall_excl_compile_s=106.026`
+  - peak reserved `23.94 GiB`
+
+This confirms the dominant first-window memory term was in env transition
+activations, not post-detach prefix history.
+
+### Fixed-seed A/B on stable training line (`aev5 + lipschitz`, same seed / same command, only envgen checkpoint differs)
+
+Logs:
+
+- `off`: `20260306_seeded_aev5_lipschitz_envgen_checkpoint_off.log`
+- `on`: `20260306_seeded_aev5_lipschitz_envgen_checkpoint_on.log`
+
+Metrics (`off -> on`):
+
+- `batch_wall_excl_compile_s`: `85.865 -> 108.696` (`+26.6%`, worse)
+- `rollout_s`: `55.287 -> 68.311` (`+23.6%`, worse)
+- `backward_s`: `30.579 -> 40.385` (`+32.1%`, worse)
+- peak reserved: `46.20 -> 23.94 GiB` (large VRAM win)
+- rollout `gpu_util_avg`: `29.31 -> 30.50` (slightly higher, but not useful)
+- `rollout_transition_checkpoint_calls=2048`
+
+Interpretation:
+
+- envgen checkpoint is a real low-VRAM mode, not a throughput optimization.
+- recompute cost dominates any benefit from lower reserved memory at fixed
+  workload.
+- do **not** mainline envgen checkpoint into the throughput skyline.
+
+### Follow-up probe: spend saved VRAM on larger TBPTT window
+
+Log:
+
+- `20260306_seeded_aev5_lipschitz_envgen_checkpoint_on_tbptt128.log`
+
+Metrics (`tbptt=64 checkpoint-on -> tbptt=128 checkpoint-on`):
+
+- `tbptt_stream_backward_calls`: `16 -> 8`
+- `batch_wall_excl_compile_s`: `108.696 -> 108.284` (`-0.38%`, near-noise)
+- peak reserved: `23.94 -> 38.40 GiB`
+
+Interpretation:
+
+- larger TBPTT window consumes the recovered VRAM, but does not recover the
+  recompute tax into a positive throughput gain.
+
+Decision:
+
+- keep prefix compaction on by default (semantic-safe memory reduction for
+  detached paged KV history).
+- under the old `batch=64` / raw-batch-wall regime, envgen checkpoint stayed
+  off by default because throughput regressed.
+- that conclusion is superseded below for the later `batch=128` /
+  per-batch-item skyline regime.
+
+## Continuation pass (2026-03-06): batch=128 mainline + per-batch-item skyline KPI
+
+Goal:
+
+- keep `TBPTT=64` fixed
+- raise physical `batch_size` to `128`
+- stop judging skyline on raw batch wall once batch size changes; use
+  `batch_wall_excl_compile_s / batch_size` directly from training logs
+
+### Code changes
+
+- `ticl/model_configs.py`
+  - `rlpfn` default physical `batch_size` changed from `64` to `128`.
+- `ticl/train.py`
+  - `[pg-phase]`, GPU-stage JSON, and wandb payload now emit:
+    - `batch_size`
+    - `batch_wall_excl_compile_per_batch_item_s`
+    - `batch_wall_incl_compile_per_batch_item_s`
+- `ticl/fit_model.py`
+  - mainline `python -m ticl.fit_model rlpfn` now defaults
+    `TICL_POLICY_ENVGEN_CHECKPOINT=1`.
+  - reason: with `batch=128` and fail-fast enabled, the non-checkpoint path
+    OOMs before the first authoritative batch KPI.
+
+### Fixed-seed observations (`TBPTT=64`, `replay_step=1`, fail-fast, merge=1)
+
+Logs:
+
+- `batch=64`, envgen checkpoint off:
+  - `20260306_seeded_batch64_kpi_per_item.log`
+- `batch=128`, envgen checkpoint off:
+  - `20260306_seeded_batch128_kpi_per_item.log`
+- `batch=128`, envgen checkpoint on:
+  - `20260306_seeded_batch128_kpi_per_item_envgenckpt.log`
+
+Metrics:
+
+- `batch=64`, envgen checkpoint off:
+  - `batch_wall_excl_compile_s=86.463`
+  - `batch_wall_excl_compile_per_batch_item_s=1.350990`
+  - peak reserved `46.20 GiB`
+  - GPU observer `gpu_util_avg=29.61`
+- `batch=128`, envgen checkpoint off:
+  - immediate OOM under fail-fast at env transition `_batch_affine`
+  - no authoritative batch KPI; excluded from skyline
+- `batch=128`, envgen checkpoint on:
+  - `batch_wall_excl_compile_s=128.773`
+  - `batch_wall_excl_compile_per_batch_item_s=1.006041`
+  - peak reserved `46.17 GiB`
+  - GPU observer `gpu_util_avg=37.08`
+
+Outcome:
+
+- raw batch wall worsens as expected when doubling physical batch:
+  - `86.463 -> 128.773` (`+48.9%`)
+- normalized skyline KPI improves materially:
+  - `1.350990 -> 1.006041` (`-25.5%`, better)
+- GPU utilization also moves in the right direction:
+  - `29.61 -> 37.08` (`+7.47` absolute points, `+25.2%` relative)
+
+Interpretation:
+
+- the blocking memory wall for `batch=128` is still env-transition activation
+  residency, not policy-step compute.
+- envgen checkpoint is throughput-negative at `batch=64`, but becomes
+  throughput-positive under the new skyline regime because it unlocks full
+  `chunk=128` execution and the per-item wall drops substantially.
+- for the `batch=128` regime, skyline should now be maintained on
+  `batch_wall_excl_compile_per_batch_item_s`, not raw
+  `batch_wall_excl_compile_s`.
+
+## Continuation pass (2026-03-07): fused-transition stable-input slots A/B
+
+Goal:
+
+- keep the new `batch=128 / TBPTT=64 / replay_step=1 / fail-fast` mainline
+- attack the env-transition checkpoint path directly
+- remove redundant transition-input copies from the fused dual-generator path
+  before escalating to heavier kernel rewrites
+
+### Code changes
+
+- `ticl/priors/environment_prior.py`
+  - fused transition builders now mark their temporary dual-packed input as
+    checkpoint-stable, so the inner envgen checkpoint no longer clones
+    `x_dual` redundantly.
+  - added optional `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS` path:
+    pre-allocates per-window dual-input slots for fused transition so rollout
+    can skip `torch.cat([x, x])` allocation churn.
+  - added rollout profile fields:
+    - `transition_stable_dual_input_enabled`
+    - `transition_stable_dual_input_call_count`
+- `ticl/train.py`
+  - startup logs, GPU-stage JSON, and wandb payload now surface the new
+    stable-dual-input observability.
+- `ticl/tests/priors/test_environment_prior.py`
+  - added direct semantic regression that compares fused transition on
+    dual-packed input vs the legacy `cat([x, x])` path under checkpoint.
+
+### Important implementation note
+
+- the first stable-slot implementation used one stacked 3D tensor and sliced
+  views per timestep.
+- that is invalid under checkpoint: writing a different slot still increments
+  the shared base tensor version and backward aborts with an in-place version
+  mismatch.
+- the surviving implementation uses a list of independent slot tensors instead.
+
+### Fixed-seed A/B (`batch_wall_excl_compile_s`)
+
+Logs:
+
+- stable slots off:
+  - `20260306_seeded_batch128_stabledualslots_off.log`
+- stable slots on:
+  - `20260307_seeded_batch128_stabledualslots_on_r2.log`
+
+Metrics:
+
+- stable slots off:
+  - `batch_wall_excl_compile_s=142.066`
+  - `batch_wall_excl_compile_per_batch_item_s=1.109893`
+  - `rollout_transition_wall_ms=25554.24`
+  - `gpu_util_avg=36.43`
+- stable slots on:
+  - `batch_wall_excl_compile_s=146.016`
+  - `batch_wall_excl_compile_per_batch_item_s=1.140750`
+  - `rollout_transition_wall_ms=26609.02`
+  - `gpu_util_avg=35.55`
+
+Outcome:
+
+- raw batch wall regressed:
+  - `142.066 -> 146.016` (`+2.78%`)
+- per-item wall also regressed:
+  - `1.109893 -> 1.140750` (`+2.78%`)
+- transition wall itself regressed:
+  - `25554.24 ms -> 26609.02 ms` (`+4.13%`)
+
+Decision:
+
+- keep the redundant inner checkpoint-clone removal in the fused transition
+  path.
+- keep stable-input slots code and observability for future experimentation,
+  but do **not** enable it by default.
+- mainline default is therefore:
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+
+## Continuation pass (2026-03-07): transition inner grouping A/B
+
+Goal:
+
+- keep the `batch=128 / TBPTT=64 / replay_step=1 / fail-fast` mainline
+- test whether the family-group transition kernel is dominated by padding waste
+- split only the inner transition batch, while keeping the outer policy-step
+  batch wide
+
+### Code changes
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_TRANSITION_INNER_GROUPING` with modes:
+    - `family` (current mainline)
+    - `structure` (exact structure buckets)
+    - `pow2`
+    - `pow2_no_depth`
+  - added transition-bucket work proxy and rollout observability:
+    - `transition_family_group_count`
+    - `transition_bucket_max_batch`
+    - `transition_bucket_mean_batch`
+    - `transition_work_fill_ratio`
+  - exact/fused family rollout now allocates CUDA streams after final inner
+    bucket construction, so stream fusion keys off real transition-group count.
+- `ticl/train.py`
+  - startup log, phase log, GPU-stage JSON, and wandb now surface the new
+    transition-bucket observability.
+- `ticl/tests/priors/test_environment_prior.py`
+  - added regressions for:
+    - coarse family mode still using `[3, 1]` inner family buckets
+    - exact structure mode splitting to singleton buckets in the toy test
+    - family vs structure semantic equivalence in deterministic setup
+
+### Fixed-seed batch benchmark
+
+Logs:
+
+- family baseline:
+  - `20260307_seeded_batch128_transition_inner_family.log`
+- exact structure probe:
+  - `20260307_seeded_batch128_transition_inner_structure.log`
+- coarse pow2-no-depth probe:
+  - `20260307_seeded_batch128_transition_inner_pow2nodepth.log`
+- offline grouping diagnostic:
+  - `20260307_transition_inner_grouping_diagnostic.txt`
+
+Metrics:
+
+- family baseline:
+  - `batch_wall_excl_compile_s=133.713`
+  - `batch_wall_excl_compile_per_batch_item_s=1.044631`
+  - `rollout_transition_wall_ms=15932.39`
+- exact structure:
+  - did not finish before manual termination
+  - lower bound at termination: `>252s` wall (`>1.88x` slower than family)
+- pow2_no_depth:
+  - did not finish before manual termination
+  - lower bound at termination: `>202s` wall (`>2.38x` slower than the
+    84.54s family epoch wall)
+
+Offline sampled-hypers diagnostic (`batch=128`, seed `42`):
+
+- family:
+  - `group_count=2`
+  - `max_batch=66`
+  - `fill_ratio=0.0945`
+- exact structure:
+  - `group_count=128`
+  - `max_batch=1`
+  - `singletons=128`
+  - `fill_ratio=0.8986`
+- pow2_no_depth:
+  - `group_count=53`
+  - `max_batch=16`
+  - `singletons=33`
+  - `fill_ratio=0.4724`
+- pow2:
+  - `group_count=74`
+  - `max_batch=16`
+  - `singletons=55`
+  - `fill_ratio=0.7461`
+
+Outcome:
+
+- the diagnosis is real: family grouping wastes most transition compute on
+  padding (`fill_ratio ~= 9.45%`).
+- but naive inner bucketing is still a net loss, because launch/sync overhead
+  dominates once the family group fractures into dozens of tiny buckets.
+- the profitable next step is therefore **not** finer grouping; it is to
+  rewrite the fused transition kernel so it stops padding the state/reward dual
+  path internally.
+
+Decision:
+
+- keep the observability and bucket-mode code for future experiments.
+- keep mainline default on:
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+- do **not** commit/push, because this pass did not produce a new positive
+  skyline.
+
+### Extra hybrid probe (2026-03-07)
+
+- added `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET` so only sufficiently large
+  inner buckets are kept and the rest merge back into the family group.
+- tested `pow2_no_depth + min_bucket=2`.
+- result:
+  - `20260307_seeded_batch128_transition_inner_pow2nodepth_min2.log`
+  - timed out at `240s` without reaching a phase line
+  - offline proxy for the same seed/config:
+    - `group_count=22`
+    - `max_batch=19`
+    - `fill_ratio=0.3093`
+- conclusion:
+  - even after merging the tiny buckets back, two-digit inner group counts are
+    still too expensive for the current implementation.
+  - the transition-grouping branch is exhausted enough to stop here.
+
+## Continuation pass (2026-03-07): Triton ragged batched affine prototype for envgen
+
+Goal:
+
+- stay on the same `batch=128 / TBPTT=64 / replay_step=1 / fail-fast` mainline
+- replace the envgen hetero-batch padded `bmm` path with a ragged batched
+  affine prototype
+- check the result with fixed-seed A/B on `batch_wall_excl_compile_s`
+- explicitly rule out Triton first-compile pollution before judging the KPI
+
+### Code changes
+
+- `ticl/priors/environment_prior.py`
+  - added CUDA-only Triton ragged batched affine kernels plus custom autograd
+    for `grad_x`
+  - hetero SCM builder now precomputes per-layer active input indices and can
+    dispatch each affine through the ragged path
+  - hetero GP builder now does the same for both the input-to-feature and
+    feature-to-output affine stages
+  - the path is opt-in behind:
+    - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=1`
+- `ticl/train.py`
+  - startup log now prints `Policy envgen ragged affine`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added CUDA semantic regression comparing dense vs ragged hetero envgen
+    forward/backward for both `scm` and `gp`
+
+### Validation
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `ragged_affine_matches_dense_hetero_batch_semantics`
+  - `fused_transition_dual_packed_matches_cat_semantics`
+  - `transition_min_bucket_merges_small_buckets_back_to_family`
+
+### Fixed-seed A/B (`batch_wall_excl_compile_s`)
+
+Command notes:
+
+- explicit control of the previous memory confounder:
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+- other runtime knobs held constant between runs:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+
+Logs:
+
+- control (`ragged=off`):
+  - `20260307_seeded_batch128_ragged_affine_off.log`
+- prototype first run (`ragged=on`):
+  - `20260307_seeded_batch128_ragged_affine_on.log`
+- prototype warm-cache rerun (`ragged=on`):
+  - `20260307_seeded_batch128_ragged_affine_on_warm.log`
+
+Metrics:
+
+- control (`ragged=off`):
+  - `batch_wall_excl_compile_s=130.739`
+  - `batch_wall_excl_compile_per_batch_item_s=1.021402`
+  - `gpu_util_avg=38.31`
+  - peak alloc/reserved: `36.18 / 46.17 GiB`
+- prototype first run (`ragged=on`):
+  - `batch_wall_excl_compile_s=136.732`
+  - `batch_wall_excl_compile_per_batch_item_s=1.068215`
+  - `gpu_util_avg=28.55`
+  - peak alloc/reserved: `35.30 / 46.15 GiB`
+- prototype warm-cache rerun (`ragged=on`):
+  - `batch_wall_excl_compile_s=137.105`
+  - `batch_wall_excl_compile_per_batch_item_s=1.071130`
+  - `gpu_util_avg=29.12`
+  - peak alloc/reserved: `35.30 / 46.15 GiB`
+
+Outcome:
+
+- first run vs control:
+  - `130.739 -> 136.732` (`+4.59%`, worse)
+- warm-cache rerun vs control:
+  - `130.739 -> 137.105` (`+4.87%`, worse)
+- per-item wall also regressed:
+  - `1.021402 -> 1.071130` (`+4.87%`, worse)
+- GPU utilization regressed materially:
+  - `38.31 -> 29.12` (`-9.19` absolute points)
+- peak allocated memory dropped slightly:
+  - `36.18 -> 35.30 GiB`
+- reserved memory stayed flat:
+  - `46.17 -> 46.15 GiB`
+
+Interpretation:
+
+- this prototype did not produce a positive skyline.
+- the warm-cache rerun stayed slightly worse than the first run, so the
+  regression is **not** explained by Triton first-compile pollution.
+- the prototype saves a small amount of live allocation, but loses too much on
+  kernel efficiency / occupancy to recover it as wall-time gain.
+
+Decision:
+
+- keep the ragged affine prototype code and semantic test for future kernel
+  work, but keep it disabled by default:
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+- do **not** commit/push, because this pass did not produce a new skyline.
+
+## Continuation pass (2026-03-07): family-specialized paired transition generator
+
+Goal:
+
+- stay on the transition mainline
+- stop using `cat([x, x])` / doubled batch inside fused transition
+- replace the legacy dual-batch transition builder with a family-specialized
+  paired path that keeps state/reward branches separate while preserving
+  legacy fixed-seed semantics
+
+### Code changes
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_FUSED_TRANSITION_PAIRED`
+  - added SCM paired transition branch builder with joint per-layer sampling so
+    state/reward weights are sampled in the exact same order as the legacy
+    dual-batch builder
+  - added GP paired transition branch builder with the same sampling-order
+    preservation
+  - added paired transition wrapper that:
+    - preserves legacy dual noise-generator advancement
+    - supports both regular input and `x_is_dual_packed=True`
+    - uses a shared checkpoint snapshot when the rollout input buffer is reused
+  - stable dual-input slots now auto-disable when the transition generator does
+    not prefer dual-packed inputs
+- `ticl/train.py`
+  - startup log now prints `Policy fused transition paired-specialized`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added strict-seed regression comparing legacy dual vs paired-specialized
+    transition for both `scm` and `gp`, including dual-packed input
+
+### Validation
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `paired_transition_matches_legacy_dual_semantics`
+  - `fused_transition_dual_packed_matches_cat_semantics`
+  - `ragged_affine_matches_dense_hetero_batch_semantics`
+
+### Fixed-seed A/B (`batch_wall_excl_compile_s`)
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0/1`
+
+Logs:
+
+- legacy dual baseline:
+  - `20260307_seeded_batch128_paired_transition_off.log`
+- paired-specialized:
+  - `20260307_seeded_batch128_paired_transition_on.log`
+
+Metrics:
+
+- legacy dual baseline:
+  - `batch_wall_excl_compile_s=133.025`
+  - `batch_wall_excl_compile_per_batch_item_s=1.039260`
+  - `gpu_util_avg=36.96`
+  - peak alloc/reserved: `36.18 / 46.17 GiB`
+- paired-specialized:
+  - `batch_wall_excl_compile_s=189.702`
+  - `batch_wall_excl_compile_per_batch_item_s=1.482049`
+  - `gpu_util_avg=29.27`
+  - peak alloc/reserved: `34.99 / 46.09 GiB`
+
+Outcome:
+
+- raw batch wall regressed severely:
+  - `133.025 -> 189.702` (`+42.61%`, worse)
+- per-item wall also regressed:
+  - `1.039260 -> 1.482049` (`+42.61%`, worse)
+- GPU utilization dropped:
+  - `36.96 -> 29.27` (`-7.69` absolute points)
+- peak allocated memory improved modestly:
+  - `36.18 -> 34.99 GiB`
+- reserved memory remained effectively flat:
+  - `46.17 -> 46.09 GiB`
+
+Interpretation:
+
+- removing doubled-batch padding alone is not enough.
+- the paired-specialized path cut some activation footprint, but replacing one
+  fused transition call with two checkpointed branch executions destroyed
+  occupancy and increased rollout/backward time sharply.
+- this is strong evidence that the current dominant bottleneck is not just
+  padded math volume; it is also the launch/recompute structure of the fused
+  transition path.
+
+Offline sampled-hypers diagnostic (`batch=128`, seed `42`):
+
+- `gp` family (`66` samples):
+  - padded work shares:
+    - input/RFF stage: `72.87%`
+    - final/output stage: `27.13%`
+  - fill ratios:
+    - input/RFF stage: `32.95%`
+    - final/output stage: `14.44%`
+  - reward branch contribution inside actual final-stage work is tiny:
+    - `0.53%`
+- `scm` family (`62` samples):
+  - padded work shares:
+    - input stage: `11.66%`
+    - hidden stack: `83.92%`
+    - final stage: `4.42%`
+  - fill ratios:
+    - input stage: `23.23%`
+    - hidden stack: `1.77%`
+    - final stage: `17.26%`
+  - reward branch contribution inside actual final-stage work is tiny:
+    - `0.15%`
+
+Implication:
+
+- for `scm`, the next profitable kernel target is the hidden stack, not the
+  final reward head.
+- for `gp`, the next target is the input/RFF projection path first, then the
+  final projection.
+
+Decision:
+
+- keep the paired-specialized code and tests for further kernel work, but keep
+  it disabled by default:
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+- do **not** commit/push, because this pass did not produce a new skyline.
+
+## 2026-03-07 07:49: SCM hidden-stack branch-fused prototype
+
+Goal:
+
+- stay on the transition mainline and replace the dominant `scm` hidden-stack
+  padded path with a single-graph branch-fused kernel, instead of expanding the
+  generic ragged path or revisiting grouping.
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED`
+  - added `_build_scm_hetero_hidden_fused_transition_fn(...)`
+  - wired `scm` hetero transition batching to prefer the hidden-fused path when
+    enabled, ahead of the legacy dual path
+- `ticl/train.py`
+  - startup log now prints `Policy fused transition SCM hidden-fused`
+- `ticl/tests/priors/test_environment_prior.py`
+  - added strict-seed regression:
+    - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+  - `paired_transition_matches_legacy_dual_semantics`
+  - `fused_transition_dual_packed_matches_cat_semantics`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=0/1`
+
+Logs:
+
+- hidden-fused disabled:
+  - `20260307_seeded_batch128_scmhiddenfused_off.log`
+- hidden-fused enabled:
+  - `20260307_seeded_batch128_scmhiddenfused_on.log`
+
+Metrics:
+
+- hidden-fused disabled:
+  - `batch_wall_excl_compile_s=136.994`
+  - `batch_wall_excl_compile_per_batch_item_s=1.070267`
+  - `gpu_util_avg=36.86`
+  - `rollout_s=86.245`
+  - `backward_s=50.749`
+- hidden-fused enabled:
+  - `batch_wall_excl_compile_s=155.141`
+  - `batch_wall_excl_compile_per_batch_item_s=1.212040`
+  - `gpu_util_avg=45.84`
+  - `rollout_s=97.773`
+  - `backward_s=57.368`
+
+Outcome:
+
+- raw batch wall regressed:
+  - `136.994 -> 155.141` (`+13.25%`, worse)
+- per-item wall also regressed:
+  - `1.070267 -> 1.212040` (`+13.25%`, worse)
+- GPU utilization increased:
+  - `36.86 -> 45.84` (`+8.98` absolute points)
+- both rollout and backward got slower:
+  - rollout: `86.245 -> 97.773`
+  - backward: `50.749 -> 57.368`
+
+Interpretation:
+
+- this is still not a skyline, so do **not** enable it by default.
+- however, it is materially better than the earlier paired-specialized split
+  branch path:
+  - paired-specialized: `189.702`
+  - hidden-fused: `155.141`
+- this confirms the mainline diagnosis:
+  - splitting state/reward into separate checkpointed branches is a major
+    throughput mistake
+  - moving more work back into one fused graph recovers a large fraction of the
+    loss
+- the remaining regression means the hidden-stack bottleneck is not solved by a
+  simple block-diagonal fusion of the existing dense path:
+  - occupancy went up, but padded math / memory traffic still dominates enough
+    to lose on wall time
+  - first-layer split plus dense block-diagonal hidden layers is still too much
+    redundant work
+
+Decision:
+
+- keep the SCM hidden-fused code and tests, but keep it disabled by default:
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=0`
+- do **not** commit/push, because this pass did not produce a new skyline.
+
+Next bottlenecks:
+
+- highest priority:
+  - replace the `scm` hidden stack with a true branch-fused kernel that avoids
+    dense block-diagonal padded matmul
+- second priority:
+  - target the `gp` input/RFF projection path, which is still the dominant `gp`
+    padded-work share
+- de-prioritized:
+  - outer/inner grouping tweaks
+  - generic ragged affine expansion
+  - split-branch paired transition paths
+
+## 2026-03-07 08:08: SCM hidden-stack packed no-padding fused kernel
+
+Goal:
+
+- continue the same `scm` hidden-stack mainline by replacing the dense
+  block-diagonal hidden stack with a packed `2B` branch batch and a specialized
+  prefix-ragged affine kernel.
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - added Triton prefix-tiled affine kernels and autograd wrapper for
+    prefix-only hidden layers
+  - added `_build_active_tile_map(...)`
+  - added `_batch_affine_prefix_tiled(...)`
+  - rewrote `_build_scm_hetero_hidden_fused_transition_fn(...)` so that:
+    - the first state/reward projection stays separate to preserve strict-seed
+      sampling order
+    - hidden/final/post layers are packed as a single `2B` branch batch
+    - each layer uses its own `(max_in, max_out)` cap instead of a global
+      `state_hidden_cap + reward_hidden_cap` work tensor
+    - hidden stack execution uses the new prefix-ragged path instead of dense
+      block-diagonal `_batch_affine`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+  - `paired_transition_matches_legacy_dual_semantics`
+  - `fused_transition_dual_packed_matches_cat_semantics`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=0/1`
+
+Logs:
+
+- hidden-fused disabled:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_off.log`
+- hidden-fused enabled, cold:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_on.log`
+- hidden-fused enabled, warm rerun:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_on_warm.log`
+
+Metrics:
+
+- hidden-fused disabled:
+  - `batch_wall_excl_compile_s=132.729`
+  - `batch_wall_excl_compile_per_batch_item_s=1.036947`
+  - `gpu_util_avg=37.07`
+  - `rollout_s=83.440`
+  - `backward_s=49.290`
+- hidden-fused enabled, cold:
+  - `batch_wall_excl_compile_s=136.789`
+  - `batch_wall_excl_compile_per_batch_item_s=1.068666`
+  - `gpu_util_avg=30.41`
+  - `rollout_s=86.960`
+  - `backward_s=49.829`
+- hidden-fused enabled, warm:
+  - `batch_wall_excl_compile_s=133.683`
+  - `batch_wall_excl_compile_per_batch_item_s=1.044399`
+  - `gpu_util_avg=29.17`
+  - `rollout_s=85.194`
+  - `backward_s=48.489`
+
+Outcome:
+
+- cold run still regressed:
+  - `132.729 -> 136.789` (`+3.06%`, worse)
+- warm rerun removed most of the first-run penalty:
+  - `136.789 -> 133.683` (`-2.27%` vs cold)
+- after warm rerun it is still not a skyline:
+  - `132.729 -> 133.683` (`+0.72%`, still worse)
+
+Interpretation:
+
+- the packed `2B` hidden-stack rewrite is a large step forward relative to the
+  earlier dense block-diagonal hidden-fused path:
+  - old hidden-fused: `155.141`
+  - packed hidden-fused warm: `133.683`
+- this validates the mainline direction:
+  - layer-local caps and packed branch execution remove most of the previous
+    hidden-stack waste
+  - the remaining delta is small enough that Triton first-run cost mattered,
+    so warm rerun was necessary
+- the remaining regression is concentrated in rollout forward time:
+  - rollout: `83.440 -> 85.194` (`+1.754s`)
+  - backward: `49.290 -> 48.489` (`-0.801s`)
+- this means the current packed prefix kernel already helps backward graph
+  pressure slightly, but its forward path still loses to the legacy dense
+  cuBLAS/bmm path on the realized shapes.
+
+Decision:
+
+- keep the packed SCM hidden-fused path in tree, but keep it disabled by
+  default:
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=0`
+- do **not** commit/push, because this pass still did not produce a new
+  skyline.
+
+Updated bottlenecks:
+
+- highest priority:
+  - reduce forward launch/dispatch overhead inside the packed `scm` hidden
+    stack, because backward is now roughly neutral-to-better while rollout
+    forward remains slower
+- second priority:
+  - revisit the `scm` first projection only after the hidden forward kernel is
+    cheaper; it is now the most likely remaining serial overhead inside this
+    path
+- third priority:
+  - `gp` input/RFF projection remains the next family-level hotspot after `scm`
+
+## 2026-03-07 08:32: SCM hidden-stack packed forward fusion skyline
+
+Goal:
+
+- continue only on the `scm` hidden-stack forward path and reduce packed-path
+  forward launch/dispatch overhead without returning to split branches or
+  grouping experiments.
+
+Code:
+
+- `ticl/priors/environment_prior.py`
+  - tightened Triton ragged loops to sample-local `in_size/out_size`
+  - fused packed hidden-layer `affine + activation` into the prefix-tiled
+    kernel path
+  - extended prefix-tiled autograd to apply row-wise activation codes and
+    handle their backward
+- `ticl/fit_model.py`
+  - default-enabled `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=1` for
+    `python -m ticl.fit_model rlpfn`
+
+Validation:
+
+- `conda run -n rlpfn python -m py_compile ...` passed
+- targeted pytest passed:
+  - `scm_hidden_fused_transition_matches_legacy_dual_semantics`
+
+Fixed-seed A/B (`batch_wall_excl_compile_s`):
+
+Command notes:
+
+- held constant:
+  - `TICL_POLICY_ENVGEN_CHECKPOINT=1`
+  - `TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT=0`
+  - `TICL_POLICY_ENVGEN_RAGGED_AFFINE=0`
+  - `TICL_POLICY_FUSED_TRANSITION_STABLE_INPUT_SLOTS=0`
+  - `TICL_POLICY_FUSED_TRANSITION_PAIRED=0`
+  - `TICL_POLICY_TRANSITION_INNER_GROUPING=family`
+  - `TICL_POLICY_TRANSITION_INNER_MIN_BUCKET=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_AUTO=0`
+  - `TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS=1`
+  - `--seed-everything True -E 1 -n 1 -b 128`
+  - `--pg-tbptt-window 64 --pg-env-replay-steps 1`
+- only changed:
+  - `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=0/1`
+
+Logs:
+
+- hidden-fused disabled, sequential confirm:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_fuseact_off_seq.log`
+- hidden-fused enabled, cold:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_fuseact_on.log`
+- hidden-fused enabled, sequential confirm:
+  - `20260307_seeded_batch128_scmhiddenfused_packed_fuseact_on_seq.log`
+
+Metrics:
+
+- hidden-fused disabled, sequential confirm:
+  - `batch_wall_excl_compile_s=134.733`
+  - `batch_wall_excl_compile_per_batch_item_s=1.052605`
+  - `rollout_s=84.830`
+  - `backward_s=49.903`
+  - `gpu_util_avg=36.12`
+- hidden-fused enabled, cold:
+  - `batch_wall_excl_compile_s=120.653`
+  - `batch_wall_excl_compile_per_batch_item_s=0.942600`
+  - `rollout_s=76.247`
+  - `backward_s=44.406`
+  - `gpu_util_avg=31.49`
+- hidden-fused enabled, sequential confirm:
+  - `batch_wall_excl_compile_s=121.483`
+  - `batch_wall_excl_compile_per_batch_item_s=0.949090`
+  - `rollout_s=76.453`
+  - `backward_s=45.031`
+  - `gpu_util_avg=31.50`
+
+Outcome:
+
+- new skyline confirmed on sequential A/B:
+  - `134.733 -> 121.483` (`-9.83%`, better)
+- per-item KPI improved equally:
+  - `1.052605 -> 0.949090` (`-9.83%`, better)
+- rollout and backward both improved materially:
+  - rollout: `84.830 -> 76.453` (`-9.88%`)
+  - backward: `49.903 -> 45.031` (`-9.76%`)
+
+Interpretation:
+
+- the earlier packed path was still losing mainly on forward launch overhead.
+- two changes together crossed the line:
+  - stop scanning masked `k/o` tiles beyond each sample's true size
+  - fuse packed hidden-layer activation into the affine kernel path
+- this is strong evidence that the remaining `scm` hidden-stack bottleneck was
+  not the math graph structure anymore; it was the residual forward launch and
+  masked-tile overhead inside the packed kernel.
+- note:
+  - a parallel confirmation attempt caused mutual OOM between two concurrent
+    benchmark processes on the same GPU; those logs are diagnostic only and
+    should not be used for skyline judgment
+
+Decision:
+
+- keep `TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED=1` as the default for
+  `python -m ticl.fit_model rlpfn`
+- commit/push this skyline
+
+Next bottlenecks:
+
+- highest priority after this skyline:
+  - keep focus on `scm`, but only if a new forward-only hotspot emerges inside
+    the first projection or adjacent policy path
+- next family-level target:
+  - `gp` input/RFF projection
