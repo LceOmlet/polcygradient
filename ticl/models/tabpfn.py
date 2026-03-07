@@ -510,20 +510,14 @@ class TabPFN(nn.Module):
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
 
-        assume_finite_policy_inputs_env = str(os.environ.get("TICL_POLICY_ASSUME_FINITE_INPUTS", "0")).strip().lower()
-        assume_finite_policy_inputs = assume_finite_policy_inputs_env not in {"0", "false", "no", "off"}
-        if assume_finite_policy_inputs:
-            obs_src = obs_t
-            action_src = action_t
+        if bool(getattr(obs_encoder, "replace_nan_by_zero", False)):
+            obs_src = torch.nan_to_num(obs_t, nan=0.0)
         else:
-            if bool(getattr(obs_encoder, "replace_nan_by_zero", False)):
-                obs_src = torch.nan_to_num(obs_t, nan=0.0)
-            else:
-                obs_src = obs_t
-            if bool(getattr(action_encoder, "replace_nan_by_zero", False)):
-                action_src = torch.nan_to_num(action_t, nan=0.0)
-            else:
-                action_src = action_t
+            obs_src = obs_t
+        if bool(getattr(action_encoder, "replace_nan_by_zero", False)):
+            action_src = torch.nan_to_num(action_t, nan=0.0)
+        else:
+            action_src = action_t
 
         if _SPLIT_ENCODE_FUSION_ENABLED:
             fused_inputs = []

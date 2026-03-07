@@ -5909,8 +5909,6 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print("Policy step projection 2D fastpath:", bool(step_proj_2d_on))
             step_layer_2d_on = _env_flag_enabled("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")
             print("Policy step layer 2D loop:", bool(step_layer_2d_on))
-            inplace_flash_prefix_on = _env_flag_enabled("TICL_POLICY_INPLACE_FLASH_PREFIX", "0")
-            print("Policy inplace flash-prefix:", bool(inplace_flash_prefix_on))
             try:
                 inplace_paged_page_size_print = int(max(0, int(os.environ.get("TICL_POLICY_INPLACE_PAGED_PAGE_SIZE", "0"))))
             except Exception:
@@ -5922,10 +5920,6 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             print("Policy token layout prepack:", bool(token_layout_prepack_on))
             cache_container_reuse_on = _env_flag_enabled("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")
             print("Policy cache container reuse:", bool(cache_container_reuse_on))
-            state_postprocess_inplace_on = _env_flag_enabled("TICL_POLICY_STATE_POSTPROCESS_INPLACE", "0")
-            print("Policy state postprocess inplace:", bool(state_postprocess_inplace_on))
-            reward_mask_buf_reuse_on = _env_flag_enabled("TICL_POLICY_REWARD_MASK_BUFFER_REUSE", "0")
-            print("Policy reward-mask buffer reuse:", bool(reward_mask_buf_reuse_on))
             policy_autocast_dtype = _resolve_policy_autocast_dtype(device)
             if policy_autocast_dtype is not None:
                 if policy_autocast_dtype == torch.float16:

@@ -26,6 +26,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_autotune"] is False
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
+    assert cfg["dataloader"]["batch_size"] == 256
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False
@@ -51,10 +52,11 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["train_kernel_profiler_with_flops"] is False
     assert cfg["optimizer"]["train_kernel_profiler_log_every_batches"] == 0
     assert cfg["optimizer"]["pg_tbptt_window"] == 64
-    assert cfg["optimizer"]["pg_env_replay_steps"] == 8
+    assert cfg["optimizer"]["pg_env_replay_steps"] == 1
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
+    assert cfg["optimizer"]["pg_oom_fail_fast"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
-    assert cfg["prior"]["environment"]["lipschitz_enforce"] is True
+    assert cfg["prior"]["environment"]["lipschitz_enforce"] is False
     assert cfg["prior"]["environment"]["lipschitz_weight_fro_norm_max"] == 1.0
     assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 

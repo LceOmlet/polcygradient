@@ -237,10 +237,6 @@ class TransformerEncoderLayer(Module):
         # When >0 and prefix exists, route small mutable tail to one dense SDPA
         # to cut flash-prefix dual-dispatch launch overhead.
         self.flash_prefix_tail_dense_max_tokens = int(max(0, flash_prefix_tail_dense_tokens_env))
-        inplace_flash_prefix_env = str(
-            os.environ.get("TICL_POLICY_INPLACE_FLASH_PREFIX", "0")
-        ).strip().lower()
-        self.inplace_flash_prefix = inplace_flash_prefix_env in {"1", "true", "yes", "on"}
         inplace_clone_prefix_env = str(
             os.environ.get("TICL_POLICY_INPLACE_CLONE_PREFIX", "0")
         ).strip().lower()
@@ -1092,10 +1088,7 @@ class TransformerEncoderLayer(Module):
                 torch.is_grad_enabled()
                 and attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
-                and (
-                    (not bool(clone_kv_for_grad))
-                    or bool(self.inplace_flash_prefix)
-                )
+                and (not bool(clone_kv_for_grad))
             ):
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
@@ -1127,10 +1120,7 @@ class TransformerEncoderLayer(Module):
             if (
                 attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
-                and (
-                    (not bool(clone_kv_for_grad))
-                    or bool(self.inplace_flash_prefix)
-                )
+                and (not bool(clone_kv_for_grad))
             ):
                 tail_dense_cap = int(max(0, self.flash_prefix_tail_dense_max_tokens))
                 if (

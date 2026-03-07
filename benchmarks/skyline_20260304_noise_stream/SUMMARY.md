@@ -4137,3 +4137,67 @@ Interpretation:
   mainline regime
 - this is a scaling observation, not a replacement of the maintained batch-128
   skyline
+
+## 2026-03-07 batch-256 default adoption + falsified micro-probe cleanup
+
+Goal:
+
+- make the maintained `rlpfn` mainline use the proven `batch=256` regime by
+  default
+- remove already-falsified micro-probe branches that were still increasing code
+  complexity around the rollout hot path
+- keep semantics, throughput, and memory behavior aligned with the retained
+  mainline path
+
+Code:
+
+- `ticl/model_configs.py`
+  - `get_rlpfn_default_config()` now sets `dataloader.batch_size = 256`
+- removed falsified / non-maintained branches:
+  - `TICL_POLICY_STATE_POSTPROCESS_INPLACE`
+  - `TICL_POLICY_REWARD_MASK_BUFFER_REUSE`
+  - `TICL_POLICY_INPLACE_FLASH_PREFIX`
+  - `TICL_POLICY_ASSUME_FINITE_INPUTS`
+- corresponding startup/fit-model guard entries were removed so these old probe
+  knobs no longer pollute later A/B work
+- added config regression coverage:
+  - `ticl/tests/test_rlpfn_split_encoder.py` now asserts `batch_size == 256`
+
+Rationale:
+
+- these removed paths were already documented as rejected or outside the
+  maintained skyline
+- keeping them in tree only added inactive branching and extra env-surface
+  area, making later diagnosis noisier
+- the kept code path after cleanup is exactly the previous default-off/mainline
+  behavior
+
+Validation:
+
+- `python -m py_compile ticl/model_configs.py ticl/fit_model.py ticl/train.py ticl/models/layer.py ticl/models/tabpfn.py ticl/priors/environment_prior.py`
+  passed
+- targeted semantics tests passed:
+  - `pytest -q ticl/tests/priors/test_environment_prior.py -k "state_highway_postprocess_toggle_semantics or state_highway_enabled_rollout_smoke"`
+  - `pytest -q ticl/tests/models/test_tabpfn_kv_cache.py -k "tbptt_detach_prefix_compaction_preserves_paged_cache_semantics or forward_policy_step_finalize_default_eager_fastpath_preserves_semantics"`
+- default batch-256 fixed-seed mainline check (no `-b` CLI override):
+  - log: `20260307_seeded_batch256_default_after_cleanup.log`
+  - phase line:
+    - `batch_size=256`
+    - `batch_wall_excl_compile_s=130.202`
+    - `batch_wall_excl_compile_per_batch_item_s=0.508601`
+    - `rollout_s=82.208`
+    - `backward_s=47.994`
+  - epoch wallclock:
+    - `82.35s`
+    - normalized `82.35 / 256 = 0.321680 s`
+  - peak alloc/reserved:
+    - `24.32 / 29.41 GiB`
+
+Interpretation:
+
+- the default batch-size switch to 256 is effective and remains runnable on the
+  documented mainline
+- after removing the falsified micro-probes, throughput and memory stay in the
+  same regime as the earlier batch-256 scaling check
+- this pass improves code quality and reduces future profiling noise without
+  introducing a new negative memory or throughput symptom

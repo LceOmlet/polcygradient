@@ -20,25 +20,6 @@ except Exception:  # pragma: no cover - optional CUDA path
 from ticl.distributions import parse_distributions, sample_distributions
 from ticl.utils import default_device
 
-_STATE_POSTPROCESS_INPLACE_ENV = str(
-    os.environ.get("TICL_POLICY_STATE_POSTPROCESS_INPLACE", "0")
-).strip().lower()
-_STATE_POSTPROCESS_INPLACE = _STATE_POSTPROCESS_INPLACE_ENV not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-_REWARD_MASK_BUFFER_REUSE_ENV = str(
-    os.environ.get("TICL_POLICY_REWARD_MASK_BUFFER_REUSE", "0")
-).strip().lower()
-_REWARD_MASK_BUFFER_REUSE = _REWARD_MASK_BUFFER_REUSE_ENV not in {
-    "0",
-    "false",
-    "no",
-    "off",
-}
-
 
 if triton is not None:
 
@@ -1395,14 +1376,8 @@ class EnvironmentPrior:
         if clip.ndim == state_next_raw.ndim - 1:
             clip = clip.unsqueeze(-1)
 
-        state_bounded = state_next_raw
-        if _STATE_POSTPROCESS_INPLACE:
-            # Hot-path in-place postprocess to cut per-step temporary allocations.
-            state_bounded.clamp_(min=-clip, max=clip)
-            state_bounded.tanh_()
-        else:
-            state_bounded = torch.maximum(torch.minimum(state_next_raw, clip), -clip)
-            state_bounded = torch.tanh(state_bounded)
+        state_bounded = torch.maximum(torch.minimum(state_next_raw, clip), -clip)
+        state_bounded = torch.tanh(state_bounded)
 
         enabled = EnvironmentPrior._coerce_bool(state_highway_enabled)
         if torch.is_tensor(enabled):
@@ -6272,12 +6247,6 @@ class EnvironmentPrior:
         env_obs_start = state_dim
         env_action_start = state_dim + obs_dim
         env_noise_start = env_action_start + action_dim
-        reward_mask_next_buf = (
-            torch.empty((batch_size,), device=device, dtype=torch.float32)
-            if _REWARD_MASK_BUFFER_REUSE
-            else None
-        )
-
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -6315,10 +6284,7 @@ class EnvironmentPrior:
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
             )
-            if reward_mask_next_buf is None:
-                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
-            else:
-                reward_mask_next = reward_mask_next_buf.fill_(1.0)
+            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if dropout_draws is not None:
                 drop_mask = dropout_active & (dropout_draws[t] < env["reward_dropout_ratio"])
@@ -6779,12 +6745,6 @@ class EnvironmentPrior:
         env_obs_start = state_dim
         env_action_start = state_dim + obs_dim
         env_noise_start = env_action_start + action_dim
-        reward_mask_next_buf = (
-            torch.empty((batch_size,), device=device, dtype=torch.float32)
-            if _REWARD_MASK_BUFFER_REUSE
-            else None
-        )
-
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             if collect_x:
@@ -6909,10 +6869,7 @@ class EnvironmentPrior:
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
             )
-            if reward_mask_next_buf is None:
-                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
-            else:
-                reward_mask_next = reward_mask_next_buf.fill_(1.0)
+            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             dropout_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             dropout_timed = False
@@ -7936,12 +7893,6 @@ class EnvironmentPrior:
                     token_action_src_cols = token_action_assign[:, 1]
                     token_action_dst_cols = token_action_cols[token_action_valid]
 
-        reward_mask_next_buf = (
-            torch.empty((batch_size,), device=device, dtype=torch.float32)
-            if _REWARD_MASK_BUFFER_REUSE
-            else None
-        )
-
         def _accumulate_gp_projection_profile(fn_obj):
             nonlocal transition_gp_first_projection_wall_s
             nonlocal transition_gp_second_projection_wall_s
@@ -8131,10 +8082,7 @@ class EnvironmentPrior:
                 transition_noise_wall_s += (time.perf_counter() - noise_timing_t0)
 
             reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
-            if reward_mask_next_buf is None:
-                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
-            else:
-                reward_mask_next = reward_mask_next_buf.fill_(1.0)
+            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
 
             transition_cuda_start = None
@@ -9531,12 +9479,6 @@ class EnvironmentPrior:
         state_noise_std = float(env["state_noise_std"])
         reward_dropout_ratio = float(env["reward_dropout_ratio"])
         reward_impute_zero = bool(env["reward_dropout_impute_zero"])
-        reward_mask_next_buf = (
-            torch.empty((batch_size,), device=device, dtype=torch.float32)
-            if _REWARD_MASK_BUFFER_REUSE
-            else None
-        )
-
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -9578,10 +9520,7 @@ class EnvironmentPrior:
                 for bi, g in enumerate(rollout_generators):
                     reward_next_raw[bi] = reward_scale * env["y_generator"](env_in[bi: bi + 1], generator=g).reshape(())
             reward_next = torch.clamp(reward_next_raw, -reward_clip, reward_clip)
-            if reward_mask_next_buf is None:
-                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
-            else:
-                reward_mask_next = reward_mask_next_buf.fill_(1.0)
+            reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if dropout_draws is not None:
                 drop_mask = dropout_draws[t] < reward_dropout_ratio
