@@ -2622,6 +2622,10 @@ class EnvironmentPrior:
                         generators_for_noise=sub_noise_generators,
                         x_input_is_packed=bool(x_input_is_packed),
                     )
+                    if state_sub.dtype != state_out.dtype or state_sub.device != state_out.device:
+                        state_sub = state_sub.to(device=state_out.device, dtype=state_out.dtype)
+                    if reward_sub.dtype != reward_out.dtype or reward_sub.device != reward_out.device:
+                        reward_sub = reward_sub.to(device=reward_out.device, dtype=reward_out.dtype)
                     state_out[:, : state_sub.shape[1]].index_copy_(0, idx_runtime, state_sub)
                     reward_out.index_copy_(0, idx_runtime, reward_sub)
                 return state_out, reward_out

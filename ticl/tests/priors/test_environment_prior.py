@@ -2823,6 +2823,47 @@ def test_environment_prior_state_grad_clip_norm_clips_per_row_global_norm():
     )
 
 
+def test_environment_prior_reference_scm_partition_aligns_autocast_dtype_before_index_copy():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for reference SCM autocast partition regression")
+
+    _seed_everything(20260311)
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    prior = EnvironmentPrior(cfg)
+    prior.reference_scm_partition_max_bytes = 1
+
+    h_list = prior._sample_batch_hypers(2)
+    for h in h_list:
+        h["family"] = "scm"
+
+    state_dims = torch.tensor([int(h["state_dim"]) for h in h_list], dtype=torch.long)
+    obs_dims = torch.tensor([int(h["obs_dim"]) for h in h_list], dtype=torch.long)
+    action_dims = torch.tensor([int(h["action_dim"]) for h in h_list], dtype=torch.long)
+    noise_dims = torch.tensor([int(h["noise_dim"]) for h in h_list], dtype=torch.long)
+    zero_pad_dims = torch.tensor([int(h["zero_pad_dim"]) for h in h_list], dtype=torch.long)
+    in_dims = state_dims + obs_dims + action_dims + noise_dims + zero_pad_dims
+
+    transition_fn = prior._build_reference_scm_joint_transition_padded_batch_fn(
+        in_dims,
+        state_dims,
+        h_list,
+        device=torch.device("cuda"),
+        generators=None,
+        input_mask=None,
+        _allow_partition=True,
+    )
+
+    x = torch.randn((2, int(in_dims.max().item())), device="cuda", dtype=torch.float32)
+    autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    with torch.autocast(device_type="cuda", dtype=autocast_dtype):
+        state_out, reward_out = transition_fn(x)
+
+    assert state_out.dtype == torch.float32
+    assert reward_out.dtype == torch.float32
+    assert torch.isfinite(state_out).all()
+    assert torch.isfinite(reward_out).all()
+
+
 def test_environment_prior_rollout_applies_action_rms_before_scm_input():
     _seed_everything(20260310)
     cfg = dict(get_prior_config()["prior"]["environment"])
