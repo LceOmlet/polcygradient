@@ -1,6 +1,7 @@
 import torch
 from torch.utils.checkpoint import checkpoint
 
+import ticl.models.layer as layer_mod
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
 from ticl.priors.environment_prior import EnvironmentPrior
@@ -290,6 +291,114 @@ def test_tbptt_detach_prefix_compaction_preserves_paged_cache_semantics():
             compact_k, compact_v = _materialize_kv_from_layer_cache(layer_compact)
             assert torch.allclose(base_k, compact_k, atol=1e-5, rtol=1e-4)
             assert torch.allclose(base_v, compact_v, atol=1e-5, rtol=1e-4)
+
+
+def test_tbptt_detach_prefix_compaction_matches_live_paged_rollout():
+    torch.manual_seed(123)
+    model_live = _build_model()
+    model_detached = _build_model()
+    model_detached.load_state_dict(model_live.state_dict())
+    model_live.train()
+    model_detached.train()
+
+    steps = 12
+    detach_after = 9
+    x_tokens = torch.randn(steps, 2, 12)
+    y_tokens = torch.randn(steps, 2)
+
+    cache_live = None
+    cache_detached = None
+    with torch.enable_grad():
+        for t in range(steps):
+            out_live, cache_live = model_live.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_live,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=1,
+                allow_grad_mutable_cache=True,
+            )
+            out_detached, cache_detached = model_detached.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache_detached,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=1,
+                allow_grad_mutable_cache=True,
+            )
+            assert torch.allclose(out_live, out_detached, atol=1e-5, rtol=1e-4)
+            if t == (detach_after - 1):
+                cache_detached = EnvironmentPrior._detach_policy_cache(cache_detached, clone_tensors=False)
+                for layer_cache in cache_detached:
+                    assert int(layer_cache.get("prefix_base_len", 0)) > 0
+                    assert len(layer_cache["k_pages"]) == 1
+                    assert len(layer_cache["v_pages"]) == 1
+
+        for layer_live, layer_detached in zip(cache_live, cache_detached):
+            live_k, live_v = _materialize_kv_from_layer_cache(layer_live)
+            detached_k, detached_v = _materialize_kv_from_layer_cache(layer_detached)
+            assert torch.allclose(live_k, detached_k, atol=1e-5, rtol=1e-4)
+            assert torch.allclose(live_v, detached_v, atol=1e-5, rtol=1e-4)
+
+
+def test_tbptt_detach_prefix_compaction_matches_live_rollout_with_tail_clone_append():
+    old_enabled = layer_mod._TAIL_FREEZE_CLONE_APPEND_ENABLED
+    old_guard = layer_mod._TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED
+    layer_mod._TAIL_FREEZE_CLONE_APPEND_ENABLED = True
+    layer_mod._TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED = False
+    try:
+        torch.manual_seed(124)
+        model_live = _build_model()
+        model_detached = _build_model()
+        model_detached.load_state_dict(model_live.state_dict())
+        model_live.train()
+        model_detached.train()
+
+        steps = 12
+        detach_after = 9
+        x_tokens = torch.randn(steps, 2, 12)
+        y_tokens = torch.randn(steps, 2)
+
+        cache_live = None
+        cache_detached = None
+        with torch.enable_grad():
+            for t in range(steps):
+                out_live, cache_live = model_live.forward_policy_step(
+                    x_tokens[t: t + 1],
+                    y_tokens[t: t + 1],
+                    kv_cache=cache_live,
+                    max_cache_len=steps,
+                    kv_cache_mode="paged",
+                    kv_cache_page_size=1,
+                    allow_grad_mutable_cache=True,
+                )
+                out_detached, cache_detached = model_detached.forward_policy_step(
+                    x_tokens[t: t + 1],
+                    y_tokens[t: t + 1],
+                    kv_cache=cache_detached,
+                    max_cache_len=steps,
+                    kv_cache_mode="paged",
+                    kv_cache_page_size=1,
+                    allow_grad_mutable_cache=True,
+                )
+                assert torch.allclose(out_live, out_detached, atol=1e-5, rtol=1e-4)
+                if t == (detach_after - 1):
+                    cache_detached = EnvironmentPrior._detach_policy_cache(cache_detached, clone_tensors=False)
+                    for layer_cache in cache_detached:
+                        assert int(layer_cache.get("prefix_base_len", 0)) > 0
+                        assert len(layer_cache["k_pages"]) == 1
+                        assert len(layer_cache["v_pages"]) == 1
+
+            for layer_live, layer_detached in zip(cache_live, cache_detached):
+                live_k, live_v = _materialize_kv_from_layer_cache(layer_live)
+                detached_k, detached_v = _materialize_kv_from_layer_cache(layer_detached)
+                assert torch.allclose(live_k, detached_k, atol=1e-5, rtol=1e-4)
+                assert torch.allclose(live_v, detached_v, atol=1e-5, rtol=1e-4)
+    finally:
+        layer_mod._TAIL_FREEZE_CLONE_APPEND_ENABLED = old_enabled
+        layer_mod._TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED = old_guard
 
 
 def test_forward_policy_step_finalize_compile_preserves_semantics(monkeypatch):

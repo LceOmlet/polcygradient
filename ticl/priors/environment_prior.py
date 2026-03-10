@@ -4277,6 +4277,7 @@ class EnvironmentPrior:
             target_t = target_t.unsqueeze(-1)
         target_t = torch.clamp(target_t, min=float(eps))
         scale = torch.clamp(rms / target_t.squeeze(-1), min=1.0)
+        scale = scale.detach()
         while scale.ndim < state_next.ndim:
             scale = scale.unsqueeze(-1)
         state_scaled = state_next / scale
@@ -4302,6 +4303,7 @@ class EnvironmentPrior:
             while eps_t.ndim < denom.ndim:
                 eps_t = eps_t.unsqueeze(0)
             rms = torch.sqrt(((action_raw * mask_t) ** 2).sum(dim=-1) / denom + eps_t)
+            rms = rms.detach()
             while rms.ndim < action_raw.ndim:
                 rms = rms.unsqueeze(-1)
             action_next = (action_raw / rms) * mask_t
@@ -4469,6 +4471,26 @@ class EnvironmentPrior:
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "no", "off", ""}
         return bool(value)
+
+    @staticmethod
+    def _normalize_policy_objective_kind(policy_objective_kind):
+        objective_kind = str(policy_objective_kind).strip().lower()
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
+            raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
+        return objective_kind
+
+    @staticmethod
+    def _policy_rollout_objective_flags(policy_objective_kind):
+        objective_kind = EnvironmentPrior._normalize_policy_objective_kind(policy_objective_kind)
+        return {
+            "objective_kind": objective_kind,
+            # Future 0th/1th fusion can share this stochastic rollout path.
+            "sample_action": objective_kind in {"first_policy_gradient", "reinforce"},
+            "collect_log_probs": objective_kind == "reinforce",
+            "detach_action_in_env": objective_kind == "reinforce",
+            "first_policy_gradient": objective_kind == "first_policy_gradient",
+            "reinforce": objective_kind == "reinforce",
+        }
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -11486,6 +11508,8 @@ class EnvironmentPrior:
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
         policy_objective_kind="policy_gradient",
+        _policy_collect_log_probs=False,
+        _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
@@ -11574,7 +11598,12 @@ class EnvironmentPrior:
             if collect_runtime_info
             else None
         )
-        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
+        sample_action = bool(objective_flags["sample_action"])
+        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        if collect_log_probs and (not sample_action):
+            raise ValueError("log-prob collection requires stochastic action sampling")
+        detach_action_in_env = bool(objective_flags["detach_action_in_env"])
         tbptt_window_active = False
         tbptt_window_size = n_samples
         if tbptt_window is not None:
@@ -11584,11 +11613,11 @@ class EnvironmentPrior:
                 tbptt_window_size = w
         log_prob_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-            if reinforce_enabled and (not tbptt_window_active)
+            if collect_log_probs and (not tbptt_window_active)
             else None
         )
         tbptt_reward_buffer = [] if tbptt_window_active else None
-        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -11626,7 +11655,7 @@ class EnvironmentPrior:
             and bool(tbptt_reward_sink_supports_aux)
         )
         reinforce_streaming_sink = bool(
-            reinforce_enabled
+            collect_log_probs
             and tbptt_window_active
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
@@ -11924,11 +11953,11 @@ class EnvironmentPrior:
                     _refresh_noise_block(t)
                 noise_block_idx = int(t - noise_block_start)
 
-            if reinforce_enabled:
+            if sample_action:
                 if t < single_eval_pos:
                     action_std_t = env["action_noise_train_std"]
                     if torch.any(action_std_t <= 0):
-                        raise ValueError("reinforce objective requires action_noise_train_std > 0 for every batch item")
+                        raise ValueError("stochastic policy objective requires action_noise_train_std > 0 for every batch item")
                     if strict_seed_mode:
                         action_eps_t = _draw_step_randn_with_optional_generators(
                             action_noise_train_generators,
@@ -11948,7 +11977,7 @@ class EnvironmentPrior:
                 else:
                     action_std_t = env["action_noise_eval_std"]
                     if torch.any(action_std_t <= 0):
-                        raise ValueError("reinforce objective requires action_noise_eval_std > 0 for every batch item")
+                        raise ValueError("stochastic policy objective requires action_noise_eval_std > 0 for every batch item")
                     if strict_seed_mode:
                         action_eps_t = _draw_step_randn_with_optional_generators(
                             action_noise_eval_generators,
@@ -11971,12 +12000,13 @@ class EnvironmentPrior:
                     mode=action_transform_mode,
                     rms_eps=action_rms_eps,
                 )
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    action_std_t,
-                    action=action_next.detach(),
-                )
+                if collect_log_probs:
+                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                        action_pre_tanh.detach(),
+                        action_mean,
+                        action_std_t,
+                        action=action_next.detach(),
+                    )
             else:
                 action_next = self._transform_reinforce_action(
                     action_mean,
@@ -12026,7 +12056,7 @@ class EnvironmentPrior:
             env_in[:, :state_dim] = self._scale_state_env_input(state_t, state_input_scale)
             if env_obs_start is not None:
                 env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
-            action_env = action_next.detach() if reinforce_enabled else action_next
+            action_env = action_next.detach() if detach_action_in_env else action_next
             env_in[:, env_action_start: env_action_start + action_dim] = action_env
             env_in[:, env_noise_start: env_noise_start + noise_dim] = noise_t
 
@@ -12317,7 +12347,7 @@ class EnvironmentPrior:
         }
         self.last_rollout_reinforce = (
             {"log_probs": log_prob_steps}
-            if (reinforce_enabled and log_prob_steps is not None)
+            if (collect_log_probs and log_prob_steps is not None)
             else None
         )
         if aev2_enabled:
@@ -12411,6 +12441,8 @@ class EnvironmentPrior:
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
         policy_objective_kind="policy_gradient",
+        _policy_collect_log_probs=False,
+        _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
@@ -12979,10 +13011,20 @@ class EnvironmentPrior:
             if bool(store_rewards)
             else None
         )
-        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
+        reinforce_enabled = bool(objective_flags["reinforce"])
+        sample_action = bool(objective_flags["sample_action"])
+        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        detach_action_in_env = (
+            bool(objective_flags["detach_action_in_env"])
+            if _policy_detach_action_in_env is None
+            else bool(_policy_detach_action_in_env)
+        )
+        if collect_log_probs and (not sample_action):
+            raise ValueError("log-prob collection requires stochastic action sampling")
         log_prob_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-            if reinforce_enabled and (not tbptt_window_active)
+            if collect_log_probs and (not tbptt_window_active)
             else None
         )
         state_abs_max = (
@@ -13002,7 +13044,7 @@ class EnvironmentPrior:
         )
 
         tbptt_reward_buffer = [] if tbptt_window_active else None
-        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -13040,7 +13082,7 @@ class EnvironmentPrior:
             and bool(tbptt_reward_sink_supports_aux)
         )
         reinforce_streaming_sink = bool(
-            reinforce_enabled
+            collect_log_probs
             and tbptt_window_active
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
@@ -13399,26 +13441,30 @@ class EnvironmentPrior:
                     _refresh_noise_block(t)
                 noise_block_idx = int(t - noise_block_start)
 
-            if reinforce_enabled:
+            if sample_action:
                 if t < single_eval_pos:
                     if torch.any(action_noise_train_std <= 0):
-                        raise ValueError("reinforce objective requires action_noise_train_std > 0 for every batch item")
+                        raise ValueError(
+                            "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
+                        )
                     if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_train_block[noise_block_idx]
                     elif action_noise_train is not None:
                         action_eps_t = action_noise_train[t]
                     else:
-                        raise RuntimeError("reinforce rollout expected pre-sampled action_noise_train")
+                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
                     action_std_t = action_noise_train_std
                 else:
                     if torch.any(action_noise_eval_std <= 0):
-                        raise ValueError("reinforce objective requires action_noise_eval_std > 0 for every batch item")
+                        raise ValueError(
+                            "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
+                        )
                     if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_eval_block[noise_block_idx]
                     elif action_noise_eval is not None:
                         action_eps_t = action_noise_eval[t]
                     else:
-                        raise RuntimeError("reinforce rollout expected pre-sampled action_noise_eval")
+                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
                     action_std_t = action_noise_eval_std
                 action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
                 action_next = self._transform_reinforce_action(
@@ -13551,10 +13597,26 @@ class EnvironmentPrior:
                     stream_transition = None
                 packed_transition_input_enabled = bool(group.get("packed_input_enabled", False))
                 packed_transition_input = None
+                transition_input_grad_active = bool(
+                    torch.is_grad_enabled()
+                    and (
+                        state_in.requires_grad
+                        or obs_in.requires_grad
+                        or action_in.requires_grad
+                        or noise_in.requires_grad
+                    )
+                )
                 if packed_transition_input_enabled:
                     transition_packed_env_input_call_count += 1
-                    packed_transition_input = group["packed_input"]
-                    packed_transition_input.zero_()
+                    if transition_input_grad_active:
+                        # First-order PG keeps the environment path in the graph.
+                        # Reusing the same packed buffer across TBPTT steps turns
+                        # the step-local index_put writes into one shared autograd
+                        # object, which breaks streamed backward in family mode.
+                        packed_transition_input = torch.zeros_like(group["packed_input"])
+                    else:
+                        packed_transition_input = group["packed_input"]
+                        packed_transition_input.zero_()
                     packed_transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
                     packed_obs_rows = group.get("packed_obs_rows", None)
                     if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
@@ -13574,7 +13636,11 @@ class EnvironmentPrior:
                 if packed_transition_input_enabled:
                     transition_input = packed_transition_input
                 else:
-                    env_in = group["env_in"]
+                    env_in = (
+                        torch.zeros_like(group["env_in"])
+                        if transition_input_grad_active
+                        else group["env_in"]
+                    )
                     env_in[:, :state_dim_g] = state_in
                     if env_obs_start is not None:
                         env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
@@ -14172,7 +14238,7 @@ class EnvironmentPrior:
         }
         self.last_rollout_reinforce = (
             {"log_probs": log_prob_steps}
-            if (reinforce_enabled and log_prob_steps is not None)
+            if (collect_log_probs and log_prob_steps is not None)
             else None
         )
         if aev2_enabled:
@@ -14271,6 +14337,8 @@ class EnvironmentPrior:
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
         policy_objective_kind="policy_gradient",
+        _policy_collect_log_probs=False,
+        _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
         num_features = int(num_features)
@@ -14325,7 +14393,17 @@ class EnvironmentPrior:
             if bool(store_rewards)
             else None
         )
-        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
+        reinforce_enabled = bool(objective_flags["reinforce"])
+        sample_action = bool(objective_flags["sample_action"])
+        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        detach_action_in_env = (
+            bool(objective_flags["detach_action_in_env"])
+            if _policy_detach_action_in_env is None
+            else bool(_policy_detach_action_in_env)
+        )
+        if collect_log_probs and (not sample_action):
+            raise ValueError("log-prob collection requires stochastic action sampling")
         state_abs_max = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_values = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_drop_count = 0 if collect_runtime_info else None
@@ -14338,11 +14416,11 @@ class EnvironmentPrior:
                 tbptt_window_size = w
         log_prob_steps = (
             torch.empty((n_samples,), device=device, dtype=state_t.dtype)
-            if reinforce_enabled and (not tbptt_window_active)
+            if collect_log_probs and (not tbptt_window_active)
             else None
         )
         tbptt_reward_buffer = [] if tbptt_window_active else None
-        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -14380,7 +14458,7 @@ class EnvironmentPrior:
             and bool(tbptt_reward_sink_supports_aux)
         )
         reinforce_streaming_sink = bool(
-            reinforce_enabled
+            collect_log_probs
             and tbptt_window_active
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
@@ -14569,10 +14647,10 @@ class EnvironmentPrior:
                 reinforce_log_prob_t = None
 
             action_noise_std = env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
-            if reinforce_enabled:
+            if sample_action:
                 if action_noise_std <= 0:
                     phase_name = "train" if t < single_eval_pos else "eval"
-                    raise ValueError(f"reinforce objective requires positive action_noise_{phase_name}_std")
+                    raise ValueError(f"stochastic policy objective requires positive action_noise_{phase_name}_std")
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
                         action_eps_t = action_noise_train[t]
@@ -14629,12 +14707,13 @@ class EnvironmentPrior:
                     mode=action_transform_mode,
                     rms_eps=action_rms_eps,
                 )
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    float(action_noise_std),
-                    action=action_next.detach(),
-                )
+                if collect_log_probs:
+                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                        action_pre_tanh.detach(),
+                        action_mean,
+                        float(action_noise_std),
+                        action=action_next.detach(),
+                    )
             else:
                 if not use_fast_env_in:
                     action_next = self._transform_reinforce_action(
@@ -14642,7 +14721,7 @@ class EnvironmentPrior:
                         mode=action_transform_mode,
                         rms_eps=action_rms_eps,
                     )
-            if (not reinforce_enabled) and (not reference_semantics_enabled) and action_noise_std > 0:
+            if (not sample_action) and (not reference_semantics_enabled) and action_noise_std > 0:
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
                         action_next = self._transform_reinforce_action(
@@ -14719,7 +14798,7 @@ class EnvironmentPrior:
                 env_in_flat[env_action_start: env_action_start + action_dim] = action_next
                 env_in = env_in_flat.unsqueeze(0)
             else:
-                action_env = action_next.detach() if reinforce_enabled else action_next
+                action_env = action_next.detach() if detach_action_in_env else action_next
                 env_in = self._pack_env_input(
                     state_t,
                     obs_t,
@@ -14993,7 +15072,7 @@ class EnvironmentPrior:
             info = None
         self.last_rollout_reinforce = (
             {"log_probs": log_prob_steps.reshape(n_samples, 1)}
-            if (reinforce_enabled and log_prob_steps is not None)
+            if (collect_log_probs and log_prob_steps is not None)
             else None
         )
         if aev2_enabled:
@@ -15580,6 +15659,8 @@ class EnvironmentPrior:
         rollout_seeds_override=None,
         store_rewards=True,
         policy_objective_kind="policy_gradient",
+        _policy_collect_log_probs=False,
+        _policy_detach_action_in_env=None,
     ):
         """
         Differentiable rollout for policy optimization.
@@ -15598,7 +15679,11 @@ class EnvironmentPrior:
         collect_runtime_info = bool(collect_runtime_info)
         self.clear_rollout_artifacts()
         store_rewards = bool(store_rewards)
-        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
+        sample_action = bool(objective_flags["sample_action"])
+        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        if collect_log_probs and (not sample_action):
+            raise ValueError("log-prob collection requires stochastic action sampling")
         tbptt_window_active = False
         if tbptt_window is not None:
             try:
@@ -15613,7 +15698,7 @@ class EnvironmentPrior:
         )
         reinforce_log_probs = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-            if reinforce_enabled and (tbptt_reward_sink is None) and (not tbptt_window_active)
+            if collect_log_probs and (tbptt_reward_sink is None) and (not tbptt_window_active)
             else None
         )
         infos = [None] * batch_size
@@ -15687,6 +15772,8 @@ class EnvironmentPrior:
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
                         policy_objective_kind=policy_objective_kind,
+                        _policy_collect_log_probs=_policy_collect_log_probs,
+                        _policy_detach_action_in_env=_policy_detach_action_in_env,
                     )
                 else:
                     env_batch = self._sample_environment_batch(
@@ -15710,6 +15797,8 @@ class EnvironmentPrior:
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
                         policy_objective_kind=policy_objective_kind,
+                        _policy_collect_log_probs=_policy_collect_log_probs,
+                        _policy_detach_action_in_env=_policy_detach_action_in_env,
                     )
                 if collect_x:
                     x[:, group_indices] = x_group
@@ -16097,6 +16186,8 @@ class EnvironmentPrior:
                 tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                 store_rewards=store_rewards,
                 policy_objective_kind=policy_objective_kind,
+                _policy_collect_log_probs=_policy_collect_log_probs,
+                _policy_detach_action_in_env=_policy_detach_action_in_env,
             )
             if collect_x:
                 x[:, b] = x_one
@@ -16410,7 +16501,7 @@ class EnvironmentPrior:
         reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
         objective_kind = str(objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "reinforce"}:
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
             objective_kind = "policy_gradient"
 
         return (
@@ -16609,6 +16700,23 @@ class EnvironmentPrior:
             stats["aev5_next_bias_thermostat_upscale"] = torch.clamp(loss_scale_det - 1.0, min=0.0)
         return loss, stats
 
+    def first_policy_gradient_loss_from_rewards(self, rewards):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        objective = rewards.mean()
+        loss = -objective
+        stats = {
+            "objective": objective.detach(),
+            "reward_mean": rewards.mean().detach(),
+            "reward_std": rewards.std(unbiased=False).detach(),
+            "reward_min": rewards.min().detach(),
+            "reward_max": rewards.max().detach(),
+            "reward_abs_max": rewards.abs().max().detach(),
+            "reward_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+            "reward_norm_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+        }
+        return loss, stats
+
     def rollout_policy_gradient_loss(
         self,
         policy_step_fn,
@@ -16633,10 +16741,9 @@ class EnvironmentPrior:
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
-        objective_kind = str(policy_objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "reinforce"}:
-            raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
+        objective_kind = self._normalize_policy_objective_kind(policy_objective_kind)
         reinforce_enabled = objective_kind == "reinforce"
+        first_pg_enabled = objective_kind == "first_policy_gradient"
         if normalize is None:
             normalize = bool(self.config.get("policy_gradient_normalize_rewards", False))
         tbptt_window_active = False
@@ -16690,6 +16797,11 @@ class EnvironmentPrior:
                     baseline_mode="leave_one_out",
                 )
                 stats["reinforce_enabled"] = 1
+            elif first_pg_enabled:
+                loss, stats = self.first_policy_gradient_loss_from_rewards(
+                    rewards=rollout["rewards"],
+                )
+                stats["first_policy_gradient_enabled"] = 1
             else:
                 loss, stats = self.policy_gradient_loss_from_rewards(
                     rewards=rollout["rewards"],
@@ -16701,7 +16813,7 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if aev2_enabled:
+            if (not first_pg_enabled) and aev2_enabled:
                 aev2_rollout = rollout.get("aev2", None)
                 aev2_penalty = None
                 if isinstance(aev2_rollout, dict):
@@ -16746,7 +16858,7 @@ class EnvironmentPrior:
                     stats["aev2_gain_std"] = zero_t
                     stats["aev2_gain_min"] = zero_t
                     stats["aev2_gain_max"] = zero_t
-            if aev3_enabled:
+            if (not first_pg_enabled) and aev3_enabled:
                 aev3_rollout = rollout.get("aev3", None)
                 aev3_penalty = None
                 aev3_penalty_drift = None
@@ -16825,7 +16937,7 @@ class EnvironmentPrior:
                     stats["aev3_gain_std"] = zero_t
                     stats["aev3_gain_min"] = zero_t
                     stats["aev3_gain_max"] = zero_t
-            if aev4_enabled:
+            if (not first_pg_enabled) and aev4_enabled:
                 aev4_rollout = rollout.get("aev4", None)
                 aev4_penalty = None
                 aev4_penalty_drift = None
@@ -16922,7 +17034,7 @@ class EnvironmentPrior:
                     stats["aev4_update_rms_mean"] = zero_t
                     stats["aev4_update_rms_std"] = zero_t
                     stats["aev4_clip_hit_share"] = zero_t
-            if aev5_enabled:
+            if (not first_pg_enabled) and aev5_enabled:
                 zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
                 stats["aev5_enabled"] = int(aev5_enabled)
                 stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
@@ -16938,7 +17050,7 @@ class EnvironmentPrior:
                     stats["aev5_reward_std_ref"] = stats.get("reward_std", zero_t)
                 if "objective_with_aev5" not in stats:
                     stats["objective_with_aev5"] = stats["objective"] * stats["aev5_loss_mul"]
-            if aev5_next_enabled:
+            if (not first_pg_enabled) and aev5_next_enabled:
                 zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
                 stats["aev5_next_enabled"] = int(aev5_next_enabled)
                 stats["aev5_next_state_gain_lo"] = float(aev5_next_cfg.get("state_gain_lo", 0.0))
@@ -17293,6 +17405,10 @@ class EnvironmentPrior:
                     discount=discount,
                     baseline_mode="leave_one_out",
                 )
+            elif first_pg_enabled:
+                loss_window, stats_window = self.first_policy_gradient_loss_from_rewards(
+                    rewards=rewards_window,
+                )
             else:
                 loss_window, stats_window = self.policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
@@ -17304,16 +17420,16 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if (not reinforce_enabled) and aev2_enabled and isinstance(aev2_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     if aev2_lambda > 0.0:
                         loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
-            if (not reinforce_enabled) and aev3_enabled and isinstance(aev3_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     loss_window = loss_window + aev3_penalty_window
-            if (not reinforce_enabled) and aev4_enabled and isinstance(aev4_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     loss_window = loss_window + aev4_penalty_window
@@ -18076,7 +18192,9 @@ class EnvironmentPrior:
                 if torch.is_tensor(log_probs_rollout):
                     stats["reinforce_log_prob_mean"] = log_probs_rollout.mean().detach()
                     stats["reinforce_log_prob_std"] = log_probs_rollout.std(unbiased=False).detach()
-        if aev2_enabled:
+        if first_pg_enabled:
+            stats["first_policy_gradient_enabled"] = 1
+        if (not first_pg_enabled) and aev2_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev2_penalty_mean is None:
                 aev2_penalty_mean = zero_t
@@ -18099,7 +18217,7 @@ class EnvironmentPrior:
             stats["aev2_gain_std"] = aev2_gain_std
             stats["aev2_gain_min"] = aev2_gain_min
             stats["aev2_gain_max"] = aev2_gain_max
-        if aev3_enabled:
+        if (not first_pg_enabled) and aev3_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev3_penalty_mean is None:
                 aev3_penalty_mean = zero_t
@@ -18141,7 +18259,7 @@ class EnvironmentPrior:
             stats["aev3_gain_std"] = aev3_gain_std
             stats["aev3_gain_min"] = aev3_gain_min
             stats["aev3_gain_max"] = aev3_gain_max
-        if aev4_enabled:
+        if (not first_pg_enabled) and aev4_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev4_penalty_mean is None:
                 aev4_penalty_mean = zero_t
@@ -18498,6 +18616,58 @@ class EnvironmentPrior:
                 None,
             )
         return loss, rollout, stats
+
+    def rollout_joint_policy_gradient_losses(
+        self,
+        policy_step_fn,
+        batch_size,
+        n_samples,
+        num_features,
+        device=default_device,
+        epoch=None,
+        single_eval_pos=None,
+        collect_x=False,
+        h_list_override=None,
+        env_seeds_override=None,
+        rollout_seeds_override=None,
+        discount=None,
+    ):
+        rollout = self.rollout_with_policy(
+            policy_step_fn=policy_step_fn,
+            batch_size=batch_size,
+            n_samples=n_samples,
+            num_features=num_features,
+            device=device,
+            epoch=epoch,
+            single_eval_pos=single_eval_pos,
+            collect_x=collect_x,
+            collect_runtime_info=False,
+            h_list_override=h_list_override,
+            env_seeds_override=env_seeds_override,
+            rollout_seeds_override=rollout_seeds_override,
+            policy_objective_kind="first_policy_gradient",
+            _policy_collect_log_probs=True,
+            _policy_detach_action_in_env=False,
+        )
+        reinforce_rollout = rollout.get("reinforce", None)
+        if not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
+            raise RuntimeError("joint policy-gradient rollout did not return reinforce log_probs")
+        first_loss, first_stats = self.first_policy_gradient_loss_from_rewards(
+            rollout["rewards"],
+        )
+        first_stats["first_policy_gradient_enabled"] = 1
+        reinforce_loss, reinforce_stats = self.reinforce_loss_from_rewards(
+            rewards=rollout["rewards"],
+            log_probs=reinforce_rollout["log_probs"],
+            discount=discount,
+            baseline_mode="leave_one_out",
+        )
+        reinforce_stats["reinforce_enabled"] = 1
+        return {
+            "rollout": rollout,
+            "first_policy_gradient": {"loss": first_loss, "stats": first_stats},
+            "reinforce": {"loss": reinforce_loss, "stats": reinforce_stats},
+        }
 
     def get_last_coverage(self):
         if not self.last_runtime_info:

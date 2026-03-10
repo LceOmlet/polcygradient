@@ -124,6 +124,17 @@ def test_rlpfn_parser_accepts_reinforce_objective():
     assert args.optimizer.rl_objective == "reinforce"
 
 
+def test_rlpfn_parser_accepts_first_policy_gradient_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "first_policy_gradient",
+        ]
+    )
+    assert args.optimizer.rl_objective == "first_policy_gradient"
+
+
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 

@@ -4,7 +4,7 @@ import pytest
 import torch
 
 import ticl.train as train_mod
-from ticl.model_configs import get_prior_config
+from ticl.model_configs import get_model_default_config, get_prior_config
 from ticl.models.encoders import Linear
 import ticl.models.layer as layer_mod
 from ticl.models.tabpfn import TabPFN
@@ -44,6 +44,35 @@ def _build_tiny_policy_model(recompute_attn=False):
     return model
 
 
+def _build_policy_model_for_num_features(
+    *,
+    num_features,
+    recompute_attn=False,
+    x_encoder_type="single",
+    x_obs_dim=None,
+    x_action_dim=None,
+):
+    model = TabPFN(
+        n_out=1,
+        n_features=int(num_features),
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        single_eval_causal=True,
+        recompute_attn=bool(recompute_attn),
+        x_encoder_type=str(x_encoder_type),
+        x_obs_dim=x_obs_dim,
+        x_action_dim=x_action_dim,
+    )
+    model.train()
+    return model
+
+
 def _fixed_env_cfg():
     cfg = dict(get_prior_config()["prior"]["environment"])
     cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
@@ -61,8 +90,9 @@ def _fixed_env_cfg():
     cfg["init_state_std"] = 0.1
     cfg["init_action_std"] = 0.1
     cfg["state_noise_std"] = 0.0
-    cfg["action_noise_train_std"] = 0.0
-    cfg["action_noise_eval_std"] = 0.0
+    # Keep stochastic objectives testable in the tiny harness.
+    cfg["action_noise_train_std"] = 0.2
+    cfg["action_noise_eval_std"] = 0.15
     cfg["init_std"] = 0.05
     cfg["noise_std"] = 0.0
     return cfg
@@ -82,6 +112,7 @@ def _run_chunk(
     n_samples=12,
     single_eval_pos=6,
     recompute_attn=False,
+    rl_objective="policy_gradient",
 ):
     _seed_everything(20260227)
     model = _build_tiny_policy_model(recompute_attn=recompute_attn)
@@ -113,15 +144,89 @@ def _run_chunk(
         pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
         pg_saved_tensors_pin_memory=True,
         pg_tbptt_window=pg_tbptt_window,
+        rl_objective=rl_objective,
     )
     model.zero_grad(set_to_none=True)
     loss.backward()
     grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
     stats_detached = {
-        k: (v.detach().clone() if torch.is_tensor(v) else torch.as_tensor(v))
+        k: (
+            v.detach().clone()
+            if torch.is_tensor(v)
+            else v
+        )
         for k, v in stats.items()
     }
     return loss.detach().clone(), stats_detached, grads
+
+
+def _run_streaming_tbptt_chunk(
+    *,
+    env_cfg,
+    num_features,
+    batch_size=2,
+    n_samples=16,
+    single_eval_pos=7,
+    recompute_attn=False,
+    kv_cache_mode="paged",
+    kv_cache_page_size=128,
+    allow_grad_mutable_cache=True,
+    rl_objective="first_policy_gradient",
+    h_list_override=None,
+    env_seeds_override=None,
+    rollout_seeds_override=None,
+):
+    _seed_everything(20260311)
+    model = _build_policy_model_for_num_features(
+        num_features=num_features,
+        recompute_attn=recompute_attn,
+    )
+    prior = EnvironmentPrior(dict(env_cfg))
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(num_features),
+        max_cache_len=n_samples,
+        kv_cache_mode=kv_cache_mode,
+        kv_cache_page_size=kv_cache_page_size,
+        allow_grad_mutable_cache=allow_grad_mutable_cache,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+    model.zero_grad(set_to_none=True)
+    streamed_roots = []
+    _, _, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        num_features=int(num_features),
+        device="cpu",
+        single_eval_pos=single_eval_pos,
+        collect_x=False,
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=8,
+        tbptt_loss_sink=lambda loss_root: (streamed_roots.append(float(loss_root.detach())), loss_root.backward()),
+        h_list_override=h_list_override,
+        env_seeds_override=env_seeds_override,
+        rollout_seeds_override=rollout_seeds_override,
+        rl_objective=rl_objective,
+    )
+    grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+    stats_detached = {
+        k: (
+            v.detach().clone()
+            if torch.is_tensor(v)
+            else v
+        )
+        for k, v in stats.items()
+    }
+    return stats_detached, grads, streamed_roots
 
 
 def test_train_keeps_aggregate_k_gradients_fixed_when_adaptive_batch_size_is_enabled(monkeypatch):
@@ -709,6 +814,7 @@ def _run_train_epoch_once_for_memory_probe(
     n_samples=24,
     batch_size=2,
     recompute_attn=True,
+    rl_objective="policy_gradient",
 ):
     _seed_everything(20260302 + int(policy_rollout_checkpoint) + int(n_samples))
     model = _build_tiny_policy_model(recompute_attn=recompute_attn)
@@ -746,6 +852,7 @@ def _run_train_epoch_once_for_memory_probe(
             pg_tbptt_window=pg_tbptt_window,
             pg_torch_compile=False,
             progress_bar=False,
+            rl_objective=rl_objective,
         )
     assert np.isfinite(float(loss))
     return float(saved_bytes) / float(1024 ** 2)
@@ -806,7 +913,8 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
     assert calls == [1, 1, 1, 1, 1]
 
 
-def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch():
+@pytest.mark.parametrize("rl_objective", ["policy_gradient", "first_policy_gradient"])
+def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch(rl_objective):
     _seed_everything(20260315)
     model = _build_tiny_policy_model()
     optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
@@ -899,6 +1007,7 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch():
             pg_torch_compile=False,
             pg_env_replay_steps=3,
             progress_bar=False,
+            rl_objective=rl_objective,
         )
     finally:
         optimizer.step = orig_step
@@ -1399,7 +1508,8 @@ def test_reentrant_immutable_checkpoint_matches_nonreentrant_mutable_semantics()
         assert torch.allclose(g_old, g_new, atol=1e-6, rtol=1e-5)
 
 
-def test_tbptt_window_equal_horizon_matches_full_horizon_semantics():
+@pytest.mark.parametrize("rl_objective", ["policy_gradient", "reinforce", "first_policy_gradient"])
+def test_tbptt_window_equal_horizon_matches_full_horizon_semantics(rl_objective):
     loss_full, stats_full, grads_full = _run_chunk(
         policy_rollout_checkpoint=True,
         policy_rollout_checkpoint_reentrant=True,
@@ -1410,6 +1520,7 @@ def test_tbptt_window_equal_horizon_matches_full_horizon_semantics():
         n_samples=12,
         single_eval_pos=6,
         pg_tbptt_window=None,
+        rl_objective=rl_objective,
     )
     loss_tbptt, stats_tbptt, grads_tbptt = _run_chunk(
         policy_rollout_checkpoint=True,
@@ -1421,6 +1532,7 @@ def test_tbptt_window_equal_horizon_matches_full_horizon_semantics():
         n_samples=12,
         single_eval_pos=6,
         pg_tbptt_window=12,
+        rl_objective=rl_objective,
     )
 
     assert torch.allclose(loss_full, loss_tbptt, atol=1e-6, rtol=1e-5)
@@ -1430,6 +1542,99 @@ def test_tbptt_window_equal_horizon_matches_full_horizon_semantics():
     assert len(grads_full) == len(grads_tbptt)
     for g_full, g_tbptt in zip(grads_full, grads_tbptt):
         assert torch.allclose(g_full, g_tbptt, atol=1e-6, rtol=1e-5)
+
+
+def test_first_policy_gradient_tbptt_matches_full_horizon_loss_and_stats_for_smaller_window():
+    loss_full, stats_full, _ = _run_chunk(
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        batch_size=2,
+        n_samples=12,
+        single_eval_pos=6,
+        pg_tbptt_window=None,
+        rl_objective="first_policy_gradient",
+    )
+    loss_tbptt, stats_tbptt, grads_tbptt = _run_chunk(
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        batch_size=2,
+        n_samples=12,
+        single_eval_pos=6,
+        pg_tbptt_window=4,
+        rl_objective="first_policy_gradient",
+    )
+
+    assert torch.allclose(loss_full, loss_tbptt, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["objective"], stats_tbptt["objective"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["reward_mean"], stats_tbptt["reward_mean"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["reward_std"], stats_tbptt["reward_std"], atol=1e-6, rtol=1e-5)
+    assert len(grads_tbptt) > 0
+    assert all(torch.isfinite(g).all() for g in grads_tbptt)
+
+
+def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg():
+    _seed_everything(7)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    base_env_cfg = dict(full_cfg["prior"]["environment"])
+    base_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    base_env_cfg["batch_vectorized_grouping"] = "structure"
+    sampler_prior = EnvironmentPrior(dict(base_env_cfg))
+    h_list = sampler_prior._sample_batch_hypers(2)
+    env_seeds = sampler_prior._sample_seed_list(2)
+    rollout_seeds = sampler_prior._sample_seed_list(2)
+
+    structure_env_cfg = dict(full_cfg["prior"]["environment"])
+    structure_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    structure_env_cfg["batch_vectorized_grouping"] = "structure"
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+
+    stats_structure, grads_structure, roots_structure = _run_streaming_tbptt_chunk(
+        env_cfg=structure_env_cfg,
+        num_features=num_features,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+    stats_family, grads_family, roots_family = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+
+    assert len(roots_structure) > 0
+    assert len(roots_family) > 0
+    assert torch.allclose(
+        stats_structure["objective"],
+        stats_family["objective"],
+        atol=5e-5,
+        rtol=5e-3,
+    )
+    assert torch.allclose(
+        stats_structure["reward_mean"],
+        stats_family["reward_mean"],
+        atol=5e-5,
+        rtol=5e-3,
+    )
+    assert torch.allclose(
+        stats_structure["reward_std"],
+        stats_family["reward_std"],
+        atol=3e-4,
+        rtol=0.1,
+    )
+    assert len(grads_structure) == len(grads_family) and len(grads_family) > 0
+    max_grad_diff = max(float((g_s - g_f).abs().max()) for g_s, g_f in zip(grads_structure, grads_family))
+    assert max_grad_diff < 1e-4
+    assert all(torch.isfinite(g).all() for g in grads_family)
 
 
 def test_tbptt_window_reduces_saved_tensor_bytes_trend():
@@ -1451,6 +1656,29 @@ def test_tbptt_window_reduces_saved_tensor_bytes_trend():
     assert np.isfinite(mem_full)
     assert np.isfinite(mem_tbptt)
     assert mem_tbptt < mem_full
+
+
+def test_first_policy_gradient_tbptt_saved_tensor_bytes_stay_close_to_reinforce():
+    mem_reinforce = _run_train_epoch_once_for_memory_probe(
+        policy_rollout_checkpoint=False,
+        n_samples=48,
+        batch_size=2,
+        recompute_attn=False,
+        pg_tbptt_window=8,
+        rl_objective="reinforce",
+    )
+    mem_first = _run_train_epoch_once_for_memory_probe(
+        policy_rollout_checkpoint=False,
+        n_samples=48,
+        batch_size=2,
+        recompute_attn=False,
+        pg_tbptt_window=8,
+        rl_objective="first_policy_gradient",
+    )
+
+    assert np.isfinite(mem_reinforce)
+    assert np.isfinite(mem_first)
+    assert mem_first <= (mem_reinforce * 1.10)
 
 
 def test_pg_phase_start_is_written_before_rollout_finishes(tmp_path):

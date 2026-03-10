@@ -2447,6 +2447,254 @@ def test_environment_prior_reinforce_loss_uses_total_return_objective():
     assert torch.isfinite(log_probs.grad).all()
 
 
+def test_environment_prior_first_policy_gradient_loss_uses_mean_reward_objective():
+    prior = EnvironmentPrior({})
+    rewards = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 5.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss, stats = prior.first_policy_gradient_loss_from_rewards(rewards)
+
+    assert torch.isfinite(loss)
+    assert float(stats["objective"]) == pytest.approx(float(rewards.mean()))
+    assert float(loss) == pytest.approx(-float(rewards.mean()))
+
+
+def test_environment_prior_first_policy_gradient_shares_reinforce_rollout_rewards():
+    _seed_everything(204)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "python_thread"
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(3)
+    h_list_reinforce = [dict(h) for h in h_list]
+    h_list_first = [dict(h) for h in h_list]
+    for h_group in (h_list_reinforce, h_list_first):
+        for h in h_group:
+            h["reward_dropout_enabled"] = False
+            h["reward_dropout_randomize"] = False
+            h["reward_dropout_ratio"] = 0.0
+            h["action_noise_train_std"] = 0.2
+            h["action_noise_eval_std"] = 0.15
+    env_seeds = [1201, 1202, 1203]
+    rollout_seeds = [2201, 2202, 2203]
+
+    rollout_reinforce = prior.rollout_with_policy(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=True,
+        h_list_override=h_list_reinforce,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="reinforce",
+    )
+    rollout_first = prior.rollout_with_policy(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=True,
+        h_list_override=h_list_first,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    assert torch.allclose(rollout_reinforce["rewards"], rollout_first["rewards"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rollout_reinforce["x"], rollout_first["x"], atol=1e-6, rtol=1e-6)
+    assert isinstance(rollout_reinforce["reinforce"], dict)
+    assert torch.is_tensor(rollout_reinforce["reinforce"]["log_probs"])
+    assert rollout_first["reinforce"] is None
+
+
+def test_environment_prior_first_policy_gradient_family_grouping_shares_reinforce_rollout_rewards():
+    _seed_everything(2041)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(dict(env_cfg))
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(3)
+    h_list_reinforce = [dict(h) for h in h_list]
+    h_list_first = [dict(h) for h in h_list]
+    for h_group in (h_list_reinforce, h_list_first):
+        for h in h_group:
+            h["reward_dropout_enabled"] = False
+            h["reward_dropout_randomize"] = False
+            h["reward_dropout_ratio"] = 0.0
+            h["action_noise_train_std"] = 0.2
+            h["action_noise_eval_std"] = 0.15
+    env_seeds = [3201, 3202, 3203]
+    rollout_seeds = [4201, 4202, 4203]
+
+    rollout_reinforce = prior.rollout_with_policy(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=True,
+        h_list_override=h_list_reinforce,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="reinforce",
+    )
+    rollout_first = prior.rollout_with_policy(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=True,
+        h_list_override=h_list_first,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    assert torch.allclose(rollout_reinforce["rewards"], rollout_first["rewards"], atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rollout_reinforce["x"], rollout_first["x"], atol=1e-6, rtol=1e-6)
+    assert isinstance(rollout_reinforce["reinforce"], dict)
+    assert torch.is_tensor(rollout_reinforce["reinforce"]["log_probs"])
+    assert rollout_first["reinforce"] is None
+
+
+def test_environment_prior_first_policy_gradient_rollout_gradients_are_finite():
+    _seed_everything(205)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(stats["objective"]) == pytest.approx(float(rollout["rewards"].mean().detach()))
+    assert float(grad_sum) > 0.0
+    assert all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None)
+
+
+def test_environment_prior_joint_first_and_reinforce_losses_are_finite():
+    _seed_everything(206)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    result = prior.rollout_joint_policy_gradient_losses(
+        policy_step_fn=policy.step,
+        batch_size=2,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+    )
+
+    total_loss = (
+        result["first_policy_gradient"]["loss"]
+        + (0.01 * result["reinforce"]["loss"])
+    )
+    total_loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+
+    assert torch.isfinite(result["first_policy_gradient"]["loss"])
+    assert torch.isfinite(result["reinforce"]["loss"])
+    assert isinstance(result["rollout"]["reinforce"], dict)
+    assert torch.is_tensor(result["rollout"]["reinforce"]["log_probs"])
+    assert torch.isfinite(result["rollout"]["rewards"]).all()
+    assert float(grad_sum) > 0.0
+
+
 def test_environment_prior_reinforce_stats_report_nonfinite_shares():
     prior = EnvironmentPrior()
     rewards = torch.tensor(

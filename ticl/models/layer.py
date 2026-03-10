@@ -1103,8 +1103,17 @@ class TransformerEncoderLayer(Module):
                     clone_kv_for_grad=bool(clone_kv_for_grad),
                     clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
-            k_all = k_pages[0][:, :, :remaining, :]
-            v_all = v_pages[0][:, :, :remaining, :]
+            if (prefix_k is not None) and (prefix_v is not None):
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+            else:
+                k_all = k_pages[0][:, :, :remaining, :]
+                v_all = v_pages[0][:, :, :remaining, :]
             if bool(clone_kv_for_grad) and torch.is_grad_enabled():
                 # In in-place paged-grad mode, cache pages are mutated every step.
                 # Clone read views so backward does not observe version bumps.
@@ -1133,10 +1142,13 @@ class TransformerEncoderLayer(Module):
                     if prefix_len < int(valid_len):
                         tail_take = int(valid_len) - prefix_len
                         if tail_take <= tail_dense_cap:
-                            tail_k = k_pages[-1][:, :, :tail_take, :]
-                            tail_v = v_pages[-1][:, :, :tail_take, :]
-                            k_all = self._concat_dim2([prefix_k, tail_k])
-                            v_all = self._concat_dim2([prefix_v, tail_v])
+                            k_all, v_all = self._combine_prefix_with_paged_tail(
+                                prefix_k,
+                                prefix_v,
+                                k_pages,
+                                v_pages,
+                                valid_len,
+                            )
                             if stats is not None:
                                 stats["paged_path_dense"] += 1
                                 stats["dense_valid_tokens_sum"] += int(valid_len)
@@ -1153,15 +1165,13 @@ class TransformerEncoderLayer(Module):
                     and (prefix_v is not None)
                 ):
                     prefix_len = int(prefix_k.shape[2])
-                    if prefix_len >= int(valid_len):
-                        k_all = prefix_k[:, :, :int(valid_len), :]
-                        v_all = prefix_v[:, :, :int(valid_len), :]
-                    else:
-                        tail_take = int(valid_len) - prefix_len
-                        tail_k = k_pages[-1][:, :, :tail_take, :]
-                        tail_v = v_pages[-1][:, :, :tail_take, :]
-                        k_all = self._concat_dim2([prefix_k, tail_k])
-                        v_all = self._concat_dim2([prefix_v, tail_v])
+                    k_all, v_all = self._combine_prefix_with_paged_tail(
+                        prefix_k,
+                        prefix_v,
+                        k_pages,
+                        v_pages,
+                        valid_len,
+                    )
                     if stats is not None:
                         stats["paged_path_dense"] += 1
                         stats["dense_valid_tokens_sum"] += int(valid_len)
@@ -1200,15 +1210,13 @@ class TransformerEncoderLayer(Module):
                 and (prefix_v is not None)
             ):
                 prefix_len = int(prefix_k.shape[2])
-                if prefix_len >= int(valid_len):
-                    k_all = prefix_k[:, :, :int(valid_len), :]
-                    v_all = prefix_v[:, :, :int(valid_len), :]
-                else:
-                    tail_take = int(valid_len) - prefix_len
-                    tail_k = k_pages[-1][:, :, :tail_take, :]
-                    tail_v = v_pages[-1][:, :, :tail_take, :]
-                    k_all = self._concat_dim2([prefix_k, tail_k])
-                    v_all = self._concat_dim2([prefix_v, tail_v])
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
                 if stats is not None:
                     stats["paged_path_dense"] += 1
                     stats["dense_valid_tokens_sum"] += int(valid_len)
@@ -1721,6 +1729,9 @@ class TransformerEncoderLayer(Module):
             and torch.is_grad_enabled()
             and bool(allow_grad_mutable_cache)
         )
+        resolved_paged_attn_train_mode = (
+            self._resolve_paged_attn_train_mode(q_bhld) if cache_mode == "paged" else None
+        )
         inplace_paged_grad = bool(mutable_paged_grad and bool(allow_grad_inplace_paged_cache))
         if cache_mode == "paged":
             # Throughput route:
@@ -1953,7 +1964,7 @@ class TransformerEncoderLayer(Module):
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
+            and resolved_paged_attn_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):
@@ -1987,6 +1998,15 @@ class TransformerEncoderLayer(Module):
                             k_prefix = self._concat_dim2([k_prefix, k_full])
                             v_prefix = self._concat_dim2([v_prefix, v_full])
                     prefix_pages = full_pages
+                if prefix_pages > 0:
+                    k_pages = list(k_pages[prefix_pages:])
+                    v_pages = list(v_pages[prefix_pages:])
+                    prefix_pages = 0
+                prefix_base_len = (
+                    int(k_prefix.shape[2])
+                    if (torch.is_tensor(k_prefix) and torch.is_tensor(v_prefix))
+                    else 0
+                )
         else:
             k_prefix = None
             v_prefix = None

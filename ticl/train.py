@@ -6361,7 +6361,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ):
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
-    if rl_objective not in {'supervised', 'policy_gradient', 'reinforce'}:
+    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce'}:
         raise ValueError(f"Unknown rl_objective: {rl_objective}")
     if rank == 0 and verbose:
         print(f'Using {device} device')
@@ -6372,7 +6372,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
 
     policy_tf32_prev = None
     if (
-        rl_objective in {'policy_gradient', 'reinforce'}
+        rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
         and ("cuda" in str(device))
         and torch.cuda.is_available()
     ):
@@ -6470,7 +6470,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"export_trace={kernel_profiler_cfg.export_trace}, "
                 f"summary_top_k={kernel_profiler_cfg.summary_top_k})"
             )
-    if rl_objective in {'policy_gradient', 'reinforce'}:
+    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
         if using_dist:
             raise ValueError(f"{rl_objective} objective does not support distributed training yet.")
         env_prior = _resolve_environment_prior(getattr(dl, "prior", None))
@@ -7043,7 +7043,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 torch.cuda.reset_peak_memory_stats()
                 gpu_start_time.record()
             
-            if rl_objective in {'policy_gradient', 'reinforce'}:
+            if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
                 new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
                     model=model,
                     aggregate_k_gradients=aggregate_k_gradients,
@@ -7116,7 +7116,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             else:
                 last_lr = scheduler.get_last_lr()[0]
             if (
-                rl_objective in {'policy_gradient', 'reinforce'}
+                rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
                 and (not pg_warmup_note_emitted)
                 and warmup_epochs > 0
                 and epoch <= warmup_epochs
@@ -7187,7 +7187,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     print(
                         f' peak gpu mem alloc/reserved {peak_alloc_gib:5.2f}GiB/{peak_reserved_gib:5.2f}GiB |',
                     )
-                if rl_objective in {'policy_gradient', 'reinforce'}:
+                if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
                     mean_loss_str = f"{float(total_loss):+.6e}"
                 else:
                     mean_loss_str = f"{float(total_loss):5.4f}"
@@ -7224,7 +7224,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print('-' * 89)
                 
             if (
-                rl_objective not in {'policy_gradient', 'reinforce'}
+                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
                 and math.isfinite(prev_total_loss)
                 and new_loss > 1.5 * prev_total_loss
             ):
