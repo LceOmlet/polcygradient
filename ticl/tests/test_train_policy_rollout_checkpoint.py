@@ -1,13 +1,16 @@
 import random
 import numpy as np
+import pytest
 import torch
 
+import ticl.train as train_mod
 from ticl.model_configs import get_prior_config
 from ticl.models.encoders import Linear
 import ticl.models.layer as layer_mod
 from ticl.models.tabpfn import TabPFN
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.train import (
+    _apply_aev5_next_step_corridor_,
     _build_policy_step_fn,
     _compute_policy_rollout_chunk_loss,
     _is_oom_exception,
@@ -114,8 +117,69 @@ def _run_chunk(
     model.zero_grad(set_to_none=True)
     loss.backward()
     grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
-    stats_detached = {k: v.detach().clone() for k, v in stats.items()}
+    stats_detached = {
+        k: (v.detach().clone() if torch.is_tensor(v) else torch.as_tensor(v))
+        for k, v in stats.items()
+    }
     return loss.detach().clone(), stats_detached, grads
+
+
+def test_train_keeps_aggregate_k_gradients_fixed_when_adaptive_batch_size_is_enabled(monkeypatch):
+    observed_aggregate = []
+    observed_epochs = []
+
+    def fake_train_epoch(
+        model,
+        aggregate_k_gradients,
+        using_dist,
+        scaler,
+        dl,
+        device,
+        optimizer,
+        criterion,
+        n_out,
+        epoch_idx=None,
+        progress_bar=False,
+        epoch_profiler=None,
+        epoch_start_time=None,
+        train_profiler_log_every_batches=0,
+        verbose=False,
+        kernel_profiler=None,
+    ):
+        observed_aggregate.append(int(aggregate_k_gradients))
+        observed_epochs.append(int(epoch_idx))
+        return 1.0, 0.0, 0.0
+
+    monkeypatch.setattr(train_mod, "train_epoch", fake_train_epoch)
+
+    class _DummyDL:
+        def __len__(self):
+            return 1
+
+    model = torch.nn.Linear(1, 1)
+    model.n_out = 1
+    criterion = torch.nn.MSELoss()
+
+    total_loss, _, _, final_epoch = train_mod.train(
+        dl=_DummyDL(),
+        model=model,
+        criterion=criterion,
+        epochs=60,
+        learning_rate=1e-3,
+        min_lr=1e-4,
+        warmup_epochs=1,
+        device="cpu",
+        aggregate_k_gradients=1,
+        adaptive_batch_size=True,
+        learning_rate_schedule="cosine",
+        verbose=False,
+        rl_objective="supervised",
+    )
+
+    assert float(total_loss) == 1.0
+    assert int(final_epoch) == 60
+    assert observed_epochs == list(range(1, 61))
+    assert observed_aggregate == [1] * 60
 
 
 def test_policy_rollout_checkpoint_matches_no_checkpoint_semantics():
@@ -167,6 +231,167 @@ def test_policy_rollout_checkpoint_and_offload_match_baseline_semantics():
     assert len(grads_base) == len(grads_combo)
     for g_base, g_combo in zip(grads_base, grads_combo):
         assert torch.allclose(g_base, g_combo, atol=1e-6, rtol=1e-5)
+
+
+def test_policy_rollout_checkpoint_preserves_aev5_next_stats_and_semantics():
+    env_cfg = _fixed_env_cfg()
+    env_cfg["anti_explosion_vanishing_v5_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v5_next_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v5_next_state_gain_lo"] = 0.985
+    env_cfg["anti_explosion_vanishing_v5_next_state_gain_hi"] = 1.035
+    env_cfg["anti_explosion_vanishing_v5_next_state_rms_lo"] = 4e-3
+    env_cfg["anti_explosion_vanishing_v5_next_state_rms_hi"] = 9e-2
+    env_cfg["anti_explosion_vanishing_v5_next_loss_target_std"] = 0.25
+    env_cfg["anti_explosion_vanishing_v5_next_loss_scale_lo"] = 0.5
+    env_cfg["anti_explosion_vanishing_v5_next_loss_scale_hi"] = 4.0
+
+    loss_base, stats_base, grads_base = _run_chunk(
+        policy_rollout_checkpoint=False,
+        env_cfg=env_cfg,
+        pg_tbptt_window=4,
+        n_samples=12,
+        single_eval_pos=6,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_chunk(
+        policy_rollout_checkpoint=True,
+        env_cfg=env_cfg,
+        pg_tbptt_window=4,
+        n_samples=12,
+        single_eval_pos=6,
+    )
+
+    assert torch.allclose(loss_base, loss_ckpt, atol=1e-6, rtol=1e-5)
+    for key in (
+        "objective",
+        "reward_mean",
+        "reward_std",
+        "objective_with_aev5_next",
+        "aev5_next_loss_mul",
+        "aev5_next_scale",
+        "aev5_next_scale_raw",
+        "aev5_next_reward_std_ref",
+        "aev5_next_gain_mean",
+        "aev5_next_gain_std",
+        "aev5_next_gain_min",
+        "aev5_next_gain_max",
+        "aev5_next_update_rms_mean",
+        "aev5_next_update_rms_std",
+        "aev5_next_scale_mean",
+        "aev5_next_scale_max",
+        "aev5_next_high_clip_share",
+        "aev5_next_low_active_share",
+        "aev5_next_low_boost_share",
+        "aev5_next_corridor_trigger_share",
+        "aev5_next_bias_thermostat_abs_offset",
+    ):
+        assert torch.allclose(stats_base[key], stats_ckpt[key], atol=1e-6, rtol=1e-5)
+    assert float(stats_base["aev5_next_enabled"]) == float(stats_ckpt["aev5_next_enabled"]) == 1.0
+    assert len(grads_base) == len(grads_ckpt)
+    for g_base, g_ckpt in zip(grads_base, grads_ckpt):
+        assert torch.allclose(g_base, g_ckpt, atol=1e-6, rtol=1e-5)
+
+
+def test_policy_rollout_tbptt_exposes_consistent_aev5_next_semantics():
+    env_cfg = _fixed_env_cfg()
+    env_cfg["anti_explosion_vanishing_v5_enabled"] = False
+    env_cfg["anti_explosion_vanishing_v5_next_enabled"] = True
+    env_cfg["anti_explosion_vanishing_v5_next_state_gain_lo"] = 0.985
+    env_cfg["anti_explosion_vanishing_v5_next_state_gain_hi"] = 1.035
+    env_cfg["anti_explosion_vanishing_v5_next_state_rms_lo"] = 4e-3
+    env_cfg["anti_explosion_vanishing_v5_next_state_rms_hi"] = 9e-2
+    env_cfg["anti_explosion_vanishing_v5_next_loss_target_std"] = 0.25
+    env_cfg["anti_explosion_vanishing_v5_next_loss_scale_lo"] = 0.5
+    env_cfg["anti_explosion_vanishing_v5_next_loss_scale_hi"] = 4.0
+
+    loss_full, stats_full, grads_full = _run_chunk(
+        policy_rollout_checkpoint=False,
+        env_cfg=env_cfg,
+        pg_tbptt_window=None,
+        n_samples=12,
+        single_eval_pos=6,
+    )
+    loss_tbptt, stats_tbptt, grads_tbptt = _run_chunk(
+        policy_rollout_checkpoint=False,
+        env_cfg=env_cfg,
+        pg_tbptt_window=4,
+        n_samples=12,
+        single_eval_pos=6,
+    )
+
+    assert torch.allclose(loss_full, loss_tbptt, atol=1e-6, rtol=1e-5)
+    for key in (
+        "objective",
+        "reward_mean",
+        "reward_std",
+    ):
+        assert torch.allclose(stats_full[key], stats_tbptt[key], atol=1e-6, rtol=1e-5)
+    for key in (
+        "objective_with_aev5_next",
+        "aev5_next_loss_mul",
+        "aev5_next_scale",
+        "aev5_next_scale_raw",
+        "aev5_next_reward_std_ref",
+        "aev5_next_corridor_trigger_share",
+        "aev5_next_bias_thermostat_abs_offset",
+    ):
+        assert torch.isfinite(stats_tbptt[key])
+    assert float(stats_tbptt["aev5_next_scale"]) == float(stats_tbptt["aev5_next_loss_mul"])
+    if abs(float(stats_tbptt["aev5_next_loss_mul"]) - 1.0) > 1e-6:
+        assert not torch.allclose(
+            stats_tbptt["objective_with_aev5_next"],
+            stats_tbptt["objective"],
+            atol=1e-6,
+            rtol=1e-5,
+        )
+    assert len(grads_full) == len(grads_tbptt)
+
+
+def test_aev5_next_step_corridor_boosts_and_clips_uniformly():
+    model = torch.nn.Linear(4, 2, bias=False)
+    with torch.no_grad():
+        model.weight.copy_(torch.tensor([[1.0, -2.0, 3.0, -4.0], [0.5, -0.5, 1.5, -1.5]]))
+
+    model.weight.grad = torch.full_like(model.weight, 1e-5)
+    stats_low = {
+        "grad_rms": float(model.weight.grad.pow(2).mean().sqrt().item()),
+    }
+    cfg = {
+        "enabled": True,
+        "step_grad_rms_lo": 1e-4,
+        "step_grad_rms_hi": 1e-2,
+        "step_reward_std_gate": 0.05,
+        "step_low_boost_cap": 4.0,
+        "eps": 1e-6,
+    }
+    grad_before = model.weight.grad.detach().clone()
+    out_low = _apply_aev5_next_step_corridor_(model, grad_stats=stats_low, reward_std=0.2, cfg=cfg)
+    grad_after_low = model.weight.grad.detach().clone()
+
+    assert out_low["enabled"] is True
+    assert out_low["high_clip"] is False
+    assert out_low["low_active"] is True
+    assert out_low["low_boost"] is True
+    assert out_low["triggered"] is True
+    assert out_low["abs_offset"] > 0.0
+    assert out_low["scale"] > 1.0
+    assert torch.allclose(grad_after_low, grad_before * float(out_low["scale"]), atol=1e-9, rtol=1e-6)
+
+    model.weight.grad = torch.full_like(model.weight, 5e-2)
+    stats_high = {
+        "grad_rms": float(model.weight.grad.pow(2).mean().sqrt().item()),
+    }
+    grad_before_high = model.weight.grad.detach().clone()
+    out_high = _apply_aev5_next_step_corridor_(model, grad_stats=stats_high, reward_std=0.2, cfg=cfg)
+    grad_after_high = model.weight.grad.detach().clone()
+
+    assert out_high["enabled"] is True
+    assert out_high["high_clip"] is True
+    assert out_high["low_active"] is False
+    assert out_high["low_boost"] is False
+    assert out_high["triggered"] is True
+    assert out_high["abs_offset"] > 0.0
+    assert 0.0 < out_high["scale"] < 1.0
+    assert torch.allclose(grad_after_high, grad_before_high * float(out_high["scale"]), atol=1e-9, rtol=1e-6)
 
 
 def test_policy_rollout_compile_matches_baseline_semantics():
@@ -540,7 +765,7 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
@@ -632,7 +857,7 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch():
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
                       pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None,
-                      h_list_override=None, env_seeds_override=None, rollout_seeds_override=None):
+                      h_list_override=None, env_seeds_override=None, rollout_seeds_override=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, n_samples, num_features, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory
@@ -741,7 +966,7 @@ def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
@@ -805,7 +1030,7 @@ def test_policy_rollout_oom_can_reduce_tbptt_before_chunk_size():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory
@@ -877,7 +1102,7 @@ def test_policy_rollout_runtime_oom_during_backward_is_caught_and_skipped():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, batch_size, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
@@ -936,7 +1161,7 @@ def test_policy_rollout_runtime_oom_debug_raise_propagates_exception():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, batch_size, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
@@ -1003,7 +1228,7 @@ def test_policy_rollout_checkpoint_temporarily_disables_inner_recompute_attn_and
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
@@ -1226,3 +1451,127 @@ def test_tbptt_window_reduces_saved_tensor_bytes_trend():
     assert np.isfinite(mem_full)
     assert np.isfinite(mem_tbptt)
     assert mem_tbptt < mem_full
+
+
+def test_pg_phase_start_is_written_before_rollout_finishes(tmp_path):
+    _seed_everything(20260318)
+    model = _build_tiny_policy_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dl = _ChunkDebugDL(batch_size=2, n_samples=12, num_features=16, steps=1)
+    env_prior = _ChunkDebugEnvPrior()
+    log_path = tmp_path / "phase.log"
+    traceback_calls = []
+
+    orig_compute = train_mod._compute_policy_rollout_chunk_loss
+    orig_print_exc = train_mod.traceback.print_exc
+
+    def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
+                      single_eval_pos, collect_x, policy_rollout_checkpoint,
+                      policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+        del env_prior, policy_step_fn, batch_size, n_samples, num_features, device
+        del single_eval_pos, collect_x, policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective
+        raise KeyboardInterrupt()
+
+    def _fake_print_exc(*args, **kwargs):
+        del args, kwargs
+        traceback_calls.append(True)
+
+    train_mod._compute_policy_rollout_chunk_loss = _fake_compute
+    train_mod.traceback.print_exc = _fake_print_exc
+    try:
+        with pytest.raises(KeyboardInterrupt):
+            train_epoch_policy_gradient(
+                model=model,
+                aggregate_k_gradients=1,
+                using_dist=False,
+                scaler=None,
+                dl=dl,
+                device="cpu",
+                optimizer=optimizer,
+                env_prior=env_prior,
+                policy_rollout_chunk_size=2,
+                policy_rollout_checkpoint=False,
+                policy_rollout_checkpoint_reentrant=False,
+                pg_grad_mutable_kv_cache=False,
+                pg_saved_tensors_cpu_offload=False,
+                pg_saved_tensors_pin_memory=False,
+                pg_torch_compile=False,
+                pg_phase_log_every_batches=1,
+                pg_phase_log_file=str(log_path),
+                progress_bar=False,
+            )
+    finally:
+        train_mod._compute_policy_rollout_chunk_loss = orig_compute
+        train_mod.traceback.print_exc = orig_print_exc
+
+    lines = log_path.read_text().splitlines()
+    assert any(line.startswith("[pg-phase-start]") for line in lines)
+    assert not any(line.startswith("[pg-phase]") for line in lines)
+    start_line = next(line for line in lines if line.startswith("[pg-phase-start]"))
+    assert "epoch=0" in start_line
+    assert "batch=0" in start_line
+    assert "status=start" in start_line
+    assert "rl_objective=policy_gradient" in start_line
+    assert traceback_calls == [True]
+
+
+def test_pg_phase_start_and_finish_are_both_written(tmp_path):
+    _seed_everything(20260319)
+    model = _build_tiny_policy_model()
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    dl = _ChunkDebugDL(batch_size=2, n_samples=12, num_features=16, steps=1)
+    env_prior = _ChunkDebugEnvPrior()
+    log_path = tmp_path / "phase.log"
+
+    orig_compute = train_mod._compute_policy_rollout_chunk_loss
+
+    def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
+                      single_eval_pos, collect_x, policy_rollout_checkpoint,
+                      policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+        del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
+        del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective
+        anchor = next(model.parameters()).sum() * 0.0
+        stats = {
+            "objective": torch.zeros((), device=device),
+            "reward_mean": torch.zeros((), device=device),
+            "reward_std": torch.zeros((), device=device),
+        }
+        return anchor, None, stats
+
+    train_mod._compute_policy_rollout_chunk_loss = _fake_compute
+    try:
+        loss, _, _ = train_epoch_policy_gradient(
+            model=model,
+            aggregate_k_gradients=1,
+            using_dist=False,
+            scaler=None,
+            dl=dl,
+            device="cpu",
+            optimizer=optimizer,
+            env_prior=env_prior,
+            policy_rollout_chunk_size=2,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=False,
+            pg_grad_mutable_kv_cache=False,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=False,
+            pg_torch_compile=False,
+            pg_phase_log_every_batches=1,
+            pg_phase_log_file=str(log_path),
+            progress_bar=False,
+        )
+    finally:
+        train_mod._compute_policy_rollout_chunk_loss = orig_compute
+
+    assert torch.isfinite(torch.tensor(loss))
+    lines = log_path.read_text().splitlines()
+    start_lines = [line for line in lines if line.startswith("[pg-phase-start]")]
+    finish_lines = [line for line in lines if line.startswith("[pg-phase]")]
+    assert len(start_lines) == 1
+    assert len(finish_lines) == 1
+    assert "status=start" in start_lines[0]
+    assert "status=ok" in finish_lines[0]

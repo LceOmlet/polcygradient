@@ -1,6 +1,7 @@
 from ticl.fit_model import main
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
+from ticl.model_configs import get_model_default_config
 from argparse import Namespace
 from ticl.fit_model import _cli_flag_is_set, _apply_continue_run_cli_overrides
 
@@ -73,13 +74,30 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_kernel_profiler_with_stack is False
     assert args.optimizer.train_kernel_profiler_with_flops is False
     assert args.optimizer.train_kernel_profiler_log_every_batches == 0
-    assert args.optimizer.pg_tbptt_window == 64
-    assert args.optimizer.pg_env_replay_steps == 8
+    assert args.optimizer.pg_tbptt_window == 32
+    assert args.optimizer.pg_env_replay_steps == 1
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
     assert args.optimizer.pg_saved_tensors_cpu_offload is False
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
+
+
+def test_rlpfn_parser_accepts_aev5_next_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--anti-explosion-vanishing-v5-next-enabled", "true",
+            "--anti-explosion-vanishing-v5-next-state-gain-lo", "0.97",
+            "--anti-explosion-vanishing-v5-next-state-gain-hi", "1.02",
+            "--anti-explosion-vanishing-v5-next-step-grad-rms-hi", "0.05",
+        ]
+    )
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_enabled is True
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_lo == 0.97
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_hi == 1.02
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_step_grad_rms_hi == 0.05
 
 
 def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
@@ -93,6 +111,51 @@ def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
     )
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
     assert args.optimizer.pg_saved_tensors_pin_memory is False
+
+
+def test_rlpfn_parser_accepts_reinforce_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "reinforce",
+        ]
+    )
+    assert args.optimizer.rl_objective == "reinforce"
+
+
+def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
+    cfg = get_model_default_config("rlpfn")
+
+    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["prior"]["environment"]["family"] == {
+        "distribution": "meta_choice",
+        "choice_values": ["scm"],
+    }
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_enabled"] is True
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_total_budget"] == 400
+    assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
+    assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
+    assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
+    assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
+    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 1e6
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
+        "distribution": "uniform",
+        "min": 1.0,
+        "max": 10.0,
+    }
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.2,
+    }
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.1,
+    }
 
 
 def test_rlpfn_parser_accepts_pg_grad_mutable_kv_cache_flag():
@@ -124,10 +187,10 @@ def test_rlpfn_parser_accepts_pg_tbptt_window_flag():
     args = parser.parse_args(
         [
             "rlpfn",
-            "--pg-tbptt-window", "128",
+            "--pg-tbptt-window", "64",
         ]
     )
-    assert args.optimizer.pg_tbptt_window == 128
+    assert args.optimizer.pg_tbptt_window == 64
 
 
 def test_rlpfn_parser_accepts_pg_env_replay_steps_flag():

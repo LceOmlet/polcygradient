@@ -188,6 +188,9 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "obs_dim": {"distribution": "uniform_int", "min": 1, "max": 400},
         "noise_dim": {"distribution": "uniform_int", "min": 1, "max": 64},
         "zero_pad_dim": {"distribution": "uniform_int", "min": 0, "max": 400},
+        "constrained_dim_sampling_enabled": False,
+        "constrained_dim_sampling_total_budget": 400,
+        "strict_joint_transition_enabled": False,
         # Fixed token slots for PFN input:
         # head-1 uses [s_t(obs slot), r_t, r_mask_t] => 402 dims by default.
         # head-2 uses [a_t] => 30 dims by default.
@@ -273,6 +276,22 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "anti_explosion_vanishing_v5_scale_hi": 4.0,
         "anti_explosion_vanishing_v5_eps": 1e-6,
         "anti_explosion_vanishing_v5_detach_reference": True,
+        "anti_explosion_vanishing_v5_next_enabled": False,
+        "anti_explosion_vanishing_v5_next_state_gain_lo": 0.985,
+        "anti_explosion_vanishing_v5_next_state_gain_hi": 1.035,
+        "anti_explosion_vanishing_v5_next_state_rms_lo": 4e-3,
+        "anti_explosion_vanishing_v5_next_state_rms_hi": 9e-2,
+        "anti_explosion_vanishing_v5_next_state_reward_gate": 0.05,
+        "anti_explosion_vanishing_v5_next_state_low_boost_cap": 1.5,
+        "anti_explosion_vanishing_v5_next_loss_target_std": 0.25,
+        "anti_explosion_vanishing_v5_next_loss_scale_lo": 0.5,
+        "anti_explosion_vanishing_v5_next_loss_scale_hi": 4.0,
+        "anti_explosion_vanishing_v5_next_step_grad_rms_lo": 1e-4,
+        "anti_explosion_vanishing_v5_next_step_grad_rms_hi": 3e-2,
+        "anti_explosion_vanishing_v5_next_step_reward_std_gate": 0.05,
+        "anti_explosion_vanishing_v5_next_step_low_boost_cap": 4.0,
+        "anti_explosion_vanishing_v5_next_eps": 1e-6,
+        "anti_explosion_vanishing_v5_next_detach_reference": True,
         # Policy-gradient stability knobs for differentiable rollout.
         # Train objective default: maximize raw discounted reward mean directly.
         "policy_gradient_normalize_rewards": False,
@@ -324,7 +343,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
     prior['classification'] = classsification_prior
 
     dataloader = {
-        "batch_size": 8 * 16,
+        "batch_size": 8 * 16* 2 ,
         "num_steps": 8 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
@@ -449,8 +468,21 @@ def get_rlpfn_default_config():
 
     env_cfg = config['prior']['environment']
     env_cfg.update({
+        "family": {"distribution": "meta_choice", "choice_values": ["scm"]},
         "obs_slot_dim": 400,
         "action_slot_dim": 30,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_total_budget": 400,
+        "strict_joint_transition_enabled": True,
+        "state_input_scale_enabled": False,
+        "state_input_scale": 1.0,
+        "state_full_rms_enabled": True,
+        "state_full_rms_target": 1.0,
+        "reinforce_reward_transform": "tanh",
+        "reinforce_reward_tanh_c": 1e6,
+        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 1.0, "max": 10.0},
+        "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
+        "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,
         "reward_dropout_randomize": True,
         "reward_dropout_ratio_min": 0.1,
@@ -471,7 +503,7 @@ def get_rlpfn_default_config():
     config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
     config['transformer']['single_eval_causal'] = True
-    config['optimizer']['rl_objective'] = 'policy_gradient'
+    config['optimizer']['rl_objective'] = 'reinforce'
     # Policy-gradient rollout chunking over batch columns.
     # None means full-batch rollout chunk (max parallel width).
     config['optimizer']['policy_rollout_chunk_size'] = None
@@ -522,7 +554,7 @@ def get_rlpfn_default_config():
     # not needed by default and can otherwise shift pressure to host RAM.
     config['optimizer']['pg_saved_tensors_cpu_offload'] = False
     # Enable TBPTT by default for memory/throughput tradeoff.
-    config['optimizer']['pg_tbptt_window'] = 64
+    config['optimizer']['pg_tbptt_window'] = 32
     # Keep one rollout->update cycle per batch by default for throughput-first
     # benchmarking and simpler PG phase attribution.
     config['optimizer']['pg_env_replay_steps'] = 1
@@ -533,12 +565,27 @@ def get_rlpfn_default_config():
     # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
     config['optimizer']['pg_oom_fail_fast'] = True
-    # Physical batch has moved to 256 on the maintained mainline; scale the
-    # default step size up with it instead of keeping the legacy tiny batch LR.
-    config['optimizer']['learning_rate'] = 3e-4
+    # Longer TBPTT mainline needs a more conservative default step size.
+    config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
-    # physical batch 512.
-    config['dataloader']['batch_size'] = 512
+    # physical batch 1024.
+    config['dataloader']['batch_size'] = 1024
+    config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
+    config['prior']['environment']['lipschitz_enforce'] = False
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_lo'] = 0.985
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_hi'] = 1.035
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_lo'] = 4e-3
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_hi'] = 9e-2
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_reward_gate'] = 0.05
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_low_boost_cap'] = 1.5
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_target_std'] = 0.25
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_lo'] = 0.5
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_hi'] = 4.0
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_lo'] = 1e-4
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_hi'] = 3e-2
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_reward_std_gate'] = 0.05
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_low_boost_cap'] = 4.0
     return config
 
 

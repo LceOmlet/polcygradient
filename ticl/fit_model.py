@@ -155,6 +155,22 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--anti-explosion-vanishing-v5-scale-hi", "anti_explosion_vanishing_v5_scale_hi"),
         ("--anti-explosion-vanishing-v5-eps", "anti_explosion_vanishing_v5_eps"),
         ("--anti-explosion-vanishing-v5-detach-reference", "anti_explosion_vanishing_v5_detach_reference"),
+        ("--anti-explosion-vanishing-v5-next-enabled", "anti_explosion_vanishing_v5_next_enabled"),
+        ("--anti-explosion-vanishing-v5-next-state-gain-lo", "anti_explosion_vanishing_v5_next_state_gain_lo"),
+        ("--anti-explosion-vanishing-v5-next-state-gain-hi", "anti_explosion_vanishing_v5_next_state_gain_hi"),
+        ("--anti-explosion-vanishing-v5-next-state-rms-lo", "anti_explosion_vanishing_v5_next_state_rms_lo"),
+        ("--anti-explosion-vanishing-v5-next-state-rms-hi", "anti_explosion_vanishing_v5_next_state_rms_hi"),
+        ("--anti-explosion-vanishing-v5-next-state-reward-gate", "anti_explosion_vanishing_v5_next_state_reward_gate"),
+        ("--anti-explosion-vanishing-v5-next-state-low-boost-cap", "anti_explosion_vanishing_v5_next_state_low_boost_cap"),
+        ("--anti-explosion-vanishing-v5-next-loss-target-std", "anti_explosion_vanishing_v5_next_loss_target_std"),
+        ("--anti-explosion-vanishing-v5-next-loss-scale-lo", "anti_explosion_vanishing_v5_next_loss_scale_lo"),
+        ("--anti-explosion-vanishing-v5-next-loss-scale-hi", "anti_explosion_vanishing_v5_next_loss_scale_hi"),
+        ("--anti-explosion-vanishing-v5-next-step-grad-rms-lo", "anti_explosion_vanishing_v5_next_step_grad_rms_lo"),
+        ("--anti-explosion-vanishing-v5-next-step-grad-rms-hi", "anti_explosion_vanishing_v5_next_step_grad_rms_hi"),
+        ("--anti-explosion-vanishing-v5-next-step-reward-std-gate", "anti_explosion_vanishing_v5_next_step_reward_std_gate"),
+        ("--anti-explosion-vanishing-v5-next-step-low-boost-cap", "anti_explosion_vanishing_v5_next_step_low_boost_cap"),
+        ("--anti-explosion-vanishing-v5-next-eps", "anti_explosion_vanishing_v5_next_eps"),
+        ("--anti-explosion-vanishing-v5-next-detach-reference", "anti_explosion_vanishing_v5_next_detach_reference"),
     )
     for flag, key in env_override_flags:
         if _cli_flag_is_set(argv, flag):

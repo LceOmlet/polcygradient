@@ -87,7 +87,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
-    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient'],
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'reinforce'],
                            help='Training objective for RL-style models.')
     optimizer.add_argument('--policy-rollout-chunk-size', type=int,
                            help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')
@@ -411,6 +411,38 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='Numerical epsilon for anti-explosion&vanishing-v5 std reference.')
     environment_prior.add_argument('--anti-explosion-vanishing-v5-detach-reference', type=str2bool,
                                    help='Detach reward std reference in anti-explosion&vanishing-v5 scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v5_next (full-state corridor + detached thermostat).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-gain-lo', type=float,
+                                   help='Lower directional gain corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-gain-hi', type=float,
+                                   help='Upper directional gain corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-rms-lo', type=float,
+                                   help='Lower RMS corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-rms-hi', type=float,
+                                   help='Upper RMS corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-reward-gate', type=float,
+                                   help='Reward-magnitude gate for low-side anti-explosion&vanishing-v5_next state protection.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-low-boost-cap', type=float,
+                                   help='Maximum low-side boost for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-target-std', type=float,
+                                   help='Target reward std used by anti-explosion&vanishing-v5_next loss scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-scale-lo', type=float,
+                                   help='Lower bound of detached loss scale in anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-scale-hi', type=float,
+                                   help='Upper bound of detached loss scale in anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-grad-rms-lo', type=float,
+                                   help='Lower train-step gradient RMS corridor for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-grad-rms-hi', type=float,
+                                   help='Upper train-step gradient RMS corridor for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-reward-std-gate', type=float,
+                                   help='Reward-std gate for low-side anti-explosion&vanishing-v5_next train-step protection.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-low-boost-cap', type=float,
+                                   help='Maximum low-side boost for anti-explosion&vanishing-v5_next train-step scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-detach-reference', type=str2bool,
+                                   help='Detach corridor references in anti-explosion&vanishing-v5_next.')
     environment_prior.add_argument('--lipschitz-enforce', type=str2bool,
                                    help='Enable Lipschitz safeguards for sampled environment generators.')
     environment_prior.add_argument('--lipschitz-weight-fro-norm-max', type=float,

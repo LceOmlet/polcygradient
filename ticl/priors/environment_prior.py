@@ -1,7 +1,9 @@
 import math
 import inspect
 import os
+import threading
 import time
+from contextlib import contextmanager
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -596,6 +598,387 @@ if triton is not None:
         grad_x_ptrs = grad_x_ptr + pid_b * stride_gxb + offs_k * stride_gxi
         tl.store(grad_x_ptrs, acc, mask=k_mask)
 
+
+    @triton.jit
+    def _prefix_tiled_input_activated_affine_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        tile_batch_ptr,
+        tile_out_offset_ptr,
+        out_ptr,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_sb,
+        stride_ab,
+        stride_tb,
+        stride_to,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        o_start = tl.load(tile_out_offset_ptr + pid_t * stride_to).to(tl.int32)
+        offs_o = o_start + tl.arange(0, BLOCK_O)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        out_mask = offs_o < out_size
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        if HAS_BIAS:
+            bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+            acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            x_vals = tl.load(x_base + offs_k * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+            if activation_code == 0:
+                x_vals = tl_libdevice.tanh(x_vals)
+            elif activation_code == 1:
+                x_vals = tl.maximum(x_vals, 0.0)
+            w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _prefix_tiled_input_activated_affine_update_fwd_kernel(
+        z_old_ptr,
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        noise_ptr,
+        hidden_mask_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        tile_batch_ptr,
+        tile_out_offset_ptr,
+        out_ptr,
+        stride_zb,
+        stride_zi,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_nb,
+        stride_ni,
+        stride_hmb,
+        stride_hmi,
+        stride_sb,
+        stride_ab,
+        stride_tb,
+        stride_to,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        HAS_NOISE: tl.constexpr,
+    ):
+        pid_t = tl.program_id(0)
+        pid_b = tl.load(tile_batch_ptr + pid_t * stride_tb).to(tl.int32)
+        o_start = tl.load(tile_out_offset_ptr + pid_t * stride_to).to(tl.int32)
+        offs_o = o_start + tl.arange(0, BLOCK_O)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb)
+        out_mask = offs_o < out_size
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+        if HAS_BIAS:
+            bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+            acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            x_vals = tl.load(x_base + offs_k * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+            if activation_code == 0:
+                x_vals = tl_libdevice.tanh(x_vals)
+            elif activation_code == 1:
+                x_vals = tl.maximum(x_vals, 0.0)
+            w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+            w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+            acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+        if HAS_NOISE:
+            noise_ptrs = noise_ptr + pid_b * stride_nb + offs_o * stride_ni
+            acc += tl.load(noise_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        hidden_mask_ptrs = hidden_mask_ptr + pid_b * stride_hmb + offs_o * stride_hmi
+        acc = acc * tl.load(hidden_mask_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+        out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
+        tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _prefix_sample_input_activated_affine_update_fwd_kernel(
+        x_ptr,
+        w_ptr,
+        b_ptr,
+        noise_ptr,
+        hidden_mask_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        out_ptr,
+        stride_xb,
+        stride_xi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bo,
+        stride_nb,
+        stride_ni,
+        stride_hmb,
+        stride_hmi,
+        stride_sb,
+        stride_ab,
+        stride_ob,
+        stride_oo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        HAS_BIAS: tl.constexpr,
+        HAS_NOISE: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb).to(tl.int32)
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb).to(tl.int32)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        x_base = x_ptr + pid_b * stride_xb
+        w_base = w_ptr + pid_b * stride_wb
+        out_base = out_ptr + pid_b * stride_ob
+        if out_size <= 0:
+            return
+        for o_start in tl.range(0, out_size, BLOCK_O):
+            offs_o = o_start + tl.arange(0, BLOCK_O)
+            out_mask = offs_o < out_size
+            acc = tl.zeros((BLOCK_O,), dtype=tl.float32)
+            if HAS_BIAS:
+                bias_ptrs = b_ptr + pid_b * stride_bb + offs_o * stride_bo
+                acc += tl.load(bias_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+            for k_start in tl.range(0, in_size, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < in_size
+                x_vals = tl.load(x_base + offs_k * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+                if activation_code == 0:
+                    x_vals = tl_libdevice.tanh(x_vals)
+                elif activation_code == 1:
+                    x_vals = tl.maximum(x_vals, 0.0)
+                w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+                w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+                acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+            if HAS_NOISE:
+                noise_ptrs = noise_ptr + pid_b * stride_nb + offs_o * stride_ni
+                acc += tl.load(noise_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+            hidden_mask_ptrs = hidden_mask_ptr + pid_b * stride_hmb + offs_o * stride_hmi
+            acc = acc * tl.load(hidden_mask_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+            out_ptrs = out_base + offs_o * stride_oo
+            tl.store(out_ptrs, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _prefix_sample_input_activated_affine_multilayer_fwd_kernel(
+        z_work_ptr,
+        z_scratch_ptr,
+        w_ptr,
+        b_ptr,
+        noise_ptr,
+        hidden_mask_ptr,
+        hidden_dims_ptr,
+        num_hidden_blocks_ptr,
+        activation_code_ptr,
+        outputs_layers_ptr,
+        stride_zwb,
+        stride_zwi,
+        stride_zsb,
+        stride_zsi,
+        stride_wb,
+        stride_wl,
+        stride_wi,
+        stride_wo,
+        stride_bb,
+        stride_bl,
+        stride_bo,
+        stride_nb,
+        stride_nl,
+        stride_ni,
+        stride_hmb,
+        stride_hmi,
+        stride_hdb,
+        stride_nhb,
+        stride_ab,
+        stride_olb,
+        stride_oll,
+        stride_olo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        MAX_LAYERS: tl.constexpr,
+        HAS_NOISE: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        hidden_dim = tl.load(hidden_dims_ptr + pid_b * stride_hdb).to(tl.int32)
+        num_layers = tl.load(num_hidden_blocks_ptr + pid_b * stride_nhb).to(tl.int32)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        if hidden_dim <= 0 or num_layers <= 0:
+            return
+        for layer_idx in tl.static_range(0, MAX_LAYERS):
+            if layer_idx < num_layers:
+                if (layer_idx % 2) == 0:
+                    curr_base = z_work_ptr + pid_b * stride_zwb
+                    next_base = z_scratch_ptr + pid_b * stride_zsb
+                else:
+                    curr_base = z_scratch_ptr + pid_b * stride_zsb
+                    next_base = z_work_ptr + pid_b * stride_zwb
+                w_layer_base = w_ptr + pid_b * stride_wb + layer_idx * stride_wl
+                b_layer_base = b_ptr + pid_b * stride_bb + layer_idx * stride_bl
+                out_layer_base = outputs_layers_ptr + pid_b * stride_olb + layer_idx * stride_oll
+                for o_start in tl.range(0, hidden_dim, BLOCK_O):
+                    offs_o = o_start + tl.arange(0, BLOCK_O)
+                    out_mask = offs_o < hidden_dim
+                    acc = tl.load(b_layer_base + offs_o * stride_bo, mask=out_mask, other=0.0).to(tl.float32)
+                    for k_start in tl.range(0, hidden_dim, BLOCK_K):
+                        offs_k = k_start + tl.arange(0, BLOCK_K)
+                        k_mask = offs_k < hidden_dim
+                        x_vals = tl.load(curr_base + offs_k * stride_zwi, mask=k_mask, other=0.0).to(tl.float32)
+                        if activation_code == 0:
+                            x_vals = tl_libdevice.tanh(x_vals)
+                        elif activation_code == 1:
+                            x_vals = tl.maximum(x_vals, 0.0)
+                        w_ptrs = w_layer_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+                        w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+                        acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+                    if HAS_NOISE:
+                        noise_layer_base = noise_ptr + pid_b * stride_nb + layer_idx * stride_nl
+                        acc += tl.load(noise_layer_base + offs_o * stride_ni, mask=out_mask, other=0.0).to(tl.float32)
+                    hidden_mask_ptrs = hidden_mask_ptr + pid_b * stride_hmb + offs_o * stride_hmi
+                    acc = acc * tl.load(hidden_mask_ptrs, mask=out_mask, other=0.0).to(tl.float32)
+                    tl.store(next_base + offs_o * stride_zsi, acc, mask=out_mask)
+                    tl.store(out_layer_base + offs_o * stride_olo, acc, mask=out_mask)
+
+
+    @triton.jit
+    def _prefix_sample_reference_scm_full_multilayer_fwd_kernel(
+        x_ptr,
+        first_w_ptr,
+        first_b_ptr,
+        z_work_ptr,
+        z_scratch_ptr,
+        hidden_w_ptr,
+        hidden_b_ptr,
+        noise_ptr,
+        in_sizes_ptr,
+        hidden_dims_ptr,
+        num_hidden_blocks_ptr,
+        activation_code_ptr,
+        outputs_layers_ptr,
+        stride_xb,
+        stride_xi,
+        stride_fwb,
+        stride_fwi,
+        stride_fwo,
+        stride_fbb,
+        stride_fbo,
+        stride_zwb,
+        stride_zwi,
+        stride_zsb,
+        stride_zsi,
+        stride_hwb,
+        stride_hwl,
+        stride_hwi,
+        stride_hwo,
+        stride_hbb,
+        stride_hbl,
+        stride_hbo,
+        stride_nb,
+        stride_nl,
+        stride_ni,
+        stride_isb,
+        stride_hdb,
+        stride_nhb,
+        stride_ab,
+        stride_olb,
+        stride_oll,
+        stride_olo,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+        MAX_LAYERS: tl.constexpr,
+        HAS_NOISE: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_isb).to(tl.int32)
+        hidden_dim = tl.load(hidden_dims_ptr + pid_b * stride_hdb).to(tl.int32)
+        num_layers = tl.load(num_hidden_blocks_ptr + pid_b * stride_nhb).to(tl.int32)
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        if hidden_dim <= 0:
+            return
+        x_base = x_ptr + pid_b * stride_xb
+        first_w_base = first_w_ptr + pid_b * stride_fwb
+        z_work_base = z_work_ptr + pid_b * stride_zwb
+        # First affine: z_work = W0^T x + b0
+        for o_start in tl.range(0, hidden_dim, BLOCK_O):
+            offs_o = o_start + tl.arange(0, BLOCK_O)
+            out_mask = offs_o < hidden_dim
+            acc = tl.load(first_b_ptr + pid_b * stride_fbb + offs_o * stride_fbo, mask=out_mask, other=0.0).to(tl.float32)
+            for k_start in tl.range(0, in_size, BLOCK_K):
+                offs_k = k_start + tl.arange(0, BLOCK_K)
+                k_mask = offs_k < in_size
+                x_vals = tl.load(x_base + offs_k * stride_xi, mask=k_mask, other=0.0).to(tl.float32)
+                w_ptrs = first_w_base + offs_k[:, None] * stride_fwi + offs_o[None, :] * stride_fwo
+                w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+                acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+            tl.store(z_work_base + offs_o * stride_zwi, acc, mask=out_mask)
+        # Hidden stack
+        for layer_idx in tl.static_range(0, MAX_LAYERS):
+            if layer_idx < num_layers:
+                if (layer_idx % 2) == 0:
+                    curr_base = z_work_ptr + pid_b * stride_zwb
+                    next_base = z_scratch_ptr + pid_b * stride_zsb
+                else:
+                    curr_base = z_scratch_ptr + pid_b * stride_zsb
+                    next_base = z_work_ptr + pid_b * stride_zwb
+                w_layer_base = hidden_w_ptr + pid_b * stride_hwb + layer_idx * stride_hwl
+                b_layer_base = hidden_b_ptr + pid_b * stride_hbb + layer_idx * stride_hbl
+                out_layer_base = outputs_layers_ptr + pid_b * stride_olb + layer_idx * stride_oll
+                for o_start in tl.range(0, hidden_dim, BLOCK_O):
+                    offs_o = o_start + tl.arange(0, BLOCK_O)
+                    out_mask = offs_o < hidden_dim
+                    acc = tl.load(b_layer_base + offs_o * stride_hbo, mask=out_mask, other=0.0).to(tl.float32)
+                    for k_start in tl.range(0, hidden_dim, BLOCK_K):
+                        offs_k = k_start + tl.arange(0, BLOCK_K)
+                        k_mask = offs_k < hidden_dim
+                        x_vals = tl.load(curr_base + offs_k * stride_zwi, mask=k_mask, other=0.0).to(tl.float32)
+                        if activation_code == 0:
+                            x_vals = tl_libdevice.tanh(x_vals)
+                        elif activation_code == 1:
+                            x_vals = tl.maximum(x_vals, 0.0)
+                        w_ptrs = w_layer_base + offs_k[:, None] * stride_hwi + offs_o[None, :] * stride_hwo
+                        w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+                        acc += tl.sum(w_vals * x_vals[:, None], axis=0)
+                    if HAS_NOISE:
+                        noise_layer_base = noise_ptr + pid_b * stride_nb + layer_idx * stride_nl
+                        acc += tl.load(noise_layer_base + offs_o * stride_ni, mask=out_mask, other=0.0).to(tl.float32)
+                    tl.store(next_base + offs_o * stride_zsi, acc, mask=out_mask)
+                    tl.store(out_layer_base + offs_o * stride_olo, acc, mask=out_mask)
+
 class _PrefixTiledBatchAffineFn(torch.autograd.Function):
     @staticmethod
     def forward(
@@ -765,6 +1148,8 @@ class EnvironmentPrior:
     - PFN token at step `t` is `(obs_t, a_t, r_t)` with fixed-width projection by pad/truncate.
     """
 
+    _lipschitz_audit_tls = threading.local()
+
     def __init__(self, config=None):
         cfg = dict(config or {})
 
@@ -777,6 +1162,9 @@ class EnvironmentPrior:
         cfg.setdefault("obs_dim", {"distribution": "uniform_int", "min": 1, "max": 400})
         cfg.setdefault("noise_dim", {"distribution": "uniform_int", "min": 1, "max": 64})
         cfg.setdefault("zero_pad_dim", {"distribution": "uniform_int", "min": 0, "max": 400})
+        cfg.setdefault("constrained_dim_sampling_enabled", False)
+        cfg.setdefault("constrained_dim_sampling_total_budget", 400)
+        cfg.setdefault("strict_joint_transition_enabled", False)
         cfg.setdefault("obs_slot_dim", 400)
         cfg.setdefault("action_slot_dim", 30)
         cfg.setdefault("reward_dropout_enabled", True)
@@ -808,6 +1196,13 @@ class EnvironmentPrior:
         cfg.setdefault("reward_scale", {"distribution": "uniform", "min": 0.1, "max": 10.0})
         cfg.setdefault("reward_clip", 10.0)
         cfg.setdefault("state_clip", 8.0)
+        cfg.setdefault("state_input_scale_enabled", False)
+        cfg.setdefault("state_input_scale", 1.0)
+        cfg.setdefault("state_full_rms_enabled", False)
+        cfg.setdefault("state_full_rms_target", 1.0)
+        cfg.setdefault("reinforce_reward_transform", "none")
+        cfg.setdefault("reinforce_reward_tanh_c", 1.0)
+        cfg.setdefault("reinforce_reward_tanh_bound", 10.0)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -870,6 +1265,24 @@ class EnvironmentPrior:
         cfg.setdefault("anti_explosion_vanishing_v5_scale_hi", 4.0)
         cfg.setdefault("anti_explosion_vanishing_v5_eps", 1e-6)
         cfg.setdefault("anti_explosion_vanishing_v5_detach_reference", True)
+        # anti-explosion&vanishing-v5-next:
+        # full-state directional corridor + detached reward thermostat.
+        cfg.setdefault("anti_explosion_vanishing_v5_next_enabled", False)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_gain_lo", 0.985)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_gain_hi", 1.035)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_rms_lo", 4e-3)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_rms_hi", 9e-2)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_reward_gate", 0.05)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_state_low_boost_cap", 1.5)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_loss_target_std", 0.25)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_loss_scale_lo", 0.5)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_loss_scale_hi", 4.0)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_step_grad_rms_lo", 1e-4)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_step_grad_rms_hi", 3e-2)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_step_reward_std_gate", 0.05)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_step_low_boost_cap", 4.0)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_eps", 1e-6)
+        cfg.setdefault("anti_explosion_vanishing_v5_next_detach_reference", True)
 
         # Reward normalization / policy-gradient stability.
         # When False, PG optimizes raw discounted reward mean directly.
@@ -906,6 +1319,7 @@ class EnvironmentPrior:
         cfg.setdefault("outputscale", {"distribution": "log_uniform", "min": 1e-5, "max": 8.0})
         cfg.setdefault("noise", {"distribution": "meta_choice", "choice_values": [1e-5, 1e-4, 1e-2]})
         cfg.setdefault("gp_rff_features", {"distribution": "uniform_int", "min": 32, "max": 256})
+        cfg.setdefault("reference_gp_forward_mode", "fixed_cost")
 
         self.config = parse_distributions(cfg)
         self.last_runtime_info = []
@@ -913,8 +1327,14 @@ class EnvironmentPrior:
         self.last_rollout_v2 = None
         self.last_rollout_v3 = None
         self.last_rollout_v4 = None
+        self.last_rollout_v5_next = None
+        self.last_rollout_reinforce = None
+        self.last_rollout_lipschitz_audit = None
+        self.last_rollout_env_semantics = None
         self._rollout_executor = None
         self._rollout_executor_workers = 0
+        self._reference_scm_layer_step_cache = {}
+        self._reference_scm_layer_step_compile_failed = set()
         envgen_bmm_flag = str(os.environ.get("TICL_POLICY_ENVGEN_BMM", "1")).strip().lower()
         self.envgen_bmm = envgen_bmm_flag not in {"0", "false", "no", "off"}
         envgen_ragged_affine_flag = str(
@@ -941,6 +1361,130 @@ class EnvironmentPrior:
             "yes",
             "on",
         }
+        reference_scm_layer_compile_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE", "0")
+        ).strip().lower()
+        self.reference_scm_layer_compile = reference_scm_layer_compile_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.reference_scm_layer_compile_backend = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE_BACKEND", "inductor")
+        ).strip()
+        self.reference_scm_layer_compile_mode = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE_MODE", "reduce-overhead")
+        ).strip()
+        reference_scm_layer_compile_fullgraph_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE_FULLGRAPH", "0")
+        ).strip().lower()
+        self.reference_scm_layer_compile_fullgraph = reference_scm_layer_compile_fullgraph_flag in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        reference_scm_layer_compile_dynamic_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE_DYNAMIC", "0")
+        ).strip().lower()
+        self.reference_scm_layer_compile_dynamic = reference_scm_layer_compile_dynamic_flag in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        reference_scm_layer_compile_log_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_LAYER_COMPILE_LOG", "1")
+        ).strip().lower()
+        self.reference_scm_layer_compile_log = reference_scm_layer_compile_log_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_hidden_noise_packed_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_NOISE_PACKED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_noise_packed = reference_scm_hidden_noise_packed_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_hidden_affine_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_AFFINE_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_affine_fused = reference_scm_hidden_affine_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.reference_scm_hidden_affine_block_o = int(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_AFFINE_BLOCK_O", "32")
+        )
+        self.reference_scm_hidden_affine_block_k = int(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_AFFINE_BLOCK_K", "64")
+        )
+        self.reference_scm_hidden_affine_num_warps = int(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_AFFINE_NUM_WARPS", "4")
+        )
+        reference_scm_hidden_update_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_update_fused = reference_scm_hidden_update_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_hidden_update_sample_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_SAMPLE_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_update_sample_fused = reference_scm_hidden_update_sample_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_hidden_multilayer_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_MULTILAYER_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_multilayer_fused = reference_scm_hidden_multilayer_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_full_multilayer_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_FULL_MULTILAYER_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_full_multilayer_fused = reference_scm_full_multilayer_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_memory_guard_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD", "1")
+        ).strip().lower()
+        self.reference_scm_memory_guard = reference_scm_memory_guard_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        self.reference_scm_memory_guard_fraction = float(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION", "0.25")
+        )
+        reference_scm_partition_max_bytes = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(256 * 1024 * 1024))
+        ).strip()
+        try:
+            self.reference_scm_partition_max_bytes = int(reference_scm_partition_max_bytes)
+        except Exception:
+            self.reference_scm_partition_max_bytes = 0
         fused_transition_scm_hidden_fused_flag = str(
             os.environ.get("TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED", "0")
         ).strip().lower()
@@ -1041,6 +1585,17 @@ class EnvironmentPrior:
             transition_inner_min_bucket = 0
         self.transition_inner_min_bucket = max(0, transition_inner_min_bucket)
 
+    def clear_rollout_artifacts(self):
+        self.last_runtime_info = []
+        self.last_rollout_profile = None
+        self.last_rollout_v2 = None
+        self.last_rollout_v3 = None
+        self.last_rollout_v4 = None
+        self.last_rollout_v5_next = None
+        self.last_rollout_reinforce = None
+        self.last_rollout_lipschitz_audit = None
+        self.last_rollout_env_semantics = None
+
     def __del__(self):
         executor = getattr(self, "_rollout_executor", None)
         if executor is not None:
@@ -1078,6 +1633,222 @@ class EnvironmentPrior:
             return None
         return v
 
+    @classmethod
+    def _get_active_lipschitz_audit_acc(cls):
+        return getattr(cls._lipschitz_audit_tls, "acc", None)
+
+    @contextmanager
+    def _lipschitz_audit_scope(self, acc):
+        prev = self._get_active_lipschitz_audit_acc()
+        self._lipschitz_audit_tls.acc = acc
+        try:
+            yield
+        finally:
+            self._lipschitz_audit_tls.acc = prev
+
+    @staticmethod
+    def _new_lipschitz_audit_accumulator(enabled, device, dtype):
+        return {
+            "enabled": bool(enabled),
+            "matrix_count": 0,
+            "matrix_clipped_count": 0,
+            "matrix_tail_mass_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "matrix_tail_rel_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "matrix_projection_abs_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "matrix_projection_rel_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "matrix_projection_rel_max": torch.zeros((), device=device, dtype=dtype),
+            "outputscale_count": 0,
+            "outputscale_clipped_count": 0,
+            "outputscale_tail_mass_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "outputscale_tail_rel_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "outputscale_projection_rel_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "outputscale_projection_rel_max": torch.zeros((), device=device, dtype=dtype),
+        }
+
+    @staticmethod
+    def _update_lipschitz_audit_matrix(acc, *, raw_fro, max_norm, scale, eps):
+        if acc is None or (not bool(acc.get("enabled", False))):
+            return
+        raw64 = raw_fro.detach().to(dtype=torch.float64).reshape(-1)
+        scale64 = scale.detach().to(dtype=torch.float64).reshape(-1)
+        cap64 = torch.as_tensor(max_norm, device=raw64.device, dtype=torch.float64).reshape(-1)
+        if cap64.numel() == 1 and raw64.numel() > 1:
+            cap64 = cap64.expand_as(raw64)
+        tail_mass = torch.clamp(raw64 - cap64, min=0.0)
+        tail_rel = tail_mass / (cap64 + float(eps))
+        proj_rel = (1.0 - scale64).abs()
+        proj_abs = raw64 * proj_rel
+        clipped = tail_mass > 0.0
+
+        acc["matrix_count"] = int(acc.get("matrix_count", 0)) + int(raw64.numel())
+        acc["matrix_clipped_count"] = int(acc.get("matrix_clipped_count", 0)) + int(clipped.to(torch.int64).sum().item())
+        acc["matrix_tail_mass_sum"] = acc["matrix_tail_mass_sum"] + tail_mass.sum()
+        acc["matrix_tail_rel_sum"] = acc["matrix_tail_rel_sum"] + tail_rel.sum()
+        acc["matrix_projection_abs_sum"] = acc["matrix_projection_abs_sum"] + proj_abs.sum()
+        acc["matrix_projection_rel_sum"] = acc["matrix_projection_rel_sum"] + proj_rel.sum()
+        acc["matrix_projection_rel_max"] = torch.maximum(
+            acc["matrix_projection_rel_max"],
+            proj_rel.max().to(device=acc["matrix_projection_rel_max"].device, dtype=acc["matrix_projection_rel_max"].dtype),
+        )
+
+    @staticmethod
+    def _update_lipschitz_audit_outputscale(acc, *, raw_value, projected_value, max_abs, eps):
+        if acc is None or (not bool(acc.get("enabled", False))):
+            return
+        raw64 = torch.as_tensor(raw_value, dtype=torch.float64).reshape(-1)
+        proj64 = torch.as_tensor(projected_value, dtype=torch.float64).reshape(-1)
+        cap64 = torch.as_tensor(max_abs, device=raw64.device, dtype=torch.float64).reshape(-1)
+        if cap64.numel() == 1 and raw64.numel() > 1:
+            cap64 = cap64.expand_as(raw64)
+        raw_abs = raw64.abs()
+        proj_abs = proj64.abs()
+        tail_mass = torch.clamp(raw_abs - cap64, min=0.0)
+        tail_rel = tail_mass / (cap64 + float(eps))
+        proj_rel = (raw_abs - proj_abs).abs() / (raw_abs + float(eps))
+        clipped = tail_mass > 0.0
+
+        acc["outputscale_count"] = int(acc.get("outputscale_count", 0)) + int(raw64.numel())
+        acc["outputscale_clipped_count"] = int(acc.get("outputscale_clipped_count", 0)) + int(
+            clipped.to(torch.int64).sum().item()
+        )
+        acc["outputscale_tail_mass_sum"] = acc["outputscale_tail_mass_sum"] + tail_mass.sum()
+        acc["outputscale_tail_rel_sum"] = acc["outputscale_tail_rel_sum"] + tail_rel.sum()
+        acc["outputscale_projection_rel_sum"] = acc["outputscale_projection_rel_sum"] + proj_rel.sum()
+        acc["outputscale_projection_rel_max"] = torch.maximum(
+            acc["outputscale_projection_rel_max"],
+            proj_rel.max().to(
+                device=acc["outputscale_projection_rel_max"].device,
+                dtype=acc["outputscale_projection_rel_max"].dtype,
+            ),
+        )
+
+    @staticmethod
+    def _finalize_lipschitz_audit_accumulator(acc, device, dtype):
+        enabled = bool(acc.get("enabled", False))
+        matrix_count = int(acc.get("matrix_count", 0))
+        matrix_clip_count = int(acc.get("matrix_clipped_count", 0))
+        output_count = int(acc.get("outputscale_count", 0))
+        output_clip_count = int(acc.get("outputscale_clipped_count", 0))
+        matrix_denom = float(max(1, matrix_count))
+        output_denom = float(max(1, output_count))
+
+        def _mean(sum_key, denom):
+            value = acc.get(sum_key, None)
+            if value is None:
+                return torch.zeros((), device=device, dtype=dtype)
+            return (value.detach() / denom).to(device=device, dtype=dtype)
+
+        return {
+            "enabled": int(enabled),
+            "matrix_count": matrix_count,
+            "matrix_clip_count": matrix_clip_count,
+            "matrix_clip_share": torch.as_tensor(
+                (float(matrix_clip_count) / matrix_denom) if matrix_count > 0 else 0.0,
+                device=device,
+                dtype=dtype,
+            ),
+            "matrix_tail_mass_mean": _mean("matrix_tail_mass_sum", matrix_denom),
+            "matrix_tail_rel_mean": _mean("matrix_tail_rel_sum", matrix_denom),
+            "matrix_projection_abs_mean": _mean("matrix_projection_abs_sum", matrix_denom),
+            "matrix_projection_rel_mean": _mean("matrix_projection_rel_sum", matrix_denom),
+            "matrix_projection_rel_max": acc.get(
+                "matrix_projection_rel_max",
+                torch.zeros((), device=device, dtype=dtype),
+            ).detach().to(device=device, dtype=dtype),
+            "outputscale_count": output_count,
+            "outputscale_clip_count": output_clip_count,
+            "outputscale_clip_share": torch.as_tensor(
+                (float(output_clip_count) / output_denom) if output_count > 0 else 0.0,
+                device=device,
+                dtype=dtype,
+            ),
+            "outputscale_tail_mass_mean": _mean("outputscale_tail_mass_sum", output_denom),
+            "outputscale_tail_rel_mean": _mean("outputscale_tail_rel_sum", output_denom),
+            "outputscale_projection_rel_mean": _mean("outputscale_projection_rel_sum", output_denom),
+            "outputscale_projection_rel_max": acc.get(
+                "outputscale_projection_rel_max",
+                torch.zeros((), device=device, dtype=dtype),
+            ).detach().to(device=device, dtype=dtype),
+        }
+
+    @staticmethod
+    def _merge_lipschitz_audit_summary(acc, summary, *, device, dtype):
+        if not isinstance(summary, dict):
+            return acc
+        if acc is None:
+            acc = EnvironmentPrior._new_lipschitz_audit_accumulator(
+                bool(summary.get("enabled", 0)),
+                device=device,
+                dtype=dtype,
+            )
+        acc["enabled"] = bool(acc.get("enabled", False) or bool(summary.get("enabled", 0)))
+        acc["matrix_count"] = int(acc.get("matrix_count", 0)) + int(summary.get("matrix_count", 0) or 0)
+        acc["matrix_clipped_count"] = int(acc.get("matrix_clipped_count", 0)) + int(
+            summary.get("matrix_clip_count", 0) or 0
+        )
+        acc["outputscale_count"] = int(acc.get("outputscale_count", 0)) + int(
+            summary.get("outputscale_count", 0) or 0
+        )
+        acc["outputscale_clipped_count"] = int(acc.get("outputscale_clipped_count", 0)) + int(
+            summary.get("outputscale_clip_count", 0) or 0
+        )
+
+        def _accumulate_mean(sum_key, mean_key, count):
+            if count <= 0:
+                return
+            value = summary.get(mean_key, None)
+            if value is None:
+                return
+            value_t = torch.as_tensor(value, device=device, dtype=torch.float64)
+            acc[sum_key] = acc[sum_key] + (value_t * float(count))
+
+        matrix_count = int(summary.get("matrix_count", 0) or 0)
+        output_count = int(summary.get("outputscale_count", 0) or 0)
+        _accumulate_mean("matrix_tail_mass_sum", "matrix_tail_mass_mean", matrix_count)
+        _accumulate_mean("matrix_tail_rel_sum", "matrix_tail_rel_mean", matrix_count)
+        _accumulate_mean("matrix_projection_abs_sum", "matrix_projection_abs_mean", matrix_count)
+        _accumulate_mean("matrix_projection_rel_sum", "matrix_projection_rel_mean", matrix_count)
+        _accumulate_mean("outputscale_tail_mass_sum", "outputscale_tail_mass_mean", output_count)
+        _accumulate_mean("outputscale_tail_rel_sum", "outputscale_tail_rel_mean", output_count)
+        _accumulate_mean("outputscale_projection_rel_sum", "outputscale_projection_rel_mean", output_count)
+
+        matrix_proj_rel_max = summary.get("matrix_projection_rel_max", None)
+        if matrix_proj_rel_max is not None:
+            acc["matrix_projection_rel_max"] = torch.maximum(
+                acc["matrix_projection_rel_max"],
+                torch.as_tensor(matrix_proj_rel_max, device=device, dtype=dtype),
+            )
+        output_proj_rel_max = summary.get("outputscale_projection_rel_max", None)
+        if output_proj_rel_max is not None:
+            acc["outputscale_projection_rel_max"] = torch.maximum(
+                acc["outputscale_projection_rel_max"],
+                torch.as_tensor(output_proj_rel_max, device=device, dtype=dtype),
+            )
+        return acc
+
+    @staticmethod
+    def _project_outputscale_abs(value, max_abs):
+        if max_abs is None:
+            return value
+        if torch.is_tensor(value):
+            cap = torch.as_tensor(max_abs, device=value.device, dtype=value.dtype)
+            projected = torch.sign(value) * torch.minimum(value.abs(), cap)
+            eps = float(torch.finfo(value.dtype).eps)
+        else:
+            cap = float(max_abs)
+            projected = math.copysign(min(abs(float(value)), cap), float(value))
+            eps = 1e-12
+        audit_acc = EnvironmentPrior._get_active_lipschitz_audit_acc()
+        if audit_acc is not None:
+            EnvironmentPrior._update_lipschitz_audit_outputscale(
+                audit_acc,
+                raw_value=value,
+                projected_value=projected,
+                max_abs=cap,
+                eps=eps,
+            )
+        return projected
+
     @staticmethod
     def _project_matrix_fro_norm(matrix, max_fro_norm):
         """
@@ -1095,7 +1866,17 @@ class EnvironmentPrior:
                 return matrix
             fro = torch.linalg.matrix_norm(matrix, ord="fro")
             scale = torch.clamp(torch.as_tensor(max_norm, device=matrix.device, dtype=matrix.dtype) / (fro + eps), max=1.0)
-            return matrix * scale
+            projected = matrix * scale
+            audit_acc = EnvironmentPrior._get_active_lipschitz_audit_acc()
+            if audit_acc is not None:
+                EnvironmentPrior._update_lipschitz_audit_matrix(
+                    audit_acc,
+                    raw_fro=fro,
+                    max_norm=max_norm,
+                    scale=scale,
+                    eps=eps,
+                )
+            return projected
         if matrix.ndim == 3:
             if torch.is_tensor(max_fro_norm):
                 max_norm = max_fro_norm.to(device=matrix.device, dtype=matrix.dtype).reshape(-1, 1)
@@ -1108,7 +1889,17 @@ class EnvironmentPrior:
                 )
             fro = torch.linalg.vector_norm(matrix.reshape(matrix.shape[0], -1), dim=1, keepdim=True)
             scale = torch.clamp(max_norm / (fro + eps), max=1.0)
-            return matrix * scale.reshape(-1, 1, 1)
+            projected = matrix * scale.reshape(-1, 1, 1)
+            audit_acc = EnvironmentPrior._get_active_lipschitz_audit_acc()
+            if audit_acc is not None:
+                EnvironmentPrior._update_lipschitz_audit_matrix(
+                    audit_acc,
+                    raw_fro=fro,
+                    max_norm=max_norm,
+                    scale=scale,
+                    eps=eps,
+                )
+            return projected
         raise ValueError(f"expected 2D or 3D matrix tensor, got shape={tuple(matrix.shape)}")
 
     @staticmethod
@@ -1123,7 +1914,7 @@ class EnvironmentPrior:
             return None
         return EnvironmentPrior._optional_positive_scalar(h.get("lipschitz_gp_outputscale_max", 1.0))
 
-    def _build_scm_fn(self, in_dim, out_dim, h, device, generator=None):
+    def _build_scm_fn(self, in_dim, out_dim, h, device, generator=None, apply_output_tanh=True):
         depth = max(2, int(h["num_layers"]))
         hidden = max(int(out_dim), int(h["prior_mlp_hidden_dim"]))
         init_std = float(h["init_std"])
@@ -1156,12 +1947,23 @@ class EnvironmentPrior:
                     z = z + torch.randn_like(z) * noise_std
                 else:
                     z = z + torch.randn(z.shape, device=z.device, dtype=z.dtype, generator=generator) * noise_std
-            return torch.tanh(z)
+            if apply_output_tanh:
+                z = torch.tanh(z)
+            return z
 
+        fn._applies_output_tanh = bool(apply_output_tanh)
         return fn
 
     @staticmethod
-    def _build_gp_fn(in_dim, out_dim, h, device, generator=None):
+    def _build_gp_fn(
+        in_dim,
+        out_dim,
+        h,
+        device,
+        generator=None,
+        apply_output_tanh=True,
+        reference_semantics=False,
+    ):
         m = max(8, int(h["gp_rff_features"]))
         lengthscale = max(1e-6, float(h["lengthscale"]))
         outputscale = float(h["outputscale"])
@@ -1169,30 +1971,1817 @@ class EnvironmentPrior:
         weight_cap = EnvironmentPrior._resolve_lipschitz_weight_cap(h)
         outputscale_cap = EnvironmentPrior._resolve_lipschitz_gp_outputscale_cap(h)
         if outputscale_cap is not None:
-            outputscale = math.copysign(min(abs(outputscale), float(outputscale_cap)), outputscale)
+            outputscale = EnvironmentPrior._project_outputscale_abs(outputscale, float(outputscale_cap))
 
         if generator is None:
             w = torch.randn(in_dim, m, device=device) / lengthscale
             b = 2.0 * math.pi * torch.rand(m, device=device)
-            a = torch.randn(m, out_dim, device=device) / math.sqrt(max(1, m))
+            a = torch.randn(m, out_dim, device=device)
         else:
             w = torch.randn(in_dim, m, device=device, generator=generator) / lengthscale
             b = 2.0 * math.pi * torch.rand(m, device=device, generator=generator)
-            a = torch.randn(m, out_dim, device=device, generator=generator) / math.sqrt(max(1, m))
+            a = torch.randn(m, out_dim, device=device, generator=generator)
         w = EnvironmentPrior._project_matrix_fro_norm(w, weight_cap)
+        if bool(reference_semantics):
+            a = a * math.sqrt(2.0 / float(max(1, m)))
+        else:
+            a = a / math.sqrt(max(1, m))
         a = EnvironmentPrior._project_matrix_fro_norm(a, weight_cap)
+        output_amp = math.sqrt(max(0.0, outputscale)) if bool(reference_semantics) else outputscale
+        noise_scale = math.sqrt(max(0.0, noise)) if bool(reference_semantics) else noise
 
         def fn(x, generator=None):
             phi = torch.cos(x @ w + b)
-            y = outputscale * (phi @ a)
-            if noise > 0:
+            y = output_amp * (phi @ a)
+            if noise_scale > 0:
                 if generator is None:
-                    y = y + torch.randn_like(y) * noise
+                    y = y + torch.randn_like(y) * noise_scale
                 else:
-                    y = y + torch.randn(y.shape, device=y.device, dtype=y.dtype, generator=generator) * noise
-            return torch.tanh(y)
+                    y = y + torch.randn(y.shape, device=y.device, dtype=y.dtype, generator=generator) * noise_scale
+            if apply_output_tanh:
+                y = torch.tanh(y)
+            return y
 
+        fn._applies_output_tanh = bool(apply_output_tanh)
+        fn._reference_gp_fixed_cost = bool(reference_semantics)
         return fn
+
+    @staticmethod
+    def _generator_randint(low, high_inclusive, *, generator=None, device="cpu"):
+        low = int(low)
+        high_inclusive = int(high_inclusive)
+        if high_inclusive < low:
+            raise ValueError(f"invalid randint range [{low}, {high_inclusive}]")
+        if low == high_inclusive:
+            return low
+        draw = torch.randint(
+            low,
+            high_inclusive + 1,
+            (1,),
+            device=device,
+            generator=generator,
+        )
+        return int(draw.item())
+
+    @staticmethod
+    def _reference_scm_apply_weight_init(
+        weight,
+        *,
+        init_std,
+        prior_mlp_dropout_prob,
+        block_wise_dropout,
+        prior_mlp_scale_weights_sqrt,
+        generator=None,
+    ):
+        if weight.ndim != 2:
+            raise ValueError("reference SCM weight init expects a 2D tensor")
+        if block_wise_dropout:
+            nn.init.zeros_(weight)
+            n_blocks = EnvironmentPrior._generator_randint(
+                1,
+                int(math.ceil(math.sqrt(min(weight.shape[0], weight.shape[1])))),
+                generator=generator,
+                device=weight.device,
+            )
+            block_h = max(1, weight.shape[0] // n_blocks)
+            block_w = max(1, weight.shape[1] // n_blocks)
+            keep_prob = float((n_blocks * block_h * block_w) / max(1, weight.numel()))
+            denom = keep_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0)
+            block_std = float(init_std) / max(denom, 1e-12)
+            for block_idx in range(n_blocks):
+                h_start = block_h * block_idx
+                h_end = min(weight.shape[0], block_h * (block_idx + 1))
+                w_start = block_w * block_idx
+                w_end = min(weight.shape[1], block_w * (block_idx + 1))
+                if h_end <= h_start or w_end <= w_start:
+                    continue
+                block_shape = (h_end - h_start, w_end - w_start)
+                if generator is None:
+                    init_block = torch.randn(block_shape, device=weight.device, dtype=weight.dtype)
+                else:
+                    init_block = torch.randn(
+                        block_shape,
+                        device=weight.device,
+                        dtype=weight.dtype,
+                        generator=generator,
+                    )
+                weight[h_start:h_end, w_start:w_end] = init_block * block_std
+            return
+
+        dropout_prob = float(min(0.99, max(0.0, prior_mlp_dropout_prob)))
+        denom = 1.0 - (dropout_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0))
+        init_scale = float(init_std) / max(denom, 1e-12)
+        if generator is None:
+            nn.init.normal_(weight, std=init_scale)
+            if dropout_prob > 0:
+                weight.mul_(torch.bernoulli(torch.zeros_like(weight) + (1.0 - dropout_prob)))
+        else:
+            weight.copy_(
+                torch.randn(
+                    weight.shape,
+                    device=weight.device,
+                    dtype=weight.dtype,
+                    generator=generator,
+                ) * init_scale
+            )
+            if dropout_prob > 0:
+                keep_mask = torch.bernoulli(
+                    torch.zeros_like(weight) + (1.0 - dropout_prob),
+                    generator=generator,
+                )
+                weight.mul_(keep_mask)
+
+    @staticmethod
+    def _reference_scm_init_bias(bias, fan_in, *, generator=None):
+        fan_in = max(1, int(fan_in))
+        bound = 1.0 / math.sqrt(float(fan_in))
+        if generator is None:
+            bias.uniform_(-bound, bound)
+        else:
+            bias.copy_(
+                (torch.rand(bias.shape, device=bias.device, dtype=bias.dtype, generator=generator) * (2.0 * bound))
+                - bound
+            )
+
+    def _reference_scm_memory_guard_allows(self, device, extra_bytes):
+        if (not bool(self.reference_scm_memory_guard)) or int(extra_bytes) <= 0:
+            return True
+        if device.type != "cuda":
+            return True
+        try:
+            free_bytes, _ = torch.cuda.mem_get_info(device=device)
+        except Exception:
+            return True
+        budget = int(float(self.reference_scm_memory_guard_fraction) * float(free_bytes))
+        return int(extra_bytes) <= max(0, budget)
+
+    @staticmethod
+    def _reference_compact_to_padded_indices(compact_indices, hidden_dim, hidden_cap, *, device):
+        compact = torch.as_tensor(compact_indices, device=device, dtype=torch.long)
+        if int(compact.numel()) <= 0:
+            return compact
+        hidden_dim = int(max(1, int(hidden_dim)))
+        hidden_cap = int(max(1, int(hidden_cap)))
+        layer_idx = torch.div(compact, hidden_dim, rounding_mode="floor")
+        offset_idx = torch.remainder(compact, hidden_dim)
+        return (layer_idx * hidden_cap) + offset_idx
+
+    @staticmethod
+    def _sample_rowwise_scaled_noise(scale, *, generators, device, dtype):
+        scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+        if scale_t.ndim != 2:
+            raise ValueError("rowwise scaled noise expects a rank-2 scale tensor")
+        batch_size = int(scale_t.shape[0])
+        width = int(scale_t.shape[1])
+        if batch_size <= 0 or width <= 0 or (not bool(torch.any(scale_t > 0))):
+            return None
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        generators_list = None if generators is None else list(generators)
+        for bi in range(batch_size):
+            active = torch.nonzero(scale_t[bi] > 0, as_tuple=False).squeeze(1)
+            if int(active.numel()) <= 0:
+                continue
+            g = None if generators_list is None or bi >= len(generators_list) else generators_list[bi]
+            draw_shape = (int(active.numel()),)
+            if g is None:
+                e_b = torch.randn(draw_shape, device=device, dtype=dtype)
+            else:
+                e_b = torch.randn(draw_shape, device=device, dtype=dtype, generator=g)
+            eps[bi, active] = e_b * scale_t[bi, active]
+        return eps
+
+    @staticmethod
+    def _sample_prefix_grouped_scaled_noise_without_generators(scale, *, device, dtype):
+        scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+        if scale_t.ndim != 2:
+            raise ValueError("prefix grouped noise expects a rank-2 scale tensor")
+        batch_size = int(scale_t.shape[0])
+        width = int(scale_t.shape[1])
+        if batch_size <= 0 or width <= 0 or (not bool(torch.any(scale_t > 0))):
+            return None
+        positive_mask = scale_t > 0
+        active_counts = positive_mask.to(dtype=torch.long).sum(dim=1)
+        prefix_mask = (
+            torch.arange(width, device=device, dtype=torch.long).unsqueeze(0)
+            < active_counts.unsqueeze(1)
+        )
+        if not bool(torch.equal(positive_mask, prefix_mask)):
+            return EnvironmentPrior._sample_rowwise_scaled_noise(
+                scale_t,
+                generators=None,
+                device=device,
+                dtype=dtype,
+            )
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        unique_counts = torch.unique(active_counts, sorted=True)
+        for count_t in unique_counts:
+            count = int(count_t.item())
+            if count <= 0:
+                continue
+            row_mask = active_counts == count_t
+            row_count = int(row_mask.sum().item())
+            if row_count <= 0:
+                continue
+            draws = torch.randn((row_count, count), device=device, dtype=dtype)
+            eps[row_mask, :count] = draws * scale_t[row_mask, :count]
+        return eps
+
+    @staticmethod
+    def _build_prefix_grouped_scale_plan(scale, *, device):
+        scale_t = torch.as_tensor(scale, device=device)
+        if scale_t.ndim != 2:
+            raise ValueError("prefix grouped scale plan expects a rank-2 scale tensor")
+        batch_size = int(scale_t.shape[0])
+        width = int(scale_t.shape[1])
+        if batch_size <= 0 or width <= 0 or (not bool(torch.any(scale_t > 0))):
+            return None
+        positive_mask = scale_t > 0
+        active_counts = positive_mask.to(dtype=torch.long).sum(dim=1)
+        prefix_mask = (
+            torch.arange(width, device=device, dtype=torch.long).unsqueeze(0)
+            < active_counts.unsqueeze(1)
+        )
+        if not bool(torch.equal(positive_mask, prefix_mask)):
+            return None
+        unique_counts = torch.unique(active_counts, sorted=True)
+        groups = []
+        perm_chunks = []
+        offset = 0
+        for count_t in unique_counts:
+            count = int(count_t.item())
+            if count <= 0:
+                continue
+            row_idx = torch.nonzero(active_counts == count_t, as_tuple=False).squeeze(1)
+            if int(row_idx.numel()) <= 0:
+                continue
+            row_count = int(row_idx.numel())
+            groups.append(
+                (
+                    int(offset),
+                    int(row_count),
+                    int(count),
+                    scale_t.index_select(0, row_idx)[:, :count].clone(),
+                )
+            )
+            perm_chunks.append(row_idx)
+            offset += row_count
+        if not groups:
+            return None
+        perm = torch.cat(perm_chunks, dim=0)
+        return {"perm": perm, "groups": groups, "batch_size": int(scale_t.shape[0]), "width": int(scale_t.shape[1])}
+
+    @staticmethod
+    def _sample_prefix_grouped_scaled_noise_with_plan(scale, groups, *, device, dtype):
+        scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+        if scale_t.ndim != 2:
+            raise ValueError("prefix grouped noise with plan expects a rank-2 scale tensor")
+        if not groups:
+            return None
+        if isinstance(groups, dict):
+            perm = groups.get("perm", None)
+            group_specs = groups.get("groups", None)
+            batch_size = int(groups.get("batch_size", int(scale_t.shape[0])))
+            width = int(groups.get("width", int(scale_t.shape[1])))
+        else:
+            perm = None
+            group_specs = groups
+            batch_size = int(scale_t.shape[0])
+            width = int(scale_t.shape[1])
+        if batch_size <= 0 or width <= 0:
+            return None
+        if perm is None:
+            eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+            for row_idx, count in group_specs:
+                if count <= 0:
+                    continue
+                row_idx_t = row_idx.to(device=device, dtype=torch.long)
+                row_count = int(row_idx_t.numel())
+                if row_count <= 0:
+                    continue
+                draws = torch.randn((row_count, count), device=device, dtype=dtype)
+                eps[row_idx_t, :count] = draws * scale_t[row_idx_t, :count]
+            return eps
+        perm_t = perm.to(device=device, dtype=torch.long)
+        total_rows = int(perm_t.numel())
+        eps_packed = torch.zeros((total_rows, width), device=device, dtype=dtype)
+        for offset, row_count, count, scale_group in group_specs:
+            if count <= 0 or row_count <= 0:
+                continue
+            draws = torch.randn((row_count, count), device=device, dtype=dtype)
+            eps_packed[offset: offset + row_count, :count] = draws * scale_group.to(device=device, dtype=dtype)
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        eps.index_copy_(0, perm_t, eps_packed)
+        return eps
+
+    @staticmethod
+    def _reference_scm_layer_step_core(
+        z,
+        active_mask,
+        hidden_mask,
+        w,
+        b,
+        noise_eps,
+        activation_relu_mask,
+        activation_identity_mask,
+        *,
+        activation_mixed=False,
+        activation_single=0,
+    ):
+        if bool(activation_mixed):
+            z_linear = z
+            z_tanh = torch.tanh(z_linear)
+            z_relu = torch.relu(z_linear)
+            z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
+            z_act = torch.where(activation_identity_mask, z_linear, z_act)
+        else:
+            if int(activation_single) == 1:
+                z_act = torch.relu(z)
+            elif int(activation_single) == 2:
+                z_act = z
+            else:
+                z_act = torch.tanh(z)
+        active_mask_expanded = active_mask.unsqueeze(1)
+        z_in_layer = torch.where(active_mask_expanded, z_act, z)
+        z_next = torch.baddbmm(
+            b.unsqueeze(1),
+            z_in_layer.unsqueeze(1),
+            w,
+        ).squeeze(1)
+        if noise_eps is not None:
+            z_next = z_next + noise_eps
+        z_next = z_next * hidden_mask
+        return torch.where(active_mask_expanded, z_next, z)
+
+
+    def _get_reference_scm_layer_step_runner(
+        self,
+        *,
+        batch_size,
+        hidden_cap,
+        device,
+        dtype,
+        activation_mixed,
+        activation_single,
+        has_noise,
+    ):
+        device_obj = torch.device(device)
+        dtype_obj = torch.empty((), device=device_obj, dtype=dtype).dtype
+        signature = (
+            str(device_obj.type),
+            str(dtype_obj),
+            int(batch_size),
+            int(hidden_cap),
+            int(bool(activation_mixed)),
+            int(activation_single),
+            int(bool(has_noise)),
+        )
+        cached = self._reference_scm_layer_step_cache.get(signature, None)
+        if cached is not None:
+            return cached
+
+        def eager_runner(z, active_mask, hidden_mask, w, b, noise_eps, activation_relu_mask, activation_identity_mask):
+            return self._reference_scm_layer_step_core(
+                z,
+                active_mask,
+                hidden_mask,
+                w,
+                b,
+                noise_eps,
+                activation_relu_mask,
+                activation_identity_mask,
+                activation_mixed=bool(activation_mixed),
+                activation_single=int(activation_single),
+            )
+        eager_runner._reference_scm_compiled = False
+
+        compile_enabled = bool(
+            self.reference_scm_layer_compile
+            and hasattr(torch, "compile")
+            and device_obj.type == "cuda"
+            and dtype_obj == torch.float32
+        )
+        if not compile_enabled:
+            self._reference_scm_layer_step_cache[signature] = eager_runner
+            return eager_runner
+
+        if signature in self._reference_scm_layer_step_compile_failed:
+            self._reference_scm_layer_step_cache[signature] = eager_runner
+            return eager_runner
+
+        compile_mode_runtime = str(self.reference_scm_layer_compile_mode)
+        if device_obj.type == "cuda" and "no-cudagraphs" not in compile_mode_runtime:
+            if bool(self.reference_scm_layer_compile_log):
+                print(
+                    "[envgen-compile-warn] kind=reference_scm_layer "
+                    f"signature={signature} normalize_mode_from={compile_mode_runtime} "
+                    "normalize_mode_to=max-autotune-no-cudagraphs reason=cudagraph_reuse_hazard"
+                )
+            compile_mode_runtime = "max-autotune-no-cudagraphs"
+
+        if bool(self.reference_scm_layer_compile_log):
+            if len(self._reference_scm_layer_step_cache) > 0:
+                print(
+                    "[envgen-compile-recompile] kind=reference_scm_layer "
+                    f"signature={signature} cached_signatures={int(len(self._reference_scm_layer_step_cache))}"
+                )
+            print(
+                "[envgen-compile] kind=reference_scm_layer "
+                f"signature={signature} backend={self.reference_scm_layer_compile_backend} "
+                f"mode={compile_mode_runtime} "
+                f"fullgraph={int(bool(self.reference_scm_layer_compile_fullgraph))} "
+                f"dynamic={int(bool(self.reference_scm_layer_compile_dynamic))}"
+            )
+
+        try:
+            compiled_runner = torch.compile(
+                eager_runner,
+                backend=str(self.reference_scm_layer_compile_backend),
+                mode=compile_mode_runtime,
+                fullgraph=bool(self.reference_scm_layer_compile_fullgraph),
+                dynamic=bool(self.reference_scm_layer_compile_dynamic),
+            )
+            hidden_mask_dummy = torch.ones((int(batch_size), int(hidden_cap)), device=device_obj, dtype=dtype_obj)
+            active_mask_dummy = torch.ones((int(batch_size),), device=device_obj, dtype=torch.bool)
+            z_dummy = torch.zeros((int(batch_size), int(hidden_cap)), device=device_obj, dtype=dtype_obj)
+            w_dummy = torch.zeros((int(batch_size), int(hidden_cap), int(hidden_cap)), device=device_obj, dtype=dtype_obj)
+            b_dummy = torch.zeros((int(batch_size), int(hidden_cap)), device=device_obj, dtype=dtype_obj)
+            noise_dummy = (
+                torch.zeros((int(batch_size), int(hidden_cap)), device=device_obj, dtype=dtype_obj)
+                if bool(has_noise)
+                else None
+            )
+            relu_mask_dummy = torch.zeros((int(batch_size), 1), device=device_obj, dtype=torch.bool)
+            identity_mask_dummy = torch.zeros((int(batch_size), 1), device=device_obj, dtype=torch.bool)
+            compile_t0 = time.perf_counter()
+            compiled_runner(
+                z_dummy,
+                active_mask_dummy,
+                hidden_mask_dummy,
+                w_dummy,
+                b_dummy,
+                noise_dummy,
+                relu_mask_dummy,
+                identity_mask_dummy,
+            )
+            if device_obj.type == "cuda" and torch.cuda.is_available():
+                torch.cuda.synchronize(device_obj)
+            compile_dt = float(time.perf_counter() - compile_t0)
+            if bool(self.reference_scm_layer_compile_log):
+                print(
+                    "[envgen-compile-done] kind=reference_scm_layer "
+                    f"signature={signature} wall_s={compile_dt:.3f}"
+                )
+            compiled_runner._reference_scm_compiled = True
+            self._reference_scm_layer_step_cache[signature] = compiled_runner
+            return compiled_runner
+        except Exception as e:
+            self._reference_scm_layer_step_compile_failed.add(signature)
+            if bool(self.reference_scm_layer_compile_log):
+                print(
+                    "[envgen-compile-warn] kind=reference_scm_layer "
+                    f"signature={signature} fallback=eager error={e}"
+                )
+            self._reference_scm_layer_step_cache[signature] = eager_runner
+            return eager_runner
+
+    def _build_reference_scm_joint_transition_padded_batch_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        *,
+        generators=None,
+        input_mask=None,
+        _allow_partition=True,
+    ):
+        device = torch.device(device)
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            raise ValueError("reference SCM padded batch builder expects a non-empty h_list")
+        if (generators is not None) and (len(generators) != batch_size):
+            raise ValueError("generators must match h_list length for reference SCM padded batch builder")
+
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if int(state_dims.numel()) != batch_size or int(in_dims.numel()) != batch_size:
+            raise ValueError("state_dims and in_dims must match h_list length")
+
+        def _estimate_reference_scm_builder_bytes(local_in_dims, local_state_dims, local_h_list):
+            local_bs = int(len(local_h_list))
+            if local_bs <= 0:
+                return 0, None, None
+            local_state_dims_t = torch.as_tensor(local_state_dims, device=device, dtype=torch.long)
+            local_in_dims_t = torch.as_tensor(local_in_dims, device=device, dtype=torch.long)
+            local_depth_values = torch.tensor(
+                [max(2, int(h["num_layers"])) for h in local_h_list],
+                device=device,
+                dtype=torch.long,
+            )
+            local_num_hidden_blocks = local_depth_values - 1
+            local_hidden_dims = torch.tensor(
+                [
+                    max(
+                        int(h["prior_mlp_hidden_dim"]),
+                        1 + (2 * int(local_state_dims_t[bi].item())),
+                    )
+                    for bi, h in enumerate(local_h_list)
+                ],
+                device=device,
+                dtype=torch.long,
+            )
+            local_in_cap = int(max(1, int(local_in_dims_t.max().item())))
+            local_hidden_cap = int(max(1, int(local_hidden_dims.max().item())))
+            local_max_hidden_blocks = int(max(1, int(local_num_hidden_blocks.max().item())))
+            bytes_f32 = 4
+            total = 0
+            total += local_bs * local_max_hidden_blocks * local_hidden_cap * local_hidden_cap * bytes_f32
+            total += local_bs * local_in_cap * local_hidden_cap * bytes_f32
+            total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
+            total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
+            return int(total), local_hidden_dims, local_num_hidden_blocks
+
+        partition_budget = int(self.reference_scm_partition_max_bytes)
+        if partition_budget <= 0 and device.type == "cuda" and bool(self.reference_scm_memory_guard):
+            try:
+                free_bytes, _ = torch.cuda.mem_get_info(device=device)
+                partition_budget = int(float(self.reference_scm_memory_guard_fraction) * float(free_bytes))
+            except Exception:
+                partition_budget = 0
+        estimated_builder_bytes, estimated_hidden_dims, estimated_num_hidden_blocks = _estimate_reference_scm_builder_bytes(
+            in_dims,
+            state_dims,
+            h_list,
+        )
+        if (
+            _allow_partition
+            and partition_budget > 0
+            and estimated_builder_bytes > partition_budget
+            and batch_size > 1
+        ):
+            if estimated_hidden_dims is None or estimated_num_hidden_blocks is None:
+                raise RuntimeError("reference SCM partition estimation unexpectedly failed")
+            group_map = {}
+            for bi in range(batch_size):
+                key = (
+                    int(self._bucket_ceil_pow2(int(in_dims[bi].item()))),
+                    int(self._bucket_ceil_pow2(int(estimated_hidden_dims[bi].item()))),
+                    int(estimated_num_hidden_blocks[bi].item()),
+                )
+                group_map.setdefault(key, []).append(int(bi))
+            partition_groups = [indices for indices in group_map.values() if indices]
+            if len(partition_groups) == 1:
+                order = sorted(
+                    range(batch_size),
+                    key=lambda idx: (
+                        int(estimated_hidden_dims[idx].item()),
+                        int(estimated_num_hidden_blocks[idx].item()),
+                        int(in_dims[idx].item()),
+                    ),
+                    reverse=True,
+                )
+                mid = max(1, len(order) // 2)
+                partition_groups = [order[:mid], order[mid:]]
+            sub_index_tensors = []
+            sub_index_lists = []
+            sub_transition_fns = []
+            input_mask_t_partition = None if input_mask is None else torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            for indices in partition_groups:
+                idx_tensor = torch.as_tensor(indices, device=device, dtype=torch.long)
+                sub_index_tensors.append(idx_tensor)
+                sub_index_lists.append([int(i) for i in indices])
+                sub_generators = None if generators is None else [generators[int(i)] for i in indices]
+                sub_input_mask = None if input_mask_t_partition is None else input_mask_t_partition.index_select(0, idx_tensor)
+                sub_transition_fns.append(
+                    self._build_reference_scm_joint_transition_padded_batch_fn(
+                        in_dims.index_select(0, idx_tensor),
+                        state_dims.index_select(0, idx_tensor),
+                        [h_list[int(i)] for i in indices],
+                        device,
+                        generators=sub_generators,
+                        input_mask=sub_input_mask,
+                        _allow_partition=True,
+                    )
+                )
+            state_cap_partition = int(max(1, int(state_dims.max().item())))
+            packed_input_cap_partition = int(max(1, int(in_dims.max().item())))
+
+            def transition_fn(x, generator=None, generators_for_noise=None, x_input_is_packed=False):
+                x_device = x.device
+                x_dtype = x.dtype
+                state_out = torch.zeros((batch_size, state_cap_partition), device=x_device, dtype=x_dtype)
+                reward_out = torch.zeros((batch_size, 1), device=x_device, dtype=x_dtype)
+                for idx_tensor, idx_list, sub_fn in zip(sub_index_tensors, sub_index_lists, sub_transition_fns):
+                    idx_runtime = idx_tensor.to(device=x_device)
+                    x_sub = x.index_select(0, idx_runtime)
+                    sub_noise_generators = None
+                    if generators_for_noise is not None:
+                        sub_noise_generators = [generators_for_noise[int(i)] for i in idx_list]
+                    state_sub, reward_sub = sub_fn(
+                        x_sub,
+                        generators_for_noise=sub_noise_generators,
+                        x_input_is_packed=bool(x_input_is_packed),
+                    )
+                    state_out[:, : state_sub.shape[1]].index_copy_(0, idx_runtime, state_sub)
+                    reward_out.index_copy_(0, idx_runtime, reward_sub)
+                return state_out, reward_out
+
+            transition_fn._applies_output_tanh = False
+            transition_fn._reference_semantics_exact = True
+            transition_fn._reference_scm_vectorized = True
+            transition_fn._prefers_packed_env_input = True
+            transition_fn._packed_input_cap = int(packed_input_cap_partition)
+            transition_fn._reference_scm_partitioned = True
+            return transition_fn
+
+        if input_mask is not None:
+            input_mask_t = torch.as_tensor(input_mask, device=device, dtype=torch.float32)
+            in_cap = int(input_mask_t.shape[1])
+        else:
+            in_cap = int(max(1, int(in_dims.max().item())))
+            input_mask_t = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
+            for bi in range(batch_size):
+                input_mask_t[bi, :int(in_dims[bi].item())] = 1.0
+
+        reward_dim = 1
+        depth_values = torch.tensor(
+            [max(2, int(h["num_layers"])) for h in h_list],
+            device=device,
+            dtype=torch.long,
+        )
+        num_hidden_blocks = depth_values - 1
+        max_hidden_blocks = int(max(1, int(num_hidden_blocks.max().item())))
+        hidden_dims = torch.tensor(
+            [
+                max(
+                    int(h["prior_mlp_hidden_dim"]),
+                    reward_dim + (2 * int(state_dims[bi].item())),
+                )
+                for bi, h in enumerate(h_list)
+            ],
+            device=device,
+            dtype=torch.long,
+        )
+        hidden_cap = int(max(1, int(hidden_dims.max().item())))
+        state_cap = int(max(1, int(state_dims.max().item())))
+        outputs_flat_cap = int(max_hidden_blocks * hidden_cap)
+
+        first_weight = torch.zeros((batch_size, in_cap, hidden_cap), device=device, dtype=torch.float32)
+        first_bias = torch.zeros((batch_size, hidden_cap), device=device, dtype=torch.float32)
+        packed_input_cap = int(max(1, int(in_dims.max().item())))
+        first_weight_packed = None if input_mask is None else torch.zeros(
+            (batch_size, packed_input_cap, hidden_cap),
+            device=device,
+            dtype=torch.float32,
+        )
+        hidden_weights_stack = torch.zeros(
+            (batch_size, max_hidden_blocks, hidden_cap, hidden_cap),
+            device=device,
+            dtype=torch.float32,
+        )
+        hidden_biases_stack = torch.zeros(
+            (batch_size, max_hidden_blocks, hidden_cap),
+            device=device,
+            dtype=torch.float32,
+        )
+        hidden_noise_scale_stack = torch.zeros(
+            (batch_size, max_hidden_blocks, hidden_cap),
+            device=device,
+            dtype=torch.float32,
+        )
+
+        state_select_idx = torch.zeros((batch_size, state_cap), device=device, dtype=torch.long)
+        state_mask = torch.zeros((batch_size, state_cap), device=device, dtype=torch.float32)
+        reward_select_idx = torch.zeros((batch_size, 1), device=device, dtype=torch.long)
+        hidden_mask = (
+            torch.arange(hidden_cap, device=device, dtype=torch.long).unsqueeze(0)
+            < hidden_dims.unsqueeze(1)
+        ).to(dtype=torch.float32)
+
+        activation_codes = []
+        hidden_noise_plans = []
+        hidden_noise_present = []
+
+        for bi, h in enumerate(h_list):
+            g = None if generators is None else generators[bi]
+            in_i = int(in_dims[bi].item())
+            state_dim_i = int(state_dims[bi].item())
+            hidden_dim_i = int(hidden_dims[bi].item())
+            num_hidden_blocks_i = int(num_hidden_blocks[bi].item())
+            init_std = float(h["init_std"])
+            noise_std = float(h["noise_std"])
+            pre_sample_weights = bool(h.get("pre_sample_weights", False))
+            prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
+            block_wise_dropout = bool(h.get("block_wise_dropout", False))
+            prior_mlp_scale_weights_sqrt = bool(h.get("prior_mlp_scale_weights_sqrt", True))
+            y_is_effect = bool(h.get("y_is_effect", True))
+            sort_features = bool(h.get("sort_features", False))
+            in_clique = bool(h.get("in_clique", False))
+            random_feature_rotation = bool(h.get("random_feature_rotation", False))
+
+            activation_name = self._activation_name(h["prior_mlp_activations"])
+            if activation_name == "relu":
+                activation_codes.append(1)
+            elif activation_name == "identity":
+                activation_codes.append(2)
+            else:
+                activation_codes.append(0)
+
+            active_idx = torch.nonzero(input_mask_t[bi] > 0, as_tuple=False).squeeze(1)
+            if int(active_idx.numel()) != in_i:
+                raise ValueError("reference SCM padded builder expected input_mask active width to match in_dims")
+
+            first_weight_i = torch.empty((in_i, hidden_dim_i), device=device, dtype=torch.float32)
+            self._reference_scm_apply_weight_init(
+                first_weight_i,
+                init_std=init_std,
+                prior_mlp_dropout_prob=0.0,
+                block_wise_dropout=block_wise_dropout,
+                prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+                generator=g,
+            )
+            first_bias_i = torch.empty((hidden_dim_i,), device=device, dtype=torch.float32)
+            self._reference_scm_init_bias(first_bias_i, in_i, generator=g)
+            first_weight[bi, active_idx, :hidden_dim_i] = first_weight_i
+            if first_weight_packed is not None:
+                first_weight_packed[bi, :in_i, :hidden_dim_i] = first_weight_i
+            first_bias[bi, :hidden_dim_i] = first_bias_i
+
+            for layer_idx in range(num_hidden_blocks_i):
+                weight = torch.empty((hidden_dim_i, hidden_dim_i), device=device, dtype=torch.float32)
+                self._reference_scm_apply_weight_init(
+                    weight,
+                    init_std=init_std,
+                    prior_mlp_dropout_prob=prior_mlp_dropout_prob,
+                    block_wise_dropout=block_wise_dropout,
+                    prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+                    generator=g,
+                )
+                bias = torch.empty((hidden_dim_i,), device=device, dtype=torch.float32)
+                self._reference_scm_init_bias(bias, hidden_dim_i, generator=g)
+                hidden_weights_stack[bi, layer_idx, :hidden_dim_i, :hidden_dim_i] = weight
+                hidden_biases_stack[bi, layer_idx, :hidden_dim_i] = bias
+                if pre_sample_weights and noise_std > 0.0:
+                    if g is None:
+                        sampled_std = torch.abs(
+                            torch.normal(
+                                mean=torch.zeros((1, hidden_dim_i), device=device, dtype=torch.float32),
+                                std=float(noise_std),
+                            )
+                        )
+                    else:
+                        sampled_std = torch.abs(
+                            torch.normal(
+                                mean=torch.zeros((1, hidden_dim_i), device=device, dtype=torch.float32),
+                                std=float(noise_std),
+                                generator=g,
+                            )
+                        )
+                    hidden_noise_scale_stack[bi, layer_idx, :hidden_dim_i] = sampled_std.squeeze(0)
+                elif noise_std > 0.0:
+                    hidden_noise_scale_stack[bi, layer_idx, :hidden_dim_i] = float(noise_std)
+
+            outputs_flat_dim_i = int(num_hidden_blocks_i * hidden_dim_i)
+            if outputs_flat_dim_i <= state_dim_i:
+                raise ValueError(
+                    f"reference SCM requires outputs_flat_dim > state_dim, got {outputs_flat_dim_i=} {state_dim_i=}"
+                )
+            if in_clique:
+                clique_hi = max(0, outputs_flat_dim_i - reward_dim - state_dim_i)
+                clique_start = self._generator_randint(
+                    0,
+                    clique_hi,
+                    generator=g,
+                    device=device,
+                )
+                selection = clique_start + torch.randperm(
+                    reward_dim + state_dim_i,
+                    device=device,
+                    generator=g,
+                )
+            else:
+                selection = torch.randperm(
+                    outputs_flat_dim_i - 1,
+                    device=device,
+                    generator=g,
+                )
+            if y_is_effect:
+                reward_index_compact = torch.tensor([outputs_flat_dim_i - reward_dim], device=device, dtype=torch.long)
+            else:
+                reward_index_compact = selection[:reward_dim].to(device=device, dtype=torch.long)
+            state_indices_compact = selection[reward_dim: reward_dim + state_dim_i].to(device=device, dtype=torch.long)
+            if sort_features and state_indices_compact.numel() > 0:
+                state_indices_compact, _ = torch.sort(state_indices_compact)
+            if random_feature_rotation and state_dim_i > 0:
+                rotation_shift = self._generator_randint(
+                    0,
+                    state_dim_i - 1,
+                    generator=g,
+                    device=device,
+                )
+                if rotation_shift > 0:
+                    rotate_idx = (
+                        torch.arange(state_dim_i, device=device, dtype=torch.long) + rotation_shift
+                    ) % state_dim_i
+                    state_indices_compact = state_indices_compact.index_select(0, rotate_idx)
+            state_indices_padded = self._reference_compact_to_padded_indices(
+                state_indices_compact,
+                hidden_dim_i,
+                hidden_cap,
+                device=device,
+            )
+            reward_index_padded = self._reference_compact_to_padded_indices(
+                reward_index_compact,
+                hidden_dim_i,
+                hidden_cap,
+                device=device,
+            )
+            state_select_idx[bi, :state_dim_i] = state_indices_padded
+            state_mask[bi, :state_dim_i] = 1.0
+            reward_select_idx[bi, 0] = reward_index_padded[0]
+
+        for layer_idx in range(max_hidden_blocks):
+            hidden_noise_plans.append(
+                self._build_prefix_grouped_scale_plan(
+                    hidden_noise_scale_stack[:, layer_idx, :],
+                    device=device,
+                )
+            )
+            hidden_noise_present.append(bool(torch.any(hidden_noise_scale_stack[:, layer_idx, :] > 0).item()))
+
+        activation_codes_t = torch.tensor(activation_codes, device=device, dtype=torch.long)
+        activation_mixed = not bool(torch.all(activation_codes_t == activation_codes_t[0]))
+        activation_relu_mask = (activation_codes_t == 1).unsqueeze(1)
+        activation_identity_mask = (activation_codes_t == 2).unsqueeze(1)
+        activation_single = int(activation_codes_t[0].item())
+        hidden_active_masks = [
+            (torch.full((batch_size,), layer_idx, device=device, dtype=torch.long) < num_hidden_blocks)
+            for layer_idx in range(max_hidden_blocks)
+        ]
+        hidden_prefix_sizes = []
+        hidden_prefix_out_tile_batch = []
+        hidden_prefix_out_tile_offsets = []
+        for layer_idx in range(max_hidden_blocks):
+            layer_sizes = hidden_dims * hidden_active_masks[layer_idx].to(dtype=torch.long)
+            hidden_prefix_sizes.append(layer_sizes)
+            out_tile_batch, out_tile_offsets = self._build_active_tile_map(
+                layer_sizes,
+                int(self.reference_scm_hidden_affine_block_o),
+            )
+            hidden_prefix_out_tile_batch.append(out_tile_batch)
+            hidden_prefix_out_tile_offsets.append(out_tile_offsets)
+        hidden_noise_stack_present = bool(torch.any(hidden_noise_scale_stack > 0).item())
+
+        def transition_fn(x, generator=None, generators_for_noise=None, x_input_is_packed=False):
+            noise_generators = generators_for_noise
+            if (noise_generators is None) and (generator is not None):
+                noise_generators = [generator] * batch_size
+            x_dtype = x.dtype
+            x_device = x.device
+            first_bias_runtime = first_bias.to(device=x_device, dtype=x_dtype)
+            first_weight_packed_runtime = (
+                first_weight.to(device=x_device, dtype=x_dtype)
+                if first_weight_packed is None
+                else first_weight_packed.to(device=x_device, dtype=x_dtype)
+            )
+            hidden_weights_stack_runtime = hidden_weights_stack.to(device=x_device, dtype=x_dtype)
+            hidden_biases_stack_runtime = hidden_biases_stack.to(device=x_device, dtype=x_dtype)
+            hidden_noise_scale_stack_runtime = hidden_noise_scale_stack.to(device=x_device, dtype=x_dtype)
+            hidden_dims_runtime = hidden_dims.to(device=x_device, dtype=torch.long)
+            num_hidden_blocks_runtime = num_hidden_blocks.to(device=x_device, dtype=torch.long)
+            activation_codes_runtime = activation_codes_t.to(device=x_device, dtype=torch.long)
+            hidden_noise_eps_all = None
+            hidden_noise_bytes = int(hidden_noise_scale_stack_runtime.numel() * hidden_noise_scale_stack_runtime.element_size())
+            if (
+                noise_generators is None
+                and hidden_noise_stack_present
+                and bool(self.reference_scm_hidden_noise_packed)
+                and self._reference_scm_memory_guard_allows(x_device, hidden_noise_bytes)
+            ):
+                hidden_noise_eps_all = torch.randn_like(hidden_noise_scale_stack_runtime) * hidden_noise_scale_stack_runtime
+            if bool(x_input_is_packed):
+                x_in = x[:, :packed_input_cap]
+                full_fused_bytes = int(
+                    (batch_size * hidden_cap * 2 + batch_size * max_hidden_blocks * hidden_cap)
+                    * x.element_size()
+                )
+                use_full_multilayer_fused = bool(
+                    self.reference_scm_full_multilayer_fused
+                    and self.reference_scm_hidden_multilayer_fused
+                    and noise_generators is None
+                    and (hidden_noise_eps_all is not None or (not hidden_noise_stack_present))
+                    and self._reference_scm_memory_guard_allows(x_device, full_fused_bytes)
+                    and x_in.device.type == "cuda"
+                    and x_in.dtype == torch.float32
+                    and (not bool(x_in.requires_grad))
+                )
+                if use_full_multilayer_fused:
+                    outputs_layers = self._reference_scm_full_multilayer_fused_forward(
+                        x_in,
+                        first_weight_packed_runtime,
+                        first_bias_runtime,
+                        hidden_weights_stack_runtime,
+                        hidden_biases_stack_runtime,
+                        hidden_noise_eps_all,
+                        in_dims.to(device=x_device, dtype=torch.long),
+                        hidden_dims_runtime,
+                        num_hidden_blocks_runtime,
+                        activation_codes_runtime,
+                        max_hidden_blocks,
+                        block_o=int(self.reference_scm_hidden_affine_block_o),
+                        block_k=int(self.reference_scm_hidden_affine_block_k),
+                        num_warps=int(self.reference_scm_hidden_affine_num_warps),
+                    )
+                    if outputs_layers is not None:
+                        outputs_flat = outputs_layers.reshape(batch_size, outputs_flat_cap)
+                        state_out = outputs_flat.gather(
+                            1,
+                            state_select_idx.to(device=outputs_flat.device),
+                        ) * state_mask.to(device=outputs_flat.device, dtype=outputs_flat.dtype)
+                        reward_out = outputs_flat.gather(
+                            1,
+                            reward_select_idx.to(device=outputs_flat.device),
+                        )
+                        return state_out, reward_out
+            else:
+                x_in = None
+            if bool(x_input_is_packed):
+                z = self._batch_affine(
+                    x_in,
+                    first_weight_packed_runtime,
+                    first_bias_runtime,
+                )
+            else:
+                x_in = x[:, :in_cap] * input_mask_t.to(device=x_device, dtype=x_dtype)
+                z = self._batch_affine(
+                    x_in,
+                    first_weight.to(device=x_device, dtype=x_dtype),
+                    first_bias_runtime,
+                )
+            hidden_mask_runtime = hidden_mask.to(device=z.device, dtype=z.dtype)
+            activation_relu_mask_runtime = activation_relu_mask.to(device=z.device)
+            activation_identity_mask_runtime = activation_identity_mask.to(device=z.device)
+            hidden_active_masks_runtime = [mask.to(device=z.device) for mask in hidden_active_masks]
+            hidden_weights_runtime = [hidden_weights_stack_runtime[:, layer_idx, :, :] for layer_idx in range(max_hidden_blocks)]
+            hidden_biases_runtime = [hidden_biases_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
+            hidden_noise_scales_runtime = [hidden_noise_scale_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
+            hidden_prefix_sizes_runtime = [s.to(device=z.device, dtype=torch.long) for s in hidden_prefix_sizes]
+            hidden_prefix_out_tile_batch_runtime = [t.to(device=z.device, dtype=torch.int32) for t in hidden_prefix_out_tile_batch]
+            hidden_prefix_out_tile_offsets_runtime = [t.to(device=z.device, dtype=torch.int32) for t in hidden_prefix_out_tile_offsets]
+            z = z * hidden_mask_runtime
+            layer_step_runner_without_noise = self._get_reference_scm_layer_step_runner(
+                batch_size=batch_size,
+                hidden_cap=hidden_cap,
+                device=z.device,
+                dtype=z.dtype,
+                activation_mixed=activation_mixed,
+                activation_single=activation_single,
+                has_noise=False,
+            )
+            layer_step_runner_with_noise = None
+            if any(hidden_noise_present):
+                layer_step_runner_with_noise = self._get_reference_scm_layer_step_runner(
+                    batch_size=batch_size,
+                    hidden_cap=hidden_cap,
+                    device=z.device,
+                    dtype=z.dtype,
+                    activation_mixed=activation_mixed,
+                    activation_single=activation_single,
+                    has_noise=True,
+                )
+            outputs_layers = torch.zeros((batch_size, max_hidden_blocks, hidden_cap), device=z.device, dtype=z.dtype)
+            use_hidden_multilayer_fused = bool(
+                self.reference_scm_hidden_multilayer_fused
+                and self.reference_scm_hidden_affine_fused
+                and self.reference_scm_hidden_update_fused
+                and noise_generators is None
+                and (hidden_noise_eps_all is not None or (not hidden_noise_stack_present))
+                and z.device.type == "cuda"
+                and z.dtype == torch.float32
+                and (not bool(z.requires_grad))
+            )
+            if use_hidden_multilayer_fused:
+                outputs_layers_fused = self._reference_scm_hidden_multilayer_fused_forward(
+                    z,
+                    hidden_weights_stack.to(device=z.device, dtype=z.dtype),
+                    hidden_biases_stack.to(device=z.device, dtype=z.dtype),
+                    hidden_noise_eps_all,
+                    hidden_mask_runtime,
+                    hidden_dims.to(device=z.device, dtype=torch.long),
+                    num_hidden_blocks.to(device=z.device, dtype=torch.long),
+                    activation_codes_t.to(device=z.device, dtype=torch.long),
+                    max_hidden_blocks,
+                    block_o=int(self.reference_scm_hidden_affine_block_o),
+                    block_k=int(self.reference_scm_hidden_affine_block_k),
+                    num_warps=int(self.reference_scm_hidden_affine_num_warps),
+                )
+                if outputs_layers_fused is not None:
+                    outputs_layers = outputs_layers_fused
+                else:
+                    use_hidden_multilayer_fused = False
+            if not use_hidden_multilayer_fused:
+                for layer_idx in range(max_hidden_blocks):
+                    active_mask = hidden_active_masks_runtime[layer_idx]
+                    if not bool(torch.any(active_mask)):
+                        continue
+                    if hidden_noise_eps_all is not None:
+                        noise_eps = hidden_noise_eps_all[:, layer_idx, :]
+                    else:
+                        noise_scale = hidden_noise_scales_runtime[layer_idx]
+                        if noise_generators is None:
+                            noise_plan = hidden_noise_plans[layer_idx]
+                            if noise_plan is None:
+                                noise_eps = self._sample_prefix_grouped_scaled_noise_without_generators(
+                                    noise_scale,
+                                    device=z.device,
+                                    dtype=z.dtype,
+                                )
+                            else:
+                                noise_eps = self._sample_prefix_grouped_scaled_noise_with_plan(
+                                    noise_scale,
+                                    noise_plan,
+                                    device=z.device,
+                                    dtype=z.dtype,
+                                )
+                        else:
+                            noise_eps = self._sample_rowwise_scaled_noise(
+                                noise_scale,
+                                generators=noise_generators,
+                                device=z.device,
+                                dtype=z.dtype,
+                            )
+                    if noise_eps is None or layer_step_runner_with_noise is None:
+                        layer_step_runner = layer_step_runner_without_noise
+                    else:
+                        layer_step_runner = layer_step_runner_with_noise
+                    use_hidden_affine_fused = bool(
+                        self.reference_scm_hidden_affine_fused
+                        and z.device.type == "cuda"
+                        and z.dtype == torch.float32
+                        and (not bool(z.requires_grad))
+                    )
+                    if use_hidden_affine_fused:
+                        if bool(self.reference_scm_hidden_update_fused):
+                            z = self._batch_affine_prefix_tiled_input_activated_update_forward(
+                                z,
+                                hidden_weights_runtime[layer_idx],
+                                hidden_biases_runtime[layer_idx],
+                                noise_eps=noise_eps,
+                                hidden_mask=hidden_mask_runtime,
+                                in_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                                out_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                                activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                                out_tile_batch=hidden_prefix_out_tile_batch_runtime[layer_idx],
+                                out_tile_offsets=hidden_prefix_out_tile_offsets_runtime[layer_idx],
+                                block_o=int(self.reference_scm_hidden_affine_block_o),
+                                block_k=int(self.reference_scm_hidden_affine_block_k),
+                                num_warps=int(self.reference_scm_hidden_affine_num_warps),
+                                sample_fused=bool(self.reference_scm_hidden_update_sample_fused),
+                            )
+                        else:
+                            z_next = self._batch_affine_prefix_tiled_input_activated_forward(
+                                z,
+                                hidden_weights_runtime[layer_idx],
+                                hidden_biases_runtime[layer_idx],
+                                in_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                                out_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                                activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                                out_tile_batch=hidden_prefix_out_tile_batch_runtime[layer_idx],
+                                out_tile_offsets=hidden_prefix_out_tile_offsets_runtime[layer_idx],
+                                block_o=int(self.reference_scm_hidden_affine_block_o),
+                                block_k=int(self.reference_scm_hidden_affine_block_k),
+                                num_warps=int(self.reference_scm_hidden_affine_num_warps),
+                            )
+                            if noise_eps is not None:
+                                z_next = z_next + noise_eps
+                            z_next = z_next * hidden_mask_runtime
+                            z = torch.where(active_mask.unsqueeze(1), z_next, z)
+                    else:
+                        if bool(getattr(layer_step_runner, "_reference_scm_compiled", False)) and hasattr(torch, "compiler"):
+                            torch.compiler.cudagraph_mark_step_begin()
+                        z = layer_step_runner(
+                            z,
+                            active_mask,
+                            hidden_mask_runtime,
+                            hidden_weights_runtime[layer_idx],
+                            hidden_biases_runtime[layer_idx],
+                            noise_eps,
+                            activation_relu_mask_runtime,
+                            activation_identity_mask_runtime,
+                        )
+                    outputs_layers[:, layer_idx, :] = torch.where(
+                        active_mask.unsqueeze(1),
+                        z,
+                        outputs_layers[:, layer_idx, :],
+                    )
+
+            outputs_flat = outputs_layers.reshape(batch_size, outputs_flat_cap)
+            state_out = outputs_flat.gather(
+                1,
+                state_select_idx.to(device=outputs_flat.device),
+            ) * state_mask.to(device=outputs_flat.device, dtype=outputs_flat.dtype)
+            reward_out = outputs_flat.gather(
+                1,
+                reward_select_idx.to(device=outputs_flat.device),
+            )
+            return state_out, reward_out
+
+        transition_fn._applies_output_tanh = False
+        transition_fn._reference_semantics_exact = True
+        transition_fn._reference_scm_vectorized = True
+        transition_fn._prefers_packed_env_input = True
+        transition_fn._packed_input_cap = int(packed_input_cap)
+        return transition_fn
+
+    def _build_reference_scm_joint_transition_fn(self, in_dim, state_dim, h, device, generator=None):
+        state_dim = int(state_dim)
+        reward_dim = 1
+        depth = max(2, int(h["num_layers"]))
+        hidden_dim = max(
+            int(h["prior_mlp_hidden_dim"]),
+            reward_dim + 2 * state_dim,
+        )
+        activation = self._resolve_activation(h["prior_mlp_activations"])
+        init_std = float(h["init_std"])
+        noise_std = float(h["noise_std"])
+        pre_sample_weights = bool(h.get("pre_sample_weights", False))
+        prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
+        block_wise_dropout = bool(h.get("block_wise_dropout", False))
+        prior_mlp_scale_weights_sqrt = bool(h.get("prior_mlp_scale_weights_sqrt", True))
+        y_is_effect = bool(h.get("y_is_effect", True))
+        sort_features = bool(h.get("sort_features", False))
+        in_clique = bool(h.get("in_clique", False))
+        random_feature_rotation = bool(h.get("random_feature_rotation", False))
+        num_hidden_blocks = depth - 1
+
+        first_weight = torch.empty((in_dim, hidden_dim), device=device, dtype=torch.float32)
+        self._reference_scm_apply_weight_init(
+            first_weight,
+            init_std=init_std,
+            prior_mlp_dropout_prob=0.0,
+            block_wise_dropout=block_wise_dropout,
+            prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+            generator=generator,
+        )
+        first_bias = torch.empty((hidden_dim,), device=device, dtype=torch.float32)
+        self._reference_scm_init_bias(first_bias, in_dim, generator=generator)
+
+        hidden_weights = []
+        hidden_biases = []
+        hidden_noise_stds = []
+        for _ in range(num_hidden_blocks):
+            weight = torch.empty((hidden_dim, hidden_dim), device=device, dtype=torch.float32)
+            self._reference_scm_apply_weight_init(
+                weight,
+                init_std=init_std,
+                prior_mlp_dropout_prob=prior_mlp_dropout_prob,
+                block_wise_dropout=block_wise_dropout,
+                prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+                generator=generator,
+            )
+            bias = torch.empty((hidden_dim,), device=device, dtype=torch.float32)
+            self._reference_scm_init_bias(bias, hidden_dim, generator=generator)
+            hidden_weights.append(weight)
+            hidden_biases.append(bias)
+            if pre_sample_weights and noise_std > 0:
+                if generator is None:
+                    sampled_std = torch.abs(
+                        torch.normal(
+                            mean=torch.zeros((1, hidden_dim), device=device, dtype=torch.float32),
+                            std=float(noise_std),
+                        )
+                    )
+                else:
+                    sampled_std = torch.abs(
+                        torch.normal(
+                            mean=torch.zeros((1, hidden_dim), device=device, dtype=torch.float32),
+                            std=float(noise_std),
+                            generator=generator,
+                        )
+                    )
+                hidden_noise_stds.append(sampled_std)
+            else:
+                hidden_noise_stds.append(float(noise_std))
+
+        outputs_flat_dim = num_hidden_blocks * hidden_dim
+        if outputs_flat_dim <= state_dim:
+            raise ValueError(
+                f"reference SCM requires outputs_flat_dim > state_dim, got {outputs_flat_dim=} {state_dim=}"
+            )
+        if in_clique:
+            clique_lo = 0
+            clique_hi = max(0, outputs_flat_dim - reward_dim - state_dim)
+            clique_start = self._generator_randint(
+                clique_lo,
+                clique_hi,
+                generator=generator,
+                device=device,
+            )
+            selection = clique_start + torch.randperm(
+                reward_dim + state_dim,
+                device=device,
+                generator=generator,
+            )
+        else:
+            selection = torch.randperm(
+                outputs_flat_dim - 1,
+                device=device,
+                generator=generator,
+            )
+        if y_is_effect:
+            reward_index = torch.tensor([outputs_flat_dim - reward_dim], device=device, dtype=torch.long)
+        else:
+            reward_index = selection[:reward_dim].to(device=device, dtype=torch.long)
+        state_indices = selection[reward_dim: reward_dim + state_dim].to(device=device, dtype=torch.long)
+        if sort_features and state_indices.numel() > 0:
+            state_indices, _ = torch.sort(state_indices)
+        rotation_shift = 0
+        if random_feature_rotation and state_dim > 0:
+            rotation_shift = self._generator_randint(
+                0,
+                state_dim - 1,
+                generator=generator,
+                device=device,
+            )
+
+        def transition_fn(x, generator=None):
+            z = x @ first_weight + first_bias
+            outputs = []
+            for weight, bias, noise_cfg in zip(hidden_weights, hidden_biases, hidden_noise_stds):
+                z = activation(z)
+                z = z @ weight + bias
+                if isinstance(noise_cfg, float):
+                    if noise_cfg > 0:
+                        if generator is None:
+                            z = z + torch.randn_like(z) * noise_cfg
+                        else:
+                            z = z + (
+                                torch.randn(
+                                    z.shape,
+                                    device=z.device,
+                                    dtype=z.dtype,
+                                    generator=generator,
+                                ) * noise_cfg
+                            )
+                else:
+                    if generator is None:
+                        z = z + torch.randn_like(z) * noise_cfg
+                    else:
+                        z = z + (
+                            torch.randn(
+                                z.shape,
+                                device=z.device,
+                                dtype=z.dtype,
+                                generator=generator,
+                            ) * noise_cfg
+                        )
+                outputs.append(z)
+            outputs_flat = torch.cat(outputs, dim=-1)
+            state_out = outputs_flat.index_select(-1, state_indices)
+            if rotation_shift > 0 and state_out.shape[-1] > 0:
+                rotate_idx = (
+                    torch.arange(state_out.shape[-1], device=state_out.device, dtype=torch.long) + rotation_shift
+                ) % state_out.shape[-1]
+                state_out = state_out.index_select(-1, rotate_idx)
+            reward_out = outputs_flat.index_select(-1, reward_index)
+            return state_out, reward_out
+
+        transition_fn._applies_output_tanh = False
+        transition_fn._reference_semantics_exact = True
+        transition_fn._reference_state_indices = state_indices
+        transition_fn._reference_reward_index = reward_index
+        transition_fn._reference_hidden_dim = int(hidden_dim)
+        transition_fn._reference_outputs_flat_dim = int(outputs_flat_dim)
+        return transition_fn
+
+    def _build_reference_scm_joint_transition_batch_fn(self, in_dim, state_dim, h_list, device, generators=None):
+        batch_size = int(len(h_list))
+        return self._build_reference_scm_joint_transition_padded_batch_fn(
+            in_dims=torch.full((batch_size,), int(in_dim), device=device, dtype=torch.long),
+            state_dims=torch.full((batch_size,), int(state_dim), device=device, dtype=torch.long),
+            h_list=h_list,
+            device=device,
+            generators=generators,
+            input_mask=None,
+        )
+
+    @staticmethod
+    def _fork_generator(generator, device):
+        if generator is None:
+            return None
+        seed = int(
+            torch.randint(
+                0,
+                2**31 - 1,
+                (1,),
+                device=device,
+                generator=generator,
+            ).item()
+        )
+        child = torch.Generator(device=device)
+        child.manual_seed(seed)
+        return child
+
+    @staticmethod
+    def _reference_gp_kernel(x1, x2, *, lengthscale, outputscale):
+        diff = (x1[:, None, :] - x2[None, :, :]) / max(float(lengthscale), 1e-12)
+        sq_dist = torch.sum(diff * diff, dim=-1)
+        return float(outputscale) * torch.exp(-0.5 * sq_dist)
+
+    @staticmethod
+    def _reference_gp_batch_kernel(x1, x2, *, lengthscale, outputscale):
+        x1_t = torch.as_tensor(x1)
+        x2_t = torch.as_tensor(x2)
+        lengthscale_t = torch.as_tensor(lengthscale, device=x1_t.device, dtype=x1_t.dtype)
+        outputscale_t = torch.as_tensor(outputscale, device=x1_t.device, dtype=x1_t.dtype)
+        diff = (x1_t[:, :, None, :] - x2_t[:, None, :, :]) / lengthscale_t[:, None, None, None].clamp_min(1e-12)
+        sq_dist = torch.sum(diff * diff, dim=-1)
+        return outputscale_t[:, None, None] * torch.exp(-0.5 * sq_dist)
+
+    @staticmethod
+    def _stable_cholesky(cov, *, jitter=1e-10, max_tries=6):
+        eye = torch.eye(cov.shape[-1], device=cov.device, dtype=cov.dtype)
+        jitter_value = float(jitter)
+        last_err = None
+        for _ in range(max_tries):
+            try:
+                return torch.linalg.cholesky(cov + (jitter_value * eye))
+            except RuntimeError as err:
+                last_err = err
+                jitter_value *= 10.0
+        if last_err is not None:
+            raise last_err
+        raise RuntimeError("stable cholesky failed without a captured exception")
+
+    def _stable_cholesky_per_sample(self, cov, *, jitter=1e-10, max_tries=6):
+        cov_t = torch.as_tensor(cov)
+        if cov_t.ndim == 2:
+            return self._stable_cholesky(cov_t, jitter=jitter, max_tries=max_tries)
+        if cov_t.ndim != 3:
+            raise ValueError("stable per-sample cholesky expects a rank-2 or rank-3 covariance tensor")
+        chol_parts = []
+        for bi in range(int(cov_t.shape[0])):
+            chol_parts.append(
+                self._stable_cholesky(
+                    cov_t[bi],
+                    jitter=jitter,
+                    max_tries=max_tries,
+                )
+            )
+        return torch.stack(chol_parts, dim=0)
+
+    def _build_reference_gp_joint_transition_fn(self, in_dim, state_dim, h, device, generator=None):
+        state_dim = int(state_dim)
+        out_dim = state_dim + 1
+        lengthscale = max(1e-6, float(h["lengthscale"]))
+        outputscale = float(h["outputscale"])
+        noise_variance = max(0.0, float(h["noise"]))
+        latent_generator = self._fork_generator(generator, device)
+        queried_x = None
+        latent_y = None
+
+        def transition_fn(x, generator=None):
+            nonlocal queried_x, latent_y
+            x64 = x.to(device=device, dtype=torch.float64)
+            batch_n = int(x64.shape[0])
+            if batch_n <= 0:
+                empty = torch.empty((0, out_dim), device=device, dtype=torch.float32)
+                return empty[:, :state_dim], empty[:, state_dim: state_dim + 1]
+
+            latent_new = torch.empty((batch_n, out_dim), device=device, dtype=torch.float64)
+            known_mask = torch.zeros((batch_n,), device=device, dtype=torch.bool)
+            if queried_x is not None and queried_x.numel() > 0:
+                exact_match = torch.all(x64[:, None, :] == queried_x[None, :, :], dim=-1)
+                known_mask = torch.any(exact_match, dim=1)
+                if bool(known_mask.any().item()):
+                    matched_idx = torch.argmax(exact_match.to(dtype=torch.int64), dim=1)
+                    latent_new[known_mask] = latent_y.index_select(0, matched_idx[known_mask])
+
+            unknown_idx = torch.nonzero(~known_mask, as_tuple=False).squeeze(1)
+            if int(unknown_idx.numel()) > 0:
+                x_unknown = x64.index_select(0, unknown_idx)
+                if queried_x is None:
+                    mean = torch.zeros((int(unknown_idx.numel()), out_dim), device=device, dtype=torch.float64)
+                    cov = self._reference_gp_kernel(
+                        x_unknown,
+                        x_unknown,
+                        lengthscale=lengthscale,
+                        outputscale=outputscale,
+                    )
+                else:
+                    k_pp = self._reference_gp_kernel(
+                        queried_x,
+                        queried_x,
+                        lengthscale=lengthscale,
+                        outputscale=outputscale,
+                    )
+                    l_pp = self._stable_cholesky(k_pp)
+                    k_np = self._reference_gp_kernel(
+                        x_unknown,
+                        queried_x,
+                        lengthscale=lengthscale,
+                        outputscale=outputscale,
+                    )
+                    alpha = torch.cholesky_solve(latent_y, l_pp)
+                    mean = k_np @ alpha
+                    solve_term = torch.linalg.solve_triangular(l_pp, k_np.transpose(0, 1), upper=False)
+                    cov = self._reference_gp_kernel(
+                        x_unknown,
+                        x_unknown,
+                        lengthscale=lengthscale,
+                        outputscale=outputscale,
+                    ) - solve_term.transpose(0, 1) @ solve_term
+                cov = 0.5 * (cov + cov.transpose(0, 1))
+                cov_absmax = float(cov.abs().max().item()) if cov.numel() > 0 else 0.0
+                if cov_absmax <= 1e-14:
+                    latent_unknown = mean
+                else:
+                    l_nn = self._stable_cholesky(cov)
+                    sample_generator = latent_generator if latent_generator is not None else generator
+                    eps = torch.randn(
+                        (int(unknown_idx.numel()), out_dim),
+                        device=device,
+                        dtype=torch.float64,
+                        generator=sample_generator,
+                    )
+                    latent_unknown = mean + (l_nn @ eps)
+                latent_new.index_copy_(0, unknown_idx, latent_unknown)
+                if queried_x is None:
+                    queried_x = x_unknown.detach().clone()
+                    latent_y = latent_unknown.detach().clone()
+                else:
+                    queried_x = torch.cat([queried_x, x_unknown.detach().clone()], dim=0)
+                    latent_y = torch.cat([latent_y, latent_unknown.detach().clone()], dim=0)
+
+            y = latent_new
+            if noise_variance > 0.0:
+                obs_generator = generator if generator is not None else latent_generator
+                obs_eps = torch.randn(
+                    (batch_n, out_dim),
+                    device=device,
+                    dtype=torch.float64,
+                    generator=obs_generator,
+                ) * math.sqrt(noise_variance)
+                y = y + obs_eps
+            y32 = y.to(dtype=torch.float32)
+            return y32[:, :state_dim], y32[:, state_dim: state_dim + 1]
+
+        transition_fn._applies_output_tanh = False
+        transition_fn._reference_semantics_exact = True
+        transition_fn._reference_gp_exact = True
+        return transition_fn
+
+    @staticmethod
+    def _resolve_reference_gp_forward_mode(h):
+        mode = str(h.get("reference_gp_forward_mode", "fixed_cost")).strip().lower()
+        return "exact" if mode == "exact" else "fixed_cost"
+
+    def _build_reference_gp_fixed_cost_joint_transition_fn(self, in_dim, state_dim, h, device, generator=None):
+        state_dim = int(state_dim)
+        joint_fn = self._build_gp_fn(
+            in_dim,
+            state_dim + 1,
+            h,
+            device,
+            generator=generator,
+            apply_output_tanh=False,
+            reference_semantics=True,
+        )
+
+        def transition_fn(x, generator=None):
+            out = joint_fn(x, generator=generator)
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        transition_fn._reference_gp_exact = False
+        transition_fn._reference_gp_fixed_cost = True
+        transition_fn._reference_semantics_exact = False
+        return transition_fn
+
+    def _build_reference_gp_joint_transition_padded_batch_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        *,
+        generators=None,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            raise ValueError("reference GP padded batch builder expects a non-empty h_list")
+        if (generators is not None) and (len(generators) != batch_size):
+            raise ValueError("generators must match h_list length for reference GP padded batch builder")
+
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if int(state_dims.numel()) != batch_size or int(in_dims.numel()) != batch_size:
+            raise ValueError("state_dims and in_dims must match h_list length")
+
+        if input_mask is not None:
+            input_mask_t = torch.as_tensor(input_mask, device=device, dtype=torch.float64)
+            in_cap = int(input_mask_t.shape[1])
+        else:
+            in_cap = int(max(1, int(in_dims.max().item())))
+            input_mask_t = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float64)
+            for bi in range(batch_size):
+                input_mask_t[bi, :int(in_dims[bi].item())] = 1.0
+
+        state_cap = int(max(1, int(state_dims.max().item())))
+        out_cap = int(state_cap + 1)
+        out_valid_mask = (
+            torch.arange(out_cap, device=device, dtype=torch.long).unsqueeze(0)
+            < (state_dims + 1).unsqueeze(1)
+        ).to(dtype=torch.float64)
+        state_mask = (
+            torch.arange(state_cap, device=device, dtype=torch.long).unsqueeze(0)
+            < state_dims.unsqueeze(1)
+        ).to(dtype=torch.float32)
+        reward_index = state_dims.unsqueeze(1)
+
+        lengthscale = torch.tensor(
+            [max(1e-6, float(h["lengthscale"])) for h in h_list],
+            device=device,
+            dtype=torch.float64,
+        )
+        outputscale = torch.tensor(
+            [float(h["outputscale"]) for h in h_list],
+            device=device,
+            dtype=torch.float64,
+        )
+        noise_variance = torch.tensor(
+            [max(0.0, float(h["noise"])) for h in h_list],
+            device=device,
+            dtype=torch.float64,
+        )
+
+        latent_generators = []
+        for bi in range(batch_size):
+            init_generator = None if generators is None else generators[bi]
+            latent_generators.append(self._fork_generator(init_generator, device))
+
+        queried_x = None
+        latent_y = None
+        query_lengths = torch.zeros((batch_size,), device=device, dtype=torch.long)
+
+        def _ensure_capacity(min_capacity):
+            nonlocal queried_x, latent_y
+            min_capacity = int(max(0, int(min_capacity)))
+            current_capacity = 0 if queried_x is None else int(queried_x.shape[1])
+            if current_capacity >= min_capacity:
+                return
+            new_capacity = max(min_capacity, max(1, current_capacity * 2))
+            queried_x_new = torch.zeros((batch_size, new_capacity, in_cap), device=device, dtype=torch.float64)
+            latent_y_new = torch.zeros((batch_size, new_capacity, out_cap), device=device, dtype=torch.float64)
+            if queried_x is not None and latent_y is not None and current_capacity > 0:
+                queried_x_new[:, :current_capacity, :] = queried_x
+                latent_y_new[:, :current_capacity, :] = latent_y
+            queried_x = queried_x_new
+            latent_y = latent_y_new
+
+        def transition_fn(x, generator=None, generators_for_noise=None):
+            nonlocal queried_x, latent_y, query_lengths
+            x64 = (x[:, :in_cap].to(device=device, dtype=torch.float64) * input_mask_t).contiguous()
+            batch_n = int(x64.shape[0])
+            if batch_n != batch_size:
+                raise ValueError("reference GP padded batch builder expects one query row per environment")
+            if batch_n <= 0:
+                empty = torch.empty((0, out_cap), device=device, dtype=torch.float32)
+                return empty[:, :state_cap], empty[:, state_cap: state_cap + 1]
+
+            if queried_x is None:
+                _ensure_capacity(1)
+
+            forward_generators = None
+            if generators_for_noise is not None:
+                forward_generators = list(generators_for_noise)
+                if len(forward_generators) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+            elif generator is not None:
+                forward_generators = [generator] * batch_size
+
+            known_mask = torch.zeros((batch_size,), device=device, dtype=torch.bool)
+            latent_cur = torch.zeros((batch_size, out_cap), device=device, dtype=torch.float64)
+            current_capacity = int(queried_x.shape[1])
+            if current_capacity > 0 and bool(torch.any(query_lengths > 0)):
+                valid_mask = (
+                    torch.arange(current_capacity, device=device, dtype=torch.long).unsqueeze(0)
+                    < query_lengths.unsqueeze(1)
+                )
+                exact_match = torch.all(x64[:, None, :] == queried_x[:, :current_capacity, :], dim=-1) & valid_mask
+                known_mask = torch.any(exact_match, dim=1)
+                if bool(known_mask.any().item()):
+                    matched_idx = torch.argmax(exact_match.to(dtype=torch.int64), dim=1)
+                    matched_rows = torch.nonzero(known_mask, as_tuple=False).squeeze(1)
+                    latent_cur[matched_rows] = latent_y[matched_rows, matched_idx[matched_rows], :]
+
+            unknown_rows = torch.nonzero(~known_mask, as_tuple=False).squeeze(1)
+            if int(unknown_rows.numel()) > 0:
+                prev_lengths = query_lengths.index_select(0, unknown_rows)
+                max_prev = int(prev_lengths.max().item()) if int(prev_lengths.numel()) > 0 else 0
+                mean = torch.zeros((int(unknown_rows.numel()), out_cap), device=device, dtype=torch.float64)
+                var = outputscale.index_select(0, unknown_rows).clone()
+                if max_prev > 0:
+                    valid = (
+                        torch.arange(max_prev, device=device, dtype=torch.long).unsqueeze(0)
+                        < prev_lengths.unsqueeze(1)
+                    )
+                    queries_prev = queried_x.index_select(0, unknown_rows)[:, :max_prev, :]
+                    latent_prev = latent_y.index_select(0, unknown_rows)[:, :max_prev, :]
+                    latent_prev = latent_prev * valid.unsqueeze(-1).to(dtype=latent_prev.dtype)
+                    lengthscale_u = lengthscale.index_select(0, unknown_rows)
+                    outputscale_u = outputscale.index_select(0, unknown_rows)
+                    k_pp = self._reference_gp_batch_kernel(
+                        queries_prev,
+                        queries_prev,
+                        lengthscale=lengthscale_u,
+                        outputscale=outputscale_u,
+                    )
+                    valid_2d = valid.unsqueeze(2) & valid.unsqueeze(1)
+                    k_pp = k_pp * valid_2d.to(dtype=k_pp.dtype)
+                    k_pp = k_pp + torch.diag_embed((~valid).to(dtype=k_pp.dtype))
+                    l_pp = self._stable_cholesky_per_sample(k_pp)
+                    k_np = self._reference_gp_batch_kernel(
+                        x64.index_select(0, unknown_rows).unsqueeze(1),
+                        queries_prev,
+                        lengthscale=lengthscale_u,
+                        outputscale=outputscale_u,
+                    ).squeeze(1)
+                    k_np = k_np * valid.to(dtype=k_np.dtype)
+                    alpha = torch.cholesky_solve(latent_prev, l_pp)
+                    mean = torch.einsum("bk,bko->bo", k_np, alpha)
+                    solve_term = torch.linalg.solve_triangular(
+                        l_pp,
+                        k_np.unsqueeze(-1),
+                        upper=False,
+                    )
+                    var = outputscale_u - solve_term.square().sum(dim=1).squeeze(-1)
+                latent_generators_u = []
+                for row in unknown_rows.detach().cpu().tolist():
+                    latent_generators_u.append(
+                        latent_generators[row] if latent_generators[row] is not None else (
+                            None if forward_generators is None else forward_generators[row]
+                        )
+                    )
+                latent_eps = self._sample_rowwise_scaled_noise(
+                    torch.sqrt(var.clamp_min(0.0)).unsqueeze(1) * out_valid_mask.index_select(0, unknown_rows),
+                    generators=latent_generators_u,
+                    device=device,
+                    dtype=torch.float64,
+                )
+                latent_unknown = mean if latent_eps is None else (mean + latent_eps)
+                latent_unknown = latent_unknown * out_valid_mask.index_select(0, unknown_rows)
+                latent_cur.index_copy_(0, unknown_rows, latent_unknown)
+
+                _ensure_capacity(int(query_lengths.max().item()) + 1)
+                append_pos = query_lengths.index_select(0, unknown_rows)
+                queried_x[unknown_rows, append_pos, :] = x64.index_select(0, unknown_rows).detach().clone()
+                latent_y[unknown_rows, append_pos, :] = latent_unknown.detach().clone()
+                query_lengths.index_add_(
+                    0,
+                    unknown_rows,
+                    torch.ones_like(unknown_rows, device=device, dtype=torch.long),
+                )
+
+            y = latent_cur
+            obs_scale = torch.sqrt(noise_variance.clamp_min(0.0))
+            obs_generators = []
+            for bi in range(batch_size):
+                obs_generators.append(
+                    forward_generators[bi]
+                    if (forward_generators is not None and forward_generators[bi] is not None)
+                    else latent_generators[bi]
+                )
+            obs_eps = self._sample_rowwise_scaled_noise(
+                obs_scale.unsqueeze(1) * out_valid_mask,
+                generators=obs_generators,
+                device=device,
+                dtype=torch.float64,
+            )
+            if obs_eps is not None:
+                y = y + obs_eps
+            y32 = y.to(dtype=torch.float32)
+            state_out = y32[:, :state_cap] * state_mask.to(device=y32.device, dtype=y32.dtype)
+            reward_out = y32.gather(1, reward_index.to(device=y32.device))
+            return state_out, reward_out
+
+        transition_fn._applies_output_tanh = False
+        transition_fn._reference_semantics_exact = True
+        transition_fn._reference_gp_exact = True
+        transition_fn._reference_gp_vectorized = True
+        return transition_fn
+
+    def _build_reference_gp_joint_transition_batch_fn(self, in_dim, state_dim, h_list, device, generators=None):
+        batch_size = int(len(h_list))
+        return self._build_reference_gp_joint_transition_padded_batch_fn(
+            in_dims=torch.full((batch_size,), int(in_dim), device=device, dtype=torch.long),
+            state_dims=torch.full((batch_size,), int(state_dim), device=device, dtype=torch.long),
+            h_list=h_list,
+            device=device,
+            generators=generators,
+            input_mask=None,
+        )
+
+    def _build_reference_gp_fixed_cost_joint_transition_batch_fn(
+        self,
+        in_dim,
+        state_dim,
+        h_list,
+        device,
+        generators=None,
+    ):
+        batch_size = int(len(h_list))
+        joint_fn = self._build_gp_hetero_batch_fn(
+            in_dims=torch.full((batch_size,), int(in_dim), device=device, dtype=torch.long),
+            out_dims=torch.full((batch_size,), int(state_dim) + 1, device=device, dtype=torch.long),
+            h_list=h_list,
+            device=device,
+            generators=generators,
+            input_mask=None,
+            apply_output_tanh=False,
+            reference_semantics=True,
+        )
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+            del x_input_is_packed
+            x_in = x[:batch_size] if bool(x_is_dual_packed) else x
+            out = joint_fn(
+                x_in,
+                generators_for_noise=generators_for_noise,
+                stable_input=True,
+            )
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        transition_fn._reference_gp_exact = False
+        transition_fn._reference_gp_fixed_cost = True
+        transition_fn._reference_semantics_exact = False
+        return transition_fn
+
+    @staticmethod
+    def _copy_transition_generator_attrs(dst, src):
+        for name in (
+            "_applies_output_tanh",
+            "_reference_semantics_exact",
+            "_reference_gp_exact",
+            "_reference_gp_fixed_cost",
+            "_reference_state_indices",
+            "_reference_reward_index",
+            "_reference_hidden_dim",
+            "_reference_outputs_flat_dim",
+            "_reference_scm_vectorized",
+            "_reference_gp_vectorized",
+            "_envgen_checkpoint_enabled",
+            "_consume_gp_projection_profile",
+            "_gp_input_rff_fused",
+            "_gp_output_projection_fused",
+            "_gp_rff_fused",
+            "_gp_shared_first_proj_fused",
+            "_gp_output_subgraph_fused",
+            "_scm_hidden_fused_specialized",
+            "_scm_hidden_fused_budget_fallback",
+            "_prefers_packed_env_input",
+            "_packed_input_cap",
+        ):
+            if hasattr(src, name):
+                setattr(dst, name, getattr(src, name))
+
+    def _build_scm_joint_transition_fn(self, in_dim, state_dim, h, device, generator=None):
+        state_dim = int(state_dim)
+        joint_fn = self._build_scm_fn(
+            in_dim,
+            state_dim + 1,
+            h,
+            device,
+            generator=generator,
+            apply_output_tanh=False,
+        )
+
+        def transition_fn(x, generator=None):
+            out = joint_fn(x, generator=generator)
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
+
+    def _build_gp_joint_transition_fn(self, in_dim, state_dim, h, device, generator=None):
+        state_dim = int(state_dim)
+        joint_fn = self._build_gp_fn(
+            in_dim,
+            state_dim + 1,
+            h,
+            device,
+            generator=generator,
+            apply_output_tanh=False,
+        )
+
+        def transition_fn(x, generator=None):
+            out = joint_fn(x, generator=generator)
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
 
     @staticmethod
     def _fit_to_num_features(x, num_features):
@@ -1255,18 +3844,437 @@ class EnvironmentPrior:
             return 0
         return block_size
 
+    @staticmethod
+    def _latent_uniform_from_h(h, key):
+        value = h.get(key, None)
+        if value is None:
+            value = float(np.random.random())
+            h[key] = value
+        value = float(value)
+        if value < 0.0:
+            return 0.0
+        if value >= 1.0:
+            return np.nextafter(1.0, 0.0)
+        return value
+
+    @staticmethod
+    def _resolve_constrained_dim_sampling_enabled(h):
+        enabled = h.get("constrained_dim_sampling_enabled", False)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(enabled)
+
+    @staticmethod
+    def _resolve_strict_joint_transition_enabled(h):
+        enabled = h.get("strict_joint_transition_enabled", False)
+        if isinstance(enabled, str):
+            enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(enabled)
+
+    @staticmethod
+    def _resolve_reference_semantics_enabled(h):
+        return EnvironmentPrior._resolve_strict_joint_transition_enabled(h)
+
+    @staticmethod
+    def _env_uses_reference_semantics(env):
+        enabled = env.get(
+            "reference_semantics_enabled",
+            env.get("strict_joint_transition_enabled", False),
+        )
+        return bool(EnvironmentPrior._coerce_bool(enabled))
+
+    @staticmethod
+    def _transition_reference_mode(family, reference_semantics_enabled, gp_forward_mode=None):
+        family_str = str(family)
+        if family_str == "gp" and bool(reference_semantics_enabled):
+            mode = str(gp_forward_mode or "exact").strip().lower()
+            if mode == "fixed_cost":
+                return "gp_fixed_cost"
+            return "gp_exact"
+        return f"{family_str}_{'exact' if bool(reference_semantics_enabled) else 'legacy'}"
+
+    @staticmethod
+    def _expand_env_value_to_list(value, batch_size):
+        batch_size = int(max(1, int(batch_size)))
+        if torch.is_tensor(value):
+            if value.ndim == 0:
+                return [value.item()] * batch_size
+            items = value.detach().cpu().reshape(-1).tolist()
+        elif isinstance(value, np.ndarray):
+            items = value.reshape(-1).tolist()
+        elif isinstance(value, (list, tuple)):
+            items = list(value)
+        else:
+            return [value] * batch_size
+        if not items:
+            return [None] * batch_size
+        if len(items) == batch_size:
+            return items
+        if len(items) == 1:
+            return items * batch_size
+        if len(items) < batch_size:
+            return items + [items[-1]] * (batch_size - len(items))
+        return items[:batch_size]
+
+    @classmethod
+    def _summarize_env_semantics(cls, env, batch_size):
+        batch_size = int(max(1, int(batch_size)))
+        families = cls._expand_env_value_to_list(env.get("family", "unknown"), batch_size)
+        gp_modes = cls._expand_env_value_to_list(env.get("reference_gp_forward_mode", None), batch_size)
+        references = [
+            bool(v)
+            for v in cls._expand_env_value_to_list(
+                env.get("reference_semantics_enabled", env.get("strict_joint_transition_enabled", False)),
+                batch_size,
+            )
+        ]
+        stricts = [
+            bool(v)
+            for v in cls._expand_env_value_to_list(env.get("strict_joint_transition_enabled", False), batch_size)
+        ]
+        exact_scm_count = 0
+        exact_gp_count = 0
+        fixed_gp_count = 0
+        legacy_scm_count = 0
+        legacy_gp_count = 0
+        for family, reference_enabled, gp_mode in zip(families, references, gp_modes):
+            family_str = str(family)
+            if family_str == "scm":
+                if reference_enabled:
+                    exact_scm_count += 1
+                else:
+                    legacy_scm_count += 1
+            elif family_str == "gp":
+                if reference_enabled:
+                    if str(gp_mode).strip().lower() == "fixed_cost":
+                        fixed_gp_count += 1
+                    else:
+                        exact_gp_count += 1
+                else:
+                    legacy_gp_count += 1
+        total = int(batch_size)
+        summary = {
+            "env_count": total,
+            "strict_joint_transition_count": int(sum(1 for flag in stricts if flag)),
+            "reference_semantics_count": int(sum(1 for flag in references if flag)),
+            "exact_scm_count": int(exact_scm_count),
+            "exact_gp_count": int(exact_gp_count),
+            "fixed_gp_count": int(fixed_gp_count),
+            "legacy_scm_count": int(legacy_scm_count),
+            "legacy_gp_count": int(legacy_gp_count),
+        }
+        return cls._finalize_env_semantics_summary(summary)
+
+    @staticmethod
+    def _new_env_semantics_accumulator():
+        return {
+            "env_count": 0,
+            "strict_joint_transition_count": 0,
+            "reference_semantics_count": 0,
+            "exact_scm_count": 0,
+            "exact_gp_count": 0,
+            "fixed_gp_count": 0,
+            "legacy_scm_count": 0,
+            "legacy_gp_count": 0,
+        }
+
+    @classmethod
+    def _merge_env_semantics_summary(cls, acc, summary):
+        if not isinstance(summary, dict):
+            return acc
+        if acc is None:
+            acc = cls._new_env_semantics_accumulator()
+        for key in (
+            "env_count",
+            "strict_joint_transition_count",
+            "reference_semantics_count",
+            "exact_scm_count",
+            "exact_gp_count",
+            "fixed_gp_count",
+            "legacy_scm_count",
+            "legacy_gp_count",
+        ):
+            acc[key] = int(acc.get(key, 0) or 0) + int(summary.get(key, 0) or 0)
+        return acc
+
+    @classmethod
+    def _finalize_env_semantics_summary(cls, acc):
+        if not isinstance(acc, dict):
+            return None
+        total = int(acc.get("env_count", 0) or 0)
+        summary = dict(acc)
+        summary["strict_joint_transition_share"] = float(
+            float(summary.get("strict_joint_transition_count", 0) or 0) / float(max(1, total))
+        )
+        summary["reference_semantics_share"] = float(
+            float(summary.get("reference_semantics_count", 0) or 0) / float(max(1, total))
+        )
+        modes = []
+        if int(summary.get("exact_scm_count", 0) or 0) > 0:
+            modes.append("scm_exact")
+        if int(summary.get("exact_gp_count", 0) or 0) > 0:
+            modes.append("gp_exact")
+        if int(summary.get("fixed_gp_count", 0) or 0) > 0:
+            modes.append("gp_fixed_cost")
+        if int(summary.get("legacy_scm_count", 0) or 0) > 0:
+            modes.append("scm_legacy")
+        if int(summary.get("legacy_gp_count", 0) or 0) > 0:
+            modes.append("gp_legacy")
+        if len(modes) == 1:
+            summary["transition_reference_mode"] = modes[0]
+        elif len(modes) == 0:
+            summary["transition_reference_mode"] = "unknown"
+        else:
+            summary["transition_reference_mode"] = "mixed"
+        return summary
+
+    @staticmethod
+    def _env_obs_input_dim(obs_dim, *, reference_semantics_enabled=False):
+        return 0 if bool(reference_semantics_enabled) else int(max(0, int(obs_dim)))
+
+    @classmethod
+    def _env_input_layout(
+        cls,
+        state_dim,
+        obs_dim,
+        action_dim,
+        noise_dim,
+        zero_pad_dim,
+        *,
+        reference_semantics_enabled=False,
+    ):
+        state_dim = int(max(0, int(state_dim)))
+        obs_dim = int(max(0, int(obs_dim)))
+        action_dim = int(max(0, int(action_dim)))
+        noise_dim = int(max(0, int(noise_dim)))
+        zero_pad_dim = int(max(0, int(zero_pad_dim)))
+        obs_input_dim = cls._env_obs_input_dim(
+            obs_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+        action_start = state_dim + obs_input_dim
+        noise_start = action_start + action_dim
+        zero_start = noise_start + noise_dim
+        total_dim = zero_start + zero_pad_dim
+        return {
+            "total_dim": int(total_dim),
+            "include_obs": bool(obs_input_dim > 0),
+            "obs_input_dim": int(obs_input_dim),
+            "obs_start": int(state_dim) if obs_input_dim > 0 else None,
+            "action_start": int(action_start),
+            "noise_start": int(noise_start),
+            "zero_start": int(zero_start),
+        }
+
     def _sample_dims(self, h):
         action_dim = self._clamp_int(h["action_dim"], 1, 30)
         state_dim = self._clamp_int(h["state_dim"], 1, 400)
-        obs_dim = self._clamp_int(h["obs_dim"], 1, 400)
-        obs_dim = min(obs_dim, state_dim)  # obs is subset of state.
-        noise_dim = max(1, int(h["noise_dim"]))
-        zero_pad_dim = max(0, int(h["zero_pad_dim"]))
+        if self._resolve_constrained_dim_sampling_enabled(h):
+            total_budget = self._clamp_int(h.get("constrained_dim_sampling_total_budget", 400), 1, 400)
+            state_dim = min(state_dim, total_budget)
+
+            obs_u = self._latent_uniform_from_h(h, "_constrained_obs_u")
+            obs_dim = 1 + int(obs_u * state_dim)
+            obs_dim = min(max(1, obs_dim), state_dim)
+
+            remaining_budget = max(0, int(total_budget - state_dim))
+            if remaining_budget <= 0:
+                noise_dim = 0
+                zero_pad_dim = 0
+            else:
+                noise_u = self._latent_uniform_from_h(h, "_constrained_noise_u")
+                noise_dim = 1 + int(noise_u * remaining_budget)
+                noise_dim = min(max(1, noise_dim), remaining_budget)
+                zero_pad_dim = remaining_budget - noise_dim
+        else:
+            obs_dim = self._clamp_int(h["obs_dim"], 1, 400)
+            obs_dim = min(obs_dim, state_dim)  # obs is subset of state.
+            noise_dim = max(1, int(h["noise_dim"]))
+            zero_pad_dim = max(0, int(h["zero_pad_dim"]))
         return state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim
 
     @staticmethod
-    def _pack_env_input(state_t, obs_t, action_t, noise_t, zero_pad_t):
-        return torch.cat([state_t, obs_t, action_t, noise_t, zero_pad_t], dim=-1)
+    def _pack_env_input(
+        state_t,
+        obs_t,
+        action_t,
+        noise_t,
+        zero_pad_t,
+        *,
+        reference_semantics_enabled=False,
+        state_input_scale=1.0,
+    ):
+        state_in = EnvironmentPrior._scale_state_env_input(state_t, state_input_scale)
+        if bool(reference_semantics_enabled):
+            return torch.cat([state_in, action_t, noise_t, zero_pad_t], dim=-1)
+        return torch.cat([state_in, obs_t, action_t, noise_t, zero_pad_t], dim=-1)
+
+    @staticmethod
+    def _resolve_state_input_scale_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("state_input_scale_enabled", False))
+
+    @staticmethod
+    def _resolve_state_input_scale(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("state_input_scale", 1.0))
+        if not math.isfinite(v):
+            return 1.0
+        return float(max(1e-6, v))
+
+    @staticmethod
+    def _scale_state_env_input(state_t, state_input_scale):
+        scale = state_input_scale
+        if not torch.is_tensor(scale):
+            scale = torch.as_tensor(scale, device=state_t.device, dtype=state_t.dtype)
+        else:
+            scale = scale.to(device=state_t.device, dtype=state_t.dtype)
+        while scale.ndim < state_t.ndim:
+            scale = scale.unsqueeze(-1)
+        scale = torch.clamp(scale, min=1e-6)
+        return state_t / scale
+
+    @staticmethod
+    def _resolve_state_full_rms_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("state_full_rms_enabled", False))
+
+    @staticmethod
+    def _resolve_state_full_rms_target(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("state_full_rms_target", 1.0))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1.0
+        return float(v)
+
+    @staticmethod
+    def _resolve_reinforce_reward_transform(h):
+        mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
+        if mode not in {"none", "tanh"}:
+            mode = "none"
+        return mode
+
+    @staticmethod
+    def _resolve_reinforce_reward_tanh_c(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_c", 1.0))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1.0
+        return float(v)
+
+    @staticmethod
+    def _resolve_reinforce_reward_tanh_bound(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 10.0
+        return float(v)
+
+    @staticmethod
+    def _apply_state_full_rms(
+        state_next,
+        *,
+        enabled=False,
+        target=1.0,
+        state_mask=None,
+        eps=1e-6,
+    ):
+        enabled_value = enabled
+        if torch.is_tensor(enabled_value):
+            enabled_value = enabled_value.to(device=state_next.device)
+            if enabled_value.dtype != torch.bool:
+                enabled_value = enabled_value != 0
+            if enabled_value.ndim == state_next.ndim - 1:
+                enabled_value = enabled_value.unsqueeze(-1)
+            if not bool(enabled_value.any().item()):
+                return state_next
+        elif not bool(enabled_value):
+            return state_next
+        else:
+            enabled_value = None
+
+        if state_mask is None:
+            mask = torch.ones_like(state_next, dtype=state_next.dtype)
+        else:
+            mask = state_mask.to(device=state_next.device, dtype=state_next.dtype)
+            if mask.ndim == state_next.ndim - 1:
+                mask = mask.unsqueeze(-1)
+            mask = mask.expand_as(state_next)
+
+        denom = mask.sum(dim=-1).clamp_min(1.0)
+        rms = torch.sqrt(((state_next * mask) ** 2).sum(dim=-1) / denom + float(eps))
+        target_t = target
+        if not torch.is_tensor(target_t):
+            target_t = torch.as_tensor(target_t, device=state_next.device, dtype=state_next.dtype)
+        else:
+            target_t = target_t.to(device=state_next.device, dtype=state_next.dtype)
+        while target_t.ndim < rms.ndim:
+            target_t = target_t.unsqueeze(-1)
+        target_t = torch.clamp(target_t, min=float(eps))
+        scale = torch.clamp(rms / target_t.squeeze(-1), min=1.0)
+        while scale.ndim < state_next.ndim:
+            scale = scale.unsqueeze(-1)
+        state_scaled = state_next / scale
+        if enabled_value is not None:
+            return torch.where(enabled_value.expand_as(state_next), state_scaled, state_next)
+        return state_scaled
+
+    def _transform_reinforce_rewards(self, rewards):
+        mode = self._resolve_reinforce_reward_transform(self.config)
+        if mode == "none":
+            return rewards, {
+                "mode": "none",
+                "tanh_c": 1.0,
+                "tanh_bound": float("inf"),
+            }
+        if mode == "tanh":
+            c = self._resolve_reinforce_reward_tanh_c(self.config)
+            bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+            rewards_t = float(bound) * torch.tanh(rewards / float(c))
+            return rewards_t, {
+                "mode": "tanh",
+                "tanh_c": float(c),
+                "tanh_bound": float(bound),
+            }
+        raise ValueError(f"Unknown reinforce reward transform mode: {mode}")
+
+    @staticmethod
+    def _transform_reward_with_params(
+        reward,
+        *,
+        mode,
+        tanh_c,
+        tanh_bound,
+    ):
+        mode = str(mode).strip().lower()
+        if mode == "none":
+            return reward
+        if mode == "tanh":
+            c_t = torch.as_tensor(tanh_c, device=reward.device, dtype=reward.dtype)
+            b_t = torch.as_tensor(tanh_bound, device=reward.device, dtype=reward.dtype)
+            while c_t.ndim < reward.ndim:
+                c_t = c_t.unsqueeze(0)
+            while b_t.ndim < reward.ndim:
+                b_t = b_t.unsqueeze(0)
+            return b_t * torch.tanh(reward / c_t)
+        raise ValueError(f"Unknown reinforce reward transform mode: {mode}")
+
+    def _transform_rollout_reward(self, reward, *, mode=None, tanh_c=None, tanh_bound=None):
+        mode_resolved = (
+            self._resolve_reinforce_reward_transform(self.config)
+            if mode is None
+            else str(mode).strip().lower()
+        )
+        tanh_c_resolved = (
+            self._resolve_reinforce_reward_tanh_c(self.config)
+            if tanh_c is None
+            else tanh_c
+        )
+        tanh_bound_resolved = (
+            self._resolve_reinforce_reward_tanh_bound(self.config)
+            if tanh_bound is None
+            else tanh_bound
+        )
+        return self._transform_reward_with_params(
+            reward,
+            mode=mode_resolved,
+            tanh_c=tanh_c_resolved,
+            tanh_bound=tanh_bound_resolved,
+        )
 
     @staticmethod
     def _fit_to_slot(x, slot_dim):
@@ -2169,6 +5177,457 @@ class EnvironmentPrior:
             "detach_reference": bool(detach_reference),
         }
 
+    def _resolve_aev5_next_config(self):
+        enabled = self._coerce_bool(self.config.get("anti_explosion_vanishing_v5_next_enabled", False))
+        enabled = bool(enabled)
+        state_gain_lo = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_gain_lo", 0.985)
+        )
+        state_gain_hi = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_gain_hi", 1.035)
+        )
+        if (not math.isfinite(state_gain_lo)) or state_gain_lo <= 0.0:
+            state_gain_lo = 0.985
+        if (not math.isfinite(state_gain_hi)) or state_gain_hi <= 0.0:
+            state_gain_hi = 1.035
+        state_gain_lo = float(max(1e-6, state_gain_lo))
+        state_gain_hi = float(max(state_gain_lo, state_gain_hi))
+
+        state_rms_lo = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_rms_lo", 4e-3)
+        )
+        state_rms_hi = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_rms_hi", 9e-2)
+        )
+        if (not math.isfinite(state_rms_lo)) or state_rms_lo <= 0.0:
+            state_rms_lo = 4e-3
+        if (not math.isfinite(state_rms_hi)) or state_rms_hi <= 0.0:
+            state_rms_hi = 9e-2
+        state_rms_lo = float(max(1e-8, state_rms_lo))
+        state_rms_hi = float(max(state_rms_lo, state_rms_hi))
+
+        state_reward_gate = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_reward_gate", 0.05)
+        )
+        if (not math.isfinite(state_reward_gate)) or state_reward_gate < 0.0:
+            state_reward_gate = 0.05
+        state_reward_gate = float(max(0.0, state_reward_gate))
+
+        state_low_boost_cap = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_state_low_boost_cap", 1.5)
+        )
+        if (not math.isfinite(state_low_boost_cap)) or state_low_boost_cap < 1.0:
+            state_low_boost_cap = 1.5
+        state_low_boost_cap = float(max(1.0, state_low_boost_cap))
+
+        loss_target_std = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_loss_target_std", 0.25)
+        )
+        if (not math.isfinite(loss_target_std)) or loss_target_std <= 0.0:
+            loss_target_std = 0.25
+        loss_scale_lo = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_loss_scale_lo", 0.5)
+        )
+        loss_scale_hi = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_loss_scale_hi", 4.0)
+        )
+        if (not math.isfinite(loss_scale_lo)) or loss_scale_lo <= 0.0:
+            loss_scale_lo = 0.5
+        if (not math.isfinite(loss_scale_hi)) or loss_scale_hi <= 0.0:
+            loss_scale_hi = 4.0
+        loss_scale_lo = float(max(1e-6, loss_scale_lo))
+        loss_scale_hi = float(max(loss_scale_lo, loss_scale_hi))
+
+        step_grad_rms_lo = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_step_grad_rms_lo", 1e-4)
+        )
+        step_grad_rms_hi = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_step_grad_rms_hi", 3e-2)
+        )
+        if (not math.isfinite(step_grad_rms_lo)) or step_grad_rms_lo <= 0.0:
+            step_grad_rms_lo = 1e-4
+        if (not math.isfinite(step_grad_rms_hi)) or step_grad_rms_hi <= 0.0:
+            step_grad_rms_hi = 3e-2
+        step_grad_rms_lo = float(max(1e-12, step_grad_rms_lo))
+        step_grad_rms_hi = float(max(step_grad_rms_lo, step_grad_rms_hi))
+
+        step_reward_std_gate = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_step_reward_std_gate", 0.05)
+        )
+        if (not math.isfinite(step_reward_std_gate)) or step_reward_std_gate < 0.0:
+            step_reward_std_gate = 0.05
+        step_reward_std_gate = float(max(0.0, step_reward_std_gate))
+
+        step_low_boost_cap = self._resolve_scalar(
+            self.config.get("anti_explosion_vanishing_v5_next_step_low_boost_cap", 4.0)
+        )
+        if (not math.isfinite(step_low_boost_cap)) or step_low_boost_cap < 1.0:
+            step_low_boost_cap = 4.0
+        step_low_boost_cap = float(max(1.0, step_low_boost_cap))
+
+        eps = self._resolve_scalar(self.config.get("anti_explosion_vanishing_v5_next_eps", 1e-6))
+        if (not math.isfinite(eps)) or eps <= 0.0:
+            eps = 1e-6
+        detach_reference = self._coerce_bool(
+            self.config.get("anti_explosion_vanishing_v5_next_detach_reference", True)
+        )
+        return {
+            "enabled": bool(enabled),
+            "state_gain_lo": float(state_gain_lo),
+            "state_gain_hi": float(state_gain_hi),
+            "state_rms_lo": float(state_rms_lo),
+            "state_rms_hi": float(state_rms_hi),
+            "state_reward_gate": float(state_reward_gate),
+            "state_low_boost_cap": float(state_low_boost_cap),
+            "loss_target_std": float(loss_target_std),
+            "loss_scale_lo": float(loss_scale_lo),
+            "loss_scale_hi": float(loss_scale_hi),
+            "step_grad_rms_lo": float(step_grad_rms_lo),
+            "step_grad_rms_hi": float(step_grad_rms_hi),
+            "step_reward_std_gate": float(step_reward_std_gate),
+            "step_low_boost_cap": float(step_low_boost_cap),
+            "eps": float(eps),
+            "detach_reference": bool(detach_reference),
+        }
+
+    @staticmethod
+    def _vector_rms_last_dim(x, eps):
+        if x.ndim == 1:
+            x = x.unsqueeze(0)
+        return torch.sqrt(torch.mean(x * x, dim=-1) + float(eps))
+
+    @staticmethod
+    def _apply_aev5_next_state_update(state_prev, state_next_post, prev_delta, reward_next, aev5_next_cfg):
+        if not bool(aev5_next_cfg.get("enabled", False)):
+            return state_next_post, None
+        if state_next_post.shape[-1] <= 0:
+            return state_next_post, None
+
+        eps = float(aev5_next_cfg.get("eps", 1e-6))
+        reward_gate = float(aev5_next_cfg.get("state_reward_gate", 0.05))
+        gain_lo = float(aev5_next_cfg.get("state_gain_lo", 0.985))
+        gain_hi = float(aev5_next_cfg.get("state_gain_hi", 1.035))
+        rms_lo = float(aev5_next_cfg.get("state_rms_lo", 4e-3))
+        rms_hi = float(aev5_next_cfg.get("state_rms_hi", 9e-2))
+        low_boost_cap = float(aev5_next_cfg.get("state_low_boost_cap", 1.5))
+        detach_reference = bool(aev5_next_cfg.get("detach_reference", True))
+
+        residual_raw = state_next_post - state_prev
+        residual_view = residual_raw if residual_raw.ndim > 1 else residual_raw.unsqueeze(0)
+        cur_rms_raw = EnvironmentPrior._vector_rms_last_dim(residual_view, eps)
+
+        if prev_delta is None:
+            prev_rms_ref = cur_rms_raw.detach() if detach_reference else cur_rms_raw
+        else:
+            prev_view = prev_delta if prev_delta.ndim > 1 else prev_delta.unsqueeze(0)
+            prev_rms_ref = EnvironmentPrior._vector_rms_last_dim(prev_view, eps)
+            if detach_reference:
+                prev_rms_ref = prev_rms_ref.detach()
+
+        gain_raw = cur_rms_raw / (prev_rms_ref + float(eps))
+        gain_hi_scale = torch.clamp(
+            torch.as_tensor(gain_hi, device=gain_raw.device, dtype=gain_raw.dtype) / (gain_raw + float(eps)),
+            max=1.0,
+        )
+        rms_hi_scale = torch.clamp(
+            torch.as_tensor(rms_hi, device=cur_rms_raw.device, dtype=cur_rms_raw.dtype) / (cur_rms_raw + float(eps)),
+            max=1.0,
+        )
+        high_scale = torch.minimum(gain_hi_scale, rms_hi_scale)
+        high_clip = high_scale < (1.0 - 1e-6)
+
+        reward_ref = reward_next
+        if torch.is_tensor(reward_ref):
+            reward_ref = reward_ref.detach() if detach_reference else reward_ref
+        reward_mag = torch.abs(torch.as_tensor(reward_ref, device=cur_rms_raw.device, dtype=cur_rms_raw.dtype))
+        if reward_mag.ndim == 0:
+            reward_mag = reward_mag.expand_as(cur_rms_raw)
+        low_active = (reward_mag >= reward_gate) & (prev_rms_ref >= rms_lo) & (~high_clip)
+
+        gain_lo_scale = torch.clamp(
+            torch.as_tensor(gain_lo, device=gain_raw.device, dtype=gain_raw.dtype) / (gain_raw + float(eps)),
+            min=1.0,
+            max=float(low_boost_cap),
+        )
+        rms_lo_scale = torch.clamp(
+            torch.as_tensor(rms_lo, device=cur_rms_raw.device, dtype=cur_rms_raw.dtype) / (cur_rms_raw + float(eps)),
+            min=1.0,
+            max=float(low_boost_cap),
+        )
+        low_scale_raw = torch.maximum(gain_lo_scale, rms_lo_scale)
+        low_scale = torch.where(low_active, low_scale_raw, torch.ones_like(low_scale_raw))
+        low_boost = low_scale > (1.0 + 1e-6)
+
+        total_scale = high_scale * low_scale
+        residual = residual_view * total_scale.unsqueeze(-1)
+        state_next = state_prev if state_prev.ndim > 1 else state_prev.unsqueeze(0)
+        state_next = state_next + residual
+        if state_next_post.ndim == 1:
+            state_next = state_next.squeeze(0)
+        cur_rms_post = cur_rms_raw * total_scale
+        gain_post = cur_rms_post / (prev_rms_ref + float(eps))
+
+        return state_next, {
+            "gain": gain_post.detach().to(dtype=torch.float32),
+            "update_rms": cur_rms_post.detach().to(dtype=torch.float32),
+            "scale": total_scale.detach().to(dtype=torch.float32),
+            "high_clip": high_clip.detach().to(dtype=torch.float32),
+            "low_active": low_active.detach().to(dtype=torch.float32),
+            "low_boost": low_boost.detach().to(dtype=torch.float32),
+        }
+
+    @staticmethod
+    def _aev5_next_new_accumulator(enabled, device, dtype, aev5_next_cfg=None):
+        if aev5_next_cfg is None:
+            aev5_next_cfg = {}
+        return {
+            "enabled": bool(enabled),
+            "state_gain_lo": float(aev5_next_cfg.get("state_gain_lo", 0.0)),
+            "state_gain_hi": float(aev5_next_cfg.get("state_gain_hi", 0.0)),
+            "state_rms_lo": float(aev5_next_cfg.get("state_rms_lo", 0.0)),
+            "state_rms_hi": float(aev5_next_cfg.get("state_rms_hi", 0.0)),
+            "state_reward_gate": float(aev5_next_cfg.get("state_reward_gate", 0.0)),
+            "state_low_boost_cap": float(aev5_next_cfg.get("state_low_boost_cap", 1.0)),
+            "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "gain_count": 0,
+            "gain_min": None,
+            "gain_max": None,
+            "update_rms_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "update_rms_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+            "update_rms_count": 0,
+            "scale_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "scale_count": 0,
+            "scale_max": None,
+            "high_clip_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "high_clip_count": 0,
+            "low_active_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "low_active_count": 0,
+            "low_boost_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "low_boost_count": 0,
+            "trigger_sum": torch.zeros((), device=device, dtype=torch.float64),
+            "trigger_count": 0,
+        }
+
+    @staticmethod
+    def _aev5_next_update_accumulator(acc, step_aux):
+        if (not bool(acc.get("enabled", False))) or (not isinstance(step_aux, dict)):
+            return
+        gain = step_aux.get("gain", None)
+        if torch.is_tensor(gain):
+            gain64 = gain.detach().to(dtype=torch.float64)
+            acc["gain_sum"] = acc["gain_sum"] + gain64.sum()
+            acc["gain_sumsq"] = acc["gain_sumsq"] + (gain64 * gain64).sum()
+            acc["gain_count"] = int(acc["gain_count"]) + int(gain64.numel())
+            gain_min = gain.detach().min()
+            gain_max = gain.detach().max()
+            acc["gain_min"] = gain_min if acc["gain_min"] is None else torch.minimum(acc["gain_min"], gain_min)
+            acc["gain_max"] = gain_max if acc["gain_max"] is None else torch.maximum(acc["gain_max"], gain_max)
+        update_rms = step_aux.get("update_rms", None)
+        if torch.is_tensor(update_rms):
+            update64 = update_rms.detach().to(dtype=torch.float64)
+            acc["update_rms_sum"] = acc["update_rms_sum"] + update64.sum()
+            acc["update_rms_sumsq"] = acc["update_rms_sumsq"] + (update64 * update64).sum()
+            acc["update_rms_count"] = int(acc["update_rms_count"]) + int(update64.numel())
+        scale = step_aux.get("scale", None)
+        if torch.is_tensor(scale):
+            scale64 = scale.detach().to(dtype=torch.float64)
+            acc["scale_sum"] = acc["scale_sum"] + scale64.sum()
+            acc["scale_count"] = int(acc["scale_count"]) + int(scale64.numel())
+            scale_max = scale.detach().max()
+            acc["scale_max"] = scale_max if acc["scale_max"] is None else torch.maximum(acc["scale_max"], scale_max)
+        high_clip = step_aux.get("high_clip", None)
+        if torch.is_tensor(high_clip):
+            high64 = high_clip.detach().to(dtype=torch.float64)
+            acc["high_clip_sum"] = acc["high_clip_sum"] + high64.sum()
+            acc["high_clip_count"] = int(acc["high_clip_count"]) + int(high64.numel())
+        low_active = step_aux.get("low_active", None)
+        if torch.is_tensor(low_active):
+            low_active64 = low_active.detach().to(dtype=torch.float64)
+            acc["low_active_sum"] = acc["low_active_sum"] + low_active64.sum()
+            acc["low_active_count"] = int(acc["low_active_count"]) + int(low_active64.numel())
+        low_boost = step_aux.get("low_boost", None)
+        if torch.is_tensor(low_boost):
+            low_boost64 = low_boost.detach().to(dtype=torch.float64)
+            acc["low_boost_sum"] = acc["low_boost_sum"] + low_boost64.sum()
+            acc["low_boost_count"] = int(acc["low_boost_count"]) + int(low_boost64.numel())
+        if torch.is_tensor(high_clip) and torch.is_tensor(low_active):
+            trigger64 = torch.logical_or(high_clip.detach() != 0, low_active.detach() != 0).to(dtype=torch.float64)
+            acc["trigger_sum"] = acc["trigger_sum"] + trigger64.sum()
+            acc["trigger_count"] = int(acc["trigger_count"]) + int(trigger64.numel())
+
+    @staticmethod
+    def _aev5_next_finalize_accumulator(acc, device, dtype):
+        enabled = bool(acc.get("enabled", False))
+        gain_count = int(acc.get("gain_count", 0))
+        gain_sum = acc.get("gain_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        gain_sumsq = acc.get("gain_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if gain_count > 0:
+            gain_mean64 = gain_sum / float(gain_count)
+            gain_var64 = (gain_sumsq / float(gain_count)) - (gain_mean64 * gain_mean64)
+            gain_mean = gain_mean64.to(dtype=dtype).detach()
+            gain_std = torch.sqrt(torch.clamp(gain_var64, min=0.0)).to(dtype=dtype).detach()
+        else:
+            gain_mean = torch.zeros((), device=device, dtype=dtype)
+            gain_std = torch.zeros((), device=device, dtype=dtype)
+        gain_min = acc.get("gain_min", None)
+        gain_min = torch.zeros((), device=device, dtype=dtype) if gain_min is None else gain_min.detach().to(device=device, dtype=dtype)
+        gain_max = acc.get("gain_max", None)
+        gain_max = torch.zeros((), device=device, dtype=dtype) if gain_max is None else gain_max.detach().to(device=device, dtype=dtype)
+
+        update_count = int(acc.get("update_rms_count", 0))
+        update_sum = acc.get("update_rms_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        update_sumsq = acc.get("update_rms_sumsq", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        if update_count > 0:
+            update_mean64 = update_sum / float(update_count)
+            update_var64 = (update_sumsq / float(update_count)) - (update_mean64 * update_mean64)
+            update_mean = update_mean64.to(dtype=dtype).detach()
+            update_std = torch.sqrt(torch.clamp(update_var64, min=0.0)).to(dtype=dtype).detach()
+        else:
+            update_mean = torch.zeros((), device=device, dtype=dtype)
+            update_std = torch.zeros((), device=device, dtype=dtype)
+
+        scale_count = int(acc.get("scale_count", 0))
+        scale_sum = acc.get("scale_sum", torch.zeros((), device=device, dtype=torch.float64)).detach()
+        scale_mean = (
+            (scale_sum / float(scale_count)).to(dtype=dtype).detach()
+            if scale_count > 0
+            else torch.ones((), device=device, dtype=dtype)
+        )
+        scale_max = acc.get("scale_max", None)
+        scale_max = torch.ones((), device=device, dtype=dtype) if scale_max is None else scale_max.detach().to(device=device, dtype=dtype)
+
+        def _share(sum_key, count_key):
+            count = int(acc.get(count_key, 0))
+            total = acc.get(sum_key, torch.zeros((), device=device, dtype=torch.float64)).detach()
+            if count <= 0:
+                return torch.zeros((), device=device, dtype=dtype)
+            return (total / float(count)).to(dtype=dtype).detach()
+
+        return {
+            "enabled": int(enabled),
+            "state_gain_lo": float(acc.get("state_gain_lo", 0.0)),
+            "state_gain_hi": float(acc.get("state_gain_hi", 0.0)),
+            "state_rms_lo": float(acc.get("state_rms_lo", 0.0)),
+            "state_rms_hi": float(acc.get("state_rms_hi", 0.0)),
+            "state_reward_gate": float(acc.get("state_reward_gate", 0.0)),
+            "state_low_boost_cap": float(acc.get("state_low_boost_cap", 1.0)),
+            "gain_sum": gain_sum,
+            "gain_sumsq": gain_sumsq,
+            "gain_count": int(gain_count),
+            "gain_mean": gain_mean,
+            "gain_std": gain_std,
+            "gain_min": gain_min,
+            "gain_max": gain_max,
+            "update_rms_sum": update_sum,
+            "update_rms_sumsq": update_sumsq,
+            "update_rms_count": int(update_count),
+            "update_rms_mean": update_mean,
+            "update_rms_std": update_std,
+            "scale_sum": scale_sum,
+            "scale_count": int(scale_count),
+            "scale_mean": scale_mean,
+            "scale_max": scale_max,
+            "high_clip_sum": acc.get("high_clip_sum", torch.zeros((), device=device, dtype=torch.float64)).detach(),
+            "high_clip_count": int(acc.get("high_clip_count", 0)),
+            "high_clip_share": _share("high_clip_sum", "high_clip_count"),
+            "low_active_sum": acc.get("low_active_sum", torch.zeros((), device=device, dtype=torch.float64)).detach(),
+            "low_active_count": int(acc.get("low_active_count", 0)),
+            "low_active_share": _share("low_active_sum", "low_active_count"),
+            "low_boost_sum": acc.get("low_boost_sum", torch.zeros((), device=device, dtype=torch.float64)).detach(),
+            "low_boost_count": int(acc.get("low_boost_count", 0)),
+            "low_boost_share": _share("low_boost_sum", "low_boost_count"),
+            "trigger_sum": acc.get("trigger_sum", torch.zeros((), device=device, dtype=torch.float64)).detach(),
+            "trigger_count": int(acc.get("trigger_count", 0)),
+            "corridor_trigger_share": _share("trigger_sum", "trigger_count"),
+        }
+
+    @staticmethod
+    def _aev5_next_accumulate_window_summary(det_acc, window_summary, device):
+        if (not isinstance(det_acc, dict)) or (not isinstance(window_summary, dict)):
+            return
+        for sum_key in (
+            "gain_sum",
+            "gain_sumsq",
+            "update_rms_sum",
+            "update_rms_sumsq",
+            "scale_sum",
+            "high_clip_sum",
+            "low_active_sum",
+            "low_boost_sum",
+            "trigger_sum",
+        ):
+            val = window_summary.get(sum_key, None)
+            if torch.is_tensor(val):
+                det_acc[sum_key] = det_acc[sum_key] + val.detach().to(device=device, dtype=torch.float64)
+        for count_key in (
+            "gain_count",
+            "update_rms_count",
+            "scale_count",
+            "high_clip_count",
+            "low_active_count",
+            "low_boost_count",
+            "trigger_count",
+        ):
+            det_acc[count_key] = int(det_acc.get(count_key, 0)) + int(window_summary.get(count_key, 0))
+        gain_min = window_summary.get("gain_min", None)
+        if torch.is_tensor(gain_min):
+            gain_min = gain_min.detach()
+            det_acc["gain_min"] = gain_min if det_acc.get("gain_min", None) is None else torch.minimum(det_acc["gain_min"], gain_min)
+        gain_max = window_summary.get("gain_max", None)
+        if torch.is_tensor(gain_max):
+            gain_max = gain_max.detach()
+            det_acc["gain_max"] = gain_max if det_acc.get("gain_max", None) is None else torch.maximum(det_acc["gain_max"], gain_max)
+        scale_max = window_summary.get("scale_max", None)
+        if torch.is_tensor(scale_max):
+            scale_max = scale_max.detach()
+            det_acc["scale_max"] = scale_max if det_acc.get("scale_max", None) is None else torch.maximum(det_acc["scale_max"], scale_max)
+
+    @staticmethod
+    def _aev5_next_merge_rollout_summary(acc, summary, batch_weight, device, dtype):
+        del batch_weight, dtype
+        if not isinstance(summary, dict):
+            return acc
+        if int(summary.get("enabled", 0)) == 0:
+            return acc
+        if acc is None:
+            acc = {
+                "enabled": 1,
+                "state_gain_lo": float(summary.get("state_gain_lo", 0.0)),
+                "state_gain_hi": float(summary.get("state_gain_hi", 0.0)),
+                "state_rms_lo": float(summary.get("state_rms_lo", 0.0)),
+                "state_rms_hi": float(summary.get("state_rms_hi", 0.0)),
+                "state_reward_gate": float(summary.get("state_reward_gate", 0.0)),
+                "state_low_boost_cap": float(summary.get("state_low_boost_cap", 1.0)),
+                "gain_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "gain_count": 0,
+                "gain_min": None,
+                "gain_max": None,
+                "update_rms_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "update_rms_sumsq": torch.zeros((), device=device, dtype=torch.float64),
+                "update_rms_count": 0,
+                "scale_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "scale_count": 0,
+                "scale_max": None,
+                "high_clip_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "high_clip_count": 0,
+                "low_active_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "low_active_count": 0,
+                "low_boost_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "low_boost_count": 0,
+                "trigger_sum": torch.zeros((), device=device, dtype=torch.float64),
+                "trigger_count": 0,
+            }
+        EnvironmentPrior._aev5_next_accumulate_window_summary(acc, summary, device=device)
+        return acc
+
+    @staticmethod
+    def _aev5_next_finalize_rollout_summary(acc, device, dtype):
+        if acc is None:
+            return None
+        return EnvironmentPrior._aev5_next_finalize_accumulator(acc, device=device, dtype=dtype)
+
     @staticmethod
     def _aev4_highway_dim(last_dim, aev4_cfg):
         d = int(last_dim)
@@ -2752,49 +6211,149 @@ class EnvironmentPrior:
             family = "scm"
 
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
-        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
-        builder = self._build_scm_fn if family == "scm" else self._build_gp_fn
+        reference_semantics_enabled = self._resolve_reference_semantics_enabled(h)
+        input_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+        in_dim = int(input_layout["total_dim"])
+        if reference_semantics_enabled:
+            if family == "scm":
+                builder = self._build_scm_fn
+                transition_builder = self._build_reference_scm_joint_transition_fn
+            else:
+                builder = self._build_gp_fn
+                transition_builder = (
+                    self._build_reference_gp_joint_transition_fn
+                    if self._resolve_reference_gp_forward_mode(h) == "exact"
+                    else self._build_reference_gp_fixed_cost_joint_transition_fn
+                )
+        else:
+            builder = self._build_scm_fn if family == "scm" else self._build_gp_fn
+            transition_builder = (
+                self._build_scm_joint_transition_fn if family == "scm" else self._build_gp_joint_transition_fn
+            )
         local_generator = None
         if rng_seed is not None:
             local_generator = torch.Generator(device=device)
             local_generator.manual_seed(int(rng_seed))
+        lipschitz_enabled = bool(h.get("lipschitz_enforce", False))
+        strict_joint_transition = self._resolve_strict_joint_transition_enabled(h)
+        lipschitz_audit_acc = self._new_lipschitz_audit_accumulator(
+            lipschitz_enabled,
+            device=device,
+            dtype=torch.float32,
+        )
 
         # X-style / Y-style generators.
-        x_generator = builder(in_dim, state_dim, h, device, generator=local_generator)  # for s_{t+1}
-        y_generator = builder(in_dim, 1, h, device, generator=local_generator)          # for r_{t+1}
-        policy_generator = builder(in_dim, action_dim, h, device, generator=local_generator)
+        with self._lipschitz_audit_scope(lipschitz_audit_acc):
+            transition_generator = (
+                transition_builder(in_dim, state_dim, h, device, generator=local_generator)
+                if strict_joint_transition
+                else None
+            )
+            x_generator = (
+                None
+                if strict_joint_transition
+                else builder(in_dim, state_dim, h, device, generator=local_generator)
+            )  # for s_{t+1}
+            y_generator = (
+                None
+                if strict_joint_transition
+                else builder(in_dim, 1, h, device, generator=local_generator)
+            )  # for r_{t+1}
+            policy_generator = builder(in_dim, action_dim, h, device, generator=local_generator)
         aev4_cfg = self._resolve_aev4_config()
+
+        alpha = float(max(1e-4, min(1.0, float(h["alpha"]))))
+        state_noise_std = float(h["state_noise_std"])
+        reward_scale = float(h["reward_scale"])
+        reward_clip = float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0))))
+        state_clip = float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0))))
+        state_input_scale_enabled = bool(self._resolve_state_input_scale_enabled(h))
+        state_input_scale = float(self._resolve_state_input_scale(h))
+        state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
+        state_full_rms_target = float(self._resolve_state_full_rms_target(h))
+        reinforce_reward_transform = self._resolve_reinforce_reward_transform(h)
+        reinforce_reward_tanh_c = float(self._resolve_reinforce_reward_tanh_c(h))
+        reinforce_reward_tanh_bound = float(self._resolve_reinforce_reward_tanh_bound(h))
+        state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
+        state_highway_lambda = float(self._resolve_state_highway_lambda(h))
+        reward_dropout_enabled = bool(h.get("reward_dropout_enabled", True))
+        reward_dropout_impute_zero = bool(h.get("reward_dropout_impute_zero", True))
+        reward_dropout_ratio = float(max(0.0, min(1.0, self._sample_reward_dropout_ratio(h))))
+        if reference_semantics_enabled:
+            alpha = 1.0
+            state_noise_std = 0.0
+            reward_scale = 1.0
+            reward_clip = float("inf")
+            state_clip = float("inf")
+            state_highway_enabled = False
+            state_highway_lambda = 0.0
+            reward_dropout_enabled = False
+            reward_dropout_impute_zero = True
+            reward_dropout_ratio = 0.0
 
         env = {
             "family": family,
+            "strict_joint_transition_enabled": bool(strict_joint_transition),
+            "reference_semantics_enabled": bool(reference_semantics_enabled),
+            "reference_gp_forward_mode": (
+                self._resolve_reference_gp_forward_mode(h)
+                if family == "gp"
+                else None
+            ),
             "state_dim": state_dim,
             "obs_dim": obs_dim,
             "action_dim": action_dim,
             "noise_dim": noise_dim,
             "zero_pad_dim": zero_pad_dim,
+            "env_input_dim": int(input_layout["total_dim"]),
+            "env_obs_input_dim": int(input_layout["obs_input_dim"]),
+            "env_obs_start": input_layout["obs_start"],
+            "env_action_start": int(input_layout["action_start"]),
+            "env_noise_start": int(input_layout["noise_start"]),
+            "env_zero_start": int(input_layout["zero_start"]),
             "obs_slot_dim": int(max(1, h.get("obs_slot_dim", 400))),
             "action_slot_dim": int(max(1, h.get("action_slot_dim", 30))),
             "x_generator": x_generator,
             "y_generator": y_generator,
+            "transition_generator": transition_generator,
             "policy_generator": policy_generator,
-            "alpha": float(max(1e-4, min(1.0, float(h["alpha"])))),
+            "alpha": alpha,
             "init_state_std": float(h["init_state_std"]),
             "init_action_std": float(h["init_action_std"]),
-            "state_noise_std": float(h["state_noise_std"]),
+            "state_noise_std": state_noise_std,
             "action_noise_train_std": float(h["action_noise_train_std"]),
             "action_noise_eval_std": float(h["action_noise_eval_std"]),
-            "reward_scale": float(h["reward_scale"]),
-            "reward_clip": float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0)))),
-            "state_clip": float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))),
-            "state_highway_enabled": bool(self._resolve_state_highway_enabled(h)),
-            "state_highway_lambda": float(self._resolve_state_highway_lambda(h)),
+            "reward_scale": reward_scale,
+            "reward_clip": reward_clip,
+            "state_clip": state_clip,
+            "state_input_scale_enabled": state_input_scale_enabled,
+            "state_input_scale": state_input_scale,
+            "state_full_rms_enabled": state_full_rms_enabled,
+            "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": reinforce_reward_transform,
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "state_highway_enabled": state_highway_enabled,
+            "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": bool(aev4_cfg.get("enabled", False)),
             "aev4_highway_ratio": float(aev4_cfg.get("highway_ratio", 0.25)),
             "aev4_update_scale": float(aev4_cfg.get("update_scale", 0.12)),
             "aev4_update_clip": float(aev4_cfg.get("update_clip", 0.0)),
-            "reward_dropout_enabled": bool(h.get("reward_dropout_enabled", True)),
-            "reward_dropout_impute_zero": bool(h.get("reward_dropout_impute_zero", True)),
-            "reward_dropout_ratio": float(max(0.0, min(1.0, self._sample_reward_dropout_ratio(h)))),
+            "reward_dropout_enabled": reward_dropout_enabled,
+            "reward_dropout_impute_zero": reward_dropout_impute_zero,
+            "reward_dropout_ratio": reward_dropout_ratio,
+            "lipschitz_audit": self._finalize_lipschitz_audit_accumulator(
+                lipschitz_audit_acc,
+                device=device,
+                dtype=torch.float32,
+            ),
         }
         return env
 
@@ -2810,10 +6369,12 @@ class EnvironmentPrior:
     def _environment_structure_signature(self, h):
         family = self._normalize_family(h.get("family", "scm"))
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        reference_semantics_enabled = self._resolve_reference_semantics_enabled(h)
         obs_slot_dim = int(max(1, h.get("obs_slot_dim", 400)))
         action_slot_dim = int(max(1, h.get("action_slot_dim", 30)))
         signature = (
             family,
+            bool(reference_semantics_enabled),
             state_dim,
             obs_dim,
             action_dim,
@@ -2829,14 +6390,19 @@ class EnvironmentPrior:
                 h["prior_mlp_activations"],
             )
         else:
-            signature += (int(h["gp_rff_features"]),)
+            signature += (
+                int(h["gp_rff_features"]),
+                self._resolve_reference_gp_forward_mode(h) if bool(reference_semantics_enabled) else "legacy",
+            )
         return signature
 
     def _environment_transition_signature(self, h):
         family = self._normalize_family(h.get("family", "scm"))
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
+        reference_semantics_enabled = self._resolve_reference_semantics_enabled(h)
         signature = (
             family,
+            bool(reference_semantics_enabled),
             state_dim,
             obs_dim,
             action_dim,
@@ -2850,7 +6416,10 @@ class EnvironmentPrior:
                 self._activation_name(h["prior_mlp_activations"]),
             )
         else:
-            signature += (int(max(8, int(h["gp_rff_features"]))),)
+            signature += (
+                int(max(8, int(h["gp_rff_features"]))),
+                self._resolve_reference_gp_forward_mode(h) if bool(reference_semantics_enabled) else "legacy",
+            )
         return signature
 
     @staticmethod
@@ -2874,17 +6443,27 @@ class EnvironmentPrior:
     def _environment_transition_bucket_signature(self, h, grouping_mode):
         grouping_mode = str(grouping_mode).strip().lower()
         family = self._normalize_family(h.get("family", "scm"))
+        reference_semantics_enabled = self._resolve_reference_semantics_enabled(h)
+        gp_mode = self._resolve_reference_gp_forward_mode(h) if (family == "gp" and bool(reference_semantics_enabled)) else "legacy"
         if grouping_mode == "family":
-            return (family,)
+            return (family, bool(reference_semantics_enabled), gp_mode)
         if grouping_mode == "structure":
             return self._environment_transition_signature(h)
         if self._resolve_transition_balanced_bucket_count(grouping_mode) is not None:
-            return (family,)
+            return (family, bool(reference_semantics_enabled), gp_mode)
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
-        total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
+        total_dim = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )["total_dim"]
         if family == "scm":
             signature = (
                 family,
+                bool(reference_semantics_enabled),
                 self._bucket_ceil_pow2(total_dim),
                 self._bucket_ceil_pow2(state_dim),
                 self._bucket_ceil_pow2(max(state_dim, int(h["prior_mlp_hidden_dim"]))),
@@ -2895,15 +6474,26 @@ class EnvironmentPrior:
             return signature
         return (
             family,
+            bool(reference_semantics_enabled),
             self._bucket_ceil_pow2(total_dim),
             self._bucket_ceil_pow2(state_dim),
             self._bucket_ceil_pow2(max(8, int(h["gp_rff_features"]))),
+            gp_mode,
         )
 
     def _estimate_transition_sample_work(self, h):
         family = self._normalize_family(h.get("family", "scm"))
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
-        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
+        in_dim = int(
+            self._env_input_layout(
+                state_dim,
+                obs_dim,
+                action_dim,
+                noise_dim,
+                zero_pad_dim,
+                reference_semantics_enabled=self._resolve_reference_semantics_enabled(h),
+            )["total_dim"]
+        )
         state_dim = int(state_dim)
         if family == "scm":
             hidden_dim = int(max(state_dim, int(h["prior_mlp_hidden_dim"])))
@@ -2918,7 +6508,16 @@ class EnvironmentPrior:
     def _transition_balanced_sort_key(self, h):
         family = self._normalize_family(h.get("family", "scm"))
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h)
-        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
+        in_dim = int(
+            self._env_input_layout(
+                state_dim,
+                obs_dim,
+                action_dim,
+                noise_dim,
+                zero_pad_dim,
+                reference_semantics_enabled=self._resolve_reference_semantics_enabled(h),
+            )["total_dim"]
+        )
         if family == "scm":
             hidden_dim = int(max(state_dim, int(h["prior_mlp_hidden_dim"])))
             depth = int(max(2, int(h["num_layers"])))
@@ -3063,6 +6662,7 @@ class EnvironmentPrior:
         activation_names,
         generators=None,
         input_mask=None,
+        apply_output_tanh=True,
     ):
         batch_size = len(h_list)
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
@@ -3258,12 +6858,14 @@ class EnvironmentPrior:
                 )
             if noise_eps is not None:
                 z = z + noise_eps
-            z = torch.tanh(z)
+            if apply_output_tanh:
+                z = torch.tanh(z)
             return z * final_out_mask
 
         fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
         fn._noise_scale = noise_std
         fn._out_width = int(final_out_mask.shape[1])
+        fn._applies_output_tanh = bool(apply_output_tanh)
 
         return fn
 
@@ -3386,6 +6988,8 @@ class EnvironmentPrior:
         generators=None,
         input_mask=None,
         sample_in_dims=None,
+        apply_output_tanh=True,
+        reference_semantics=False,
     ):
         batch_size = len(h_list)
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
@@ -3422,7 +7026,9 @@ class EnvironmentPrior:
             outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
         weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
-        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+        outputscale = self._project_outputscale_abs(outputscale, outputscale_cap)
+        output_amp = torch.sqrt(outputscale.clamp_min(0.0)) if bool(reference_semantics) else outputscale
+        noise_scale = torch.sqrt(noise.clamp_min(0.0)) if bool(reference_semantics) else noise
 
         if input_mask is not None:
             in_cap = int(input_mask.shape[1])
@@ -3471,7 +7077,10 @@ class EnvironmentPrior:
             w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
             if sample_in_i != in_i:
                 w_b = w_b[:in_i]
-            a_b = a_b / math.sqrt(max(1, m_i))
+            if bool(reference_semantics):
+                a_b = a_b * math.sqrt(2.0 / float(max(1, m_i)))
+            else:
+                a_b = a_b / math.sqrt(max(1, m_i))
             a_b = self._project_matrix_fro_norm(a_b, float(weight_cap[bi].item()))
             if gp_input_fused_enabled:
                 w[bi, :in_i, :m_i] = w_b
@@ -3592,7 +7201,7 @@ class EnvironmentPrior:
                     gp_projection_profile["rff_fused_call_count"] += 1
             second_proj_t0 = time.perf_counter() if gp_projection_timing_enabled else None
             if gp_output_fused_enabled:
-                y = outputscale[:, None] * self._batch_affine_prefix_tiled(
+                y = output_amp[:, None] * self._batch_affine_prefix_tiled(
                     phi[:, :m_cap],
                     a,
                     None,
@@ -3605,9 +7214,9 @@ class EnvironmentPrior:
                     in_tile_offsets=a_in_tile_offsets,
                 )
             elif a_input_index is None:
-                y = outputscale[:, None] * self._batch_affine(phi, a, None)
+                y = output_amp[:, None] * self._batch_affine(phi, a, None)
             else:
-                y = outputscale[:, None] * self._batch_affine_with_layout(
+                y = output_amp[:, None] * self._batch_affine_with_layout(
                     phi,
                     a,
                     None,
@@ -3633,22 +7242,25 @@ class EnvironmentPrior:
                 )
             else:
                 y = _core_fn(x)
-            if (noise_eps is None) and torch.any(noise > 0):
+            if (noise_eps is None) and torch.any(noise_scale > 0):
                 noise_eps = self._sample_scaled_noise_batch(
                     generators_for_noise,
-                    scale=noise,
+                    scale=noise_scale,
                     width=y.shape[1],
                     device=y.device,
                     dtype=y.dtype,
                 )
             if noise_eps is not None:
                 y = y + noise_eps
-            y = torch.tanh(y)
+            if apply_output_tanh:
+                y = torch.tanh(y)
             return y * out_mask
 
         fn._envgen_checkpoint_enabled = bool(self.envgen_checkpoint)
         fn._noise_scale = noise
         fn._out_width = int(out_mask.shape[1])
+        fn._applies_output_tanh = bool(apply_output_tanh)
+        fn._reference_gp_fixed_cost = bool(reference_semantics)
         fn._gp_input_rff_fused = bool(gp_input_fused_enabled)
         fn._gp_output_projection_fused = bool(gp_output_fused_enabled)
         fn._gp_rff_fused = bool(gp_rff_fused_enabled)
@@ -3939,7 +7551,7 @@ class EnvironmentPrior:
             outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
         weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
-        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+        outputscale = self._project_outputscale_abs(outputscale, outputscale_cap)
 
         if input_mask is not None:
             in_cap = int(input_mask.shape[1])
@@ -4072,7 +7684,7 @@ class EnvironmentPrior:
             outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
         weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
-        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+        outputscale = self._project_outputscale_abs(outputscale, outputscale_cap)
 
         if input_mask is not None:
             in_cap = int(input_mask.shape[1])
@@ -4140,14 +7752,15 @@ class EnvironmentPrior:
         checkpoint_enabled = bool(self.envgen_checkpoint)
 
         def _core_dual(x_state, x_reward):
-            state_in = x_state[:, :in_cap] * in_mask
-            reward_in = x_reward[:, :in_cap] * in_mask
-            state_phi = torch.cos(self._batch_affine(state_in, state_w, state_b)) * m_mask
-            reward_phi = torch.cos(self._batch_affine(reward_in, reward_w, reward_b)) * m_mask
-            state_y = outputscale[:, None] * self._batch_affine(state_phi, state_a, None)
-            reward_y = outputscale[:, None] * (reward_phi * reward_a_vec).sum(dim=1, keepdim=True)
             out_dual = torch.zeros((2 * batch_size, state_out_cap), device=x_state.device, dtype=x_state.dtype)
+            state_in = x_state[:, :in_cap] * in_mask
+            state_phi = torch.cos(self._batch_affine(state_in, state_w, state_b)) * m_mask
+            state_y = outputscale[:, None] * self._batch_affine(state_phi, state_a, None)
             out_dual[:batch_size] = state_y * state_out_mask
+            del state_phi, state_y, state_in
+            reward_in = x_reward[:, :in_cap] * in_mask
+            reward_phi = torch.cos(self._batch_affine(reward_in, reward_w, reward_b)) * m_mask
+            reward_y = outputscale[:, None] * (reward_phi * reward_a_vec).sum(dim=1, keepdim=True)
             out_dual[batch_size:, :1] = reward_y
             return out_dual
 
@@ -4459,6 +8072,7 @@ class EnvironmentPrior:
             return torch.where(mask, z_act, z)
 
         def _core_fn(x_state, x_reward):
+            z = torch.zeros((packed_batch_size, packed_branch_cap), device=x_state.device, dtype=x_state.dtype)
             state_hidden = self._batch_affine_with_layout(
                 x_state[:, :input_cap] * first_in_mask,
                 first_state_w,
@@ -4467,6 +8081,8 @@ class EnvironmentPrior:
                 in_sizes=in_dims,
                 out_sizes=hidden_state_dims,
             )
+            z[:batch_size, :state_hidden_cap] = state_hidden
+            del state_hidden
             reward_hidden = self._batch_affine_with_layout(
                 x_reward[:, :input_cap] * first_in_mask,
                 first_reward_w,
@@ -4475,9 +8091,8 @@ class EnvironmentPrior:
                 in_sizes=in_dims,
                 out_sizes=hidden_reward_dims,
             )
-            z = torch.zeros((packed_batch_size, packed_branch_cap), device=x_state.device, dtype=x_state.dtype)
-            z[:batch_size, :state_hidden_cap] = state_hidden
             z[batch_size:, :reward_hidden_cap] = reward_hidden
+            del reward_hidden
             z = _apply_activation(z, torch.ones((packed_batch_size,), device=z.device, dtype=torch.bool))
             for layer in packed_layers:
                 z = self._batch_affine_prefix_tiled(
@@ -4573,7 +8188,29 @@ class EnvironmentPrior:
             return None
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
-        if bool(self.fused_transition_scm_hidden_fused):
+        use_hidden_fused = bool(self.fused_transition_scm_hidden_fused)
+        hidden_fused_budget_fallback = False
+        if use_hidden_fused:
+            try:
+                hidden_fused_temp_cap_mb = float(
+                    os.environ.get("TICL_POLICY_SCM_HIDDEN_FUSED_MAX_TEMP_MB", "512")
+                )
+            except Exception:
+                hidden_fused_temp_cap_mb = 512.0
+            if math.isfinite(hidden_fused_temp_cap_mb) and hidden_fused_temp_cap_mb > 0.0:
+                state_hidden_cap_est = max(
+                    int(state_dims.max().item()),
+                    max(int(max(int(state_dims[bi].item()), int(h["prior_mlp_hidden_dim"]))) for bi, h in enumerate(h_list)),
+                )
+                reward_hidden_cap_est = max(max(1, int(h["prior_mlp_hidden_dim"])) for h in h_list)
+                packed_branch_cap_est = max(state_hidden_cap_est, reward_hidden_cap_est, int(state_dims.max().item()), 1)
+                branch_temp_bytes = float(batch_size * max(state_hidden_cap_est, reward_hidden_cap_est) * 4)
+                packed_z_bytes = float((2 * batch_size) * packed_branch_cap_est * 4)
+                estimated_peak_bytes = (2.0 * branch_temp_bytes) + packed_z_bytes
+                if estimated_peak_bytes > float(hidden_fused_temp_cap_mb) * (1024.0 ** 2):
+                    use_hidden_fused = False
+                    hidden_fused_budget_fallback = True
+        if use_hidden_fused:
             return self._build_scm_hetero_hidden_fused_transition_fn(
                 in_dims=in_dims,
                 state_dims=state_dims,
@@ -4646,6 +8283,7 @@ class EnvironmentPrior:
             getattr(dual_fn, "_gp_output_projection_fused", False)
         )
         transition_fn._gp_rff_fused = bool(getattr(dual_fn, "_gp_rff_fused", False))
+        transition_fn._scm_hidden_fused_budget_fallback = bool(hidden_fused_budget_fallback)
         if callable(getattr(dual_fn, "_consume_gp_projection_profile", None)):
             transition_fn._consume_gp_projection_profile = dual_fn._consume_gp_projection_profile
 
@@ -4929,6 +8567,174 @@ class EnvironmentPrior:
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
         return transition_fn
 
+    def _build_scm_hetero_joint_transition_batch_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        depth_values,
+        activation_names,
+        generators=None,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if all(bool(self._resolve_reference_semantics_enabled(h)) for h in h_list):
+            transition_core = self._build_reference_scm_joint_transition_padded_batch_fn(
+                in_dims=in_dims,
+                state_dims=state_dims,
+                h_list=h_list,
+                device=device,
+                generators=generators,
+                input_mask=input_mask,
+            )
+
+            def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+                x_in = x[:batch_size] if bool(x_is_dual_packed) else x
+                return transition_core(
+                    x_in,
+                    generators_for_noise=generators_for_noise,
+                    x_input_is_packed=bool(x_input_is_packed),
+                )
+
+            self._copy_transition_generator_attrs(transition_fn, transition_core)
+            return transition_fn
+
+        state_cap = int(max(1, int(state_dims.max().item())))
+        joint_out_dims = state_dims + 1
+        joint_fn = self._build_scm_hetero_batch_fn(
+            in_dims=in_dims,
+            out_dims=joint_out_dims,
+            h_list=h_list,
+            device=device,
+            depth_values=depth_values,
+            activation_names=activation_names,
+            generators=generators,
+            input_mask=input_mask,
+            apply_output_tanh=False,
+        )
+        state_mask = (
+            torch.arange(state_cap, device=device, dtype=torch.long).unsqueeze(0)
+            < state_dims.unsqueeze(1)
+        ).to(dtype=torch.float32)
+        reward_index = state_dims.unsqueeze(1)
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+            del x_input_is_packed
+            x_in = x[:batch_size] if bool(x_is_dual_packed) else x
+            out = joint_fn(
+                x_in,
+                generators_for_noise=generators_for_noise,
+                stable_input=True,
+            )
+            state_out = out[:, :state_cap] * state_mask.to(device=out.device, dtype=out.dtype)
+            reward_out = out.gather(1, reward_index.to(device=out.device))
+            return state_out, reward_out
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
+
+    def _build_gp_hetero_joint_transition_batch_fn(
+        self,
+        in_dims,
+        state_dims,
+        h_list,
+        device,
+        generators=None,
+        input_mask=None,
+    ):
+        batch_size = int(len(h_list))
+        state_dims = torch.as_tensor(state_dims, device=device, dtype=torch.long)
+        in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
+        if all(bool(self._resolve_reference_semantics_enabled(h)) for h in h_list):
+            gp_modes = [self._resolve_reference_gp_forward_mode(h) for h in h_list]
+            if all(mode == "exact" for mode in gp_modes):
+                transition_core = self._build_reference_gp_joint_transition_padded_batch_fn(
+                    in_dims=in_dims,
+                    state_dims=state_dims,
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                )
+            elif all(mode == "fixed_cost" for mode in gp_modes):
+                state_cap = int(max(1, int(state_dims.max().item())))
+                joint_out_dims = state_dims + 1
+                joint_fn = self._build_gp_hetero_batch_fn(
+                    in_dims=in_dims,
+                    out_dims=joint_out_dims,
+                    h_list=h_list,
+                    device=device,
+                    generators=generators,
+                    input_mask=input_mask,
+                    apply_output_tanh=False,
+                    reference_semantics=True,
+                )
+                state_mask = (
+                    torch.arange(state_cap, device=device, dtype=torch.long).unsqueeze(0)
+                    < state_dims.unsqueeze(1)
+                ).to(dtype=torch.float32)
+                reward_index = state_dims.unsqueeze(1)
+
+                def transition_core(x, generators_for_noise=None):
+                    out = joint_fn(
+                        x,
+                        generators_for_noise=generators_for_noise,
+                        stable_input=True,
+                    )
+                    state_out = out[:, :state_cap] * state_mask.to(device=out.device, dtype=out.dtype)
+                    reward_out = out.gather(1, reward_index.to(device=out.device))
+                    return state_out, reward_out
+
+                self._copy_transition_generator_attrs(transition_core, joint_fn)
+                transition_core._reference_gp_exact = False
+                transition_core._reference_gp_fixed_cost = True
+                transition_core._reference_semantics_exact = False
+            else:
+                raise ValueError("mixed GP reference forward modes inside one family group are not supported")
+
+            def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+                del x_input_is_packed
+                x_in = x[:batch_size] if bool(x_is_dual_packed) else x
+                return transition_core(x_in, generators_for_noise=generators_for_noise)
+
+            self._copy_transition_generator_attrs(transition_fn, transition_core)
+            return transition_fn
+
+        state_cap = int(max(1, int(state_dims.max().item())))
+        joint_out_dims = state_dims + 1
+        joint_fn = self._build_gp_hetero_batch_fn(
+            in_dims=in_dims,
+            out_dims=joint_out_dims,
+            h_list=h_list,
+            device=device,
+            generators=generators,
+            input_mask=input_mask,
+            apply_output_tanh=False,
+        )
+        state_mask = (
+            torch.arange(state_cap, device=device, dtype=torch.long).unsqueeze(0)
+            < state_dims.unsqueeze(1)
+        ).to(dtype=torch.float32)
+        reward_index = state_dims.unsqueeze(1)
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False, x_input_is_packed=False):
+            del x_input_is_packed
+            x_in = x[:batch_size] if bool(x_is_dual_packed) else x
+            out = joint_fn(
+                x_in,
+                generators_for_noise=generators_for_noise,
+                stable_input=True,
+            )
+            state_out = out[:, :state_cap] * state_mask.to(device=out.device, dtype=out.dtype)
+            reward_out = out.gather(1, reward_index.to(device=out.device))
+            return state_out, reward_out
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
+
     def _build_gp_hetero_shared_first_proj_transition_fn(self, in_dims, state_dims, h_list, device, input_mask=None):
         batch_size = int(len(h_list))
         if batch_size <= 0:
@@ -4956,7 +8762,7 @@ class EnvironmentPrior:
             outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
         weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
-        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+        outputscale = self._project_outputscale_abs(outputscale, outputscale_cap)
 
         if input_mask is not None:
             in_cap = int(input_mask.shape[1])
@@ -5162,6 +8968,12 @@ class EnvironmentPrior:
                 g = torch.Generator(device=device)
                 g.manual_seed(int(s))
                 generators.append(g)
+        strict_joint_transition = any(self._resolve_strict_joint_transition_enabled(h) for h in h_list)
+        reference_semantics_mask = torch.tensor(
+            [bool(self._resolve_reference_semantics_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
         family_build_wall_t0 = time.perf_counter()
         generator_build_wall_s = 0.0
         transition_generator_build_wall_s = 0.0
@@ -5174,21 +8986,23 @@ class EnvironmentPrior:
         noise_dims = torch.tensor([d[3] for d in dims], device=device, dtype=torch.long)
         zero_pad_dims = torch.tensor([d[4] for d in dims], device=device, dtype=torch.long)
 
-        in_dims = state_dims + obs_dims + action_dims + noise_dims + zero_pad_dims
+        obs_input_dims = torch.where(reference_semantics_mask, torch.zeros_like(obs_dims), obs_dims)
+        in_dims = state_dims + obs_input_dims + action_dims + noise_dims + zero_pad_dims
         max_state_dim = int(state_dims.max().item())
         max_obs_dim = int(obs_dims.max().item())
+        max_obs_input_dim = int(obs_input_dims.max().item())
         max_action_dim = int(action_dims.max().item())
         max_noise_dim = int(noise_dims.max().item())
         max_zero_pad_dim = int(zero_pad_dims.max().item())
-        in_cap = int(max_state_dim + max_obs_dim + max_action_dim + max_noise_dim + max_zero_pad_dim)
+        in_cap = int(max_state_dim + max_obs_input_dim + max_action_dim + max_noise_dim + max_zero_pad_dim)
         input_mask = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float32)
         obs_start = max_state_dim
-        action_start = max_state_dim + max_obs_dim
+        action_start = max_state_dim + max_obs_input_dim
         noise_start = action_start + max_action_dim
         zero_start = noise_start + max_noise_dim
         for bi in range(batch_size):
             s_i = int(state_dims[bi].item())
-            o_i = int(obs_dims[bi].item())
+            o_i = int(obs_input_dims[bi].item())
             a_i = int(action_dims[bi].item())
             n_i = int(noise_dims[bi].item())
             z_i = int(zero_pad_dims[bi].item())
@@ -5210,9 +9024,14 @@ class EnvironmentPrior:
             and generators is None
         )
         transition_only_build_enabled = bool(prefer_transition_only and enable_fused_transition)
+        if strict_joint_transition:
+            transition_only_build_enabled = False
         build_x_generator = bool(build_x_generator) and not transition_only_build_enabled
         build_y_generator = bool(build_y_generator) and not transition_only_build_enabled
         build_policy_generator = bool(build_policy_generator) and not transition_only_build_enabled
+        if strict_joint_transition:
+            build_x_generator = False
+            build_y_generator = False
         preserve_skipped_generator_rng = bool(preserve_skipped_generator_rng)
         transition_generator = None
         x_generator = None
@@ -5220,6 +9039,12 @@ class EnvironmentPrior:
         policy_generator = None
         skipped_non_transition_generator_count = 0
         skipped_non_transition_rng_preserve_count = 0
+        lipschitz_enabled = any(bool(h.get("lipschitz_enforce", False)) for h in h_list)
+        lipschitz_audit_acc = self._new_lipschitz_audit_accumulator(
+            lipschitz_enabled,
+            device=device,
+            dtype=torch.float32,
+        )
 
         def _preserve_skipped_rng(build_needed, out_dims):
             nonlocal skipped_non_transition_generator_count
@@ -5250,125 +9075,151 @@ class EnvironmentPrior:
                     input_mask=input_mask,
                 )
 
-        if family == "scm":
-            depth_values = [max(2, int(h["num_layers"])) for h in h_list]
-            activation_values = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
-            if enable_fused_transition:
-                build_t0 = time.perf_counter()
-                transition_generator = self._build_scm_hetero_transition_batch_fn(
-                    in_dims=in_dims,
-                    state_dims=state_dims,
-                    h_list=h_list,
-                    device=device,
-                    depth_values=depth_values,
-                    activation_names=activation_values,
-                    input_mask=input_mask,
-                )
-                transition_generator_build_wall_s += (time.perf_counter() - build_t0)
-            if build_x_generator:
-                build_t0 = time.perf_counter()
-                x_generator = self._build_scm_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=state_dims,
-                    h_list=h_list,
-                    device=device,
-                    depth_values=depth_values,
-                    activation_names=activation_values,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
+        with self._lipschitz_audit_scope(lipschitz_audit_acc):
+            if family == "scm":
+                depth_values = [max(2, int(h["num_layers"])) for h in h_list]
+                activation_values = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
+                if strict_joint_transition:
+                    build_t0 = time.perf_counter()
+                    transition_generator = self._build_scm_hetero_joint_transition_batch_fn(
+                        in_dims=in_dims,
+                        state_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        depth_values=depth_values,
+                        activation_names=activation_values,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    transition_generator_build_wall_s += (time.perf_counter() - build_t0)
+                elif enable_fused_transition:
+                    build_t0 = time.perf_counter()
+                    transition_generator = self._build_scm_hetero_transition_batch_fn(
+                        in_dims=in_dims,
+                        state_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        depth_values=depth_values,
+                        activation_names=activation_values,
+                        input_mask=input_mask,
+                    )
+                    transition_generator_build_wall_s += (time.perf_counter() - build_t0)
+                if build_x_generator:
+                    build_t0 = time.perf_counter()
+                    x_generator = self._build_scm_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        depth_values=depth_values,
+                        activation_names=activation_values,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(build_x_generator, state_dims)
+                if build_y_generator:
+                    build_t0 = time.perf_counter()
+                    y_generator = self._build_scm_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
+                        h_list=h_list,
+                        device=device,
+                        depth_values=depth_values,
+                        activation_names=activation_values,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(
+                        build_y_generator,
+                        torch.ones((batch_size,), device=device, dtype=torch.long),
+                    )
+                if build_policy_generator:
+                    build_t0 = time.perf_counter()
+                    policy_generator = self._build_scm_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=action_dims,
+                        h_list=h_list,
+                        device=device,
+                        depth_values=depth_values,
+                        activation_names=activation_values,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(build_policy_generator, action_dims)
             else:
-                _preserve_skipped_rng(build_x_generator, state_dims)
-            if build_y_generator:
-                build_t0 = time.perf_counter()
-                y_generator = self._build_scm_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                    h_list=h_list,
-                    device=device,
-                    depth_values=depth_values,
-                    activation_names=activation_values,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
-            else:
-                _preserve_skipped_rng(
-                    build_y_generator,
-                    torch.ones((batch_size,), device=device, dtype=torch.long),
-                )
-            if build_policy_generator:
-                build_t0 = time.perf_counter()
-                policy_generator = self._build_scm_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=action_dims,
-                    h_list=h_list,
-                    device=device,
-                    depth_values=depth_values,
-                    activation_names=activation_values,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
-            else:
-                _preserve_skipped_rng(build_policy_generator, action_dims)
-        else:
-            if enable_fused_transition:
-                build_t0 = time.perf_counter()
-                transition_generator = self._build_gp_hetero_transition_batch_fn(
-                    in_dims=in_dims,
-                    state_dims=state_dims,
-                    h_list=h_list,
-                    device=device,
-                    input_mask=input_mask,
-                )
-                build_dt = (time.perf_counter() - build_t0)
-                transition_generator_build_wall_s += build_dt
-                if bool(getattr(transition_generator, "_gp_shared_first_proj_fused", False)):
-                    gp_shared_transition_build_wall_s += build_dt
-            if build_x_generator:
-                build_t0 = time.perf_counter()
-                x_generator = self._build_gp_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=state_dims,
-                    h_list=h_list,
-                    device=device,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
-            else:
-                _preserve_skipped_rng(build_x_generator, state_dims)
-            if build_y_generator:
-                build_t0 = time.perf_counter()
-                y_generator = self._build_gp_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                    h_list=h_list,
-                    device=device,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
-            else:
-                _preserve_skipped_rng(
-                    build_y_generator,
-                    torch.ones((batch_size,), device=device, dtype=torch.long),
-                )
-            if build_policy_generator:
-                build_t0 = time.perf_counter()
-                policy_generator = self._build_gp_hetero_batch_fn(
-                    in_dims=in_dims,
-                    out_dims=action_dims,
-                    h_list=h_list,
-                    device=device,
-                    generators=generators,
-                    input_mask=input_mask,
-                )
-                generator_build_wall_s += (time.perf_counter() - build_t0)
-            else:
-                _preserve_skipped_rng(build_policy_generator, action_dims)
+                if strict_joint_transition:
+                    build_t0 = time.perf_counter()
+                    transition_generator = self._build_gp_hetero_joint_transition_batch_fn(
+                        in_dims=in_dims,
+                        state_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    build_dt = (time.perf_counter() - build_t0)
+                    transition_generator_build_wall_s += build_dt
+                elif enable_fused_transition:
+                    build_t0 = time.perf_counter()
+                    transition_generator = self._build_gp_hetero_transition_batch_fn(
+                        in_dims=in_dims,
+                        state_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        input_mask=input_mask,
+                    )
+                    build_dt = (time.perf_counter() - build_t0)
+                    transition_generator_build_wall_s += build_dt
+                    if bool(getattr(transition_generator, "_gp_shared_first_proj_fused", False)):
+                        gp_shared_transition_build_wall_s += build_dt
+                if build_x_generator:
+                    build_t0 = time.perf_counter()
+                    x_generator = self._build_gp_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=state_dims,
+                        h_list=h_list,
+                        device=device,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(build_x_generator, state_dims)
+                if build_y_generator:
+                    build_t0 = time.perf_counter()
+                    y_generator = self._build_gp_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
+                        h_list=h_list,
+                        device=device,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(
+                        build_y_generator,
+                        torch.ones((batch_size,), device=device, dtype=torch.long),
+                    )
+                if build_policy_generator:
+                    build_t0 = time.perf_counter()
+                    policy_generator = self._build_gp_hetero_batch_fn(
+                        in_dims=in_dims,
+                        out_dims=action_dims,
+                        h_list=h_list,
+                        device=device,
+                        generators=generators,
+                        input_mask=input_mask,
+                    )
+                    generator_build_wall_s += (time.perf_counter() - build_t0)
+                else:
+                    _preserve_skipped_rng(build_policy_generator, action_dims)
 
         alpha = torch.tensor(
             [float(max(1e-4, min(1.0, float(h["alpha"])))) for h in h_list],
@@ -5396,6 +9247,46 @@ class EnvironmentPrior:
         )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_input_scale_enabled = torch.tensor(
+            [bool(self._resolve_state_input_scale_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_input_scale = torch.tensor(
+            [float(self._resolve_state_input_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_full_rms_enabled = torch.tensor(
+            [bool(self._resolve_state_full_rms_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_full_rms_target = torch.tensor(
+            [float(self._resolve_state_full_rms_target(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_c = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_bound = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_c = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_bound = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -5449,6 +9340,37 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        if bool(reference_semantics_mask.any().item()):
+            alpha = torch.where(reference_semantics_mask, torch.ones_like(alpha), alpha)
+            state_noise_std = torch.where(reference_semantics_mask, torch.zeros_like(state_noise_std), state_noise_std)
+            reward_scale = torch.where(reference_semantics_mask, torch.ones_like(reward_scale), reward_scale)
+            reward_clip = torch.where(reference_semantics_mask, torch.full_like(reward_clip, float("inf")), reward_clip)
+            state_clip = torch.where(reference_semantics_mask, torch.full_like(state_clip, float("inf")), state_clip)
+            state_highway_enabled = torch.where(
+                reference_semantics_mask,
+                torch.zeros_like(state_highway_enabled),
+                state_highway_enabled,
+            )
+            state_highway_lambda = torch.where(
+                reference_semantics_mask,
+                torch.zeros_like(state_highway_lambda),
+                state_highway_lambda,
+            )
+            reward_dropout_enabled = torch.where(
+                reference_semantics_mask,
+                torch.zeros_like(reward_dropout_enabled),
+                reward_dropout_enabled,
+            )
+            reward_dropout_impute_zero = torch.where(
+                reference_semantics_mask,
+                torch.ones_like(reward_dropout_impute_zero),
+                reward_dropout_impute_zero,
+            )
+            reward_dropout_ratio = torch.where(
+                reference_semantics_mask,
+                torch.zeros_like(reward_dropout_ratio),
+                reward_dropout_ratio,
+            )
         obs_slot_dims = torch.tensor(
             [int(max(1, h.get("obs_slot_dim", 400))) for h in h_list],
             device=device,
@@ -5462,6 +9384,12 @@ class EnvironmentPrior:
 
         env = {
             "family": family,
+            "strict_joint_transition_enabled": bool(strict_joint_transition),
+            "reference_semantics_enabled": reference_semantics_mask,
+            "reference_gp_forward_mode": [
+                self._resolve_reference_gp_forward_mode(h) if str(h.get("family", family)).lower() == "gp" else None
+                for h in h_list
+            ],
             "state_dim": int(max_state_dim),
             "obs_dim": int(max_obs_dim),
             "action_dim": int(max_action_dim),
@@ -5469,6 +9397,7 @@ class EnvironmentPrior:
             "zero_pad_dim": int(max_zero_pad_dim),
             "state_dim_per_sample": state_dims,
             "obs_dim_per_sample": obs_dims,
+            "env_obs_input_dim_per_sample": obs_input_dims,
             "action_dim_per_sample": action_dims,
             "noise_dim_per_sample": noise_dims,
             "zero_pad_dim_per_sample": zero_pad_dims,
@@ -5476,6 +9405,8 @@ class EnvironmentPrior:
             "action_slot_dim_per_sample": action_slot_dims,
             "obs_slot_dim": int(obs_slot_dims.max().item()),
             "action_slot_dim": int(action_slot_dims.max().item()),
+            "env_input_dim": int(in_cap),
+            "env_obs_input_dim": int(max_obs_input_dim),
             "x_generator": x_generator,
             "y_generator": y_generator,
             "transition_generator": transition_generator,
@@ -5511,6 +9442,13 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_input_scale_enabled": state_input_scale_enabled,
+            "state_input_scale": state_input_scale,
+            "state_full_rms_enabled": state_full_rms_enabled,
+            "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -5520,10 +9458,15 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
+            "lipschitz_audit": self._finalize_lipschitz_audit_accumulator(
+                lipschitz_audit_acc,
+                device=device,
+                dtype=torch.float32,
+            ),
         }
         return env
 
-    def _build_scm_batch_fn(self, in_dim, out_dim, h_list, device, generators=None):
+    def _build_scm_batch_fn(self, in_dim, out_dim, h_list, device, generators=None, apply_output_tanh=True):
         batch_size = len(h_list)
         depth = max(2, int(h_list[0]["num_layers"]))
         hidden = max(int(out_dim), int(h_list[0]["prior_mlp_hidden_dim"]))
@@ -5592,11 +9535,14 @@ class EnvironmentPrior:
                             noise_b = torch.randn((z.shape[1],), device=z.device, dtype=z.dtype, generator=g)
                         noise[bi] = noise_b * noise_std[bi]
                     z = z + noise
-            return torch.tanh(z)
+            if apply_output_tanh:
+                z = torch.tanh(z)
+            return z
 
+        fn._applies_output_tanh = bool(apply_output_tanh)
         return fn
 
-    def _build_gp_batch_fn(self, in_dim, out_dim, h_list, device, generators=None):
+    def _build_gp_batch_fn(self, in_dim, out_dim, h_list, device, generators=None, apply_output_tanh=True):
         batch_size = len(h_list)
         m = max(8, int(h_list[0]["gp_rff_features"]))
         lengthscale = torch.tensor(
@@ -5623,7 +9569,7 @@ class EnvironmentPrior:
             outputscale_cap_values.append(float(s_cap) if s_cap is not None else float("inf"))
         weight_cap = torch.tensor(weight_cap_values, device=device, dtype=torch.float32)
         outputscale_cap = torch.tensor(outputscale_cap_values, device=device, dtype=torch.float32)
-        outputscale = torch.sign(outputscale) * torch.minimum(outputscale.abs(), outputscale_cap)
+        outputscale = self._project_outputscale_abs(outputscale, outputscale_cap)
         if generators is None:
             w = torch.randn((batch_size, in_dim, m), device=device, dtype=torch.float32) / lengthscale[:, None, None]
             b = 2.0 * math.pi * torch.rand((batch_size, m), device=device, dtype=torch.float32)
@@ -5664,9 +9610,48 @@ class EnvironmentPrior:
                             e_b = torch.randn((y.shape[1],), device=y.device, dtype=y.dtype, generator=g)
                         eps[bi] = e_b * noise[bi]
                     y = y + eps
-            return torch.tanh(y)
+            if apply_output_tanh:
+                y = torch.tanh(y)
+            return y
 
+        fn._applies_output_tanh = bool(apply_output_tanh)
         return fn
+
+    def _build_scm_joint_transition_batch_fn(self, in_dim, state_dim, h_list, device, generators=None):
+        state_dim = int(state_dim)
+        joint_fn = self._build_scm_batch_fn(
+            in_dim,
+            state_dim + 1,
+            h_list,
+            device,
+            generators=generators,
+            apply_output_tanh=False,
+        )
+
+        def transition_fn(x, generators_for_noise=None):
+            out = joint_fn(x, generators_for_noise=generators_for_noise)
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
+
+    def _build_gp_joint_transition_batch_fn(self, in_dim, state_dim, h_list, device, generators=None):
+        state_dim = int(state_dim)
+        joint_fn = self._build_gp_batch_fn(
+            in_dim,
+            state_dim + 1,
+            h_list,
+            device,
+            generators=generators,
+            apply_output_tanh=False,
+        )
+
+        def transition_fn(x, generators_for_noise=None):
+            out = joint_fn(x, generators_for_noise=generators_for_noise)
+            return out[..., :state_dim], out[..., state_dim: state_dim + 1]
+
+        self._copy_transition_generator_attrs(transition_fn, joint_fn)
+        return transition_fn
 
     def _sample_environment_batch(self, h_list, device, rng_seeds=None):
         if not h_list:
@@ -5682,8 +9667,34 @@ class EnvironmentPrior:
             family = "scm"
 
         state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = self._sample_dims(h_list[0])
-        in_dim = int(state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim)
-        builder = self._build_scm_batch_fn if family == "scm" else self._build_gp_batch_fn
+        reference_semantics_enabled = self._resolve_reference_semantics_enabled(h_list[0])
+        input_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+        in_dim = int(input_layout["total_dim"])
+        if reference_semantics_enabled:
+            if family == "scm":
+                builder = self._build_scm_batch_fn
+                transition_builder = self._build_reference_scm_joint_transition_batch_fn
+            else:
+                builder = self._build_gp_batch_fn
+                transition_builder = (
+                    self._build_reference_gp_joint_transition_batch_fn
+                    if self._resolve_reference_gp_forward_mode(h_list[0]) == "exact"
+                    else self._build_reference_gp_fixed_cost_joint_transition_batch_fn
+                )
+        else:
+            builder = self._build_scm_batch_fn if family == "scm" else self._build_gp_batch_fn
+            transition_builder = (
+                self._build_scm_joint_transition_batch_fn
+                if family == "scm"
+                else self._build_gp_joint_transition_batch_fn
+            )
         generators = None
         if rng_seeds is not None:
             if len(rng_seeds) != len(h_list):
@@ -5693,10 +9704,30 @@ class EnvironmentPrior:
                 g = torch.Generator(device=device)
                 g.manual_seed(int(s))
                 generators.append(g)
-
-        x_generator = builder(in_dim, state_dim, h_list, device, generators=generators)
-        y_generator = builder(in_dim, 1, h_list, device, generators=generators)
-        policy_generator = builder(in_dim, action_dim, h_list, device, generators=generators)
+        lipschitz_enabled = any(bool(h.get("lipschitz_enforce", False)) for h in h_list)
+        strict_joint_transition = any(self._resolve_strict_joint_transition_enabled(h) for h in h_list)
+        lipschitz_audit_acc = self._new_lipschitz_audit_accumulator(
+            lipschitz_enabled,
+            device=device,
+            dtype=torch.float32,
+        )
+        with self._lipschitz_audit_scope(lipschitz_audit_acc):
+            transition_generator = (
+                transition_builder(in_dim, state_dim, h_list, device, generators=generators)
+                if strict_joint_transition
+                else None
+            )
+            x_generator = (
+                None
+                if strict_joint_transition
+                else builder(in_dim, state_dim, h_list, device, generators=generators)
+            )
+            y_generator = (
+                None
+                if strict_joint_transition
+                else builder(in_dim, 1, h_list, device, generators=generators)
+            )
+            policy_generator = builder(in_dim, action_dim, h_list, device, generators=generators)
 
         alpha = torch.tensor(
             [float(max(1e-4, min(1.0, float(h["alpha"])))) for h in h_list],
@@ -5724,6 +9755,26 @@ class EnvironmentPrior:
         )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_input_scale_enabled = torch.tensor(
+            [bool(self._resolve_state_input_scale_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_input_scale = torch.tensor(
+            [float(self._resolve_state_input_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_full_rms_enabled = torch.tensor(
+            [bool(self._resolve_state_full_rms_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_full_rms_target = torch.tensor(
+            [float(self._resolve_state_full_rms_target(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -5777,18 +9828,43 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        if reference_semantics_enabled:
+            alpha.fill_(1.0)
+            state_noise_std.zero_()
+            reward_scale.fill_(1.0)
+            reward_clip.fill_(float("inf"))
+            state_clip.fill_(float("inf"))
+            state_highway_enabled.zero_()
+            state_highway_lambda.zero_()
+            reward_dropout_enabled.zero_()
+            reward_dropout_impute_zero.fill_(True)
+            reward_dropout_ratio.zero_()
 
         env = {
             "family": family,
+            "strict_joint_transition_enabled": bool(strict_joint_transition),
+            "reference_semantics_enabled": bool(reference_semantics_enabled),
+            "reference_gp_forward_mode": (
+                self._resolve_reference_gp_forward_mode(h_list[0])
+                if family == "gp"
+                else None
+            ),
             "state_dim": state_dim,
             "obs_dim": obs_dim,
             "action_dim": action_dim,
             "noise_dim": noise_dim,
             "zero_pad_dim": zero_pad_dim,
+            "env_input_dim": int(input_layout["total_dim"]),
+            "env_obs_input_dim": int(input_layout["obs_input_dim"]),
+            "env_obs_start": input_layout["obs_start"],
+            "env_action_start": int(input_layout["action_start"]),
+            "env_noise_start": int(input_layout["noise_start"]),
+            "env_zero_start": int(input_layout["zero_start"]),
             "obs_slot_dim": int(max(1, h_list[0].get("obs_slot_dim", 400))),
             "action_slot_dim": int(max(1, h_list[0].get("action_slot_dim", 30))),
             "x_generator": x_generator,
             "y_generator": y_generator,
+            "transition_generator": transition_generator,
             "policy_generator": policy_generator,
             "alpha": alpha,
             "init_state_std": init_state_std,
@@ -5799,6 +9875,13 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_input_scale_enabled": state_input_scale_enabled,
+            "state_input_scale": state_input_scale,
+            "state_full_rms_enabled": state_full_rms_enabled,
+            "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -5808,6 +9891,11 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
+            "lipschitz_audit": self._finalize_lipschitz_audit_accumulator(
+                lipschitz_audit_acc,
+                device=device,
+                dtype=torch.float32,
+            ),
         }
         return env
 
@@ -5995,6 +10083,494 @@ class EnvironmentPrior:
             int(block_k),
             int(num_warps),
         )
+
+    def _batch_affine_prefix_tiled_input_activated_forward(
+        self,
+        x,
+        w,
+        b=None,
+        in_sizes=None,
+        out_sizes=None,
+        activation_codes=None,
+        out_tile_batch=None,
+        out_tile_offsets=None,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(x)
+            and torch.is_tensor(w)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and torch.is_tensor(activation_codes)
+            and torch.is_tensor(out_tile_batch)
+            and torch.is_tensor(out_tile_offsets)
+            and x.device.type == "cuda"
+            and w.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and out_tile_batch.device.type == "cuda"
+            and out_tile_offsets.device.type == "cuda"
+            and x.dtype == torch.float32
+            and w.dtype == torch.float32
+            and x.ndim == 2
+            and w.ndim == 3
+            and int(x.shape[0]) == int(w.shape[0])
+            and int(in_sizes.shape[0]) == int(x.shape[0])
+            and int(out_sizes.shape[0]) == int(x.shape[0])
+            and (not bool(x.requires_grad))
+        ):
+            activation_codes_t = activation_codes.to(device=x.device, dtype=torch.long)
+            x_act = x
+            relu_mask = activation_codes_t == 1
+            tanh_mask = activation_codes_t == 0
+            if bool(torch.any(relu_mask)):
+                x_act = torch.where(relu_mask.unsqueeze(1), torch.relu(x_act), x_act)
+            if bool(torch.any(tanh_mask)):
+                x_act = torch.where(tanh_mask.unsqueeze(1), torch.tanh(x), x_act)
+            no_activation_codes = torch.full_like(activation_codes_t, -1)
+            in_tile_batch, in_tile_offsets = self._build_active_tile_map(in_sizes.to(device=x.device, dtype=torch.long), 32)
+            return self._batch_affine_prefix_tiled(
+                x_act,
+                w,
+                b,
+                in_sizes=in_sizes,
+                out_sizes=out_sizes,
+                activation_codes=no_activation_codes,
+                out_tile_batch=out_tile_batch,
+                out_tile_offsets=out_tile_offsets,
+                in_tile_batch=in_tile_batch.to(device=x.device, dtype=torch.int32),
+                in_tile_offsets=in_tile_offsets.to(device=x.device, dtype=torch.int32),
+                block_o=block_o,
+                block_k=block_k,
+                num_warps=num_warps,
+            )
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        x_contig = x.contiguous()
+        w_contig = w.contiguous()
+        b_contig = None if b is None else b.contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        out_tile_batch_i32 = out_tile_batch.to(dtype=torch.int32).contiguous()
+        out_tile_offsets_i32 = out_tile_offsets.to(dtype=torch.int32).contiguous()
+        batch_size = int(x_contig.shape[0])
+        out_cap = int(w_contig.shape[2])
+        out = torch.zeros((batch_size, out_cap), device=x_contig.device, dtype=x_contig.dtype)
+        if batch_size > 0 and out_cap > 0 and int(out_tile_batch_i32.numel()) > 0:
+            grid = (int(out_tile_batch_i32.numel()),)
+            _prefix_tiled_input_activated_affine_fwd_kernel[grid](
+                x_contig,
+                w_contig,
+                b_contig,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out_tile_batch_i32,
+                out_tile_offsets_i32,
+                out,
+                x_contig.stride(0),
+                x_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                0 if b_contig is None else b_contig.stride(0),
+                0 if b_contig is None else b_contig.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out_tile_batch_i32.stride(0),
+                out_tile_offsets_i32.stride(0),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
+                HAS_BIAS=bool(b_contig is not None),
+                num_warps=num_warps,
+            )
+        return out
+
+    def _batch_affine_prefix_tiled_input_activated_update_forward(
+        self,
+        z_old,
+        w,
+        b=None,
+        noise_eps=None,
+        hidden_mask=None,
+        in_sizes=None,
+        out_sizes=None,
+        activation_codes=None,
+        out_tile_batch=None,
+        out_tile_offsets=None,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+        sample_fused=False,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(z_old)
+            and torch.is_tensor(w)
+            and torch.is_tensor(hidden_mask)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and torch.is_tensor(activation_codes)
+            and torch.is_tensor(out_tile_batch)
+            and torch.is_tensor(out_tile_offsets)
+            and z_old.device.type == "cuda"
+            and w.device.type == "cuda"
+            and hidden_mask.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and out_tile_batch.device.type == "cuda"
+            and out_tile_offsets.device.type == "cuda"
+            and z_old.dtype == torch.float32
+            and w.dtype == torch.float32
+            and z_old.ndim == 2
+            and w.ndim == 3
+            and int(z_old.shape[0]) == int(w.shape[0])
+            and int(in_sizes.shape[0]) == int(z_old.shape[0])
+            and int(out_sizes.shape[0]) == int(z_old.shape[0])
+            and (not bool(z_old.requires_grad))
+            and (noise_eps is None or (torch.is_tensor(noise_eps) and noise_eps.device.type == "cuda" and noise_eps.dtype == torch.float32))
+        ):
+            z_next = self._batch_affine_prefix_tiled_input_activated_forward(
+                z_old,
+                w,
+                b,
+                in_sizes=in_sizes,
+                out_sizes=out_sizes,
+                activation_codes=activation_codes,
+                out_tile_batch=out_tile_batch,
+                out_tile_offsets=out_tile_offsets,
+                block_o=block_o,
+                block_k=block_k,
+                num_warps=num_warps,
+            )
+            if noise_eps is not None:
+                z_next = z_next + noise_eps
+            z_next = z_next * hidden_mask
+            return z_next
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        z_old_contig = z_old.contiguous()
+        w_contig = w.contiguous()
+        b_contig = None if b is None else b.contiguous()
+        noise_contig = None if noise_eps is None else noise_eps.contiguous()
+        hidden_mask_contig = hidden_mask.contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        out_tile_batch_i32 = out_tile_batch.to(dtype=torch.int32).contiguous()
+        out_tile_offsets_i32 = out_tile_offsets.to(dtype=torch.int32).contiguous()
+        out = z_old_contig.clone()
+        if bool(sample_fused):
+            grid = (int(z_old_contig.shape[0]),)
+            _prefix_sample_input_activated_affine_update_fwd_kernel[grid](
+                z_old_contig,
+                w_contig,
+                b_contig,
+                noise_contig,
+                hidden_mask_contig,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out,
+                z_old_contig.stride(0),
+                z_old_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                0 if b_contig is None else b_contig.stride(0),
+                0 if b_contig is None else b_contig.stride(1),
+                0 if noise_contig is None else noise_contig.stride(0),
+                0 if noise_contig is None else noise_contig.stride(1),
+                hidden_mask_contig.stride(0),
+                hidden_mask_contig.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
+                HAS_BIAS=bool(b_contig is not None),
+                HAS_NOISE=bool(noise_contig is not None),
+                num_warps=num_warps,
+            )
+        elif int(out_tile_batch_i32.numel()) > 0:
+            grid = (int(out_tile_batch_i32.numel()),)
+            _prefix_tiled_input_activated_affine_update_fwd_kernel[grid](
+                z_old_contig,
+                z_old_contig,
+                w_contig,
+                b_contig,
+                noise_contig,
+                hidden_mask_contig,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out_tile_batch_i32,
+                out_tile_offsets_i32,
+                out,
+                z_old_contig.stride(0),
+                z_old_contig.stride(1),
+                z_old_contig.stride(0),
+                z_old_contig.stride(1),
+                w_contig.stride(0),
+                w_contig.stride(1),
+                w_contig.stride(2),
+                0 if b_contig is None else b_contig.stride(0),
+                0 if b_contig is None else b_contig.stride(1),
+                0 if noise_contig is None else noise_contig.stride(0),
+                0 if noise_contig is None else noise_contig.stride(1),
+                hidden_mask_contig.stride(0),
+                hidden_mask_contig.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out_tile_batch_i32.stride(0),
+                out_tile_offsets_i32.stride(0),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
+                HAS_BIAS=bool(b_contig is not None),
+                HAS_NOISE=bool(noise_contig is not None),
+                num_warps=num_warps,
+            )
+        return out
+
+    def _reference_scm_hidden_multilayer_fused_forward(
+        self,
+        z,
+        hidden_weights,
+        hidden_biases,
+        hidden_noise_eps_all,
+        hidden_mask,
+        hidden_dims,
+        num_hidden_blocks,
+        activation_codes,
+        max_hidden_blocks,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(z)
+            and torch.is_tensor(hidden_weights)
+            and torch.is_tensor(hidden_biases)
+            and torch.is_tensor(hidden_mask)
+            and torch.is_tensor(hidden_dims)
+            and torch.is_tensor(num_hidden_blocks)
+            and torch.is_tensor(activation_codes)
+            and z.device.type == "cuda"
+            and hidden_weights.device.type == "cuda"
+            and hidden_biases.device.type == "cuda"
+            and hidden_mask.device.type == "cuda"
+            and hidden_dims.device.type == "cuda"
+            and num_hidden_blocks.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and z.dtype == torch.float32
+            and hidden_weights.dtype == torch.float32
+            and hidden_biases.dtype == torch.float32
+            and hidden_mask.dtype == torch.float32
+            and z.ndim == 2
+            and hidden_weights.ndim == 4
+            and hidden_biases.ndim == 3
+            and int(hidden_weights.shape[0]) == int(z.shape[0])
+            and int(hidden_biases.shape[0]) == int(z.shape[0])
+            and (hidden_noise_eps_all is None or (torch.is_tensor(hidden_noise_eps_all) and hidden_noise_eps_all.device.type == "cuda" and hidden_noise_eps_all.dtype == torch.float32 and hidden_noise_eps_all.ndim == 3))
+            and (not bool(z.requires_grad))
+        ):
+            return None
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        z_work = z.contiguous().clone()
+        z_scratch = torch.zeros_like(z_work)
+        hidden_weights_contig = hidden_weights.contiguous()
+        hidden_biases_contig = hidden_biases.contiguous()
+        noise_contig = None if hidden_noise_eps_all is None else hidden_noise_eps_all.contiguous()
+        hidden_mask_contig = hidden_mask.contiguous()
+        hidden_dims_i32 = hidden_dims.to(dtype=torch.int32).contiguous()
+        num_hidden_blocks_i32 = num_hidden_blocks.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        outputs_layers = torch.zeros(
+            (int(z.shape[0]), int(max_hidden_blocks), int(z.shape[1])),
+            device=z.device,
+            dtype=z.dtype,
+        )
+        grid = (int(z.shape[0]),)
+        _prefix_sample_input_activated_affine_multilayer_fwd_kernel[grid](
+            z_work,
+            z_scratch,
+            hidden_weights_contig,
+            hidden_biases_contig,
+            noise_contig,
+            hidden_mask_contig,
+            hidden_dims_i32,
+            num_hidden_blocks_i32,
+            activation_codes_i32,
+            outputs_layers,
+            z_work.stride(0),
+            z_work.stride(1),
+            z_scratch.stride(0),
+            z_scratch.stride(1),
+            hidden_weights_contig.stride(0),
+            hidden_weights_contig.stride(1),
+            hidden_weights_contig.stride(2),
+            hidden_weights_contig.stride(3),
+            hidden_biases_contig.stride(0),
+            hidden_biases_contig.stride(1),
+            hidden_biases_contig.stride(2),
+            0 if noise_contig is None else noise_contig.stride(0),
+            0 if noise_contig is None else noise_contig.stride(1),
+            0 if noise_contig is None else noise_contig.stride(2),
+            hidden_mask_contig.stride(0),
+            hidden_mask_contig.stride(1),
+            hidden_dims_i32.stride(0),
+            num_hidden_blocks_i32.stride(0),
+            activation_codes_i32.stride(0),
+            outputs_layers.stride(0),
+            outputs_layers.stride(1),
+            outputs_layers.stride(2),
+            BLOCK_O=block_o,
+            BLOCK_K=block_k,
+            MAX_LAYERS=int(max_hidden_blocks),
+            HAS_NOISE=bool(noise_contig is not None),
+            num_warps=num_warps,
+        )
+        return outputs_layers
+
+    def _reference_scm_full_multilayer_fused_forward(
+        self,
+        x,
+        first_weight,
+        first_bias,
+        hidden_weights,
+        hidden_biases,
+        hidden_noise_eps_all,
+        in_sizes,
+        hidden_dims,
+        num_hidden_blocks,
+        activation_codes,
+        max_hidden_blocks,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(x)
+            and torch.is_tensor(first_weight)
+            and torch.is_tensor(first_bias)
+            and torch.is_tensor(hidden_weights)
+            and torch.is_tensor(hidden_biases)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(hidden_dims)
+            and torch.is_tensor(num_hidden_blocks)
+            and torch.is_tensor(activation_codes)
+            and x.device.type == "cuda"
+            and first_weight.device.type == "cuda"
+            and first_bias.device.type == "cuda"
+            and hidden_weights.device.type == "cuda"
+            and hidden_biases.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and hidden_dims.device.type == "cuda"
+            and num_hidden_blocks.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and x.dtype == torch.float32
+            and first_weight.dtype == torch.float32
+            and first_bias.dtype == torch.float32
+            and hidden_weights.dtype == torch.float32
+            and hidden_biases.dtype == torch.float32
+            and x.ndim == 2
+            and first_weight.ndim == 3
+            and hidden_weights.ndim == 4
+            and hidden_biases.ndim == 3
+            and int(first_weight.shape[0]) == int(x.shape[0])
+            and int(hidden_weights.shape[0]) == int(x.shape[0])
+            and int(hidden_biases.shape[0]) == int(x.shape[0])
+            and (hidden_noise_eps_all is None or (torch.is_tensor(hidden_noise_eps_all) and hidden_noise_eps_all.device.type == "cuda" and hidden_noise_eps_all.dtype == torch.float32 and hidden_noise_eps_all.ndim == 3))
+            and (not bool(x.requires_grad))
+        ):
+            return None
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        x_contig = x.contiguous()
+        first_weight_contig = first_weight.contiguous()
+        first_bias_contig = first_bias.contiguous()
+        z_work = torch.zeros((int(x.shape[0]), int(first_weight.shape[2])), device=x.device, dtype=x.dtype)
+        z_scratch = torch.zeros_like(z_work)
+        hidden_weights_contig = hidden_weights.contiguous()
+        hidden_biases_contig = hidden_biases.contiguous()
+        noise_contig = None if hidden_noise_eps_all is None else hidden_noise_eps_all.contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        hidden_dims_i32 = hidden_dims.to(dtype=torch.int32).contiguous()
+        num_hidden_blocks_i32 = num_hidden_blocks.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        outputs_layers = torch.zeros(
+            (int(x.shape[0]), int(max_hidden_blocks), int(first_weight.shape[2])),
+            device=x.device,
+            dtype=x.dtype,
+        )
+        grid = (int(x.shape[0]),)
+        _prefix_sample_reference_scm_full_multilayer_fwd_kernel[grid](
+            x_contig,
+            first_weight_contig,
+            first_bias_contig,
+            z_work,
+            z_scratch,
+            hidden_weights_contig,
+            hidden_biases_contig,
+            noise_contig,
+            in_sizes_i32,
+            hidden_dims_i32,
+            num_hidden_blocks_i32,
+            activation_codes_i32,
+            outputs_layers,
+            x_contig.stride(0),
+            x_contig.stride(1),
+            first_weight_contig.stride(0),
+            first_weight_contig.stride(1),
+            first_weight_contig.stride(2),
+            first_bias_contig.stride(0),
+            first_bias_contig.stride(1),
+            z_work.stride(0),
+            z_work.stride(1),
+            z_scratch.stride(0),
+            z_scratch.stride(1),
+            hidden_weights_contig.stride(0),
+            hidden_weights_contig.stride(1),
+            hidden_weights_contig.stride(2),
+            hidden_weights_contig.stride(3),
+            hidden_biases_contig.stride(0),
+            hidden_biases_contig.stride(1),
+            hidden_biases_contig.stride(2),
+            0 if noise_contig is None else noise_contig.stride(0),
+            0 if noise_contig is None else noise_contig.stride(1),
+            0 if noise_contig is None else noise_contig.stride(2),
+            in_sizes_i32.stride(0),
+            hidden_dims_i32.stride(0),
+            num_hidden_blocks_i32.stride(0),
+            activation_codes_i32.stride(0),
+            outputs_layers.stride(0),
+            outputs_layers.stride(1),
+            outputs_layers.stride(2),
+            BLOCK_O=block_o,
+            BLOCK_K=block_k,
+            MAX_LAYERS=int(max_hidden_blocks),
+            HAS_NOISE=bool(noise_contig is not None),
+            num_warps=num_warps,
+        )
+        return outputs_layers
 
     def _batch_affine_with_layout_tiled(
         self,
@@ -6191,6 +10767,20 @@ class EnvironmentPrior:
             aev4_update_clip_cpu = [float(v) for v in aev4_update_clip]
         else:
             aev4_update_clip_cpu = [float(aev4_update_clip)] * batch_size
+        action_noise_train_std = env.get("action_noise_train_std", 0.0)
+        if torch.is_tensor(action_noise_train_std):
+            action_noise_train_std_cpu = action_noise_train_std.detach().cpu().tolist()
+        elif isinstance(action_noise_train_std, (list, tuple)):
+            action_noise_train_std_cpu = [float(v) for v in action_noise_train_std]
+        else:
+            action_noise_train_std_cpu = [float(action_noise_train_std)] * batch_size
+        action_noise_eval_std = env.get("action_noise_eval_std", 0.0)
+        if torch.is_tensor(action_noise_eval_std):
+            action_noise_eval_std_cpu = action_noise_eval_std.detach().cpu().tolist()
+        elif isinstance(action_noise_eval_std, (list, tuple)):
+            action_noise_eval_std_cpu = [float(v) for v in action_noise_eval_std]
+        else:
+            action_noise_eval_std_cpu = [float(action_noise_eval_std)] * batch_size
 
         def _env_value_at(key, b, cast_int=False):
             value = env[key]
@@ -6222,14 +10812,27 @@ class EnvironmentPrior:
                     "reward_max": float(reward_max_cpu[b]),
                     "reward_std": float(reward_std_cpu[b]),
                     "state_abs_max": float(state_abs_max_cpu[b]),
+                    "action_noise_train_std": float(action_noise_train_std_cpu[b]),
+                    "action_noise_eval_std": float(action_noise_eval_std_cpu[b]),
                     "reward_dropout_ratio": float(reward_dropout_ratio_cpu[b]),
                     "reward_drop_frac_realized": float(reward_drop_frac_cpu[b]),
+                    "state_input_scale_enabled": bool(_env_value_at("state_input_scale_enabled", b)),
+                    "state_input_scale": float(_env_value_at("state_input_scale", b)),
+                    "state_full_rms_enabled": bool(_env_value_at("state_full_rms_enabled", b)),
+                    "state_full_rms_target": float(_env_value_at("state_full_rms_target", b)),
                     "state_highway_enabled": bool(state_highway_enabled_cpu[b]),
                     "state_highway_lambda": float(state_highway_lambda_cpu[b]),
                     "aev4_enabled": bool(aev4_enabled_cpu[b]),
                     "aev4_highway_ratio": float(aev4_highway_ratio_cpu[b]),
                     "aev4_update_scale": float(aev4_update_scale_cpu[b]),
                     "aev4_update_clip": float(aev4_update_clip_cpu[b]),
+                    "strict_joint_transition_enabled": bool(_env_value_at("strict_joint_transition_enabled", b)),
+                    "reference_semantics_enabled": bool(_env_value_at("reference_semantics_enabled", b)),
+                    "transition_reference_mode": EnvironmentPrior._transition_reference_mode(
+                        _env_value_at("family", b),
+                        bool(_env_value_at("reference_semantics_enabled", b)),
+                        _env_value_at("reference_gp_forward_mode", b),
+                    ),
                 }
             )
         return infos
@@ -6257,6 +10860,15 @@ class EnvironmentPrior:
         action_dim = int(env["action_dim"])
         noise_dim = int(env["noise_dim"])
         zero_pad_dim = int(env["zero_pad_dim"])
+        reference_semantics_enabled = self._env_uses_reference_semantics(env)
+        env_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
         obs_slot_dim = int(env["obs_slot_dim"])
         action_slot_dim = int(env["action_slot_dim"])
         rollout_generators = self._make_generators_from_seeds(rng_seeds, batch_size, device)
@@ -6329,11 +10941,12 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
 
-        env_total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
+        env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
-        env_obs_start = state_dim
-        env_action_start = state_dim + obs_dim
-        env_noise_start = env_action_start + action_dim
+        env_obs_start = env_layout["obs_start"]
+        env_action_start = env_layout["action_start"]
+        env_noise_start = env_layout["noise_start"]
+        state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -6350,23 +10963,32 @@ class EnvironmentPrior:
                 token_row[:, token_action_start: token_action_start + action_write] = action_t[:, :action_write]
 
             noise_t = transition_noise[t]
-            env_in[:, :state_dim] = state_t
-            env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
+            env_in[:, :state_dim] = self._scale_state_env_input(state_t, state_input_scale)
+            if env_obs_start is not None:
+                env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
             env_in[:, env_action_start: env_action_start + action_dim] = action_t
             env_in[:, env_noise_start: env_noise_start + noise_dim] = noise_t
             action_next = torch.tanh(env["policy_generator"](env_in, generators_for_noise=rollout_generators))
 
-            if t < single_eval_pos:
+            if (not reference_semantics_enabled) and t < single_eval_pos:
                 if action_noise_train is not None:
                     action_next = torch.tanh(action_next + action_noise_train[t] * env["action_noise_train_std"][:, None])
-            elif action_noise_eval is not None:
+            elif (not reference_semantics_enabled) and action_noise_eval is not None:
                 action_next = torch.tanh(action_next + action_noise_eval[t] * env["action_noise_eval_std"][:, None])
 
             env_in[:, env_action_start: env_action_start + action_dim] = action_next
-            reward_next_raw = env["reward_scale"] * env["y_generator"](
-                env_in,
-                generators_for_noise=rollout_generators,
-            ).reshape(batch_size)
+            transition_generator = env.get("transition_generator", None)
+            if callable(transition_generator):
+                x_next, reward_unit = transition_generator(
+                    env_in,
+                    generators_for_noise=rollout_generators,
+                )
+                reward_next_raw = env["reward_scale"] * reward_unit.reshape(batch_size)
+            else:
+                reward_next_raw = env["reward_scale"] * env["y_generator"](
+                    env_in,
+                    generators_for_noise=rollout_generators,
+                ).reshape(batch_size)
             reward_next = torch.maximum(
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
@@ -6379,17 +11001,30 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+            reward_next = self._transform_rollout_reward(
+                reward_next,
+                mode=env.get("reinforce_reward_transform", "none"),
+                tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+            )
 
-            x_next = env["x_generator"](env_in, generators_for_noise=rollout_generators)
+            if not callable(transition_generator):
+                x_next = env["x_generator"](env_in, generators_for_noise=rollout_generators)
             state_next = (1.0 - env["alpha"][:, None]) * state_t + env["alpha"][:, None] * x_next
             if state_noise is not None:
                 state_next = state_next + state_noise[t] * env["state_noise_std"][:, None]
-            state_next = self._apply_state_postprocess(
-                state_next_raw=state_next,
-                state_prev=state_t,
-                state_clip=env["state_clip"],
-                state_highway_enabled=env.get("state_highway_enabled", False),
-                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            if not reference_semantics_enabled:
+                state_next = self._apply_state_postprocess(
+                    state_next_raw=state_next,
+                    state_prev=state_t,
+                    state_clip=env["state_clip"],
+                    state_highway_enabled=env.get("state_highway_enabled", False),
+                    state_highway_lambda=env.get("state_highway_lambda", 0.0),
+                )
+            state_next = self._apply_state_full_rms(
+                state_next,
+                enabled=env.get("state_full_rms_enabled", False),
+                target=env.get("state_full_rms_target", 1.0),
             )
 
             y_steps[t] = reward_next
@@ -6547,6 +11182,7 @@ class EnvironmentPrior:
         tbptt_reward_sink=None,
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
+        policy_objective_kind="policy_gradient",
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
@@ -6560,6 +11196,15 @@ class EnvironmentPrior:
         action_dim = int(env["action_dim"])
         noise_dim = int(env["noise_dim"])
         zero_pad_dim = int(env["zero_pad_dim"])
+        reference_semantics_enabled = bool(self._env_uses_reference_semantics(env))
+        env_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
         obs_slot_dim = int(env["obs_slot_dim"])
         action_slot_dim = int(env["action_slot_dim"])
         rollout_generators = self._make_generators_from_seeds(rng_seeds, batch_size, device)
@@ -6626,6 +11271,7 @@ class EnvironmentPrior:
             if collect_runtime_info
             else None
         )
+        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
         tbptt_window_active = False
         tbptt_window_size = n_samples
         if tbptt_window is not None:
@@ -6633,7 +11279,13 @@ class EnvironmentPrior:
             if 0 < w < n_samples:
                 tbptt_window_active = True
                 tbptt_window_size = w
+        log_prob_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if reinforce_enabled and (not tbptt_window_active)
+            else None
+        )
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -6643,6 +11295,9 @@ class EnvironmentPrior:
         aev4_cfg = self._resolve_aev4_config()
         aev4_reg_enabled = bool(aev4_cfg.get("enabled", False))
         aev4_prev_delta = None
+        aev5_next_cfg = self._resolve_aev5_next_config()
+        aev5_next_enabled = bool(aev5_next_cfg.get("enabled", False))
+        aev5_next_prev_delta = None
         aev2_streaming_sink = bool(
             aev2_enabled
             and tbptt_window_active
@@ -6661,6 +11316,18 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        aev5_next_streaming_sink = bool(
+            aev5_next_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        reinforce_streaming_sink = bool(
+            reinforce_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -6672,6 +11339,12 @@ class EnvironmentPrior:
         )
         aev4_det_acc = self._aev4_new_accumulator(
             aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
+        aev5_next_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=torch.float32, aev5_next_cfg=aev5_next_cfg
+        )
+        aev5_next_det_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=torch.float32, aev5_next_cfg=aev5_next_cfg
         )
 
         strict_seed_mode = rollout_generators is not None
@@ -6870,11 +11543,12 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
 
-        env_total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
+        env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
-        env_obs_start = state_dim
-        env_action_start = state_dim + obs_dim
-        env_noise_start = env_action_start + action_dim
+        env_obs_start = env_layout["obs_start"]
+        env_action_start = env_layout["action_start"]
+        env_noise_start = env_layout["noise_start"]
+        state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             if collect_x:
@@ -6935,7 +11609,8 @@ class EnvironmentPrior:
                 raise ValueError(
                     f"policy action dim mismatch: expected {action_dim}, got {action_next.shape[-1]}"
                 )
-            action_next = torch.tanh(action_next)
+            action_mean = action_next
+            reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             noise_block_idx = None
@@ -6944,32 +11619,81 @@ class EnvironmentPrior:
                     _refresh_noise_block(t)
                 noise_block_idx = int(t - noise_block_start)
 
-            if t < single_eval_pos:
-                if strict_seed_mode and action_noise_train_generators is not None:
-                    action_noise_train_t = _draw_step_randn_with_optional_generators(
-                        action_noise_train_generators,
-                        action_dim,
-                    )
-                    action_next = torch.tanh(action_next + action_noise_train_t * env["action_noise_train_std"][:, None])
-                elif noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
-                    action_next = torch.tanh(
-                        action_next + action_noise_train_block[noise_block_idx] * env["action_noise_train_std"][:, None]
-                    )
-                elif action_noise_train is not None:
-                    action_next = torch.tanh(action_next + action_noise_train[t] * env["action_noise_train_std"][:, None])
+            if reinforce_enabled:
+                if t < single_eval_pos:
+                    action_std_t = env["action_noise_train_std"]
+                    if torch.any(action_std_t <= 0):
+                        raise ValueError("reinforce objective requires action_noise_train_std > 0 for every batch item")
+                    if strict_seed_mode:
+                        action_eps_t = _draw_step_randn_with_optional_generators(
+                            action_noise_train_generators,
+                            action_dim,
+                        )
+                    elif noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_train_block[noise_block_idx]
+                    elif action_noise_train is not None:
+                        action_eps_t = action_noise_train[t]
+                    else:
+                        action_eps_t = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, action_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                else:
+                    action_std_t = env["action_noise_eval_std"]
+                    if torch.any(action_std_t <= 0):
+                        raise ValueError("reinforce objective requires action_noise_eval_std > 0 for every batch item")
+                    if strict_seed_mode:
+                        action_eps_t = _draw_step_randn_with_optional_generators(
+                            action_noise_eval_generators,
+                            action_dim,
+                        )
+                    elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_eval_block[noise_block_idx]
+                    elif action_noise_eval is not None:
+                        action_eps_t = action_noise_eval[t]
+                    else:
+                        action_eps_t = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, action_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
+                action_next = torch.tanh(action_pre_tanh)
+                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                    action_pre_tanh.detach(),
+                    action_mean,
+                    action_std_t,
+                    action=action_next.detach(),
+                )
             else:
-                if strict_seed_mode and action_noise_eval_generators is not None:
-                    action_noise_eval_t = _draw_step_randn_with_optional_generators(
-                        action_noise_eval_generators,
-                        action_dim,
-                    )
-                    action_next = torch.tanh(action_next + action_noise_eval_t * env["action_noise_eval_std"][:, None])
-                elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
-                    action_next = torch.tanh(
-                        action_next + action_noise_eval_block[noise_block_idx] * env["action_noise_eval_std"][:, None]
-                    )
-                elif action_noise_eval is not None:
-                    action_next = torch.tanh(action_next + action_noise_eval[t] * env["action_noise_eval_std"][:, None])
+                action_next = torch.tanh(action_mean)
+                if not reference_semantics_enabled:
+                    # Keep legacy RNG consumption for action-noise streams, but
+                    # do not perturb policy actions in the learned-policy rollout
+                    # path.
+                    if t < single_eval_pos:
+                        if strict_seed_mode and action_noise_train_generators is not None:
+                            _draw_step_randn_with_optional_generators(
+                                action_noise_train_generators,
+                                action_dim,
+                            )
+                        elif noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                            pass
+                        elif action_noise_train is not None:
+                            pass
+                    else:
+                        if strict_seed_mode and action_noise_eval_generators is not None:
+                            _draw_step_randn_with_optional_generators(
+                                action_noise_eval_generators,
+                                action_dim,
+                            )
+                        elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                            pass
+                        elif action_noise_eval is not None:
+                            pass
 
             transition_cuda_start = None
             if profile_rollout_breakdown_cuda:
@@ -6986,15 +11710,25 @@ class EnvironmentPrior:
                 noise_t = transition_noise[t]
             if profile_rollout_timing and noise_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - noise_timing_t0)
-            env_in[:, :state_dim] = state_t
-            env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
-            env_in[:, env_action_start: env_action_start + action_dim] = action_next
+            env_in[:, :state_dim] = self._scale_state_env_input(state_t, state_input_scale)
+            if env_obs_start is not None:
+                env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
+            action_env = action_next.detach() if reinforce_enabled else action_next
+            env_in[:, env_action_start: env_action_start + action_dim] = action_env
             env_in[:, env_noise_start: env_noise_start + noise_dim] = noise_t
 
-            reward_next_raw = env["reward_scale"] * env["y_generator"](
-                env_in,
-                generators_for_noise=env_noise_generators,
-            ).reshape(batch_size)
+            transition_generator = env.get("transition_generator", None)
+            if callable(transition_generator):
+                x_next, reward_unit = transition_generator(
+                    env_in,
+                    generators_for_noise=env_noise_generators,
+                )
+                reward_next_raw = env["reward_scale"] * reward_unit.reshape(batch_size)
+            else:
+                reward_next_raw = env["reward_scale"] * env["y_generator"](
+                    env_in,
+                    generators_for_noise=env_noise_generators,
+                ).reshape(batch_size)
             reward_next = torch.maximum(
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
@@ -7028,10 +11762,17 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+            reward_next = self._transform_rollout_reward(
+                reward_next,
+                mode=env.get("reinforce_reward_transform", "none"),
+                tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+            )
             if profile_rollout_timing and dropout_timed and dropout_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
 
-            x_next = env["x_generator"](env_in, generators_for_noise=env_noise_generators)
+            if not callable(transition_generator):
+                x_next = env["x_generator"](env_in, generators_for_noise=env_noise_generators)
             state_next = (1.0 - env["alpha"][:, None]) * state_t + env["alpha"][:, None] * x_next
             state_noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             state_noise_timed = False
@@ -7050,13 +11791,28 @@ class EnvironmentPrior:
                 state_next = state_next + state_noise[t] * env["state_noise_std"][:, None]
             if profile_rollout_timing and state_noise_timed and state_noise_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
-            state_next = self._apply_state_postprocess(
-                state_next_raw=state_next,
-                state_prev=state_t,
-                state_clip=env["state_clip"],
-                state_highway_enabled=env.get("state_highway_enabled", False),
-                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            if not reference_semantics_enabled:
+                state_next = self._apply_state_postprocess(
+                    state_next_raw=state_next,
+                    state_prev=state_t,
+                    state_clip=env["state_clip"],
+                    state_highway_enabled=env.get("state_highway_enabled", False),
+                    state_highway_lambda=env.get("state_highway_lambda", 0.0),
+                )
+            state_next = self._apply_state_full_rms(
+                state_next,
+                enabled=env.get("state_full_rms_enabled", False),
+                target=env.get("state_full_rms_target", 1.0),
             )
+            aev5_next_step_aux = None
+            if aev5_next_enabled:
+                state_next, aev5_next_step_aux = self._apply_aev5_next_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    prev_delta=aev5_next_prev_delta,
+                    reward_next=reward_next,
+                    aev5_next_cfg=aev5_next_cfg,
+                )
             aev4_step_aux = None
             if aev4_reg_enabled:
                 state_next, aev4_step_aux = self._apply_aev4_state_update(
@@ -7071,6 +11827,9 @@ class EnvironmentPrior:
             if aev3_enabled and (aev3_prev_delta is not None):
                 self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
             aev3_prev_delta = state_delta
+            if aev5_next_enabled:
+                self._aev5_next_update_accumulator(aev5_next_acc, aev5_next_step_aux)
+            aev5_next_prev_delta = state_delta
             if aev4_reg_enabled and (aev4_prev_delta is not None):
                 self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
             aev4_prev_delta = state_delta
@@ -7083,15 +11842,19 @@ class EnvironmentPrior:
                 if y_steps is not None:
                     y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
+                if tbptt_log_prob_buffer is not None:
+                    tbptt_log_prob_buffer.append(reinforce_log_prob_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
+                if log_prob_steps is not None and reinforce_log_prob_t is not None:
+                    log_prob_steps[t] = reinforce_log_prob_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
 
             state_t = state_next
-            action_t = action_next
+            action_t = action_env
             reward_t = reward_next
             reward_mask_t = reward_mask_next
 
@@ -7100,6 +11863,10 @@ class EnvironmentPrior:
                 if is_window_end:
                     rewards_window = torch.stack(tbptt_reward_buffer, dim=0)
                     tbptt_reward_buffer = []
+                    log_probs_window = None
+                    if tbptt_log_prob_buffer is not None:
+                        log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
+                        tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -7110,12 +11877,22 @@ class EnvironmentPrior:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
                             aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev5_next_prev_delta is not None:
+                            aev5_next_prev_delta = aev5_next_prev_delta.detach()
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                        if (
+                            aev2_streaming_sink
+                            or aev3_streaming_sink
+                            or aev4_streaming_sink
+                            or aev5_next_streaming_sink
+                            or reinforce_streaming_sink
+                        ):
                             payload_aux = {}
+                            if reinforce_streaming_sink and (log_probs_window is not None):
+                                payload_aux["reinforce"] = {"log_probs": log_probs_window}
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -7156,6 +11933,24 @@ class EnvironmentPrior:
                                     dtype=torch.float32,
                                     aev4_cfg=aev4_cfg,
                                 )
+                            if aev5_next_streaming_sink:
+                                aev5_next_window_summary = self._aev5_next_finalize_accumulator(
+                                    aev5_next_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                                payload_aux["aev5_next"] = aev5_next_window_summary
+                                self._aev5_next_accumulate_window_summary(
+                                    aev5_next_det_acc,
+                                    aev5_next_window_summary,
+                                    device=device,
+                                )
+                                aev5_next_acc = self._aev5_next_new_accumulator(
+                                    aev5_next_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev5_next_cfg=aev5_next_cfg,
+                                )
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
                                 tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
                             else:
@@ -7174,22 +11969,43 @@ class EnvironmentPrior:
             )
         else:
             infos = [None] * batch_size
-        rollout_profile = None
+        noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
+        rollout_profile = {
+            "steps": int(n_samples),
+            "batch_size": int(batch_size),
+            "noise_mode": noise_mode,
+            "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
+            "transition_noise_wall_ms": float(transition_noise_wall_s * 1000.0),
+        }
+        rollout_profile.update(self._summarize_env_semantics(env, batch_size))
         if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
             torch.cuda.synchronize(device=device_obj)
             policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
             transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
-            noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
-            rollout_profile = {
-                "policy_cuda_ms": policy_cuda_ms,
-                "transition_cuda_ms": transition_cuda_ms,
-                "steps": int(n_samples),
-                "batch_size": int(batch_size),
-                "noise_mode": noise_mode,
-                "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
-                "transition_noise_wall_ms": float(transition_noise_wall_s * 1000.0),
-            }
+            rollout_profile["policy_cuda_ms"] = policy_cuda_ms
+            rollout_profile["transition_cuda_ms"] = transition_cuda_ms
         self.last_rollout_profile = rollout_profile
+        self.last_rollout_env_semantics = {
+            key: rollout_profile[key]
+            for key in (
+                "env_count",
+                "strict_joint_transition_count",
+                "strict_joint_transition_share",
+                "reference_semantics_count",
+                "reference_semantics_share",
+                "exact_scm_count",
+                "exact_gp_count",
+                "fixed_gp_count",
+                "legacy_scm_count",
+                "legacy_gp_count",
+                "transition_reference_mode",
+            )
+        }
+        self.last_rollout_reinforce = (
+            {"log_probs": log_prob_steps}
+            if (reinforce_enabled and log_prob_steps is not None)
+            else None
+        )
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -7244,6 +12060,22 @@ class EnvironmentPrior:
                 )
         else:
             self.last_rollout_v4 = None
+        if aev5_next_enabled:
+            if aev5_next_streaming_sink:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            else:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_acc,
+                    device=device,
+                    dtype=torch.float32,
+                )
+        else:
+            self.last_rollout_v5_next = None
+        self.last_rollout_lipschitz_audit = env.get("lipschitz_audit", None) if isinstance(env, dict) else None
         if y_steps is None:
             y_steps = torch.empty((0, batch_size), device=device, dtype=torch.float32)
         return x_steps, y_steps, infos
@@ -7264,6 +12096,7 @@ class EnvironmentPrior:
         tbptt_reward_sink=None,
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
+        policy_objective_kind="policy_gradient",
     ):
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
@@ -7290,7 +12123,7 @@ class EnvironmentPrior:
         transition_inner_min_bucket = int(max(0, int(getattr(self, "transition_inner_min_bucket", 0) or 0)))
         for bi, h in enumerate(h_list_effective):
             family = self._normalize_family(h.get("family", "scm"))
-            sig = (family,)
+            sig = (family, bool(self._resolve_reference_semantics_enabled(h)))
             family_groups.setdefault(sig, []).append((bi, h))
 
         rollout_generators = self._make_generators_from_seeds(rollout_rng_seeds, batch_size, device)
@@ -7375,6 +12208,7 @@ class EnvironmentPrior:
         transition_family_build_wall_s = 0.0
         transition_generator_build_wall_s = 0.0
         transition_gp_shared_build_wall_s = 0.0
+        lipschitz_rollout_acc = None
 
         state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
         obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
@@ -7391,8 +12225,14 @@ class EnvironmentPrior:
         action_noise_eval_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_input_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_full_rms_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_full_rms_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_highway_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_highway_lambda = torch.empty((batch_size,), device=device, dtype=torch.float32)
         aev4_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -7402,6 +12242,7 @@ class EnvironmentPrior:
         reward_dropout_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         reward_dropout_impute_zero = torch.empty((batch_size,), device=device, dtype=torch.bool)
         reward_dropout_ratio = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reference_semantics = torch.empty((batch_size,), device=device, dtype=torch.bool)
         family_list = [None] * batch_size
 
         transition_groups = []
@@ -7471,6 +12312,12 @@ class EnvironmentPrior:
                     prefer_transition_only=False,
                     preserve_skipped_generator_rng=True,
                 )
+                lipschitz_rollout_acc = self._merge_lipschitz_audit_summary(
+                    lipschitz_rollout_acc,
+                    env_batch.get("lipschitz_audit", None),
+                    device=device,
+                    dtype=torch.float32,
+                )
                 if setup_t0 is not None:
                     transition_setup_wall_s += (time.perf_counter() - setup_t0)
                 build_profile = env_batch.get("_build_profile", None)
@@ -7538,8 +12385,14 @@ class EnvironmentPrior:
                 action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
                 reward_scale[group_idx] = env_batch["reward_scale"]
                 reward_clip[group_idx] = env_batch["reward_clip"]
+                reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
+                reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
                 alpha[group_idx] = env_batch["alpha"]
                 state_clip[group_idx] = env_batch["state_clip"]
+                state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
+                state_input_scale[group_idx] = env_batch["state_input_scale"]
+                state_full_rms_enabled[group_idx] = env_batch["state_full_rms_enabled"]
+                state_full_rms_target[group_idx] = env_batch["state_full_rms_target"]
                 state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
                 state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
                 aev4_enabled[group_idx] = env_batch.get("aev4_enabled", False)
@@ -7549,6 +12402,11 @@ class EnvironmentPrior:
                 reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
                 reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
                 reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
+                ref_value = env_batch.get("reference_semantics_enabled", False)
+                if torch.is_tensor(ref_value):
+                    reference_semantics[group_idx] = ref_value.to(device=device, dtype=torch.bool)
+                else:
+                    reference_semantics[group_idx] = bool(ref_value)
                 for global_idx in group_indices:
                     family_list[global_idx] = str(env_batch["family"])
 
@@ -7562,9 +12420,23 @@ class EnvironmentPrior:
                 gp_projection_profile_capable = bool(
                     callable(getattr(transition_generator, "_consume_gp_projection_profile", None))
                 )
-                group_env_total_dim = state_dim_g + obs_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
+                reference_semantics_group = env_batch.get("reference_semantics_enabled", False)
+                if torch.is_tensor(reference_semantics_group):
+                    reference_semantics_group = bool(reference_semantics_group.any().item())
+                else:
+                    reference_semantics_group = bool(reference_semantics_group)
+                obs_input_dims_group = env_batch.get("env_obs_input_dim_per_sample", obs_dims_group)
+                if not torch.is_tensor(obs_input_dims_group):
+                    obs_input_dims_group = torch.as_tensor(
+                        obs_input_dims_group,
+                        device=device,
+                        dtype=torch.long,
+                    )
+                obs_input_dim_g = int(obs_input_dims_group.max().item()) if int(obs_input_dims_group.numel()) > 0 else 0
+                group_env_total_dim = state_dim_g + obs_input_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
                 packed_input_enabled = bool(
-                    use_fused_transition and bool(getattr(transition_generator, "_prefers_packed_env_input", False))
+                    use_fused_transition
+                    and bool(getattr(transition_generator, "_prefers_packed_env_input", False))
                 )
                 packed_input_cap = int(
                     max(
@@ -7573,7 +12445,7 @@ class EnvironmentPrior:
                             getattr(
                                 transition_generator,
                                 "_packed_input_cap",
-                                int((state_dims_group + obs_dims_group + action_dims_group + noise_dims_group).max().item()),
+                                int((state_dims_group + obs_input_dims_group + action_dims_group + noise_dims_group).max().item()),
                             )
                         ),
                     )
@@ -7595,16 +12467,16 @@ class EnvironmentPrior:
                     packed_state_mask = (state_cols < state_dims_group.unsqueeze(1)).to(dtype=torch.float32)
                     packed_obs_rows, packed_obs_dst_cols, packed_obs_src_cols = self._build_segment_write_map(
                         state_dims_group,
-                        obs_dims_group,
-                        obs_dim_g,
+                        obs_input_dims_group,
+                        obs_input_dim_g,
                     )
                     packed_action_rows, packed_action_dst_cols, packed_action_src_cols = self._build_segment_write_map(
-                        state_dims_group + obs_dims_group,
+                        state_dims_group + obs_input_dims_group,
                         action_dims_group,
                         action_dim_g,
                     )
                     packed_noise_rows, packed_noise_dst_cols, packed_noise_src_cols = self._build_segment_write_map(
-                        state_dims_group + obs_dims_group + action_dims_group,
+                        state_dims_group + obs_input_dims_group + action_dims_group,
                         noise_dims_group,
                         noise_dim_g,
                     )
@@ -7619,12 +12491,17 @@ class EnvironmentPrior:
                         "batch_size": group_bs,
                         "state_dim": state_dim_g,
                         "obs_dim": obs_dim_g,
+                        "env_obs_input_dim": obs_input_dim_g,
                         "action_dim": action_dim_g,
                         "noise_dim": noise_dim_g,
-                        "env_obs_start": state_dim_g,
-                        "env_action_start": state_dim_g + obs_dim_g,
-                        "env_noise_start": state_dim_g + obs_dim_g + action_dim_g,
+                        "reference_semantics_enabled": reference_semantics_group,
+                        "env_obs_start": (state_dim_g if obs_input_dim_g > 0 else None),
+                        "env_action_start": state_dim_g + obs_input_dim_g,
+                        "env_noise_start": state_dim_g + obs_input_dim_g + action_dim_g,
                         "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
+                        "state_input_scale_view": state_input_scale[group_idx],
+                        "state_full_rms_enabled_view": state_full_rms_enabled[group_idx],
+                        "state_full_rms_target_view": state_full_rms_target[group_idx],
                         "packed_input_enabled": packed_input_enabled,
                         "packed_input_cap": packed_input_cap,
                         "packed_input": packed_input_buf,
@@ -7679,8 +12556,12 @@ class EnvironmentPrior:
             action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
             reward_scale = reward_scale.index_select(0, perm)
             reward_clip = reward_clip.index_select(0, perm)
+            reinforce_reward_tanh_c = reinforce_reward_tanh_c.index_select(0, perm)
+            reinforce_reward_tanh_bound = reinforce_reward_tanh_bound.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
+            state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
+            state_input_scale = state_input_scale.index_select(0, perm)
             state_highway_enabled = state_highway_enabled.index_select(0, perm)
             state_highway_lambda = state_highway_lambda.index_select(0, perm)
             aev4_enabled = aev4_enabled.index_select(0, perm)
@@ -7778,6 +12659,12 @@ class EnvironmentPrior:
             if bool(store_rewards)
             else None
         )
+        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        log_prob_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if reinforce_enabled and (not tbptt_window_active)
+            else None
+        )
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -7795,6 +12682,7 @@ class EnvironmentPrior:
         )
 
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -7804,6 +12692,9 @@ class EnvironmentPrior:
         aev4_cfg = self._resolve_aev4_config()
         aev4_reg_enabled = bool(aev4_cfg.get("enabled", False))
         aev4_prev_delta = None
+        aev5_next_cfg = self._resolve_aev5_next_config()
+        aev5_next_enabled = bool(aev5_next_cfg.get("enabled", False))
+        aev5_next_prev_delta = None
         aev2_streaming_sink = bool(
             aev2_enabled
             and tbptt_window_active
@@ -7822,6 +12713,18 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        aev5_next_streaming_sink = bool(
+            aev5_next_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        reinforce_streaming_sink = bool(
+            reinforce_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -7833,6 +12736,12 @@ class EnvironmentPrior:
         )
         aev4_det_acc = self._aev4_new_accumulator(
             aev4_reg_enabled, device=device, dtype=torch.float32, aev4_cfg=aev4_cfg
+        )
+        aev5_next_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=torch.float32, aev5_next_cfg=aev5_next_cfg
+        )
+        aev5_next_det_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=torch.float32, aev5_next_cfg=aev5_next_cfg
         )
 
         strict_seed_mode = rollout_generators is not None
@@ -7960,6 +12869,10 @@ class EnvironmentPrior:
             "reward_dropout_ratio": reward_dropout_ratio,
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
+            "state_input_scale_enabled": state_input_scale_enabled,
+            "state_input_scale": state_input_scale,
+            "state_full_rms_enabled": state_full_rms_enabled,
+            "state_full_rms_target": state_full_rms_target,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -8148,7 +13061,8 @@ class EnvironmentPrior:
                 raise ValueError(
                     f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
                 )
-            action_next = torch.tanh(action_next) * action_mask
+            action_mean = action_next
+            reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             noise_block_idx = None
@@ -8157,25 +13071,50 @@ class EnvironmentPrior:
                     _refresh_noise_block(t)
                 noise_block_idx = int(t - noise_block_start)
 
-            if t < single_eval_pos:
-                if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
-                    action_next = torch.tanh(
-                        action_next
-                        + action_noise_train_block[noise_block_idx] * action_noise_train_std[:, None]
-                    ) * action_mask
-                elif action_noise_train is not None:
-                    action_next = torch.tanh(
-                        action_next + action_noise_train[t] * action_noise_train_std[:, None]
-                    ) * action_mask
-            elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
-                action_next = torch.tanh(
-                    action_next
-                    + action_noise_eval_block[noise_block_idx] * action_noise_eval_std[:, None]
-                ) * action_mask
-            elif action_noise_eval is not None:
-                action_next = torch.tanh(
-                    action_next + action_noise_eval[t] * action_noise_eval_std[:, None]
-                ) * action_mask
+            if reinforce_enabled:
+                if t < single_eval_pos:
+                    if torch.any(action_noise_train_std <= 0):
+                        raise ValueError("reinforce objective requires action_noise_train_std > 0 for every batch item")
+                    if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_train_block[noise_block_idx]
+                    elif action_noise_train is not None:
+                        action_eps_t = action_noise_train[t]
+                    else:
+                        raise RuntimeError("reinforce rollout expected pre-sampled action_noise_train")
+                    action_std_t = action_noise_train_std
+                else:
+                    if torch.any(action_noise_eval_std <= 0):
+                        raise ValueError("reinforce objective requires action_noise_eval_std > 0 for every batch item")
+                    if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_eval_block[noise_block_idx]
+                    elif action_noise_eval is not None:
+                        action_eps_t = action_noise_eval[t]
+                    else:
+                        raise RuntimeError("reinforce rollout expected pre-sampled action_noise_eval")
+                    action_std_t = action_noise_eval_std
+                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
+                action_next = torch.tanh(action_pre_tanh) * action_mask
+                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                    action_pre_tanh.detach(),
+                    action_mean,
+                    action_std_t,
+                    action=action_next.detach(),
+                    mask=action_mask,
+                )
+            else:
+                action_next = torch.tanh(action_mean) * action_mask
+                # Preserve action-noise RNG draws for reproducible downstream
+                # transition/state noise, but keep the learned policy deterministic
+                # after a single tanh squash.
+                if t < single_eval_pos:
+                    if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                        pass
+                    elif action_noise_train is not None:
+                        pass
+                elif noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                    pass
+                elif action_noise_eval is not None:
+                    pass
 
             if noise_streaming_mode and noise_block_idx is not None:
                 noise_t = transition_noise_block[noise_block_idx]
@@ -8199,6 +13138,7 @@ class EnvironmentPrior:
             reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
+            action_env = action_next.detach() if reinforce_enabled else action_next
 
             transition_cuda_start = None
             transition_wall_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -8227,16 +13167,18 @@ class EnvironmentPrior:
                 if group_slice is None:
                     state_in = state_t.index_select(0, group_indices)[:, :state_dim_g]
                     obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
-                    action_in = action_next.index_select(0, group_indices)[:, :action_dim_g]
+                    action_in = action_env.index_select(0, group_indices)[:, :action_dim_g]
                     noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
                 else:
                     state_in = state_t[group_slice, :state_dim_g]
                     obs_in = obs_t[group_slice, :obs_dim_g]
-                    action_in = action_next[group_slice, :action_dim_g]
+                    action_in = action_env[group_slice, :action_dim_g]
                     noise_in = noise_t[group_slice, :noise_dim_g]
-                env_obs_start = int(group["env_obs_start"])
+                state_in = self._scale_state_env_input(state_in, group.get("state_input_scale_view", 1.0))
+                env_obs_start = group["env_obs_start"]
                 env_action_start = int(group["env_action_start"])
                 env_noise_start = int(group["env_noise_start"])
+                reference_semantics_group = bool(group.get("reference_semantics_enabled", False))
 
                 reward_scale_g = group["reward_scale_view"]
                 alpha_g = group["alpha_view"]
@@ -8296,7 +13238,8 @@ class EnvironmentPrior:
                 else:
                     env_in = group["env_in"]
                     env_in[:, :state_dim_g] = state_in
-                    env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                    if env_obs_start is not None:
+                        env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
                     env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
                     env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
                     transition_input = env_in
@@ -8476,18 +13419,41 @@ class EnvironmentPrior:
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
                 if profile_rollout_timing and dropout_timing_t0 is not None:
                     transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
+            reward_next = self._transform_rollout_reward(
+                reward_next,
+                mode=self._resolve_reinforce_reward_transform(self.config),
+                tanh_c=reinforce_reward_tanh_c,
+                tanh_bound=reinforce_reward_tanh_bound,
+            )
             if state_noise_t is not None:
                 state_noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
                 state_next = state_next + state_noise_t * state_noise_std[:, None]
                 if profile_rollout_timing and state_noise_timing_t0 is not None:
                     transition_noise_wall_s += (time.perf_counter() - state_noise_timing_t0)
-            state_next = self._apply_state_postprocess(
-                state_next_raw=state_next,
-                state_prev=state_t,
-                state_clip=state_clip,
-                state_highway_enabled=state_highway_enabled,
-                state_highway_lambda=state_highway_lambda,
+            if not bool(reference_semantics.all().item()):
+                state_next_post = self._apply_state_postprocess(
+                    state_next_raw=state_next,
+                    state_prev=state_t,
+                    state_clip=state_clip,
+                    state_highway_enabled=state_highway_enabled,
+                    state_highway_lambda=state_highway_lambda,
+                )
+                state_next = torch.where(reference_semantics[:, None], state_next, state_next_post)
+            state_next = self._apply_state_full_rms(
+                state_next,
+                enabled=state_full_rms_enabled,
+                target=state_full_rms_target,
+                state_mask=state_mask,
             )
+            aev5_next_step_aux = None
+            if aev5_next_enabled:
+                state_next, aev5_next_step_aux = self._apply_aev5_next_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    prev_delta=aev5_next_prev_delta,
+                    reward_next=reward_next,
+                    aev5_next_cfg=aev5_next_cfg,
+                )
             aev4_step_aux = None
             if aev4_reg_enabled:
                 # Family-group vectorization uses one global v4 config.
@@ -8511,6 +13477,9 @@ class EnvironmentPrior:
             if aev3_enabled and (aev3_prev_delta is not None):
                 self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
             aev3_prev_delta = state_delta
+            if aev5_next_enabled:
+                self._aev5_next_update_accumulator(aev5_next_acc, aev5_next_step_aux)
+            aev5_next_prev_delta = state_delta
             if aev4_reg_enabled and (aev4_prev_delta is not None):
                 self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
             aev4_prev_delta = state_delta
@@ -8519,15 +13488,19 @@ class EnvironmentPrior:
                 if y_steps is not None:
                     y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
+                if tbptt_log_prob_buffer is not None:
+                    tbptt_log_prob_buffer.append(reinforce_log_prob_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
+                if log_prob_steps is not None and reinforce_log_prob_t is not None:
+                    log_prob_steps[t] = reinforce_log_prob_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
 
             state_t = state_next
-            action_t = action_next
+            action_t = action_env
             reward_t = reward_next
             reward_mask_t = reward_mask_next
 
@@ -8536,6 +13509,10 @@ class EnvironmentPrior:
                 if is_window_end:
                     rewards_window = torch.stack(tbptt_reward_buffer, dim=0)
                     tbptt_reward_buffer = []
+                    log_probs_window = None
+                    if tbptt_log_prob_buffer is not None:
+                        log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
+                        tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -8545,14 +13522,24 @@ class EnvironmentPrior:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
                             aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev5_next_prev_delta is not None:
+                            aev5_next_prev_delta = aev5_next_prev_delta.detach()
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         for group in transition_groups:
                             group["env_in"] = group["env_in"].detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                        if (
+                            aev2_streaming_sink
+                            or aev3_streaming_sink
+                            or aev4_streaming_sink
+                            or aev5_next_streaming_sink
+                            or reinforce_streaming_sink
+                        ):
                             payload_aux = {}
+                            if reinforce_streaming_sink and (log_probs_window is not None):
+                                payload_aux["reinforce"] = {"log_probs": log_probs_window}
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -8593,6 +13580,24 @@ class EnvironmentPrior:
                                     dtype=torch.float32,
                                     aev4_cfg=aev4_cfg,
                                 )
+                            if aev5_next_streaming_sink:
+                                aev5_next_window_summary = self._aev5_next_finalize_accumulator(
+                                    aev5_next_acc,
+                                    device=device,
+                                    dtype=torch.float32,
+                                )
+                                payload_aux["aev5_next"] = aev5_next_window_summary
+                                self._aev5_next_accumulate_window_summary(
+                                    aev5_next_det_acc,
+                                    aev5_next_window_summary,
+                                    device=device,
+                                )
+                                aev5_next_acc = self._aev5_next_new_accumulator(
+                                    aev5_next_enabled,
+                                    device=device,
+                                    dtype=torch.float32,
+                                    aev5_next_cfg=aev5_next_cfg,
+                                )
                             payload_rewards = rewards_window.index_select(1, inv_perm) if needs_unpermute else rewards_window
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
                                 tbptt_reward_sink((payload_rewards, payload_aux["aev2"]))
@@ -8609,6 +13614,8 @@ class EnvironmentPrior:
                 y_steps = y_steps.index_select(1, inv_perm)
             if collect_x:
                 x_steps = x_steps.index_select(1, inv_perm)
+            if log_prob_steps is not None:
+                log_prob_steps = log_prob_steps.index_select(1, inv_perm)
 
         if collect_runtime_info:
             if needs_unpermute:
@@ -8623,6 +13630,10 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
                 action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
                 reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
+                state_input_scale_enabled_meta = state_input_scale_enabled.index_select(0, inv_perm)
+                state_input_scale_meta = state_input_scale.index_select(0, inv_perm)
+                state_full_rms_enabled_meta = state_full_rms_enabled.index_select(0, inv_perm)
+                state_full_rms_target_meta = state_full_rms_target.index_select(0, inv_perm)
                 aev4_enabled_meta = aev4_enabled.index_select(0, inv_perm)
                 aev4_highway_ratio_meta = aev4_highway_ratio.index_select(0, inv_perm)
                 aev4_update_scale_meta = aev4_update_scale.index_select(0, inv_perm)
@@ -8638,6 +13649,10 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims
                 action_slot_dims_meta = action_slot_dims
                 reward_dropout_ratio_meta = reward_dropout_ratio
+                state_input_scale_enabled_meta = state_input_scale_enabled
+                state_input_scale_meta = state_input_scale
+                state_full_rms_enabled_meta = state_full_rms_enabled
+                state_full_rms_target_meta = state_full_rms_target
                 aev4_enabled_meta = aev4_enabled
                 aev4_highway_ratio_meta = aev4_highway_ratio
                 aev4_update_scale_meta = aev4_update_scale
@@ -8647,6 +13662,12 @@ class EnvironmentPrior:
             reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
             env_meta = {
                 "family": family_meta,
+                "strict_joint_transition_enabled": reference_semantics,
+                "reference_semantics_enabled": reference_semantics,
+                "reference_gp_forward_mode": [
+                    self._resolve_reference_gp_forward_mode(h) if str(h.get("family", "scm")).lower() == "gp" else None
+                    for h in h_list
+                ],
                 "state_dim": state_dims_meta,
                 "obs_dim": obs_dims_meta,
                 "action_dim": action_dims_meta,
@@ -8655,6 +13676,10 @@ class EnvironmentPrior:
                 "obs_slot_dim": obs_slot_dims_meta,
                 "action_slot_dim": action_slot_dims_meta,
                 "reward_dropout_ratio": reward_dropout_ratio_meta,
+                "state_input_scale_enabled": state_input_scale_enabled_meta,
+                "state_input_scale": state_input_scale_meta,
+                "state_full_rms_enabled": state_full_rms_enabled_meta,
+                "state_full_rms_target": state_full_rms_target_meta,
                 "aev4_enabled": aev4_enabled_meta,
                 "aev4_highway_ratio": aev4_highway_ratio_meta,
                 "aev4_update_scale": aev4_update_scale_meta,
@@ -8669,22 +13694,30 @@ class EnvironmentPrior:
             )
         else:
             infos = [None] * batch_size
-        rollout_profile = None
-        if (profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs)) or profile_rollout_timing:
-            noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
-            rollout_profile = {
-                "steps": int(n_samples),
-                "batch_size": int(batch_size),
-                "noise_mode": noise_mode,
-                "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
+            env_meta = {
+                "family": family_list,
+                "strict_joint_transition_enabled": reference_semantics,
+                "reference_semantics_enabled": reference_semantics,
+                "reference_gp_forward_mode": [
+                    self._resolve_reference_gp_forward_mode(h) if str(h.get("family", "scm")).lower() == "gp" else None
+                    for h in h_list
+                ],
             }
-            if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
-                torch.cuda.synchronize(device=device_obj)
-                policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
-                transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
-                rollout_profile["policy_cuda_ms"] = policy_cuda_ms
-                rollout_profile["transition_cuda_ms"] = transition_cuda_ms
-            if profile_rollout_timing:
+        noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
+        rollout_profile = {
+            "steps": int(n_samples),
+            "batch_size": int(batch_size),
+            "noise_mode": noise_mode,
+            "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
+        }
+        rollout_profile.update(self._summarize_env_semantics(env_meta, batch_size))
+        if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
+            torch.cuda.synchronize(device=device_obj)
+            policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
+            transition_cuda_ms = float(sum(start.elapsed_time(end) for start, end in transition_cuda_pairs))
+            rollout_profile["policy_cuda_ms"] = policy_cuda_ms
+            rollout_profile["transition_cuda_ms"] = transition_cuda_ms
+        if profile_rollout_timing:
                 rollout_profile["policy_wall_ms"] = float(policy_wall_s * 1000.0)
                 rollout_profile["transition_wall_ms"] = float(transition_wall_s * 1000.0)
                 rollout_profile["transition_y_wall_ms"] = float(transition_y_wall_s * 1000.0)
@@ -8782,6 +13815,27 @@ class EnvironmentPrior:
                     bool(transition_stream_fusion and async_group_commit_in_stream)
                 )
         self.last_rollout_profile = rollout_profile
+        self.last_rollout_env_semantics = {
+            key: rollout_profile[key]
+            for key in (
+                "env_count",
+                "strict_joint_transition_count",
+                "strict_joint_transition_share",
+                "reference_semantics_count",
+                "reference_semantics_share",
+                "exact_scm_count",
+                "exact_gp_count",
+                "fixed_gp_count",
+                "legacy_scm_count",
+                "legacy_gp_count",
+                "transition_reference_mode",
+            )
+        }
+        self.last_rollout_reinforce = (
+            {"log_probs": log_prob_steps}
+            if (reinforce_enabled and log_prob_steps is not None)
+            else None
+        )
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -8836,6 +13890,28 @@ class EnvironmentPrior:
                 )
         else:
             self.last_rollout_v4 = None
+        if aev5_next_enabled:
+            if aev5_next_streaming_sink:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_det_acc,
+                    device=device,
+                    dtype=torch.float32,
+                )
+            else:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_acc,
+                    device=device,
+                    dtype=torch.float32,
+                )
+        else:
+            self.last_rollout_v5_next = None
+        self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
+            lipschitz_rollout_acc
+            if lipschitz_rollout_acc is not None
+            else self._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
+            device=device,
+            dtype=torch.float32,
+        )
         if y_steps is None:
             y_steps = torch.empty((0, batch_size), device=device, dtype=torch.float32)
         return x_steps, y_steps, infos
@@ -8855,6 +13931,7 @@ class EnvironmentPrior:
         tbptt_reward_sink=None,
         tbptt_reward_sink_supports_aux=False,
         store_rewards=True,
+        policy_objective_kind="policy_gradient",
     ):
         n_samples = int(n_samples)
         num_features = int(num_features)
@@ -8884,6 +13961,15 @@ class EnvironmentPrior:
         action_dim = int(env["action_dim"])
         noise_dim = int(env["noise_dim"])
         zero_pad_dim = int(env["zero_pad_dim"])
+        reference_semantics_enabled = bool(self._env_uses_reference_semantics(env))
+        env_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
         obs_slot_dim = int(env["obs_slot_dim"])
         action_slot_dim = int(env["action_slot_dim"])
 
@@ -8900,6 +13986,7 @@ class EnvironmentPrior:
             if bool(store_rewards)
             else None
         )
+        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
         state_abs_max = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_values = torch.empty((n_samples,), device=device, dtype=state_t.dtype) if collect_runtime_info else None
         reward_drop_count = 0 if collect_runtime_info else None
@@ -8910,7 +13997,13 @@ class EnvironmentPrior:
             if 0 < w < n_samples:
                 tbptt_window_active = True
                 tbptt_window_size = w
+        log_prob_steps = (
+            torch.empty((n_samples,), device=device, dtype=state_t.dtype)
+            if reinforce_enabled and (not tbptt_window_active)
+            else None
+        )
         tbptt_reward_buffer = [] if tbptt_window_active else None
+        tbptt_log_prob_buffer = [] if (tbptt_window_active and reinforce_enabled) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -8920,6 +14013,9 @@ class EnvironmentPrior:
         aev4_cfg = self._resolve_aev4_config()
         aev4_enabled = bool(aev4_cfg.get("enabled", False))
         aev4_prev_delta = None
+        aev5_next_cfg = self._resolve_aev5_next_config()
+        aev5_next_enabled = bool(aev5_next_cfg.get("enabled", False))
+        aev5_next_prev_delta = None
         aev2_streaming_sink = bool(
             aev2_enabled
             and tbptt_window_active
@@ -8938,6 +14034,18 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        aev5_next_streaming_sink = bool(
+            aev5_next_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        reinforce_streaming_sink = bool(
+            reinforce_enabled
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=state_t.dtype, aev3_cfg=aev3_cfg)
@@ -8947,6 +14055,12 @@ class EnvironmentPrior:
         aev4_acc = self._aev4_new_accumulator(aev4_enabled, device=device, dtype=state_t.dtype, aev4_cfg=aev4_cfg)
         aev4_det_acc = self._aev4_new_accumulator(
             aev4_enabled, device=device, dtype=state_t.dtype, aev4_cfg=aev4_cfg
+        )
+        aev5_next_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=state_t.dtype, aev5_next_cfg=aev5_next_cfg
+        )
+        aev5_next_det_acc = self._aev5_next_new_accumulator(
+            aev5_next_enabled, device=device, dtype=state_t.dtype, aev5_next_cfg=aev5_next_cfg
         )
 
         zero_pad_t = torch.zeros(zero_pad_dim, device=device, dtype=state_t.dtype)
@@ -9031,13 +14145,13 @@ class EnvironmentPrior:
         env_in_flat = None
         if use_fast_env_in:
             env_in_flat = torch.zeros(
-                state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim,
+                env_layout["total_dim"],
                 device=device,
                 dtype=state_t.dtype,
             )
-            env_obs_start = state_dim
-            env_action_start = state_dim + obs_dim
-            env_noise_start = env_action_start + action_dim
+            env_obs_start = env_layout["obs_start"]
+            env_action_start = env_layout["action_start"]
+            env_noise_start = env_layout["noise_start"]
 
         for t in range(n_samples):
             obs_t = state_t[:obs_dim]  # observable subset of state
@@ -9069,8 +14183,9 @@ class EnvironmentPrior:
                 )
 
             if use_fast_env_in:
-                env_in_flat[:state_dim] = state_t
-                env_in_flat[env_obs_start: env_obs_start + obs_dim] = obs_t
+                env_in_flat[:state_dim] = self._scale_state_env_input(state_t, env.get("state_input_scale", 1.0))
+                if env_obs_start is not None:
+                    env_in_flat[env_obs_start: env_obs_start + obs_dim] = obs_t
                 env_in_flat[env_action_start: env_action_start + action_dim] = action_t
                 env_in_flat[env_noise_start: env_noise_start + noise_dim] = noise_t
                 policy_in = env_in_flat.unsqueeze(0)
@@ -9105,44 +14220,159 @@ class EnvironmentPrior:
                     raise ValueError(
                         f"policy action dim mismatch: expected {env['action_dim']}, got {action_next.shape[-1]}"
                     )
-                action_next = torch.tanh(action_next)
+                action_mean = action_next
+                reinforce_log_prob_t = None
 
             action_noise_std = env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
-            if action_noise_std > 0:
-                if t < single_eval_pos and action_noise_train is not None:
-                    action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_std)
-                elif t >= single_eval_pos and action_noise_eval is not None:
-                    action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_std)
-                elif t < single_eval_pos and env["action_noise_train_std"] > 0:
-                    if action_noise_train_generator is None:
-                        action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
+            if reinforce_enabled:
+                if action_noise_std <= 0:
+                    phase_name = "train" if t < single_eval_pos else "eval"
+                    raise ValueError(f"reinforce objective requires positive action_noise_{phase_name}_std")
+                if use_fast_env_in:
+                    if t < single_eval_pos and action_noise_train is not None:
+                        action_eps_t = action_noise_train[t]
+                    elif t >= single_eval_pos and action_noise_eval is not None:
+                        action_eps_t = action_noise_eval[t]
+                    elif t < single_eval_pos:
+                        if action_noise_train_generator is None:
+                            action_eps_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_eps_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_train_generator,
+                            )
                     else:
-                        action_noise_t = torch.randn(
-                            (action_dim,),
-                            device=device,
-                            dtype=state_t.dtype,
-                            generator=action_noise_train_generator,
-                        )
-                    action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
-                elif t >= single_eval_pos and env["action_noise_eval_std"] > 0:
-                    if action_noise_eval_generator is None:
-                        action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
+                        if action_noise_eval_generator is None:
+                            action_eps_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_eps_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_eval_generator,
+                            )
+                else:
+                    if t < single_eval_pos:
+                        if action_noise_train is not None:
+                            action_eps_t = action_noise_train[t]
+                        elif action_noise_train_generator is None:
+                            action_eps_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_eps_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_train_generator,
+                            )
                     else:
-                        action_noise_t = torch.randn(
-                            (action_dim,),
-                            device=device,
-                            dtype=state_t.dtype,
-                            generator=action_noise_eval_generator,
-                        )
-                    action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
+                        if action_noise_eval is not None:
+                            action_eps_t = action_noise_eval[t]
+                        elif action_noise_eval_generator is None:
+                            action_eps_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_eps_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_eval_generator,
+                            )
+                action_pre_tanh = action_mean + (action_eps_t * float(action_noise_std))
+                action_next = torch.tanh(action_pre_tanh)
+                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                    action_pre_tanh.detach(),
+                    action_mean,
+                    float(action_noise_std),
+                    action=action_next.detach(),
+                )
+            else:
+                if not use_fast_env_in:
+                    action_next = torch.tanh(action_mean)
+            if (not reinforce_enabled) and (not reference_semantics_enabled) and action_noise_std > 0:
+                if use_fast_env_in:
+                    if t < single_eval_pos and action_noise_train is not None:
+                        action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_std)
+                    elif t >= single_eval_pos and action_noise_eval is not None:
+                        action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_std)
+                    elif t < single_eval_pos and env["action_noise_train_std"] > 0:
+                        if action_noise_train_generator is None:
+                            action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_noise_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_train_generator,
+                            )
+                        action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
+                    elif t >= single_eval_pos and env["action_noise_eval_std"] > 0:
+                        if action_noise_eval_generator is None:
+                            action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            action_noise_t = torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_eval_generator,
+                            )
+                        action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
+                else:
+                    # Learned-policy rollout uses a single tanh squash. Keep
+                    # action-noise RNG consumption only to preserve downstream
+                    # transition/state-noise streams under fixed seeds.
+                    if t < single_eval_pos and env["action_noise_train_std"] > 0:
+                        if action_noise_train is not None:
+                            _ = action_noise_train[t]
+                        elif action_noise_train_generator is None:
+                            _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_train_generator,
+                            )
+                    elif t >= single_eval_pos and env["action_noise_eval_std"] > 0:
+                        if action_noise_eval is not None:
+                            _ = action_noise_eval[t]
+                        elif action_noise_eval_generator is None:
+                            _randn((action_dim,), dtype=state_t.dtype)
+                        else:
+                            torch.randn(
+                                (action_dim,),
+                                device=device,
+                                dtype=state_t.dtype,
+                                generator=action_noise_eval_generator,
+                            )
 
             if use_fast_env_in:
                 env_in_flat[env_action_start: env_action_start + action_dim] = action_next
                 env_in = env_in_flat.unsqueeze(0)
             else:
-                env_in = self._pack_env_input(state_t, obs_t, action_next, noise_t, zero_pad_t).unsqueeze(0)
+                action_env = action_next.detach() if reinforce_enabled else action_next
+                env_in = self._pack_env_input(
+                    state_t,
+                    obs_t,
+                    action_env,
+                    noise_t,
+                    zero_pad_t,
+                    reference_semantics_enabled=reference_semantics_enabled,
+                    state_input_scale=env.get("state_input_scale", 1.0),
+                ).unsqueeze(0)
+            if use_fast_env_in:
+                action_env = action_next
 
-            reward_next_raw = env["reward_scale"] * env["y_generator"](env_in, generator=local_generator).reshape(())
+            transition_generator = env.get("transition_generator", None)
+            if callable(transition_generator):
+                x_next, reward_unit = transition_generator(env_in, generator=local_generator)
+                x_next = x_next.squeeze(0)
+                reward_next_raw = env["reward_scale"] * reward_unit.reshape(())
+            else:
+                reward_next_raw = env["reward_scale"] * env["y_generator"](
+                    env_in,
+                    generator=local_generator,
+                ).reshape(())
             reward_next = torch.clamp(
                 reward_next_raw,
                 -float(env["reward_clip"]),
@@ -9172,8 +14402,15 @@ class EnvironmentPrior:
                     reward_mask_next = torch.zeros((), device=device, dtype=reward_next_raw.dtype)
                     if env["reward_dropout_impute_zero"]:
                         reward_next = torch.zeros_like(reward_next_raw)
+            reward_next = self._transform_rollout_reward(
+                reward_next,
+                mode=env.get("reinforce_reward_transform", "none"),
+                tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+            )
 
-            x_next = env["x_generator"](env_in, generator=local_generator).squeeze(0)
+            if not callable(transition_generator):
+                x_next = env["x_generator"](env_in, generator=local_generator).squeeze(0)
             state_next = (1.0 - env["alpha"]) * state_t + env["alpha"] * x_next
             if state_noise is not None:
                 state_next = state_next + state_noise[t] * env["state_noise_std"]
@@ -9188,13 +14425,28 @@ class EnvironmentPrior:
                         generator=state_noise_generator,
                     )
                 state_next = state_next + state_noise_t * env["state_noise_std"]
-            state_next = self._apply_state_postprocess(
-                state_next_raw=state_next,
-                state_prev=state_t,
-                state_clip=env["state_clip"],
-                state_highway_enabled=env.get("state_highway_enabled", False),
-                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+            if not reference_semantics_enabled:
+                state_next = self._apply_state_postprocess(
+                    state_next_raw=state_next,
+                    state_prev=state_t,
+                    state_clip=env["state_clip"],
+                    state_highway_enabled=env.get("state_highway_enabled", False),
+                    state_highway_lambda=env.get("state_highway_lambda", 0.0),
+                )
+            state_next = self._apply_state_full_rms(
+                state_next,
+                enabled=env.get("state_full_rms_enabled", False),
+                target=env.get("state_full_rms_target", 1.0),
             )
+            aev5_next_step_aux = None
+            if aev5_next_enabled:
+                state_next, aev5_next_step_aux = self._apply_aev5_next_state_update(
+                    state_prev=state_t,
+                    state_next_post=state_next,
+                    prev_delta=aev5_next_prev_delta,
+                    reward_next=reward_next,
+                    aev5_next_cfg=aev5_next_cfg,
+                )
             aev4_step_aux = None
             if aev4_enabled:
                 state_next, aev4_step_aux = self._apply_aev4_state_update(
@@ -9209,6 +14461,9 @@ class EnvironmentPrior:
             if aev3_enabled and (aev3_prev_delta is not None):
                 self._aev3_update_accumulator(aev3_acc, aev3_prev_delta, state_delta, aev3_cfg)
             aev3_prev_delta = state_delta
+            if aev5_next_enabled:
+                self._aev5_next_update_accumulator(aev5_next_acc, aev5_next_step_aux)
+            aev5_next_prev_delta = state_delta
             if aev4_enabled and (aev4_prev_delta is not None):
                 self._aev4_update_accumulator(aev4_acc, aev4_prev_delta, state_delta, aev4_cfg, step_aux=aev4_step_aux)
             aev4_prev_delta = state_delta
@@ -9217,15 +14472,19 @@ class EnvironmentPrior:
                 if y_steps is not None:
                     y_steps[t] = reward_next.detach()
                 tbptt_reward_buffer.append(reward_next)
+                if tbptt_log_prob_buffer is not None:
+                    tbptt_log_prob_buffer.append(reinforce_log_prob_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
+                if log_prob_steps is not None and reinforce_log_prob_t is not None:
+                    log_prob_steps[t] = reinforce_log_prob_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = torch.abs(state_next).max().detach()
 
             state_t = state_next
-            action_t = action_next
+            action_t = action_env
             reward_t = reward_next.reshape(())
             reward_mask_t = reward_mask_next.reshape(())
 
@@ -9234,6 +14493,10 @@ class EnvironmentPrior:
                 if is_window_end:
                     rewards_window = torch.stack(tbptt_reward_buffer, dim=0).reshape(-1, 1)
                     tbptt_reward_buffer = []
+                    log_probs_window = None
+                    if tbptt_log_prob_buffer is not None:
+                        log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0).reshape(-1, 1)
+                        tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -9243,12 +14506,22 @@ class EnvironmentPrior:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
                             aev3_prev_delta = aev3_prev_delta.detach()
+                        if aev5_next_prev_delta is not None:
+                            aev5_next_prev_delta = aev5_next_prev_delta.detach()
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
                     if tbptt_reward_sink is not None:
-                        if aev2_streaming_sink or aev3_streaming_sink or aev4_streaming_sink:
+                        if (
+                            aev2_streaming_sink
+                            or aev3_streaming_sink
+                            or aev4_streaming_sink
+                            or aev5_next_streaming_sink
+                            or reinforce_streaming_sink
+                        ):
                             payload_aux = {}
+                            if reinforce_streaming_sink and (log_probs_window is not None):
+                                payload_aux["reinforce"] = {"log_probs": log_probs_window}
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -9291,6 +14564,24 @@ class EnvironmentPrior:
                                     dtype=state_t.dtype,
                                     aev4_cfg=aev4_cfg,
                                 )
+                            if aev5_next_streaming_sink:
+                                aev5_next_window_summary = self._aev5_next_finalize_accumulator(
+                                    aev5_next_acc,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                )
+                                payload_aux["aev5_next"] = aev5_next_window_summary
+                                self._aev5_next_accumulate_window_summary(
+                                    aev5_next_det_acc,
+                                    aev5_next_window_summary,
+                                    device=device,
+                                )
+                                aev5_next_acc = self._aev5_next_new_accumulator(
+                                    aev5_next_enabled,
+                                    device=device,
+                                    dtype=state_t.dtype,
+                                    aev5_next_cfg=aev5_next_cfg,
+                                )
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
                                 tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
                             else:
@@ -9317,6 +14608,8 @@ class EnvironmentPrior:
                 "reward_max": float(rewards_for_stats.max().cpu()),
                 "reward_std": float(rewards_for_stats.std(unbiased=False).cpu()),
                 "state_abs_max": float(state_abs_for_stats.max().cpu()),
+                "action_noise_train_std": float(env["action_noise_train_std"]),
+                "action_noise_eval_std": float(env["action_noise_eval_std"]),
                 "reward_dropout_ratio": float(env["reward_dropout_ratio"]),
                 "reward_drop_frac_realized": float(reward_drop_count / max(1, int(n_samples))),
                 "state_highway_enabled": bool(env.get("state_highway_enabled", False)),
@@ -9328,6 +14621,11 @@ class EnvironmentPrior:
             }
         else:
             info = None
+        self.last_rollout_reinforce = (
+            {"log_probs": log_prob_steps.reshape(n_samples, 1)}
+            if (reinforce_enabled and log_prob_steps is not None)
+            else None
+        )
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -9382,6 +14680,22 @@ class EnvironmentPrior:
                 )
         else:
             self.last_rollout_v4 = None
+        if aev5_next_enabled:
+            if aev5_next_streaming_sink:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_det_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                )
+            else:
+                self.last_rollout_v5_next = self._aev5_next_finalize_accumulator(
+                    aev5_next_acc,
+                    device=device,
+                    dtype=state_t.dtype,
+                )
+        else:
+            self.last_rollout_v5_next = None
+        self.last_rollout_lipschitz_audit = env.get("lipschitz_audit", None) if isinstance(env, dict) else None
         return x, y, info
 
     def _get_rollout_executor(self, workers):
@@ -9479,21 +14793,70 @@ class EnvironmentPrior:
         action_dim = int(env["action_dim"])
         noise_dim = int(env["noise_dim"])
         zero_pad_dim = int(env["zero_pad_dim"])
+        reference_semantics_enabled = bool(self._env_uses_reference_semantics(env))
+        env_layout = self._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
         obs_slot_dim = int(env["obs_slot_dim"])
         action_slot_dim = int(env["action_slot_dim"])
+        init_state_std = env.get("init_state_std", 0.0)
+        if not torch.is_tensor(init_state_std):
+            init_state_std = torch.full((batch_size,), float(init_state_std), device=device, dtype=torch.float32)
+        else:
+            init_state_std = init_state_std.to(device=device, dtype=torch.float32)
+        init_action_std = env.get("init_action_std", 0.0)
+        if not torch.is_tensor(init_action_std):
+            init_action_std = torch.full((batch_size,), float(init_action_std), device=device, dtype=torch.float32)
+        else:
+            init_action_std = init_action_std.to(device=device, dtype=torch.float32)
+        action_noise_train_std = env.get("action_noise_train_std", 0.0)
+        if not torch.is_tensor(action_noise_train_std):
+            action_noise_train_std = torch.full((batch_size,), float(action_noise_train_std), device=device, dtype=torch.float32)
+        else:
+            action_noise_train_std = action_noise_train_std.to(device=device, dtype=torch.float32)
+        action_noise_eval_std = env.get("action_noise_eval_std", 0.0)
+        if not torch.is_tensor(action_noise_eval_std):
+            action_noise_eval_std = torch.full((batch_size,), float(action_noise_eval_std), device=device, dtype=torch.float32)
+        else:
+            action_noise_eval_std = action_noise_eval_std.to(device=device, dtype=torch.float32)
+        state_noise_std = env.get("state_noise_std", 0.0)
+        if not torch.is_tensor(state_noise_std):
+            state_noise_std = torch.full((batch_size,), float(state_noise_std), device=device, dtype=torch.float32)
+        else:
+            state_noise_std = state_noise_std.to(device=device, dtype=torch.float32)
+        reward_dropout_enabled = env.get("reward_dropout_enabled", False)
+        if not torch.is_tensor(reward_dropout_enabled):
+            reward_dropout_enabled = torch.full((batch_size,), bool(reward_dropout_enabled), device=device, dtype=torch.bool)
+        else:
+            reward_dropout_enabled = reward_dropout_enabled.to(device=device, dtype=torch.bool)
+        reward_dropout_ratio = env.get("reward_dropout_ratio", 0.0)
+        if not torch.is_tensor(reward_dropout_ratio):
+            reward_dropout_ratio = torch.full((batch_size,), float(reward_dropout_ratio), device=device, dtype=torch.float32)
+        else:
+            reward_dropout_ratio = reward_dropout_ratio.to(device=device, dtype=torch.float32)
+        reward_impute_zero = env.get("reward_dropout_impute_zero", True)
+        if not torch.is_tensor(reward_impute_zero):
+            reward_impute_zero = torch.full((batch_size,), bool(reward_impute_zero), device=device, dtype=torch.bool)
+        else:
+            reward_impute_zero = reward_impute_zero.to(device=device, dtype=torch.bool)
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
             (batch_size, state_dim),
             device=device,
             dtype=torch.float32,
-        ) * env["init_state_std"]
+        ) * init_state_std[:, None]
         action_t = self._stack_randn_with_generators(
             rollout_generators,
             (batch_size, action_dim),
             device=device,
             dtype=torch.float32,
-        ) * env["init_action_std"]
+        ) * init_action_std[:, None]
         reward_t = torch.zeros((batch_size,), device=device, dtype=torch.float32)
         reward_mask_t = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
@@ -9512,21 +14875,21 @@ class EnvironmentPrior:
         action_noise_train = None
         action_noise_eval = None
         state_noise = None
-        if env["action_noise_train_std"] > 0:
+        if torch.any(action_noise_train_std > 0):
             action_noise_train = self._stack_randn_with_generators(
                 rollout_generators,
                 (batch_size, n_samples, action_dim),
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1)
-        if env["action_noise_eval_std"] > 0:
+        if torch.any(action_noise_eval_std > 0):
             action_noise_eval = self._stack_randn_with_generators(
                 rollout_generators,
                 (batch_size, n_samples, action_dim),
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1)
-        if env["state_noise_std"] > 0:
+        if torch.any(state_noise_std > 0):
             state_noise = self._stack_randn_with_generators(
                 rollout_generators,
                 (batch_size, n_samples, state_dim),
@@ -9534,7 +14897,7 @@ class EnvironmentPrior:
                 dtype=torch.float32,
             ).transpose(0, 1)
         dropout_draws = None
-        if env["reward_dropout_enabled"] and env["reward_dropout_ratio"] > 0.0:
+        if torch.any(reward_dropout_enabled & (reward_dropout_ratio > 0.0)):
             dropout_draws = self._stack_rand_with_generators(
                 rollout_generators,
                 (batch_size, n_samples),
@@ -9548,21 +14911,21 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
 
-        env_total_dim = state_dim + obs_dim + action_dim + noise_dim + zero_pad_dim
+        env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
-        env_obs_start = state_dim
-        env_action_start = state_dim + obs_dim
-        env_noise_start = env_action_start + action_dim
+        env_obs_start = env_layout["obs_start"]
+        env_action_start = env_layout["action_start"]
+        env_noise_start = env_layout["noise_start"]
 
-        alpha = float(env["alpha"])
-        reward_scale = float(env["reward_scale"])
-        reward_clip = float(env.get("reward_clip", 10.0))
-        state_clip = float(env["state_clip"])
-        action_noise_train_std = float(env["action_noise_train_std"])
-        action_noise_eval_std = float(env["action_noise_eval_std"])
-        state_noise_std = float(env["state_noise_std"])
-        reward_dropout_ratio = float(env["reward_dropout_ratio"])
-        reward_impute_zero = bool(env["reward_dropout_impute_zero"])
+        alpha = env["alpha"].to(device=device, dtype=torch.float32) if torch.is_tensor(env["alpha"]) else torch.full((batch_size,), float(env["alpha"]), device=device, dtype=torch.float32)
+        reward_scale = env["reward_scale"].to(device=device, dtype=torch.float32) if torch.is_tensor(env["reward_scale"]) else torch.full((batch_size,), float(env["reward_scale"]), device=device, dtype=torch.float32)
+        reward_clip = env.get("reward_clip", torch.full((batch_size,), float("inf"), device=device, dtype=torch.float32))
+        if not torch.is_tensor(reward_clip):
+            reward_clip = torch.full((batch_size,), float(reward_clip), device=device, dtype=torch.float32)
+        else:
+            reward_clip = reward_clip.to(device=device, dtype=torch.float32)
+        state_clip = env["state_clip"].to(device=device, dtype=torch.float32) if torch.is_tensor(env["state_clip"]) else torch.full((batch_size,), float(env["state_clip"]), device=device, dtype=torch.float32)
+        state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -9579,8 +14942,9 @@ class EnvironmentPrior:
                 token_row[:, token_action_start: token_action_start + action_write] = action_t[:, :action_write]
 
             noise_t = transition_noise[t]
-            env_in[:, :state_dim] = state_t
-            env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
+            env_in[:, :state_dim] = self._scale_state_env_input(state_t, state_input_scale)
+            if env_obs_start is not None:
+                env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
             env_in[:, env_action_start: env_action_start + action_dim] = action_t
             env_in[:, env_noise_start: env_noise_start + noise_dim] = noise_t
             if rollout_generators is None:
@@ -9590,44 +14954,66 @@ class EnvironmentPrior:
                 for bi, g in enumerate(rollout_generators):
                     action_next[bi] = torch.tanh(env["policy_generator"](env_in[bi: bi + 1], generator=g).squeeze(0))
 
-            if t < single_eval_pos:
+            if (not reference_semantics_enabled) and t < single_eval_pos:
                 if action_noise_train is not None:
-                    action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_train_std)
-            elif action_noise_eval is not None:
-                action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_eval_std)
+                    action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_train_std[:, None])
+            elif (not reference_semantics_enabled) and action_noise_eval is not None:
+                action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_eval_std[:, None])
 
             env_in[:, env_action_start: env_action_start + action_dim] = action_next
-            if rollout_generators is None:
+            transition_generator = env.get("transition_generator", None)
+            if callable(transition_generator):
+                x_next, reward_unit = transition_generator(
+                    env_in,
+                    generators_for_noise=rollout_generators,
+                )
+                reward_next_raw = reward_scale * reward_unit.reshape(batch_size)
+            elif rollout_generators is None:
                 reward_next_raw = reward_scale * env["y_generator"](env_in).reshape(batch_size)
             else:
                 reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
                 for bi, g in enumerate(rollout_generators):
-                    reward_next_raw[bi] = reward_scale * env["y_generator"](env_in[bi: bi + 1], generator=g).reshape(())
-            reward_next = torch.clamp(reward_next_raw, -reward_clip, reward_clip)
+                    reward_next_raw[bi] = reward_scale[bi] * env["y_generator"](
+                        env_in[bi: bi + 1],
+                        generator=g,
+                    ).reshape(())
+            reward_next = torch.maximum(torch.minimum(reward_next_raw, reward_clip), -reward_clip)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
             if dropout_draws is not None:
                 drop_mask = dropout_draws[t] < reward_dropout_ratio
                 reward_drop_count = reward_drop_count + drop_mask.to(dtype=torch.int64)
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
-                if reward_impute_zero:
-                    reward_next = torch.where(drop_mask, torch.zeros_like(reward_next), reward_next)
+                reward_next = torch.where(reward_impute_zero & drop_mask, torch.zeros_like(reward_next), reward_next)
+            reward_next = self._transform_rollout_reward(
+                reward_next,
+                mode=env.get("reinforce_reward_transform", "none"),
+                tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+            )
 
-            if rollout_generators is None:
-                x_next = env["x_generator"](env_in)
-            else:
-                x_next = torch.empty((batch_size, state_dim), device=device, dtype=torch.float32)
-                for bi, g in enumerate(rollout_generators):
-                    x_next[bi] = env["x_generator"](env_in[bi: bi + 1], generator=g).squeeze(0)
-            state_next = (1.0 - alpha) * state_t + alpha * x_next
+            if not callable(transition_generator):
+                if rollout_generators is None:
+                    x_next = env["x_generator"](env_in)
+                else:
+                    x_next = torch.empty((batch_size, state_dim), device=device, dtype=torch.float32)
+                    for bi, g in enumerate(rollout_generators):
+                        x_next[bi] = env["x_generator"](env_in[bi: bi + 1], generator=g).squeeze(0)
+            state_next = (1.0 - alpha[:, None]) * state_t + alpha[:, None] * x_next
             if state_noise is not None:
-                state_next = state_next + state_noise[t] * state_noise_std
-            state_next = self._apply_state_postprocess(
-                state_next_raw=state_next,
-                state_prev=state_t,
-                state_clip=state_clip,
-                state_highway_enabled=env.get("state_highway_enabled", False),
-                state_highway_lambda=env.get("state_highway_lambda", 0.0),
+                state_next = state_next + state_noise[t] * state_noise_std[:, None]
+            if not reference_semantics_enabled:
+                state_next = self._apply_state_postprocess(
+                    state_next_raw=state_next,
+                    state_prev=state_t,
+                    state_clip=state_clip,
+                    state_highway_enabled=env.get("state_highway_enabled", False),
+                    state_highway_lambda=env.get("state_highway_lambda", 0.0),
+                )
+            state_next = self._apply_state_full_rms(
+                state_next,
+                enabled=env.get("state_full_rms_enabled", False),
+                target=env.get("state_full_rms_target", 1.0),
             )
 
             y_steps[t] = reward_next
@@ -9664,6 +15050,10 @@ class EnvironmentPrior:
             shared_environment = self._resolve_batch_shared_environment()
             strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
             h_list = self._sample_batch_hypers(batch_size)
+            # Keep per-sample seed locking for semantic A/B only. Exact-reference
+            # training must not implicitly force strict-seed rollout mode because
+            # that disables transition stream fusion and other hot-loop
+            # throughput paths.
             env_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
             rollout_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
 
@@ -9818,6 +15208,7 @@ class EnvironmentPrior:
         env_seeds_override=None,
         rollout_seeds_override=None,
         store_rewards=True,
+        policy_objective_kind="policy_gradient",
     ):
         """
         Differentiable rollout for policy optimization.
@@ -9834,15 +15225,25 @@ class EnvironmentPrior:
         batch_size = int(batch_size)
         num_features = int(num_features)
         collect_runtime_info = bool(collect_runtime_info)
-        self.last_rollout_profile = None
-        self.last_rollout_v2 = None
-        self.last_rollout_v3 = None
+        self.clear_rollout_artifacts()
         store_rewards = bool(store_rewards)
+        reinforce_enabled = str(policy_objective_kind).strip().lower() == "reinforce"
+        tbptt_window_active = False
+        if tbptt_window is not None:
+            try:
+                tbptt_window_active = 0 < int(tbptt_window) < n_samples
+            except Exception:
+                tbptt_window_active = False
         x = torch.empty((n_samples, batch_size, num_features), device=device, dtype=torch.float32) if collect_x else None
         rewards = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if store_rewards
             else torch.empty((0, batch_size), device=device, dtype=torch.float32)
+        )
+        reinforce_log_probs = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if reinforce_enabled and (tbptt_reward_sink is None) and (not tbptt_window_active)
+            else None
         )
         infos = [None] * batch_size
 
@@ -9882,6 +15283,8 @@ class EnvironmentPrior:
             rollout_v2_acc = None
             rollout_v3_acc = None
             rollout_v4_acc = None
+            rollout_v5_next_acc = None
+            rollout_lipschitz_acc = None
 
             for group in grouped.values():
                 group_indices = [idx for idx, _ in group]
@@ -9912,6 +15315,7 @@ class EnvironmentPrior:
                         tbptt_reward_sink=tbptt_reward_sink,
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
+                        policy_objective_kind=policy_objective_kind,
                     )
                 else:
                     env_batch = self._sample_environment_batch(
@@ -9934,11 +15338,16 @@ class EnvironmentPrior:
                         tbptt_reward_sink=tbptt_reward_sink,
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
+                        policy_objective_kind=policy_objective_kind,
                     )
                 if collect_x:
                     x[:, group_indices] = x_group
                 if store_rewards:
                     rewards[:, group_indices] = y_group
+                if reinforce_log_probs is not None:
+                    group_reinforce = self.last_rollout_reinforce
+                    if isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
+                        reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
                 for local_idx, global_idx in enumerate(group_indices):
                     infos[global_idx] = infos_group[local_idx]
                 group_v2 = self.last_rollout_v2
@@ -9962,6 +15371,20 @@ class EnvironmentPrior:
                     rollout_v4_acc,
                     group_v4,
                     batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                group_v5_next = self.last_rollout_v5_next
+                rollout_v5_next_acc = self._aev5_next_merge_rollout_summary(
+                    rollout_v5_next_acc,
+                    group_v5_next,
+                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
+                    device=device,
+                    dtype=torch.float32,
+                )
+                rollout_lipschitz_acc = self._merge_lipschitz_audit_summary(
+                    rollout_lipschitz_acc,
+                    self.last_rollout_lipschitz_audit,
                     device=device,
                     dtype=torch.float32,
                 )
@@ -10020,6 +15443,14 @@ class EnvironmentPrior:
                             "noise_block_size": 0,
                             "steps": int(n_samples),
                             "batch_size": int(batch_size),
+                            "env_count": 0,
+                            "strict_joint_transition_count": 0,
+                            "reference_semantics_count": 0,
+                            "exact_scm_count": 0,
+                            "exact_gp_count": 0,
+                            "fixed_gp_count": 0,
+                            "legacy_scm_count": 0,
+                            "legacy_gp_count": 0,
                         }
                     rollout_profile_acc["policy_cuda_ms"] += float(group_profile.get("policy_cuda_ms", 0.0))
                     rollout_profile_acc["transition_cuda_ms"] += float(group_profile.get("transition_cuda_ms", 0.0))
@@ -10180,6 +15611,17 @@ class EnvironmentPrior:
                         group_noise_block_size = 0
                     if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
                         rollout_profile_acc["noise_block_size"] = group_noise_block_size
+                    for key in (
+                        "env_count",
+                        "strict_joint_transition_count",
+                        "reference_semantics_count",
+                        "exact_scm_count",
+                        "exact_gp_count",
+                        "fixed_gp_count",
+                        "legacy_scm_count",
+                        "legacy_gp_count",
+                    ):
+                        rollout_profile_acc[key] += int(group_profile.get(key, 0) or 0)
             if rollout_profile_acc is not None:
                 rollout_profile_acc["transition_bucket_mean_batch"] = float(
                     batch_size / max(1, int(rollout_profile_acc.get("transition_group_count", 0) or 0))
@@ -10188,7 +15630,27 @@ class EnvironmentPrior:
                     float(rollout_profile_acc.get("transition_work_actual_est", 0.0) or 0.0)
                     / max(1e-9, float(rollout_profile_acc.get("transition_work_padded_est", 0.0) or 0.0))
                 )
+                rollout_profile_acc = self._finalize_env_semantics_summary(rollout_profile_acc)
             self.last_rollout_profile = rollout_profile_acc
+            self.last_rollout_env_semantics = (
+                {
+                    key: rollout_profile_acc[key]
+                    for key in (
+                        "env_count",
+                        "strict_joint_transition_count",
+                        "strict_joint_transition_share",
+                        "reference_semantics_count",
+                        "reference_semantics_share",
+                        "exact_scm_count",
+                        "exact_gp_count",
+                        "legacy_scm_count",
+                        "legacy_gp_count",
+                        "transition_reference_mode",
+                    )
+                }
+                if isinstance(rollout_profile_acc, dict)
+                else None
+            )
             self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
                 rollout_v2_acc,
                 device=device,
@@ -10204,6 +15666,23 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             )
+            self.last_rollout_v5_next = self._aev5_next_finalize_rollout_summary(
+                rollout_v5_next_acc,
+                device=device,
+                dtype=torch.float32,
+            )
+            self.last_rollout_reinforce = (
+                {"log_probs": reinforce_log_probs}
+                if reinforce_log_probs is not None
+                else None
+            )
+            self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
+                rollout_lipschitz_acc
+                if rollout_lipschitz_acc is not None
+                else self._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
+                device=device,
+                dtype=torch.float32,
+            )
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
                 "x": x,
@@ -10214,12 +15693,18 @@ class EnvironmentPrior:
                 "aev2": self.last_rollout_v2,
                 "aev3": self.last_rollout_v3,
                 "aev4": self.last_rollout_v4,
+                "aev5_next": self.last_rollout_v5_next,
+                "reinforce": self.last_rollout_reinforce,
+                "lipschitz_audit": self.last_rollout_lipschitz_audit,
             }
 
         # Fallback serial baseline for explicit non-vectorized backend.
         rollout_v2_acc = None
         rollout_v3_acc = None
         rollout_v4_acc = None
+        rollout_v5_next_acc = None
+        rollout_lipschitz_acc = None
+        rollout_env_semantics_acc = None
         for b, h in enumerate(h_list):
             env = self._sample_environment(
                 h=h,
@@ -10240,11 +15725,16 @@ class EnvironmentPrior:
                 tbptt_reward_sink=tbptt_reward_sink,
                 tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                 store_rewards=store_rewards,
+                policy_objective_kind=policy_objective_kind,
             )
             if collect_x:
                 x[:, b] = x_one
             if store_rewards:
                 rewards[:, b] = y_one
+            if reinforce_log_probs is not None:
+                rollout_reinforce_one = self.last_rollout_reinforce
+                if isinstance(rollout_reinforce_one, dict) and torch.is_tensor(rollout_reinforce_one.get("log_probs", None)):
+                    reinforce_log_probs[:, b] = rollout_reinforce_one["log_probs"].reshape(n_samples)
             infos[b] = info
             rollout_v2_acc = self._aev2_merge_rollout_summary(
                 rollout_v2_acc,
@@ -10267,8 +15757,47 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             )
+            rollout_v5_next_acc = self._aev5_next_merge_rollout_summary(
+                rollout_v5_next_acc,
+                self.last_rollout_v5_next,
+                batch_weight=(1.0 / float(max(1, batch_size))),
+                device=device,
+                dtype=torch.float32,
+            )
+            rollout_lipschitz_acc = self._merge_lipschitz_audit_summary(
+                rollout_lipschitz_acc,
+                self.last_rollout_lipschitz_audit,
+                device=device,
+                dtype=torch.float32,
+            )
+            rollout_env_semantics_acc = self._merge_env_semantics_summary(
+                rollout_env_semantics_acc,
+                self._summarize_env_semantics(env, 1),
+            )
         self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
-        self.last_rollout_profile = None
+        self.last_rollout_profile = self._finalize_env_semantics_summary(rollout_env_semantics_acc)
+        if isinstance(self.last_rollout_profile, dict):
+            self.last_rollout_profile["steps"] = int(n_samples)
+            self.last_rollout_profile["batch_size"] = int(batch_size)
+        self.last_rollout_env_semantics = (
+            {
+                key: self.last_rollout_profile[key]
+                for key in (
+                    "env_count",
+                    "strict_joint_transition_count",
+                    "strict_joint_transition_share",
+                    "reference_semantics_count",
+                    "reference_semantics_share",
+                    "exact_scm_count",
+                    "exact_gp_count",
+                    "legacy_scm_count",
+                    "legacy_gp_count",
+                    "transition_reference_mode",
+                )
+            }
+            if isinstance(self.last_rollout_profile, dict)
+            else None
+        )
         self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
             rollout_v2_acc,
             device=device,
@@ -10284,6 +15813,23 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        self.last_rollout_v5_next = self._aev5_next_finalize_rollout_summary(
+            rollout_v5_next_acc,
+            device=device,
+            dtype=torch.float32,
+        )
+        self.last_rollout_reinforce = (
+            {"log_probs": reinforce_log_probs}
+            if reinforce_log_probs is not None
+            else None
+        )
+        self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
+            rollout_lipschitz_acc
+            if rollout_lipschitz_acc is not None
+            else self._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
+            device=device,
+            dtype=torch.float32,
+        )
         return {
             "x": x,
             "rewards": rewards,
@@ -10293,6 +15839,9 @@ class EnvironmentPrior:
             "aev2": self.last_rollout_v2,
             "aev3": self.last_rollout_v3,
             "aev4": self.last_rollout_v4,
+            "aev5_next": self.last_rollout_v5_next,
+            "reinforce": self.last_rollout_reinforce,
+            "lipschitz_audit": self.last_rollout_lipschitz_audit,
         }
 
     def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True, return_stats=False):
@@ -10321,6 +15870,141 @@ class EnvironmentPrior:
             }
         return normalized
 
+    @staticmethod
+    def _squashed_gaussian_log_prob(pre_tanh_action, action_mean, action_std, *, action=None, mask=None, eps=1e-6):
+        if pre_tanh_action.shape != action_mean.shape:
+            raise ValueError(
+                "pre_tanh_action and action_mean must have identical shape, "
+                f"got {tuple(pre_tanh_action.shape)} and {tuple(action_mean.shape)}"
+            )
+        if action is None:
+            action = torch.tanh(pre_tanh_action)
+        std = action_std
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+        std = std.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+        while std.ndim < pre_tanh_action.ndim:
+            std = std.unsqueeze(-1)
+        std = std.expand_as(pre_tanh_action).clamp_min(float(max(1e-12, eps)))
+        log_std = torch.log(std)
+        centered = (pre_tanh_action - action_mean) / std
+        gaussian_log_prob = -0.5 * (
+            centered.square() + (2.0 * log_std) + math.log(2.0 * math.pi)
+        )
+        squash_logdet = torch.log(
+            torch.clamp(1.0 - action.square(), min=float(max(1e-12, eps)))
+        )
+        log_prob_per_dim = gaussian_log_prob - squash_logdet
+        if mask is not None:
+            mask_t = mask.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+            while mask_t.ndim < log_prob_per_dim.ndim:
+                mask_t = mask_t.unsqueeze(0)
+            log_prob_per_dim = log_prob_per_dim * mask_t
+        return log_prob_per_dim.sum(dim=-1)
+
+    @staticmethod
+    def _returns_to_go(rewards, discount):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        discount = float(max(0.0, min(1.0, discount)))
+        returns = torch.empty_like(rewards)
+        running = torch.zeros((rewards.shape[1],), device=rewards.device, dtype=rewards.dtype)
+        for t in range(int(rewards.shape[0]) - 1, -1, -1):
+            running = rewards[t] + (discount * running)
+            returns[t] = running
+        return returns
+
+    @staticmethod
+    def _leave_one_out_baseline(values):
+        if values.ndim != 2:
+            raise ValueError(f"values must have shape (T, B), got {tuple(values.shape)}")
+        batch_size = int(values.shape[1])
+        if batch_size <= 1:
+            return torch.zeros_like(values)
+        batch_sum = values.sum(dim=1, keepdim=True)
+        return (batch_sum - values) / float(batch_size - 1)
+
+    def reinforce_loss_from_rewards(
+        self,
+        rewards,
+        log_probs,
+        discount=None,
+        baseline_mode="leave_one_out",
+        detach_baseline=True,
+    ):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        if log_probs.ndim != 2:
+            raise ValueError(f"log_probs must have shape (T, B), got {tuple(log_probs.shape)}")
+        if tuple(rewards.shape) != tuple(log_probs.shape):
+            raise ValueError(
+                "rewards and log_probs must share shape, "
+                f"got {tuple(rewards.shape)} and {tuple(log_probs.shape)}"
+            )
+        if discount is None:
+            discount = self._resolve_scalar(self.config.get("discount", 1.0))
+        discount = float(max(0.0, min(1.0, discount)))
+        rewards_used = rewards
+        reward_transform_stats = {
+            "mode": self._resolve_reinforce_reward_transform(self.config),
+            "tanh_c": float(self._resolve_reinforce_reward_tanh_c(self.config)),
+            "tanh_bound": float(self._resolve_reinforce_reward_tanh_bound(self.config)),
+        }
+        returns = self._returns_to_go(rewards_used, discount=discount)
+        baseline_mode = str(baseline_mode).strip().lower()
+        if baseline_mode in {"loo", "leave_one_out", "leave-one-out"}:
+            baseline = self._leave_one_out_baseline(returns)
+            baseline_mode = "leave_one_out"
+        elif baseline_mode in {"zero", "none", ""}:
+            baseline = torch.zeros_like(returns)
+            baseline_mode = "zero"
+        else:
+            raise ValueError(f"Unknown REINFORCE baseline mode: {baseline_mode}")
+        if detach_baseline:
+            baseline = baseline.detach()
+        advantages = returns - baseline
+        loss = -(advantages.detach() * log_probs).mean()
+
+        def _share(mask):
+            return mask.to(dtype=torch.float32).mean().detach()
+
+        stats = {
+            "objective": returns[0].mean().detach(),
+            "reward_mean": rewards.mean().detach(),
+            "reward_std": rewards.std(unbiased=False).detach(),
+            "reward_min": rewards.min().detach(),
+            "reward_max": rewards.max().detach(),
+            "reward_abs_max": rewards.abs().max().detach(),
+            "reward_nonfinite_share": _share(~torch.isfinite(rewards)),
+            "reward_nan_share": _share(torch.isnan(rewards)),
+            "reward_inf_share": _share(torch.isinf(rewards)),
+            "reinforce_reward_used_mean": rewards_used.mean().detach(),
+            "reinforce_reward_used_std": rewards_used.std(unbiased=False).detach(),
+            "reinforce_reward_used_abs_max": rewards_used.abs().max().detach(),
+            "reward_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+            "reward_norm_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+            "reinforce_return_mean": returns[0].mean().detach(),
+            "reinforce_return_std": returns[0].std(unbiased=False).detach(),
+            "reinforce_return_nonfinite_share": _share(~torch.isfinite(returns)),
+            "reinforce_return_nan_share": _share(torch.isnan(returns)),
+            "reinforce_return_inf_share": _share(torch.isinf(returns)),
+            "reinforce_adv_mean": advantages.mean().detach(),
+            "reinforce_adv_std": advantages.std(unbiased=False).detach(),
+            "reinforce_adv_nonfinite_share": _share(~torch.isfinite(advantages)),
+            "reinforce_adv_nan_share": _share(torch.isnan(advantages)),
+            "reinforce_adv_inf_share": _share(torch.isinf(advantages)),
+            "reinforce_log_prob_mean": log_probs.mean().detach(),
+            "reinforce_log_prob_std": log_probs.std(unbiased=False).detach(),
+            "reinforce_log_prob_nonfinite_share": _share(~torch.isfinite(log_probs)),
+            "reinforce_log_prob_nan_share": _share(torch.isnan(log_probs)),
+            "reinforce_log_prob_inf_share": _share(torch.isinf(log_probs)),
+            "reinforce_baseline_mode": baseline_mode,
+            "reinforce_reward_transform": reward_transform_stats["mode"],
+            "reinforce_reward_tanh_c": float(reward_transform_stats["tanh_c"]),
+            "reinforce_reward_tanh_bound": float(reward_transform_stats["tanh_bound"]),
+        }
+        return loss, stats
+
     def policy_gradient_loss_signature(
         self,
         normalize,
@@ -10328,6 +16012,7 @@ class EnvironmentPrior:
         detach_stats,
         eps,
         clip,
+        objective_kind="policy_gradient",
     ):
         def _fmt_float(x):
             try:
@@ -10349,8 +16034,17 @@ class EnvironmentPrior:
         aev3_cfg = self._resolve_aev3_config()
         aev4_cfg = self._resolve_aev4_config()
         aev5_cfg = self._resolve_aev5_config()
+        aev5_next_cfg = self._resolve_aev5_next_config()
+        reinforce_reward_transform = self._resolve_reinforce_reward_transform(self.config)
+        reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
+        reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+        objective_kind = str(objective_kind).strip().lower()
+        if objective_kind not in {"policy_gradient", "reinforce"}:
+            objective_kind = "policy_gradient"
+
         return (
             f"{loss_form}"
+            f"|obj={objective_kind}"
             f"|norm={int(bool(normalize))}"
             f"|disc={_fmt_float(discount)}"
             f"|detach={int(bool(detach_stats))}"
@@ -10376,6 +16070,14 @@ class EnvironmentPrior:
             f"|aev5t={_fmt_float(aev5_cfg.get('target_std', 0.0))}"
             f"|aev5slo={_fmt_float(aev5_cfg.get('scale_lo', 0.0))}"
             f"|aev5shi={_fmt_float(aev5_cfg.get('scale_hi', 0.0))}"
+            f"|aev5n={int(bool(aev5_next_cfg.get('enabled', False)))}"
+            f"|aev5nglo={_fmt_float(aev5_next_cfg.get('state_gain_lo', 0.0))}"
+            f"|aev5nghi={_fmt_float(aev5_next_cfg.get('state_gain_hi', 0.0))}"
+            f"|aev5nslo={_fmt_float(aev5_next_cfg.get('state_rms_lo', 0.0))}"
+            f"|aev5nshi={_fmt_float(aev5_next_cfg.get('state_rms_hi', 0.0))}"
+            f"|rrtx={reinforce_reward_transform}"
+            f"|rrtc={_fmt_float(reinforce_reward_tanh_c)}"
+            f"|rrtb={_fmt_float(reinforce_reward_tanh_bound)}"
         )
 
     def policy_gradient_loss_from_rewards(
@@ -10387,6 +16089,7 @@ class EnvironmentPrior:
         eps=None,
         clip=None,
         aev5_cfg=None,
+        aev5_next_cfg=None,
     ):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
@@ -10435,12 +16138,39 @@ class EnvironmentPrior:
         loss = -objective
         reward_std_for_scale = rewards.std(unbiased=False)
 
+        if aev5_next_cfg is None:
+            aev5_next_cfg = self._resolve_aev5_next_config()
+        aev5_next_enabled = bool(aev5_next_cfg.get("enabled", False))
         if aev5_cfg is None:
             aev5_cfg = self._resolve_aev5_config()
-        aev5_enabled = bool(aev5_cfg.get("enabled", False))
-        aev5_scale_raw = torch.ones((), device=rewards.device, dtype=rewards.dtype)
-        aev5_scale = torch.ones((), device=rewards.device, dtype=rewards.dtype)
-        if aev5_enabled:
+        aev5_enabled = bool(aev5_cfg.get("enabled", False)) and (not aev5_next_enabled)
+
+        loss_scale_raw = torch.ones((), device=rewards.device, dtype=rewards.dtype)
+        loss_scale = torch.ones((), device=rewards.device, dtype=rewards.dtype)
+        loss_scale_name = None
+        if aev5_next_enabled:
+            std_ref = reward_std_for_scale
+            if bool(aev5_next_cfg.get("detach_reference", True)):
+                std_ref = std_ref.detach()
+            eps_loss = float(aev5_next_cfg.get("eps", 1e-6))
+            target_std = float(aev5_next_cfg.get("loss_target_std", 0.25))
+            scale_lo = float(aev5_next_cfg.get("loss_scale_lo", 0.5))
+            scale_hi = float(aev5_next_cfg.get("loss_scale_hi", 4.0))
+            loss_scale_raw = torch.as_tensor(
+                target_std,
+                device=std_ref.device,
+                dtype=std_ref.dtype,
+            ) / (std_ref + float(max(1e-12, eps_loss)))
+            loss_scale = torch.clamp(loss_scale_raw, min=scale_lo, max=scale_hi)
+            loss_scale = torch.nan_to_num(
+                loss_scale,
+                nan=1.0,
+                posinf=float(scale_hi),
+                neginf=float(scale_lo),
+            )
+            loss_scale_name = "aev5_next"
+            loss = loss * loss_scale
+        elif aev5_enabled:
             std_ref = reward_std_for_scale
             if bool(aev5_cfg.get("detach_reference", True)):
                 std_ref = std_ref.detach()
@@ -10448,19 +16178,20 @@ class EnvironmentPrior:
             target_std = float(aev5_cfg.get("target_std", 0.25))
             scale_lo = float(aev5_cfg.get("scale_lo", 0.5))
             scale_hi = float(aev5_cfg.get("scale_hi", 4.0))
-            aev5_scale_raw = torch.as_tensor(
+            loss_scale_raw = torch.as_tensor(
                 target_std,
                 device=std_ref.device,
                 dtype=std_ref.dtype,
             ) / (std_ref + float(max(1e-12, eps_aev5)))
-            aev5_scale = torch.clamp(aev5_scale_raw, min=scale_lo, max=scale_hi)
-            aev5_scale = torch.nan_to_num(
-                aev5_scale,
+            loss_scale = torch.clamp(loss_scale_raw, min=scale_lo, max=scale_hi)
+            loss_scale = torch.nan_to_num(
+                loss_scale,
                 nan=1.0,
                 posinf=float(scale_hi),
                 neginf=float(scale_lo),
             )
-            loss = loss * aev5_scale
+            loss_scale_name = "aev5"
+            loss = loss * loss_scale
 
         stats = {
             "objective": objective.detach(),
@@ -10477,15 +16208,34 @@ class EnvironmentPrior:
             stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
             stats["aev5_scale_lo"] = float(aev5_cfg.get("scale_lo", 0.5))
             stats["aev5_scale_hi"] = float(aev5_cfg.get("scale_hi", 4.0))
-            stats["aev5_loss_mul"] = aev5_scale.detach().to(dtype=torch.float32)
-            stats["aev5_scale"] = aev5_scale.detach().to(dtype=torch.float32)
-            stats["aev5_scale_raw"] = aev5_scale_raw.detach().to(dtype=torch.float32)
+            stats["aev5_loss_mul"] = loss_scale.detach().to(dtype=torch.float32)
+            stats["aev5_scale"] = loss_scale.detach().to(dtype=torch.float32)
+            stats["aev5_scale_raw"] = loss_scale_raw.detach().to(dtype=torch.float32)
             stats["aev5_reward_std_ref"] = (
                 reward_std_for_scale.detach().to(dtype=torch.float32)
             )
             stats["objective_with_aev5"] = (
-                objective.detach() * aev5_scale.detach().to(dtype=objective.detach().dtype)
+                objective.detach() * loss_scale.detach().to(dtype=objective.detach().dtype)
             ).to(dtype=torch.float32)
+        if aev5_next_enabled:
+            stats["aev5_next_enabled"] = int(aev5_next_enabled)
+            stats["aev5_next_loss_target_std"] = float(aev5_next_cfg.get("loss_target_std", 0.25))
+            stats["aev5_next_loss_scale_lo"] = float(aev5_next_cfg.get("loss_scale_lo", 0.5))
+            stats["aev5_next_loss_scale_hi"] = float(aev5_next_cfg.get("loss_scale_hi", 4.0))
+            stats["aev5_next_loss_mul"] = loss_scale.detach().to(dtype=torch.float32)
+            stats["aev5_next_scale"] = loss_scale.detach().to(dtype=torch.float32)
+            stats["aev5_next_scale_raw"] = loss_scale_raw.detach().to(dtype=torch.float32)
+            stats["aev5_next_reward_std_ref"] = reward_std_for_scale.detach().to(dtype=torch.float32)
+            stats["objective_with_aev5_next"] = (
+                objective.detach() * loss_scale.detach().to(dtype=objective.detach().dtype)
+            ).to(dtype=torch.float32)
+            loss_scale_det = loss_scale.detach().to(dtype=torch.float32)
+            stats["aev5_next_bias_thermostat_abs_offset"] = (loss_scale_det - 1.0).abs()
+            stats["aev5_next_bias_thermostat_log_abs_offset"] = torch.log(
+                loss_scale_det.clamp_min(float(max(1e-12, aev5_next_cfg.get("eps", 1e-6))))
+            ).abs()
+            stats["aev5_next_bias_thermostat_downscale"] = torch.clamp(1.0 - loss_scale_det, min=0.0)
+            stats["aev5_next_bias_thermostat_upscale"] = torch.clamp(loss_scale_det - 1.0, min=0.0)
         return loss, stats
 
     def rollout_policy_gradient_loss(
@@ -10508,9 +16258,14 @@ class EnvironmentPrior:
         h_list_override=None,
         env_seeds_override=None,
         rollout_seeds_override=None,
+        policy_objective_kind="policy_gradient",
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
+        objective_kind = str(policy_objective_kind).strip().lower()
+        if objective_kind not in {"policy_gradient", "reinforce"}:
+            raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
+        reinforce_enabled = objective_kind == "reinforce"
         if normalize is None:
             normalize = bool(self.config.get("policy_gradient_normalize_rewards", False))
         tbptt_window_active = False
@@ -10532,7 +16287,9 @@ class EnvironmentPrior:
         aev4_lambda_drift = float(aev4_cfg.get("lambda_drift", 0.0))
         aev4_lambda_tail = float(aev4_cfg.get("lambda_tail", 0.0))
         aev5_cfg = self._resolve_aev5_config()
-        aev5_enabled = bool(aev5_cfg.get("enabled", False))
+        aev5_next_cfg = self._resolve_aev5_next_config()
+        aev5_next_enabled = bool(aev5_next_cfg.get("enabled", False))
+        aev5_enabled = bool(aev5_cfg.get("enabled", False)) and (not aev5_next_enabled)
 
         if not tbptt_window_active:
             rollout = self.rollout_with_policy(
@@ -10545,20 +16302,34 @@ class EnvironmentPrior:
                 single_eval_pos=single_eval_pos,
                 collect_x=collect_x,
                 collect_runtime_info=False,
-                tbptt_reward_sink_supports_aux=False,
+                tbptt_reward_sink_supports_aux=bool(reinforce_enabled),
                 h_list_override=h_list_override,
                 env_seeds_override=env_seeds_override,
                 rollout_seeds_override=rollout_seeds_override,
+                policy_objective_kind=objective_kind,
             )
-            loss, stats = self.policy_gradient_loss_from_rewards(
-                rewards=rollout["rewards"],
-                normalize=normalize,
-                discount=discount,
-                detach_stats=detach_stats,
-                eps=eps,
-                clip=clip,
-                aev5_cfg=aev5_cfg,
-            )
+            if reinforce_enabled:
+                reinforce_rollout = rollout.get("reinforce", None)
+                if not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
+                    raise RuntimeError("reinforce rollout did not return log_probs")
+                loss, stats = self.reinforce_loss_from_rewards(
+                    rewards=rollout["rewards"],
+                    log_probs=reinforce_rollout["log_probs"],
+                    discount=discount,
+                    baseline_mode="leave_one_out",
+                )
+                stats["reinforce_enabled"] = 1
+            else:
+                loss, stats = self.policy_gradient_loss_from_rewards(
+                    rewards=rollout["rewards"],
+                    normalize=normalize,
+                    discount=discount,
+                    detach_stats=detach_stats,
+                    eps=eps,
+                    clip=clip,
+                    aev5_cfg=aev5_cfg,
+                    aev5_next_cfg=aev5_next_cfg,
+                )
             if aev2_enabled:
                 aev2_rollout = rollout.get("aev2", None)
                 aev2_penalty = None
@@ -10796,6 +16567,79 @@ class EnvironmentPrior:
                     stats["aev5_reward_std_ref"] = stats.get("reward_std", zero_t)
                 if "objective_with_aev5" not in stats:
                     stats["objective_with_aev5"] = stats["objective"] * stats["aev5_loss_mul"]
+            if aev5_next_enabled:
+                zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+                stats["aev5_next_enabled"] = int(aev5_next_enabled)
+                stats["aev5_next_state_gain_lo"] = float(aev5_next_cfg.get("state_gain_lo", 0.0))
+                stats["aev5_next_state_gain_hi"] = float(aev5_next_cfg.get("state_gain_hi", 0.0))
+                stats["aev5_next_state_rms_lo"] = float(aev5_next_cfg.get("state_rms_lo", 0.0))
+                stats["aev5_next_state_rms_hi"] = float(aev5_next_cfg.get("state_rms_hi", 0.0))
+                if "aev5_next_loss_mul" not in stats:
+                    stats["aev5_next_loss_mul"] = torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                if "aev5_next_scale" not in stats:
+                    stats["aev5_next_scale"] = stats["aev5_next_loss_mul"]
+                if "aev5_next_scale_raw" not in stats:
+                    stats["aev5_next_scale_raw"] = stats["aev5_next_scale"]
+                if "aev5_next_reward_std_ref" not in stats:
+                    stats["aev5_next_reward_std_ref"] = stats.get("reward_std", zero_t)
+                if "objective_with_aev5_next" not in stats:
+                    stats["objective_with_aev5_next"] = stats["objective"] * stats["aev5_next_loss_mul"]
+                loss_mul = torch.as_tensor(
+                    stats["aev5_next_loss_mul"],
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
+                stats["aev5_next_bias_thermostat_abs_offset"] = (loss_mul - 1.0).abs()
+                stats["aev5_next_bias_thermostat_log_abs_offset"] = torch.log(
+                    loss_mul.clamp_min(float(max(1e-12, aev5_next_cfg.get("eps", 1e-6))))
+                ).abs()
+                stats["aev5_next_bias_thermostat_downscale"] = torch.clamp(1.0 - loss_mul, min=0.0)
+                stats["aev5_next_bias_thermostat_upscale"] = torch.clamp(loss_mul - 1.0, min=0.0)
+                aev5_next_rollout = rollout.get("aev5_next", None)
+                if isinstance(aev5_next_rollout, dict):
+                    for key in (
+                        "gain_mean",
+                        "gain_std",
+                        "gain_min",
+                        "gain_max",
+                        "update_rms_mean",
+                        "update_rms_std",
+                        "scale_mean",
+                        "scale_max",
+                        "high_clip_share",
+                        "low_active_share",
+                        "low_boost_share",
+                        "corridor_trigger_share",
+                    ):
+                        stats[f"aev5_next_{key}"] = aev5_next_rollout.get(
+                            key,
+                            torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                        )
+                    stats["aev5_next_bias_state_trigger_share"] = aev5_next_rollout.get(
+                        "corridor_trigger_share",
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+            lipschitz_rollout = rollout.get("lipschitz_audit", None)
+            if isinstance(lipschitz_rollout, dict):
+                stats["lipschitz_audit_enabled"] = int(lipschitz_rollout.get("enabled", 0))
+                for key in (
+                    "matrix_clip_share",
+                    "matrix_tail_mass_mean",
+                    "matrix_tail_rel_mean",
+                    "matrix_projection_abs_mean",
+                    "matrix_projection_rel_mean",
+                    "matrix_projection_rel_max",
+                    "outputscale_clip_share",
+                    "outputscale_tail_mass_mean",
+                    "outputscale_tail_rel_mean",
+                    "outputscale_projection_rel_mean",
+                    "outputscale_projection_rel_max",
+                ):
+                    stats[f"lipschitz_{key}"] = torch.as_tensor(
+                        lipschitz_rollout.get(key, 0.0),
+                        device=rollout["rewards"].device,
+                        dtype=torch.float32,
+                    )
             rollout_profile = rollout.get("rollout_profile", None)
             if isinstance(rollout_profile, dict):
                 stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
@@ -10936,6 +16780,27 @@ class EnvironmentPrior:
                 )
                 stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
                 stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
+                stats["rollout_env_count"] = int(rollout_profile.get("env_count", 0) or 0)
+                stats["rollout_strict_joint_transition_count"] = int(
+                    rollout_profile.get("strict_joint_transition_count", 0) or 0
+                )
+                stats["rollout_strict_joint_transition_share"] = float(
+                    rollout_profile.get("strict_joint_transition_share", 0.0) or 0.0
+                )
+                stats["rollout_reference_semantics_count"] = int(
+                    rollout_profile.get("reference_semantics_count", 0) or 0
+                )
+                stats["rollout_reference_semantics_share"] = float(
+                    rollout_profile.get("reference_semantics_share", 0.0) or 0.0
+                )
+                stats["rollout_exact_scm_count"] = int(rollout_profile.get("exact_scm_count", 0) or 0)
+                stats["rollout_exact_gp_count"] = int(rollout_profile.get("exact_gp_count", 0) or 0)
+                stats["rollout_legacy_scm_count"] = int(rollout_profile.get("legacy_scm_count", 0) or 0)
+                stats["rollout_legacy_gp_count"] = int(rollout_profile.get("legacy_gp_count", 0) or 0)
+                stats["rollout_transition_reference_mode"] = rollout_profile.get(
+                    "transition_reference_mode",
+                    None,
+                )
             return loss, rollout, stats
 
         reward_sum = None
@@ -10990,6 +16855,16 @@ class EnvironmentPrior:
         aev5_scale_raw_accum = None
         aev5_reward_std_ref_accum = None
         aev5_objective_scaled_accum = None
+        aev5_next_scale_accum = None
+        aev5_next_scale_raw_accum = None
+        aev5_next_reward_std_ref_accum = None
+        aev5_next_objective_scaled_accum = None
+        reward_nonfinite_share_accum = None
+        reward_nan_share_accum = None
+        reward_inf_share_accum = None
+        reinforce_return_nonfinite_share_accum = None
+        reinforce_log_prob_nonfinite_share_accum = None
+        reinforce_adv_nonfinite_share_accum = None
         n_samples_f = float(max(1, n_samples))
         batch_size_f = float(max(1, batch_size))
 
@@ -11013,12 +16888,20 @@ class EnvironmentPrior:
             nonlocal aev4_update_rms_sum_accum, aev4_update_rms_sumsq_accum, aev4_update_rms_count_accum
             nonlocal aev4_clip_hit_sum_accum, aev4_clip_hit_count_accum
             nonlocal aev5_scale_accum, aev5_scale_raw_accum, aev5_reward_std_ref_accum, aev5_objective_scaled_accum
+            nonlocal aev5_next_scale_accum, aev5_next_scale_raw_accum
+            nonlocal aev5_next_reward_std_ref_accum, aev5_next_objective_scaled_accum
+            nonlocal reward_nonfinite_share_accum, reward_nan_share_accum, reward_inf_share_accum
+            nonlocal reinforce_return_nonfinite_share_accum
+            nonlocal reinforce_log_prob_nonfinite_share_accum, reinforce_adv_nonfinite_share_accum
             aev2_window = None
             aev3_window = None
             aev4_window = None
+            reinforce_window = None
             rewards_window = reward_payload
             if isinstance(reward_payload, tuple) and len(reward_payload) == 2:
                 rewards_window, aux = reward_payload
+                if isinstance(aux, dict):
+                    reinforce_window = aux.get("reinforce", None)
                 if isinstance(aux, dict) and (("aev2" in aux) or ("aev3" in aux) or ("aev4" in aux)):
                     aev2_window = aux.get("aev2", None)
                     aev3_window = aux.get("aev3", None)
@@ -11030,25 +16913,36 @@ class EnvironmentPrior:
                         aev3_window = aux
                     elif aev4_enabled:
                         aev4_window = aux
-            loss_window, stats_window = self.policy_gradient_loss_from_rewards(
-                rewards=rewards_window,
-                normalize=normalize,
-                discount=discount,
-                detach_stats=detach_stats,
-                eps=eps,
-                clip=clip,
-                aev5_cfg=aev5_cfg,
-            )
-            if aev2_enabled and isinstance(aev2_window, dict):
+            if reinforce_enabled:
+                if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
+                    raise RuntimeError("TBPTT reinforce rollout did not provide log_probs window")
+                loss_window, stats_window = self.reinforce_loss_from_rewards(
+                    rewards=rewards_window,
+                    log_probs=reinforce_window["log_probs"],
+                    discount=discount,
+                    baseline_mode="leave_one_out",
+                )
+            else:
+                loss_window, stats_window = self.policy_gradient_loss_from_rewards(
+                    rewards=rewards_window,
+                    normalize=normalize,
+                    discount=discount,
+                    detach_stats=detach_stats,
+                    eps=eps,
+                    clip=clip,
+                    aev5_cfg=aev5_cfg,
+                    aev5_next_cfg=aev5_next_cfg,
+                )
+            if (not reinforce_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     if aev2_lambda > 0.0:
                         loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
-            if aev3_enabled and isinstance(aev3_window, dict):
+            if (not reinforce_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     loss_window = loss_window + aev3_penalty_window
-            if aev4_enabled and isinstance(aev4_window, dict):
+            if (not reinforce_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     loss_window = loss_window + aev4_penalty_window
@@ -11097,6 +16991,39 @@ class EnvironmentPrior:
                         aev5_obj_scaled_term
                         if aev5_objective_scaled_accum is None
                         else (aev5_objective_scaled_accum + aev5_obj_scaled_term)
+                    )
+            if aev5_next_enabled:
+                aev5_next_scale_w = stats_window.get("aev5_next_scale", None)
+                if torch.is_tensor(aev5_next_scale_w):
+                    aev5_next_scale_term = aev5_next_scale_w.detach() * float(window_weight)
+                    aev5_next_scale_accum = (
+                        aev5_next_scale_term
+                        if aev5_next_scale_accum is None
+                        else (aev5_next_scale_accum + aev5_next_scale_term)
+                    )
+                aev5_next_scale_raw_w = stats_window.get("aev5_next_scale_raw", None)
+                if torch.is_tensor(aev5_next_scale_raw_w):
+                    aev5_next_scale_raw_term = aev5_next_scale_raw_w.detach() * float(window_weight)
+                    aev5_next_scale_raw_accum = (
+                        aev5_next_scale_raw_term
+                        if aev5_next_scale_raw_accum is None
+                        else (aev5_next_scale_raw_accum + aev5_next_scale_raw_term)
+                    )
+                aev5_next_std_ref_w = stats_window.get("aev5_next_reward_std_ref", None)
+                if torch.is_tensor(aev5_next_std_ref_w):
+                    aev5_next_std_ref_term = aev5_next_std_ref_w.detach() * float(window_weight)
+                    aev5_next_reward_std_ref_accum = (
+                        aev5_next_std_ref_term
+                        if aev5_next_reward_std_ref_accum is None
+                        else (aev5_next_reward_std_ref_accum + aev5_next_std_ref_term)
+                    )
+                aev5_next_obj_scaled_w = stats_window.get("objective_with_aev5_next", None)
+                if torch.is_tensor(aev5_next_obj_scaled_w):
+                    aev5_next_obj_scaled_term = aev5_next_obj_scaled_w.detach() * float(window_weight)
+                    aev5_next_objective_scaled_accum = (
+                        aev5_next_obj_scaled_term
+                        if aev5_next_objective_scaled_accum is None
+                        else (aev5_next_objective_scaled_accum + aev5_next_obj_scaled_term)
                     )
             if aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
@@ -11336,6 +17263,56 @@ class EnvironmentPrior:
                     if reward_norm_clip_hit_accum is None
                     else reward_norm_clip_hit_accum + reward_norm_clip_hit_w
                 )
+            reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
+            if reward_nonfinite_share_w is not None:
+                reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * float(window_weight)
+                reward_nonfinite_share_accum = (
+                    reward_nonfinite_share_w
+                    if reward_nonfinite_share_accum is None
+                    else reward_nonfinite_share_accum + reward_nonfinite_share_w
+                )
+            reward_nan_share_w = stats_window.get("reward_nan_share", None)
+            if reward_nan_share_w is not None:
+                reward_nan_share_w = reward_nan_share_w.detach() * float(window_weight)
+                reward_nan_share_accum = (
+                    reward_nan_share_w
+                    if reward_nan_share_accum is None
+                    else reward_nan_share_accum + reward_nan_share_w
+                )
+            reward_inf_share_w = stats_window.get("reward_inf_share", None)
+            if reward_inf_share_w is not None:
+                reward_inf_share_w = reward_inf_share_w.detach() * float(window_weight)
+                reward_inf_share_accum = (
+                    reward_inf_share_w
+                    if reward_inf_share_accum is None
+                    else reward_inf_share_accum + reward_inf_share_w
+                )
+            reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
+            if reinforce_return_nonfinite_share_w is not None:
+                reinforce_return_nonfinite_share_w = reinforce_return_nonfinite_share_w.detach() * float(window_weight)
+                reinforce_return_nonfinite_share_accum = (
+                    reinforce_return_nonfinite_share_w
+                    if reinforce_return_nonfinite_share_accum is None
+                    else reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w
+                )
+            reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
+            if reinforce_log_prob_nonfinite_share_w is not None:
+                reinforce_log_prob_nonfinite_share_w = (
+                    reinforce_log_prob_nonfinite_share_w.detach() * float(window_weight)
+                )
+                reinforce_log_prob_nonfinite_share_accum = (
+                    reinforce_log_prob_nonfinite_share_w
+                    if reinforce_log_prob_nonfinite_share_accum is None
+                    else reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w
+                )
+            reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
+            if reinforce_adv_nonfinite_share_w is not None:
+                reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * float(window_weight)
+                reinforce_adv_nonfinite_share_accum = (
+                    reinforce_adv_nonfinite_share_w
+                    if reinforce_adv_nonfinite_share_accum is None
+                    else reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w
+                )
 
             rewards_det = rewards_window.detach().to(dtype=torch.float64)
             if reward_sum is None:
@@ -11365,10 +17342,13 @@ class EnvironmentPrior:
             collect_runtime_info=False,
             tbptt_window=tbptt_window_size,
             tbptt_reward_sink=_tbptt_reward_sink,
-            tbptt_reward_sink_supports_aux=bool(aev2_enabled or aev3_enabled or aev4_enabled),
+            tbptt_reward_sink_supports_aux=bool(
+                reinforce_enabled or aev2_enabled or aev3_enabled or aev4_enabled or aev5_next_enabled
+            ),
             h_list_override=h_list_override,
             env_seeds_override=env_seeds_override,
             rollout_seeds_override=rollout_seeds_override,
+            policy_objective_kind=objective_kind,
         )
 
         if tbptt_loss_sink is None:
@@ -11648,9 +17628,83 @@ class EnvironmentPrior:
             "reward_min": reward_min,
             "reward_max": reward_max,
             "reward_abs_max": reward_absmax,
+            "reward_nonfinite_share": (
+                reward_nonfinite_share_accum
+                if reward_nonfinite_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            ),
+            "reward_nan_share": (
+                reward_nan_share_accum
+                if reward_nan_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            ),
+            "reward_inf_share": (
+                reward_inf_share_accum
+                if reward_inf_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            ),
             "reward_clip_hit_share": reward_clip_hit,
             "reward_norm_clip_hit_share": reward_norm_clip_hit,
         }
+        infos = rollout.get("info", None)
+        if isinstance(infos, dict):
+            infos = [infos]
+        if isinstance(infos, list):
+            info_dicts = [x for x in infos if isinstance(x, dict)]
+            if info_dicts:
+                state_abs_values = [
+                    float(x.get("state_abs_max", 0.0))
+                    for x in info_dicts
+                    if x.get("state_abs_max", None) is not None
+                ]
+                if state_abs_values:
+                    stats["state_abs_max"] = torch.as_tensor(
+                        max(state_abs_values),
+                        device=rollout["rewards"].device,
+                        dtype=torch.float32,
+                    )
+                action_std_values = []
+                for x in info_dicts:
+                    train_std = x.get("action_noise_train_std", None)
+                    eval_std = x.get("action_noise_eval_std", None)
+                    if train_std is not None:
+                        action_std_values.append(float(train_std))
+                    if eval_std is not None:
+                        action_std_values.append(float(eval_std))
+                if action_std_values:
+                    stats["action_std_min"] = torch.as_tensor(
+                        min(action_std_values),
+                        device=rollout["rewards"].device,
+                        dtype=torch.float32,
+                    )
+                    stats["action_std_max"] = torch.as_tensor(
+                        max(action_std_values),
+                        device=rollout["rewards"].device,
+                        dtype=torch.float32,
+                    )
+        if reinforce_enabled:
+            stats["reinforce_enabled"] = 1
+            stats["reinforce_baseline_mode"] = "leave_one_out"
+            stats["reinforce_return_nonfinite_share"] = (
+                reinforce_return_nonfinite_share_accum
+                if reinforce_return_nonfinite_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            )
+            stats["reinforce_log_prob_nonfinite_share"] = (
+                reinforce_log_prob_nonfinite_share_accum
+                if reinforce_log_prob_nonfinite_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            )
+            stats["reinforce_adv_nonfinite_share"] = (
+                reinforce_adv_nonfinite_share_accum
+                if reinforce_adv_nonfinite_share_accum is not None
+                else torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            )
+            if isinstance(rollout.get("reinforce", None), dict):
+                log_probs_rollout = rollout["reinforce"].get("log_probs", None)
+                if torch.is_tensor(log_probs_rollout):
+                    stats["reinforce_log_prob_mean"] = log_probs_rollout.mean().detach()
+                    stats["reinforce_log_prob_std"] = log_probs_rollout.std(unbiased=False).detach()
         if aev2_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev2_penalty_mean is None:
@@ -11811,6 +17865,106 @@ class EnvironmentPrior:
             stats["objective_with_aev5"] = (
                 aev5_objective_scaled_mean if aev5_objective_scaled_mean is not None else objective
             )
+        if aev5_next_enabled:
+            zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
+            stats["aev5_next_enabled"] = int(aev5_next_enabled)
+            stats["aev5_next_state_gain_lo"] = float(aev5_next_cfg.get("state_gain_lo", 0.0))
+            stats["aev5_next_state_gain_hi"] = float(aev5_next_cfg.get("state_gain_hi", 0.0))
+            stats["aev5_next_state_rms_lo"] = float(aev5_next_cfg.get("state_rms_lo", 0.0))
+            stats["aev5_next_state_rms_hi"] = float(aev5_next_cfg.get("state_rms_hi", 0.0))
+            if total_weight > 0.0:
+                aev5_next_scale_mean = (
+                    aev5_next_scale_accum / float(total_weight)
+                    if aev5_next_scale_accum is not None
+                    else torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                )
+                aev5_next_scale_raw_mean = (
+                    aev5_next_scale_raw_accum / float(total_weight)
+                    if aev5_next_scale_raw_accum is not None
+                    else aev5_next_scale_mean
+                )
+                aev5_next_reward_std_ref_mean = (
+                    aev5_next_reward_std_ref_accum / float(total_weight)
+                    if aev5_next_reward_std_ref_accum is not None
+                    else reward_std
+                )
+                aev5_next_objective_scaled_mean = (
+                    aev5_next_objective_scaled_accum / float(total_weight)
+                    if aev5_next_objective_scaled_accum is not None
+                    else (objective * aev5_next_scale_mean)
+                )
+            else:
+                aev5_next_scale_mean = torch.ones((), device=rollout["rewards"].device, dtype=torch.float32)
+                aev5_next_scale_raw_mean = aev5_next_scale_mean
+                aev5_next_reward_std_ref_mean = reward_std
+                aev5_next_objective_scaled_mean = objective
+            stats["aev5_next_loss_mul"] = aev5_next_scale_mean if aev5_next_scale_mean is not None else torch.ones_like(zero_t)
+            stats["aev5_next_scale"] = stats["aev5_next_loss_mul"]
+            stats["aev5_next_scale_raw"] = (
+                aev5_next_scale_raw_mean if aev5_next_scale_raw_mean is not None else stats["aev5_next_scale"]
+            )
+            stats["aev5_next_reward_std_ref"] = (
+                aev5_next_reward_std_ref_mean if aev5_next_reward_std_ref_mean is not None else reward_std
+            )
+            stats["objective_with_aev5_next"] = (
+                aev5_next_objective_scaled_mean if aev5_next_objective_scaled_mean is not None else objective
+            )
+            loss_mul = torch.as_tensor(
+                stats["aev5_next_loss_mul"],
+                device=rollout["rewards"].device,
+                dtype=torch.float32,
+            )
+            stats["aev5_next_bias_thermostat_abs_offset"] = (loss_mul - 1.0).abs()
+            stats["aev5_next_bias_thermostat_log_abs_offset"] = torch.log(
+                loss_mul.clamp_min(float(max(1e-12, aev5_next_cfg.get("eps", 1e-6))))
+            ).abs()
+            stats["aev5_next_bias_thermostat_downscale"] = torch.clamp(1.0 - loss_mul, min=0.0)
+            stats["aev5_next_bias_thermostat_upscale"] = torch.clamp(loss_mul - 1.0, min=0.0)
+            aev5_next_rollout = rollout.get("aev5_next", None)
+            if isinstance(aev5_next_rollout, dict):
+                for key in (
+                    "gain_mean",
+                    "gain_std",
+                    "gain_min",
+                    "gain_max",
+                    "update_rms_mean",
+                    "update_rms_std",
+                    "scale_mean",
+                    "scale_max",
+                    "high_clip_share",
+                    "low_active_share",
+                    "low_boost_share",
+                    "corridor_trigger_share",
+                ):
+                    stats[f"aev5_next_{key}"] = aev5_next_rollout.get(
+                        key,
+                        torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                    )
+                stats["aev5_next_bias_state_trigger_share"] = aev5_next_rollout.get(
+                    "corridor_trigger_share",
+                    torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32),
+                )
+        lipschitz_rollout = rollout.get("lipschitz_audit", None)
+        if isinstance(lipschitz_rollout, dict):
+            stats["lipschitz_audit_enabled"] = int(lipschitz_rollout.get("enabled", 0))
+            for key in (
+                "matrix_clip_share",
+                "matrix_tail_mass_mean",
+                "matrix_tail_rel_mean",
+                "matrix_projection_abs_mean",
+                "matrix_projection_rel_mean",
+                "matrix_projection_rel_max",
+                "outputscale_clip_share",
+                "outputscale_tail_mass_mean",
+                "outputscale_tail_rel_mean",
+                "outputscale_projection_rel_mean",
+                "outputscale_projection_rel_max",
+            ):
+                stats[f"lipschitz_{key}"] = torch.as_tensor(
+                    lipschitz_rollout.get(key, 0.0),
+                    device=rollout["rewards"].device,
+                    dtype=torch.float32,
+                )
         rollout_profile = rollout.get("rollout_profile", None)
         if isinstance(rollout_profile, dict):
             stats["rollout_policy_cuda_ms"] = float(rollout_profile.get("policy_cuda_ms", 0.0))
@@ -11951,6 +18105,27 @@ class EnvironmentPrior:
             )
             stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
             stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
+            stats["rollout_env_count"] = int(rollout_profile.get("env_count", 0) or 0)
+            stats["rollout_strict_joint_transition_count"] = int(
+                rollout_profile.get("strict_joint_transition_count", 0) or 0
+            )
+            stats["rollout_strict_joint_transition_share"] = float(
+                rollout_profile.get("strict_joint_transition_share", 0.0) or 0.0
+            )
+            stats["rollout_reference_semantics_count"] = int(
+                rollout_profile.get("reference_semantics_count", 0) or 0
+            )
+            stats["rollout_reference_semantics_share"] = float(
+                rollout_profile.get("reference_semantics_share", 0.0) or 0.0
+            )
+            stats["rollout_exact_scm_count"] = int(rollout_profile.get("exact_scm_count", 0) or 0)
+            stats["rollout_exact_gp_count"] = int(rollout_profile.get("exact_gp_count", 0) or 0)
+            stats["rollout_legacy_scm_count"] = int(rollout_profile.get("legacy_scm_count", 0) or 0)
+            stats["rollout_legacy_gp_count"] = int(rollout_profile.get("legacy_gp_count", 0) or 0)
+            stats["rollout_transition_reference_mode"] = rollout_profile.get(
+                "transition_reference_mode",
+                None,
+            )
         return loss, rollout, stats
 
     def get_last_coverage(self):

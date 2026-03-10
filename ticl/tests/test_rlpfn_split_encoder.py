@@ -17,7 +17,35 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
-    assert cfg["optimizer"]["rl_objective"] == "policy_gradient"
+    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["prior"]["environment"]["family"] == {
+        "distribution": "meta_choice",
+        "choice_values": ["scm"],
+    }
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_enabled"] is True
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_total_budget"] == 400
+    assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
+    assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
+    assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
+    assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
+    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 1e6
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
+        "distribution": "uniform",
+        "min": 1.0,
+        "max": 10.0,
+    }
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.2,
+    }
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.1,
+    }
     assert cfg["optimizer"]["policy_rollout_chunk_size"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is True
     assert cfg["optimizer"]["pg_grad_mutable_kv_cache"] is True
@@ -26,8 +54,8 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_autotune"] is False
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
-    assert cfg["optimizer"]["learning_rate"] == 3e-4
-    assert cfg["dataloader"]["batch_size"] == 512
+    assert cfg["optimizer"]["learning_rate"] == 4e-4
+    assert cfg["dataloader"]["batch_size"] == 1024
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False
@@ -52,12 +80,23 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["train_kernel_profiler_with_stack"] is False
     assert cfg["optimizer"]["train_kernel_profiler_with_flops"] is False
     assert cfg["optimizer"]["train_kernel_profiler_log_every_batches"] == 0
-    assert cfg["optimizer"]["pg_tbptt_window"] == 64
+    assert cfg["optimizer"]["pg_tbptt_window"] == 32
     assert cfg["optimizer"]["pg_env_replay_steps"] == 1
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_oom_fail_fast"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_enabled"] is False
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_enabled"] is False
     assert cfg["prior"]["environment"]["lipschitz_enforce"] is False
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_gain_lo"] == 0.985
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_gain_hi"] == 1.035
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_rms_lo"] == 4e-3
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_rms_hi"] == 9e-2
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_low_boost_cap"] == 1.5
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_loss_scale_hi"] == 4.0
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_grad_rms_lo"] == 1e-4
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_grad_rms_hi"] == 3e-2
+    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_low_boost_cap"] == 4.0
     assert cfg["prior"]["environment"]["lipschitz_weight_fro_norm_max"] == 1.0
     assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 
