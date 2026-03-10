@@ -30,12 +30,15 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
-    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 1e6
+    assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 1.0,
         "max": 10.0,
     }
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
+    assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,

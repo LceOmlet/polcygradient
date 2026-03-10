@@ -1201,8 +1201,11 @@ class EnvironmentPrior:
         cfg.setdefault("state_full_rms_enabled", False)
         cfg.setdefault("state_full_rms_target", 1.0)
         cfg.setdefault("reinforce_reward_transform", "none")
+        cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
         cfg.setdefault("reinforce_reward_tanh_bound", 10.0)
+        cfg.setdefault("reinforce_action_transform", "rms")
+        cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -1311,6 +1314,7 @@ class EnvironmentPrior:
             "prior_mlp_activations",
             {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity]},
         )
+        cfg.setdefault("scm_standard_linear_init_enabled", False)
         cfg.setdefault("init_std", {"distribution": "log_uniform", "min": 1e-3, "max": 1.0})
         cfg.setdefault("noise_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
 
@@ -1920,17 +1924,29 @@ class EnvironmentPrior:
         init_std = float(h["init_std"])
         noise_std = float(h["noise_std"])
         activation = self._resolve_activation(h["prior_mlp_activations"])
+        activation_name = self._activation_name(h["prior_mlp_activations"])
+        standard_init_enabled = self._scm_standard_linear_init_enabled(h)
         weight_cap = self._resolve_lipschitz_weight_cap(h)
 
         layer_dims = [in_dim] + [hidden] * (depth - 1) + [out_dim]
         weights = []
         biases = []
         for d_in, d_out in zip(layer_dims[:-1], layer_dims[1:]):
+            if bool(standard_init_enabled):
+                weight_std = self._scm_linear_init_std(
+                    d_in,
+                    d_out,
+                    activation_name=activation_name,
+                    standard_init_enabled=True,
+                    init_std=init_std,
+                )
+            else:
+                weight_std = float(init_std) / math.sqrt(max(1, d_in))
             if generator is None:
-                w = torch.randn(d_in, d_out, device=device) * (init_std / math.sqrt(max(1, d_in)))
+                w = torch.randn(d_in, d_out, device=device) * weight_std
                 b = torch.randn(d_out, device=device) * (init_std * 0.1)
             else:
-                w = torch.randn(d_in, d_out, device=device, generator=generator) * (init_std / math.sqrt(max(1, d_in)))
+                w = torch.randn(d_in, d_out, device=device, generator=generator) * weight_std
                 b = torch.randn(d_out, device=device, generator=generator) * (init_std * 0.1)
             w = self._project_matrix_fro_norm(w, weight_cap)
             weights.append(w)
@@ -2024,10 +2040,26 @@ class EnvironmentPrior:
         return int(draw.item())
 
     @staticmethod
+    def _scm_standard_linear_init_enabled(h):
+        return bool(h.get("scm_standard_linear_init_enabled", False))
+
+    @staticmethod
+    def _scm_linear_init_std(fan_in, fan_out, *, activation_name, standard_init_enabled, init_std):
+        fan_in = max(1, int(fan_in))
+        fan_out = max(1, int(fan_out))
+        if not bool(standard_init_enabled):
+            return float(init_std)
+        if str(activation_name).strip().lower() == "relu":
+            return math.sqrt(2.0 / float(fan_in))
+        return math.sqrt(2.0 / float(fan_in + fan_out))
+
+    @staticmethod
     def _reference_scm_apply_weight_init(
         weight,
         *,
         init_std,
+        activation_name,
+        standard_init_enabled,
         prior_mlp_dropout_prob,
         block_wise_dropout,
         prior_mlp_scale_weights_sqrt,
@@ -2035,6 +2067,13 @@ class EnvironmentPrior:
     ):
         if weight.ndim != 2:
             raise ValueError("reference SCM weight init expects a 2D tensor")
+        base_std = EnvironmentPrior._scm_linear_init_std(
+            weight.shape[0],
+            weight.shape[1],
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
+            init_std=init_std,
+        )
         if block_wise_dropout:
             nn.init.zeros_(weight)
             n_blocks = EnvironmentPrior._generator_randint(
@@ -2047,7 +2086,7 @@ class EnvironmentPrior:
             block_w = max(1, weight.shape[1] // n_blocks)
             keep_prob = float((n_blocks * block_h * block_w) / max(1, weight.numel()))
             denom = keep_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0)
-            block_std = float(init_std) / max(denom, 1e-12)
+            block_std = float(base_std) / max(denom, 1e-12)
             for block_idx in range(n_blocks):
                 h_start = block_h * block_idx
                 h_end = min(weight.shape[0], block_h * (block_idx + 1))
@@ -2070,7 +2109,7 @@ class EnvironmentPrior:
 
         dropout_prob = float(min(0.99, max(0.0, prior_mlp_dropout_prob)))
         denom = 1.0 - (dropout_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0))
-        init_scale = float(init_std) / max(denom, 1e-12)
+        init_scale = float(base_std) / max(denom, 1e-12)
         if generator is None:
             nn.init.normal_(weight, std=init_scale)
             if dropout_prob > 0:
@@ -2670,6 +2709,7 @@ class EnvironmentPrior:
             num_hidden_blocks_i = int(num_hidden_blocks[bi].item())
             init_std = float(h["init_std"])
             noise_std = float(h["noise_std"])
+            standard_init_enabled = self._scm_standard_linear_init_enabled(h)
             pre_sample_weights = bool(h.get("pre_sample_weights", False))
             prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
             block_wise_dropout = bool(h.get("block_wise_dropout", False))
@@ -2695,6 +2735,8 @@ class EnvironmentPrior:
             self._reference_scm_apply_weight_init(
                 first_weight_i,
                 init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
                 prior_mlp_dropout_prob=0.0,
                 block_wise_dropout=block_wise_dropout,
                 prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -2712,6 +2754,8 @@ class EnvironmentPrior:
                 self._reference_scm_apply_weight_init(
                     weight,
                     init_std=init_std,
+                    activation_name=activation_name,
+                    standard_init_enabled=standard_init_enabled,
                     prior_mlp_dropout_prob=prior_mlp_dropout_prob,
                     block_wise_dropout=block_wise_dropout,
                     prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3102,7 +3146,9 @@ class EnvironmentPrior:
             reward_dim + 2 * state_dim,
         )
         activation = self._resolve_activation(h["prior_mlp_activations"])
+        activation_name = self._activation_name(h["prior_mlp_activations"])
         init_std = float(h["init_std"])
+        standard_init_enabled = self._scm_standard_linear_init_enabled(h)
         noise_std = float(h["noise_std"])
         pre_sample_weights = bool(h.get("pre_sample_weights", False))
         prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
@@ -3118,6 +3164,8 @@ class EnvironmentPrior:
         self._reference_scm_apply_weight_init(
             first_weight,
             init_std=init_std,
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
             prior_mlp_dropout_prob=0.0,
             block_wise_dropout=block_wise_dropout,
             prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3134,6 +3182,8 @@ class EnvironmentPrior:
             self._reference_scm_apply_weight_init(
                 weight,
                 init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
                 prior_mlp_dropout_prob=prior_mlp_dropout_prob,
                 block_wise_dropout=block_wise_dropout,
                 prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -4146,9 +4196,16 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_reinforce_reward_transform(h):
         mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
-        if mode not in {"none", "tanh"}:
+        if mode not in {"none", "tanh", "rms", "clip"}:
             mode = "none"
         return mode
+
+    @staticmethod
+    def _resolve_reinforce_reward_rms_eps(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_rms_eps", 1e-6))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1e-6
+        return float(v)
 
     @staticmethod
     def _resolve_reinforce_reward_tanh_c(h):
@@ -4162,6 +4219,20 @@ class EnvironmentPrior:
         v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
         if (not math.isfinite(v)) or v <= 0.0:
             return 10.0
+        return float(v)
+
+    @staticmethod
+    def _resolve_reinforce_action_transform(h):
+        mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
+        if mode not in {"tanh", "rms", "none"}:
+            mode = "rms"
+        return mode
+
+    @staticmethod
+    def _resolve_reinforce_action_rms_eps(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1e-6
         return float(v)
 
     @staticmethod
@@ -4213,13 +4284,70 @@ class EnvironmentPrior:
             return torch.where(enabled_value.expand_as(state_next), state_scaled, state_next)
         return state_scaled
 
+    @staticmethod
+    def _transform_reinforce_action(action_raw, *, mode="rms", rms_eps=1e-6, mask=None):
+        mode = str(mode).strip().lower()
+        if mode == "tanh":
+            action_next = torch.tanh(action_raw)
+        elif mode == "rms":
+            if mask is None:
+                mask_t = torch.ones_like(action_raw, dtype=action_raw.dtype)
+            else:
+                mask_t = mask.to(device=action_raw.device, dtype=action_raw.dtype)
+                while mask_t.ndim < action_raw.ndim:
+                    mask_t = mask_t.unsqueeze(0)
+                mask_t = mask_t.expand_as(action_raw)
+            denom = mask_t.sum(dim=-1).clamp_min(1.0)
+            eps_t = torch.as_tensor(rms_eps, device=action_raw.device, dtype=action_raw.dtype)
+            while eps_t.ndim < denom.ndim:
+                eps_t = eps_t.unsqueeze(0)
+            rms = torch.sqrt(((action_raw * mask_t) ** 2).sum(dim=-1) / denom + eps_t)
+            while rms.ndim < action_raw.ndim:
+                rms = rms.unsqueeze(-1)
+            action_next = (action_raw / rms) * mask_t
+        elif mode == "none":
+            action_next = action_raw
+            if mask is not None:
+                mask_t = mask.to(device=action_raw.device, dtype=action_raw.dtype)
+                while mask_t.ndim < action_raw.ndim:
+                    mask_t = mask_t.unsqueeze(0)
+                action_next = action_next * mask_t
+        else:
+            raise ValueError(f"Unknown reinforce action transform: {mode}")
+        return action_next
+
     def _transform_reinforce_rewards(self, rewards):
         mode = self._resolve_reinforce_reward_transform(self.config)
         if mode == "none":
             return rewards, {
                 "mode": "none",
+                "rms_eps": 1e-6,
                 "tanh_c": 1.0,
                 "tanh_bound": float("inf"),
+            }
+        if mode == "rms":
+            rms_eps = self._resolve_reinforce_reward_rms_eps(self.config)
+            finite_mask = torch.isfinite(rewards)
+            if bool(finite_mask.any().item()):
+                finite_rewards = rewards[finite_mask]
+                rms = torch.sqrt(finite_rewards.square().mean() + float(rms_eps))
+                rewards_t = rewards / rms
+            else:
+                rewards_t = rewards
+            return rewards_t, {
+                "mode": "rms",
+                "rms_eps": float(rms_eps),
+                "tanh_c": 1.0,
+                "tanh_bound": float("inf"),
+            }
+        if mode == "clip":
+            bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+            rewards_t = torch.clamp(rewards, min=-float(bound), max=float(bound))
+            return rewards_t, {
+                "mode": "clip",
+                "rms_eps": 1e-6,
+                "tanh_c": 1.0,
+                "tanh_bound": float(bound),
             }
         if mode == "tanh":
             c = self._resolve_reinforce_reward_tanh_c(self.config)
@@ -4227,6 +4355,7 @@ class EnvironmentPrior:
             rewards_t = float(bound) * torch.tanh(rewards / float(c))
             return rewards_t, {
                 "mode": "tanh",
+                "rms_eps": 1e-6,
                 "tanh_c": float(c),
                 "tanh_bound": float(bound),
             }
@@ -4237,12 +4366,26 @@ class EnvironmentPrior:
         reward,
         *,
         mode,
+        rms_eps,
         tanh_c,
         tanh_bound,
     ):
         mode = str(mode).strip().lower()
         if mode == "none":
             return reward
+        if mode == "rms":
+            eps_t = torch.as_tensor(rms_eps, device=reward.device, dtype=reward.dtype)
+            finite_mask = torch.isfinite(reward)
+            if bool(finite_mask.any().item()):
+                finite_reward = reward[finite_mask]
+                rms = torch.sqrt(finite_reward.square().mean() + eps_t)
+                return reward / rms
+            return reward
+        if mode == "clip":
+            b_t = torch.as_tensor(tanh_bound, device=reward.device, dtype=reward.dtype)
+            while b_t.ndim < reward.ndim:
+                b_t = b_t.unsqueeze(0)
+            return torch.clamp(reward, min=-b_t, max=b_t)
         if mode == "tanh":
             c_t = torch.as_tensor(tanh_c, device=reward.device, dtype=reward.dtype)
             b_t = torch.as_tensor(tanh_bound, device=reward.device, dtype=reward.dtype)
@@ -4253,11 +4396,16 @@ class EnvironmentPrior:
             return b_t * torch.tanh(reward / c_t)
         raise ValueError(f"Unknown reinforce reward transform mode: {mode}")
 
-    def _transform_rollout_reward(self, reward, *, mode=None, tanh_c=None, tanh_bound=None):
+    def _transform_rollout_reward(self, reward, *, mode=None, rms_eps=None, tanh_c=None, tanh_bound=None):
         mode_resolved = (
             self._resolve_reinforce_reward_transform(self.config)
             if mode is None
             else str(mode).strip().lower()
+        )
+        rms_eps_resolved = (
+            self._resolve_reinforce_reward_rms_eps(self.config)
+            if rms_eps is None
+            else rms_eps
         )
         tanh_c_resolved = (
             self._resolve_reinforce_reward_tanh_c(self.config)
@@ -4272,6 +4420,7 @@ class EnvironmentPrior:
         return self._transform_reward_with_params(
             reward,
             mode=mode_resolved,
+            rms_eps=rms_eps_resolved,
             tanh_c=tanh_c_resolved,
             tanh_bound=tanh_bound_resolved,
         )
@@ -6279,8 +6428,11 @@ class EnvironmentPrior:
         state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
         state_full_rms_target = float(self._resolve_state_full_rms_target(h))
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(h)
+        reinforce_reward_rms_eps = float(self._resolve_reinforce_reward_rms_eps(h))
         reinforce_reward_tanh_c = float(self._resolve_reinforce_reward_tanh_c(h))
         reinforce_reward_tanh_bound = float(self._resolve_reinforce_reward_tanh_bound(h))
+        reinforce_action_transform = self._resolve_reinforce_action_transform(h)
+        reinforce_action_rms_eps = float(self._resolve_reinforce_action_rms_eps(h))
         state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
         state_highway_lambda = float(self._resolve_state_highway_lambda(h))
         reward_dropout_enabled = bool(h.get("reward_dropout_enabled", True))
@@ -6338,8 +6490,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": reinforce_reward_transform,
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": reinforce_action_transform,
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": bool(aev4_cfg.get("enabled", False)),
@@ -6708,6 +6863,7 @@ class EnvironmentPrior:
             activation_values = [self._activation_name(v) for v in activation_names]
         if len(activation_values) != batch_size:
             raise ValueError("activation_names must match h_list length")
+        standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
             if name == "relu":
@@ -6769,13 +6925,23 @@ class EnvironmentPrior:
                         w[bi, active_idx[:d], eye_idx] = 1.0
                 else:
                     g = None if generators is None else generators[bi]
+                    if bool(standard_init_values[bi]):
+                        weight_std = self._scm_linear_init_std(
+                            in_i,
+                            out_i,
+                            activation_name=activation_values[bi],
+                            standard_init_enabled=True,
+                            init_std=float(init_std[bi].item()),
+                        )
+                    else:
+                        weight_std = float(init_std[bi].item()) / math.sqrt(max(1, in_i))
                     if g is None:
                         w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
                         b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
                     else:
                         w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32, generator=g)
                         b_b = torch.randn((out_i,), device=device, dtype=torch.float32, generator=g)
-                    w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+                    w_b = w_b * float(weight_std)
                     w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                     w[bi, active_idx, :out_i] = w_b
                     b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
@@ -7334,6 +7500,7 @@ class EnvironmentPrior:
             activation_values = [self._activation_name(v) for v in activation_names]
         if len(activation_values) != batch_size:
             raise ValueError("activation_names must match h_list length")
+        standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
             if name == "relu":
@@ -7403,9 +7570,19 @@ class EnvironmentPrior:
                             eye_idx = torch.arange(d, device=device, dtype=torch.long)
                             state_w[bi, active_idx[:d], eye_idx] = 1.0
                     else:
+                        if bool(standard_init_values[bi]):
+                            weight_std = self._scm_linear_init_std(
+                                state_in_i,
+                                state_out_i,
+                                activation_name=activation_values[bi],
+                                standard_init_enabled=True,
+                                init_std=float(init_std[bi].item()),
+                            )
+                        else:
+                            weight_std = float(init_std[bi].item()) / math.sqrt(max(1, state_in_i))
                         w_b = torch.randn((state_in_i, state_out_i), device=device, dtype=torch.float32)
                         b_b = torch.randn((state_out_i,), device=device, dtype=torch.float32)
-                        w_b = w_b * (init_std[bi] / math.sqrt(max(1, state_in_i)))
+                        w_b = w_b * float(weight_std)
                         w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                         state_w[bi, active_idx, :state_out_i] = w_b
                         state_b[bi, :state_out_i] = b_b * (init_std[bi] * 0.1)
@@ -7429,9 +7606,19 @@ class EnvironmentPrior:
                             eye_idx = torch.arange(d, device=device, dtype=torch.long)
                             reward_w[bi, active_idx[:d], eye_idx] = 1.0
                     else:
+                        if bool(standard_init_values[bi]):
+                            weight_std = self._scm_linear_init_std(
+                                reward_in_i,
+                                reward_out_i,
+                                activation_name=activation_values[bi],
+                                standard_init_enabled=True,
+                                init_std=float(init_std[bi].item()),
+                            )
+                        else:
+                            weight_std = float(init_std[bi].item()) / math.sqrt(max(1, reward_in_i))
                         w_b = torch.randn((reward_in_i, reward_out_i), device=device, dtype=torch.float32)
                         b_b = torch.randn((reward_out_i,), device=device, dtype=torch.float32)
-                        w_b = w_b * (init_std[bi] / math.sqrt(max(1, reward_in_i)))
+                        w_b = w_b * float(weight_std)
                         w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                         reward_w[bi, active_idx, :reward_out_i] = w_b
                         reward_b[bi, :reward_out_i] = b_b * (init_std[bi] * 0.1)
@@ -7882,6 +8069,7 @@ class EnvironmentPrior:
             activation_values = [self._activation_name(v) for v in activation_names]
         if len(activation_values) != batch_size:
             raise ValueError("activation_names must match h_list length")
+        standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
             if name == "relu":
@@ -7927,9 +8115,19 @@ class EnvironmentPrior:
             out_i = int(hidden_state_dims[bi].item())
             if in_i <= 0 or out_i <= 0:
                 continue
+            if bool(standard_init_values[bi]):
+                weight_std = self._scm_linear_init_std(
+                    in_i,
+                    out_i,
+                    activation_name=activation_values[bi],
+                    standard_init_enabled=True,
+                    init_std=float(init_std[bi].item()),
+                )
+            else:
+                weight_std = float(init_std[bi].item()) / math.sqrt(max(1, in_i))
             w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
             b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
-            w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+            w_b = w_b * float(weight_std)
             w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
             first_state_w[bi, active_idx, :out_i] = w_b
             first_state_b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
@@ -7944,9 +8142,19 @@ class EnvironmentPrior:
             out_i = int(hidden_reward_dims[bi].item())
             if in_i <= 0 or out_i <= 0:
                 continue
+            if bool(standard_init_values[bi]):
+                weight_std = self._scm_linear_init_std(
+                    in_i,
+                    out_i,
+                    activation_name=activation_values[bi],
+                    standard_init_enabled=True,
+                    init_std=float(init_std[bi].item()),
+                )
+            else:
+                weight_std = float(init_std[bi].item()) / math.sqrt(max(1, in_i))
             w_b = torch.randn((in_i, out_i), device=device, dtype=torch.float32)
             b_b = torch.randn((out_i,), device=device, dtype=torch.float32)
-            w_b = w_b * (init_std[bi] / math.sqrt(max(1, in_i)))
+            w_b = w_b * float(weight_std)
             w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
             first_reward_w[bi, active_idx, :out_i] = w_b
             first_reward_b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
@@ -8001,9 +8209,19 @@ class EnvironmentPrior:
                         eye_idx = torch.arange(d, device=device, dtype=torch.long)
                         layer_w[state_row, eye_idx, eye_idx] = 1.0
                     continue
+                if bool(standard_init_values[bi]):
+                    weight_std = self._scm_linear_init_std(
+                        state_in_i,
+                        state_out_i,
+                        activation_name=activation_values[bi],
+                        standard_init_enabled=True,
+                        init_std=float(init_std[bi].item()),
+                    )
+                else:
+                    weight_std = float(init_std[bi].item()) / math.sqrt(max(1, state_in_i))
                 w_b = torch.randn((state_in_i, state_out_i), device=device, dtype=torch.float32)
                 b_b = torch.randn((state_out_i,), device=device, dtype=torch.float32)
-                w_b = w_b * (init_std[bi] / math.sqrt(max(1, state_in_i)))
+                w_b = w_b * float(weight_std)
                 w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                 layer_w[state_row, :state_in_i, :state_out_i] = w_b
                 layer_b[state_row, :state_out_i] = b_b * (init_std[bi] * 0.1)
@@ -8022,9 +8240,19 @@ class EnvironmentPrior:
                         eye_idx = torch.arange(d, device=device, dtype=torch.long)
                         layer_w[reward_row, eye_idx, eye_idx] = 1.0
                     continue
+                if bool(standard_init_values[bi]):
+                    weight_std = self._scm_linear_init_std(
+                        reward_in_i,
+                        reward_out_i,
+                        activation_name=activation_values[bi],
+                        standard_init_enabled=True,
+                        init_std=float(init_std[bi].item()),
+                    )
+                else:
+                    weight_std = float(init_std[bi].item()) / math.sqrt(max(1, reward_in_i))
                 w_b = torch.randn((reward_in_i, reward_out_i), device=device, dtype=torch.float32)
                 b_b = torch.randn((reward_out_i,), device=device, dtype=torch.float32)
-                w_b = w_b * (init_std[bi] / math.sqrt(max(1, reward_in_i)))
+                w_b = w_b * float(weight_std)
                 w_b = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                 layer_w[reward_row, :reward_in_i, :reward_out_i] = w_b
                 layer_b[reward_row, :reward_out_i] = b_b * (init_std[bi] * 0.1)
@@ -9245,6 +9473,26 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_reward_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_reward_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_action_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_c = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_bound = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -9270,13 +9518,13 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
-        reinforce_reward_tanh_c = torch.tensor(
-            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+        reinforce_reward_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_reward_rms_eps(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
-        reinforce_reward_tanh_bound = torch.tensor(
-            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
+        reinforce_action_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -9447,8 +9695,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -9471,6 +9722,8 @@ class EnvironmentPrior:
         depth = max(2, int(h_list[0]["num_layers"]))
         hidden = max(int(out_dim), int(h_list[0]["prior_mlp_hidden_dim"]))
         activation = self._resolve_activation(h_list[0]["prior_mlp_activations"])
+        activation_name = self._activation_name(h_list[0]["prior_mlp_activations"])
+        standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
 
         init_std = torch.tensor(
             [float(h["init_std"]) for h in h_list],
@@ -9493,7 +9746,23 @@ class EnvironmentPrior:
         biases = []
         if generators is None:
             for d_in, d_out in zip(layer_dims[:-1], layer_dims[1:]):
-                scale = init_std[:, None, None] / math.sqrt(max(1, d_in))
+                scale_values = torch.tensor(
+                    [
+                        self._scm_linear_init_std(
+                            d_in,
+                            d_out,
+                            activation_name=activation_name,
+                            standard_init_enabled=True,
+                            init_std=float(init_std[bi].item()),
+                        )
+                        if bool(standard_init_values[bi])
+                        else float(init_std[bi].item()) / math.sqrt(max(1, d_in))
+                        for bi in range(batch_size)
+                    ],
+                    device=device,
+                    dtype=torch.float32,
+                )
+                scale = scale_values[:, None, None]
                 w = torch.randn((batch_size, d_in, d_out), device=device, dtype=torch.float32) * scale
                 w = self._project_matrix_fro_norm(w, weight_cap)
                 b = torch.randn((batch_size, d_out), device=device, dtype=torch.float32) * (init_std[:, None] * 0.1)
@@ -9507,7 +9776,17 @@ class EnvironmentPrior:
                     g = generators[bi]
                     w_b = torch.randn((d_in, d_out), device=device, dtype=torch.float32, generator=g)
                     b_b = torch.randn((d_out,), device=device, dtype=torch.float32, generator=g)
-                    w_b = w_b * (init_std[bi] / math.sqrt(max(1, d_in)))
+                    if bool(standard_init_values[bi]):
+                        weight_std = self._scm_linear_init_std(
+                            d_in,
+                            d_out,
+                            activation_name=activation_name,
+                            standard_init_enabled=True,
+                            init_std=float(init_std[bi].item()),
+                        )
+                    else:
+                        weight_std = float(init_std[bi].item()) / math.sqrt(max(1, d_in))
+                    w_b = w_b * float(weight_std)
                     w[bi] = self._project_matrix_fro_norm(w_b, float(weight_cap[bi].item()))
                     b[bi] = b_b * (init_std[bi] * 0.1)
                 weights.append(w)
@@ -9753,6 +10032,26 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_reward_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_reward_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_action_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_c = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_bound = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -9880,8 +10179,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -11004,6 +11306,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -11610,6 +11913,8 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
+            action_transform_mode = env.get("reinforce_action_transform", "rms")
+            action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -11661,7 +11966,11 @@ class EnvironmentPrior:
                             dtype=torch.float32,
                         )
                 action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = torch.tanh(action_pre_tanh)
+                action_next = self._transform_reinforce_action(
+                    action_pre_tanh,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                )
                 reinforce_log_prob_t = self._squashed_gaussian_log_prob(
                     action_pre_tanh.detach(),
                     action_mean,
@@ -11669,7 +11978,11 @@ class EnvironmentPrior:
                     action=action_next.detach(),
                 )
             else:
-                action_next = torch.tanh(action_mean)
+                action_next = self._transform_reinforce_action(
+                    action_mean,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                )
                 if not reference_semantics_enabled:
                     # Keep legacy RNG consumption for action-noise streams, but
                     # do not perturb policy actions in the learned-policy rollout
@@ -11765,6 +12078,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -12225,8 +12539,10 @@ class EnvironmentPrior:
         action_noise_eval_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_action_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -12385,8 +12701,10 @@ class EnvironmentPrior:
                 action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
                 reward_scale[group_idx] = env_batch["reward_scale"]
                 reward_clip[group_idx] = env_batch["reward_clip"]
+                reinforce_reward_rms_eps[group_idx] = env_batch["reinforce_reward_rms_eps"]
                 reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
                 reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
+                reinforce_action_rms_eps[group_idx] = env_batch["reinforce_action_rms_eps"]
                 alpha[group_idx] = env_batch["alpha"]
                 state_clip[group_idx] = env_batch["state_clip"]
                 state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
@@ -12556,8 +12874,10 @@ class EnvironmentPrior:
             action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
             reward_scale = reward_scale.index_select(0, perm)
             reward_clip = reward_clip.index_select(0, perm)
+            reinforce_reward_rms_eps = reinforce_reward_rms_eps.index_select(0, perm)
             reinforce_reward_tanh_c = reinforce_reward_tanh_c.index_select(0, perm)
             reinforce_reward_tanh_bound = reinforce_reward_tanh_bound.index_select(0, perm)
+            reinforce_action_rms_eps = reinforce_action_rms_eps.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
             state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
@@ -12873,6 +13193,12 @@ class EnvironmentPrior:
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -13062,6 +13388,8 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
+            action_transform_mode = env_info.get("reinforce_action_transform", "rms")
+            action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -13093,7 +13421,12 @@ class EnvironmentPrior:
                         raise RuntimeError("reinforce rollout expected pre-sampled action_noise_eval")
                     action_std_t = action_noise_eval_std
                 action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = torch.tanh(action_pre_tanh) * action_mask
+                action_next = self._transform_reinforce_action(
+                    action_pre_tanh,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                    mask=action_mask,
+                )
                 reinforce_log_prob_t = self._squashed_gaussian_log_prob(
                     action_pre_tanh.detach(),
                     action_mean,
@@ -13102,10 +13435,15 @@ class EnvironmentPrior:
                     mask=action_mask,
                 )
             else:
-                action_next = torch.tanh(action_mean) * action_mask
+                action_next = self._transform_reinforce_action(
+                    action_mean,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                    mask=action_mask,
+                )
                 # Preserve action-noise RNG draws for reproducible downstream
                 # transition/state noise, but keep the learned policy deterministic
-                # after a single tanh squash.
+                # after the configured action transform.
                 if t < single_eval_pos:
                     if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
                         pass
@@ -13422,6 +13760,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=self._resolve_reinforce_reward_transform(self.config),
+                rms_eps=reinforce_reward_rms_eps,
                 tanh_c=reinforce_reward_tanh_c,
                 tanh_bound=reinforce_reward_tanh_bound,
             )
@@ -14152,6 +14491,8 @@ class EnvironmentPrior:
             env_obs_start = env_layout["obs_start"]
             env_action_start = env_layout["action_start"]
             env_noise_start = env_layout["noise_start"]
+        action_transform_mode = env.get("reinforce_action_transform", "rms")
+        action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
 
         for t in range(n_samples):
             obs_t = state_t[:obs_dim]  # observable subset of state
@@ -14189,7 +14530,11 @@ class EnvironmentPrior:
                 env_in_flat[env_action_start: env_action_start + action_dim] = action_t
                 env_in_flat[env_noise_start: env_noise_start + noise_dim] = noise_t
                 policy_in = env_in_flat.unsqueeze(0)
-                action_next = torch.tanh(env["policy_generator"](policy_in, generator=local_generator)).squeeze(0)
+                action_next = self._transform_reinforce_action(
+                    env["policy_generator"](policy_in, generator=local_generator).squeeze(0),
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                )
             else:
                 if policy_accepts_reward_mask:
                     policy_out = policy_step_fn(
@@ -14279,7 +14624,11 @@ class EnvironmentPrior:
                                 generator=action_noise_eval_generator,
                             )
                 action_pre_tanh = action_mean + (action_eps_t * float(action_noise_std))
-                action_next = torch.tanh(action_pre_tanh)
+                action_next = self._transform_reinforce_action(
+                    action_pre_tanh,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                )
                 reinforce_log_prob_t = self._squashed_gaussian_log_prob(
                     action_pre_tanh.detach(),
                     action_mean,
@@ -14288,13 +14637,25 @@ class EnvironmentPrior:
                 )
             else:
                 if not use_fast_env_in:
-                    action_next = torch.tanh(action_mean)
+                    action_next = self._transform_reinforce_action(
+                        action_mean,
+                        mode=action_transform_mode,
+                        rms_eps=action_rms_eps,
+                    )
             if (not reinforce_enabled) and (not reference_semantics_enabled) and action_noise_std > 0:
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
-                        action_next = torch.tanh(action_next + action_noise_train[t] * action_noise_std)
+                        action_next = self._transform_reinforce_action(
+                            action_next + action_noise_train[t] * action_noise_std,
+                            mode=action_transform_mode,
+                            rms_eps=action_rms_eps,
+                        )
                     elif t >= single_eval_pos and action_noise_eval is not None:
-                        action_next = torch.tanh(action_next + action_noise_eval[t] * action_noise_std)
+                        action_next = self._transform_reinforce_action(
+                            action_next + action_noise_eval[t] * action_noise_std,
+                            mode=action_transform_mode,
+                            rms_eps=action_rms_eps,
+                        )
                     elif t < single_eval_pos and env["action_noise_train_std"] > 0:
                         if action_noise_train_generator is None:
                             action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
@@ -14305,7 +14666,11 @@ class EnvironmentPrior:
                                 dtype=state_t.dtype,
                                 generator=action_noise_train_generator,
                             )
-                        action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
+                        action_next = self._transform_reinforce_action(
+                            action_next + action_noise_t * action_noise_std,
+                            mode=action_transform_mode,
+                            rms_eps=action_rms_eps,
+                        )
                     elif t >= single_eval_pos and env["action_noise_eval_std"] > 0:
                         if action_noise_eval_generator is None:
                             action_noise_t = _randn((action_dim,), dtype=state_t.dtype)
@@ -14316,9 +14681,13 @@ class EnvironmentPrior:
                                 dtype=state_t.dtype,
                                 generator=action_noise_eval_generator,
                             )
-                        action_next = torch.tanh(action_next + action_noise_t * action_noise_std)
+                        action_next = self._transform_reinforce_action(
+                            action_next + action_noise_t * action_noise_std,
+                            mode=action_transform_mode,
+                            rms_eps=action_rms_eps,
+                        )
                 else:
-                    # Learned-policy rollout uses a single tanh squash. Keep
+                    # Learned-policy rollout uses the configured action transform. Keep
                     # action-noise RNG consumption only to preserve downstream
                     # transition/state-noise streams under fixed seeds.
                     if t < single_eval_pos and env["action_noise_train_std"] > 0:
@@ -14405,6 +14774,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -14988,6 +15358,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )

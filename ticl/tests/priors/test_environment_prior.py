@@ -2510,6 +2510,122 @@ def test_environment_prior_reinforce_tanh_reward_transform_is_bounded_and_monoto
     assert float(stats["reinforce_reward_used_abs_max"]) <= 10.0 + 1e-6
 
 
+def test_environment_prior_action_rms_masks_inactive_dims():
+    action_raw = torch.tensor(
+        [
+            [3.0, 4.0, 9.0],
+            [5.0, -2.0, 7.0],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    transformed = EnvironmentPrior._transform_reinforce_action(
+        action_raw,
+        mode="rms",
+        rms_eps=1e-6,
+        mask=mask,
+    )
+
+    assert torch.allclose(transformed[0, 2], torch.tensor(0.0))
+    assert torch.allclose(transformed[1, 0], torch.tensor(0.0))
+    assert torch.allclose(transformed[1, 2], torch.tensor(0.0))
+    rms_0 = torch.sqrt(transformed[0, :2].square().mean())
+    rms_1 = torch.sqrt(transformed[1, 1:2].square().mean())
+    assert math.isclose(float(rms_0), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+    assert math.isclose(float(rms_1), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+
+
+def test_environment_prior_rollout_applies_action_rms_before_scm_input():
+    _seed_everything(20260310)
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    cfg["batch_parallel_backend"] = "torch_vectorized"
+    cfg["state_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    cfg["obs_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["noise_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 0, "max": 0}
+    cfg["obs_slot_dim"] = 4
+    cfg["action_slot_dim"] = 2
+    cfg["strict_joint_transition_enabled"] = True
+    cfg["reinforce_action_transform"] = "rms"
+    cfg["reinforce_action_rms_eps"] = 1e-6
+    prior = EnvironmentPrior(cfg)
+
+    class FixedPolicy:
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            batch = obs_t.shape[0]
+            del action_t, reward_t, cache, step_idx, env_info
+            return torch.tensor([[3.0, 4.0]], dtype=torch.float32).expand(batch, -1)
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=FixedPolicy().step,
+        batch_size=2,
+        n_samples=3,
+        num_features=8,
+        device="cpu",
+        single_eval_pos=1,
+        collect_x=True,
+    )
+    x = rollout["x"]
+    action_start = int(cfg["obs_slot_dim"]) + 2
+    action_tokens = x[1, :, action_start: action_start + 2]
+    expected = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    expected = expected / torch.sqrt(expected.square().mean())
+    assert torch.allclose(action_tokens, expected.unsqueeze(0).expand_as(action_tokens), atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_state_full_rms_only_downscales_active_dims():
+    state_next = torch.tensor(
+        [
+            [3.0, 4.0, 100.0],
+            [0.2, 0.0, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+    state_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    enabled = torch.tensor([True, False])
+
+    transformed = EnvironmentPrior._apply_state_full_rms(
+        state_next,
+        enabled=enabled,
+        target=1.0,
+        state_mask=state_mask,
+        eps=1e-6,
+    )
+
+    rms_0 = torch.sqrt(transformed[0, :2].square().mean())
+    rms_1 = torch.sqrt(transformed[1, :2].square().mean())
+    scale_0 = float(torch.sqrt(state_next[0, :2].square().mean()))
+    assert math.isclose(float(rms_0), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+    assert math.isclose(
+        float(rms_1),
+        float(torch.sqrt(state_next[1, :2].square().mean())),
+        rel_tol=1e-5,
+        abs_tol=1e-5,
+    )
+    assert math.isclose(
+        float(transformed[0, 2]),
+        float(state_next[0, 2] / scale_0),
+        rel_tol=1e-5,
+        abs_tol=1e-5,
+    )
+    assert torch.allclose(transformed[1, 2], state_next[1, 2])
+
+
 def test_environment_prior_squashed_gaussian_log_prob_matches_clean_score_function_gradient():
     action_mean = torch.tensor([0.3], dtype=torch.float32, requires_grad=True)
     action_std = 0.7
@@ -2947,11 +3063,20 @@ def _reference_scm_apply_weight_init(
     weight,
     *,
     init_std,
+    activation_name,
+    standard_init_enabled,
     prior_mlp_dropout_prob,
     block_wise_dropout,
     prior_mlp_scale_weights_sqrt,
     generator,
 ):
+    base_std = EnvironmentPrior._scm_linear_init_std(
+        weight.shape[0],
+        weight.shape[1],
+        activation_name=activation_name,
+        standard_init_enabled=standard_init_enabled,
+        init_std=init_std,
+    )
     if block_wise_dropout:
         weight.zero_()
         n_blocks = int(
@@ -2966,7 +3091,7 @@ def _reference_scm_apply_weight_init(
         block_w = max(1, weight.shape[1] // n_blocks)
         keep_prob = float((n_blocks * block_h * block_w) / max(1, weight.numel()))
         denom = keep_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0)
-        block_std = float(init_std) / max(denom, 1e-12)
+        block_std = float(base_std) / max(denom, 1e-12)
         for block_idx in range(n_blocks):
             h_start = block_h * block_idx
             h_end = min(weight.shape[0], block_h * (block_idx + 1))
@@ -2981,7 +3106,7 @@ def _reference_scm_apply_weight_init(
 
     dropout_prob = float(min(0.99, max(0.0, prior_mlp_dropout_prob)))
     denom = 1.0 - (dropout_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0))
-    init_scale = float(init_std) / max(denom, 1e-12)
+    init_scale = float(base_std) / max(denom, 1e-12)
     weight.copy_(torch.randn(weight.shape, generator=generator) * init_scale)
     if dropout_prob > 0:
         keep_mask = torch.bernoulli(
@@ -3013,11 +3138,15 @@ def _reference_scm_joint_eval(x, h, *, generator):
     sort_features = bool(h.get("sort_features", False))
     in_clique = bool(h.get("in_clique", False))
     random_feature_rotation = bool(h.get("random_feature_rotation", False))
+    standard_init_enabled = bool(h.get("scm_standard_linear_init_enabled", False))
+    activation_name = EnvironmentPrior._activation_name(h["prior_mlp_activations"])
 
     first_weight = torch.empty((in_dim, hidden_dim), dtype=x.dtype)
     _reference_scm_apply_weight_init(
         first_weight,
         init_std=init_std,
+        activation_name=activation_name,
+        standard_init_enabled=standard_init_enabled,
         prior_mlp_dropout_prob=0.0,
         block_wise_dropout=block_wise_dropout,
         prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3034,6 +3163,8 @@ def _reference_scm_joint_eval(x, h, *, generator):
         _reference_scm_apply_weight_init(
             weight,
             init_std=init_std,
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
             prior_mlp_dropout_prob=prior_mlp_dropout_prob,
             block_wise_dropout=block_wise_dropout,
             prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3202,6 +3333,7 @@ def test_environment_prior_strict_reference_scm_joint_transition_matches_referen
         num_layers=4,
     )
     h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = False
     h["noise_std"] = 0.0
     h["pre_sample_weights"] = False
     h["prior_mlp_dropout_prob"] = 0.0
@@ -3218,6 +3350,39 @@ def test_environment_prior_strict_reference_scm_joint_transition_matches_referen
 
     ref_generator = torch.Generator(device="cpu")
     ref_generator.manual_seed(seed)
+    state_ref, reward_ref = _reference_scm_joint_eval(env_in, h, generator=ref_generator)
+
+    assert torch.allclose(state_actual, state_ref, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(reward_actual, reward_ref, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_strict_reference_scm_joint_transition_matches_reference_builder_with_standard_linear_init():
+    _seed_everything(20260309)
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=5,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=4,
+        zero_pad_dim=1,
+        num_layers=4,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = True
+    h["noise_std"] = 0.0
+    h["pre_sample_weights"] = False
+    h["prior_mlp_dropout_prob"] = 0.0
+    h["block_wise_dropout"] = False
+    h["random_feature_rotation"] = False
+
+    env = prior._sample_environment(h, device="cpu", rng_seed=321)
+    in_dim = int(env["env_input_dim"])
+    env_in = torch.linspace(-1.0, 1.0, steps=3 * in_dim, dtype=torch.float32).reshape(3, in_dim)
+    state_actual, reward_actual = env["transition_generator"](env_in)
+
+    ref_generator = torch.Generator(device="cpu")
+    ref_generator.manual_seed(321)
     state_ref, reward_ref = _reference_scm_joint_eval(env_in, h, generator=ref_generator)
 
     assert torch.allclose(state_actual, state_ref, atol=1e-6, rtol=1e-6)
@@ -4971,13 +5136,13 @@ def test_environment_prior_rollout_with_policy_strict_joint_transition_matches_s
             num_layers=3,
         ),
         _manual_sampled_h(
-            family="gp",
+            family="scm",
             state_dim=7,
             obs_dim=5,
             action_dim=2,
             noise_dim=3,
             zero_pad_dim=1,
-            gp_rff_features=32,
+            num_layers=2,
         ),
         _manual_sampled_h(
             family="scm",
@@ -5052,9 +5217,9 @@ def test_environment_prior_rollout_with_policy_strict_joint_transition_matches_s
     loss_vec.backward()
     grads_vec = [p.grad.detach().clone() for p in policy_vec.parameters()]
 
-    # Strict joint-reference semantics removes several legacy squash/mix steps,
-    # so serial and vectorized paths now differ only by small floating-point
-    # ordering effects inside the fused joint transition.
+    # Strict joint-reference SCM semantics removes several legacy squash/mix
+    # steps, so serial and vectorized paths now differ only by small
+    # floating-point ordering effects inside the fused joint transition.
     assert torch.allclose(rollout_serial["x"], rollout_vec["x"], atol=3e-4, rtol=1e-4)
     assert torch.allclose(rollout_serial["rewards"], rollout_vec["rewards"], atol=3e-4, rtol=1e-4)
     assert torch.allclose(loss_serial.detach(), loss_vec.detach(), atol=3e-4, rtol=1e-4)
@@ -5356,13 +5521,13 @@ def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_in
             num_layers=3,
         ),
         _manual_sampled_h(
-            family="gp",
+            family="scm",
             state_dim=7,
             obs_dim=5,
             action_dim=2,
             noise_dim=3,
             zero_pad_dim=1,
-            gp_rff_features=32,
+            num_layers=2,
         ),
         _manual_sampled_h(
             family="scm",
@@ -5374,13 +5539,13 @@ def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_in
             num_layers=2,
         ),
         _manual_sampled_h(
-            family="gp",
+            family="scm",
             state_dim=8,
             obs_dim=5,
             action_dim=2,
             noise_dim=3,
             zero_pad_dim=1,
-            gp_rff_features=64,
+            num_layers=3,
         ),
     ]
     for h in sampled:
