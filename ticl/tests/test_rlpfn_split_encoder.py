@@ -39,6 +39,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,

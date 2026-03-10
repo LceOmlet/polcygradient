@@ -1206,6 +1206,7 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_reward_tanh_bound", 10.0)
         cfg.setdefault("reinforce_action_transform", "rms")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
+        cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -4236,6 +4237,13 @@ class EnvironmentPrior:
         return float(v)
 
     @staticmethod
+    def _resolve_first_policy_gradient_state_grad_clip_norm(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("first_policy_gradient_state_grad_clip_norm", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(max(0.0, v))
+
+    @staticmethod
     def _apply_state_full_rms(
         state_next,
         *,
@@ -4284,6 +4292,43 @@ class EnvironmentPrior:
         if enabled_value is not None:
             return torch.where(enabled_value.expand_as(state_next), state_scaled, state_next)
         return state_scaled
+
+    @staticmethod
+    def _clip_tensor_grad_by_global_norm(tensor, *, max_norm=0.0):
+        if (not torch.is_tensor(tensor)) or (not bool(tensor.requires_grad)):
+            return tensor
+        if torch.is_tensor(max_norm):
+            max_norm_t = max_norm.to(device=tensor.device, dtype=tensor.dtype)
+            if max_norm_t.numel() != 1:
+                raise ValueError("max_norm tensor must be scalar")
+            max_norm_value = float(max_norm_t.detach().item())
+        else:
+            max_norm_value = float(max_norm)
+            max_norm_t = torch.as_tensor(max_norm_value, device=tensor.device, dtype=tensor.dtype)
+        if (not math.isfinite(max_norm_value)) or max_norm_value <= 0.0:
+            return tensor
+
+        def _hook(grad):
+            if grad is None:
+                return grad
+            grad = torch.nan_to_num(
+                grad,
+                nan=0.0,
+                posinf=max_norm_value,
+                neginf=-max_norm_value,
+            )
+            if grad.ndim <= 1:
+                grad_flat = grad.reshape(1, -1)
+            else:
+                grad_flat = grad.reshape(grad.shape[0], -1)
+            grad_norm = grad_flat.norm(dim=-1, keepdim=True)
+            scale = torch.clamp(max_norm_t / grad_norm.clamp_min(max_norm_t), max=1.0)
+            while scale.ndim < grad.ndim:
+                scale = scale.unsqueeze(-1)
+            return grad * scale
+
+        tensor.register_hook(_hook)
+        return tensor
 
     @staticmethod
     def _transform_reinforce_action(action_raw, *, mode="rms", rms_eps=1e-6, mask=None):
@@ -13014,6 +13059,11 @@ class EnvironmentPrior:
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         reinforce_enabled = bool(objective_flags["reinforce"])
         sample_action = bool(objective_flags["sample_action"])
+        first_pg_state_grad_clip_norm = (
+            self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
@@ -13875,6 +13925,11 @@ class EnvironmentPrior:
                 transition_wall_s += (time.perf_counter() - transition_wall_t0)
 
             state_next = state_next * state_mask
+            if first_pg_state_grad_clip_norm > 0.0:
+                state_next = self._clip_tensor_grad_by_global_norm(
+                    state_next,
+                    max_norm=first_pg_state_grad_clip_norm,
+                )
             state_delta = state_next - state_t
             if aev2_enabled and (aev2_prev_delta is not None):
                 self._aev2_update_accumulator(aev2_acc, aev2_prev_delta, state_delta, aev2_cfg)
@@ -14396,6 +14451,11 @@ class EnvironmentPrior:
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         reinforce_enabled = bool(objective_flags["reinforce"])
         sample_action = bool(objective_flags["sample_action"])
+        first_pg_state_grad_clip_norm = (
+            self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
@@ -14902,6 +14962,11 @@ class EnvironmentPrior:
                     state_prev=state_t,
                     state_next_post=state_next,
                     aev4_cfg=aev4_cfg,
+                )
+            if first_pg_state_grad_clip_norm > 0.0:
+                state_next = self._clip_tensor_grad_by_global_norm(
+                    state_next,
+                    max_norm=first_pg_state_grad_clip_norm,
                 )
             state_delta = state_next - state_t
             if aev2_enabled and (aev2_prev_delta is not None):

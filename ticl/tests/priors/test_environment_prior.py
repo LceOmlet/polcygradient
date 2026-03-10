@@ -2790,6 +2790,39 @@ def test_environment_prior_action_rms_masks_inactive_dims():
     assert math.isclose(float(rms_1), 1.0, rel_tol=1e-5, abs_tol=1e-5)
 
 
+def test_environment_prior_state_grad_clip_norm_clips_per_row_global_norm():
+    state_next = torch.tensor(
+        [
+            [1.0, -2.0, 3.0],
+            [4.0, 0.0, -3.0],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    state_clipped = EnvironmentPrior._clip_tensor_grad_by_global_norm(
+        state_next,
+        max_norm=2.0,
+    )
+    incoming = torch.tensor(
+        [
+            [6.0, 8.0, 0.0],
+            [0.0, -9.0, -12.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss = (state_clipped * incoming).sum()
+    loss.backward()
+
+    row_norms = state_next.grad.norm(dim=-1)
+    assert torch.allclose(
+        row_norms,
+        torch.tensor([2.0, 2.0], dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_environment_prior_rollout_applies_action_rms_before_scm_input():
     _seed_everything(20260310)
     cfg = dict(get_prior_config()["prior"]["environment"])
