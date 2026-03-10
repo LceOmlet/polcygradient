@@ -11645,6 +11645,11 @@ class EnvironmentPrior:
         )
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         sample_action = bool(objective_flags["sample_action"])
+        first_pg_state_grad_clip_norm = (
+            self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
@@ -12208,6 +12213,11 @@ class EnvironmentPrior:
                     state_prev=state_t,
                     state_next_post=state_next,
                     aev4_cfg=aev4_cfg,
+                )
+            if first_pg_state_grad_clip_norm > 0.0:
+                state_next = self._clip_tensor_grad_by_global_norm(
+                    state_next,
+                    max_norm=first_pg_state_grad_clip_norm,
                 )
             state_delta = state_next - state_t
             if aev2_enabled and (aev2_prev_delta is not None):
