@@ -87,7 +87,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
-    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'reinforce'],
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce'],
                            help='Training objective for RL-style models.')
     optimizer.add_argument('--policy-rollout-chunk-size', type=int,
                            help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')

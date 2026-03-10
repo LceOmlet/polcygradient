@@ -1,0 +1,35 @@
+2026-03-07 transition inner grouping diagnostic
+
+Fixed-seed batch benchmark baseline:
+- family
+  - log: 20260307_seeded_batch128_transition_inner_family.log
+  - batch_wall_excl_compile_s=133.713
+  - batch_wall_excl_compile_per_batch_item_s=1.044631
+  - rollout_transition_wall_ms=15932.39
+
+Negative probes:
+- structure
+  - log: 20260307_seeded_batch128_transition_inner_structure.log
+  - did not finish before manual termination
+  - elapsed lower bound > 252s wall at termination (> 1.88x vs family baseline)
+- pow2_no_depth
+  - log: 20260307_seeded_batch128_transition_inner_pow2nodepth.log
+  - did not finish before manual termination
+  - elapsed lower bound > 202s wall at termination (> 2.38x vs family epoch wall 84.54s)
+
+Offline sampled-hypers diagnostic (batch=128, seed=42):
+- family: group_count=2, max_batch=66, fill_ratio=0.0945
+- exact structure: group_count=128, max_batch=1, singletons=128, fill_ratio=0.8986
+- pow2_no_depth: group_count=53, max_batch=16, singletons=33, fill_ratio=0.4724
+- pow2: group_count=74, max_batch=16, singletons=55, fill_ratio=0.7461
+
+Conclusion:
+- Padding waste in family grouping is real and large.
+- Simple inner bucketing is not sufficient: launch/sync overhead dominates before the fill-ratio gains can amortize.
+- Next profitable direction should eliminate the dual-path/state-reward transition padding inside the fused kernel itself, instead of only splitting groups finer.
+
+Additional hybrid probe:
+- pow2_no_depth + min_bucket=2
+  - log: 20260307_seeded_batch128_transition_inner_pow2nodepth_min2.log
+  - timed out at 240s without reaching phase line
+  - offline proxy: group_count=22, max_batch=19, fill_ratio=0.3093

@@ -1,6 +1,7 @@
 import os, pdb
 import pathlib
 import random
+import inspect
 from pathlib import Path
 import itertools
 from sklearn.decomposition import PCA
@@ -17,6 +18,18 @@ from torch.utils.checkpoint import checkpoint
 from ticl.model_builder import load_model
 from ticl.utils import NOP, normalize_by_used_features_f, normalize_data, remove_outliers
 import pandas as pd
+
+
+def _validation_all_finite_kwargs(value):
+    check_xy_params = inspect.signature(check_X_y).parameters
+    check_array_params = inspect.signature(check_array).parameters
+
+    xy_key = "ensure_all_finite" if "ensure_all_finite" in check_xy_params else "force_all_finite"
+    array_key = "ensure_all_finite" if "ensure_all_finite" in check_array_params else "force_all_finite"
+    return {xy_key: value}, {array_key: value}
+
+
+_CHECK_X_Y_ALL_FINITE_KWARGS, _CHECK_ARRAY_ALL_FINITE_KWARGS = _validation_all_finite_kwargs(False)
 
 
 def _get_file(e, base_path, add_name, eval_addition):
@@ -252,7 +265,7 @@ class TabPFNClassifier(BaseEstimator, ClassifierMixin):
         self.model = model
         if self.no_grad:
             # Check that X and y have correct shape
-            X, y = check_X_y(X, y, force_all_finite=False)
+            X, y = check_X_y(X, y, **_CHECK_X_Y_ALL_FINITE_KWARGS)
         # Store the classes seen during fit
         y = self._validate_targets(y)
         self.label_encoder = LabelEncoder()
@@ -273,7 +286,7 @@ class TabPFNClassifier(BaseEstimator, ClassifierMixin):
 
         # Input validation
         if self.no_grad:
-            X = check_array(X, force_all_finite=False)
+            X = check_array(X, **_CHECK_ARRAY_ALL_FINITE_KWARGS)
             if X.shape[1] > self.max_num_features:      
                 if self.dimension_reduction == 'random':
                     X = X[:, self.feature_selected]

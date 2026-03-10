@@ -751,6 +751,44 @@ def _run_train_epoch_once_for_memory_probe(
     return float(saved_bytes) / float(1024 ** 2)
 
 
+def _run_train_epoch_once_for_tbptt_smoke(*, rl_objective="policy_gradient", n_samples=12, tbptt_window=4):
+    _seed_everything(20260310 + int(n_samples))
+    model = _build_tiny_policy_model(recompute_attn=False)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    params_before = [p.detach().clone() for p in model.parameters()]
+    dl = _ChunkDebugDL(batch_size=1, n_samples=n_samples, num_features=16, steps=1)
+    env_prior = EnvironmentPrior(_fixed_env_cfg())
+    loss, _, _ = train_epoch_policy_gradient(
+        model=model,
+        aggregate_k_gradients=1,
+        using_dist=False,
+        scaler=None,
+        dl=dl,
+        device="cpu",
+        optimizer=optimizer,
+        env_prior=env_prior,
+        policy_rollout_chunk_size=1,
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_grad_mutable_kv_cache=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=False,
+        pg_tbptt_window=tbptt_window,
+        pg_torch_compile=False,
+        progress_bar=False,
+        rl_objective=rl_objective,
+    )
+    assert np.isfinite(float(loss))
+    params_after = [p.detach() for p in model.parameters()]
+    any_param_changed = any(
+        not torch.allclose(before, after)
+        for before, after in zip(params_before, params_after)
+    )
+    assert any_param_changed
+    assert optimizer.state
+    return float(loss)
+
+
 def test_policy_rollout_chunk_size_one_runs_per_column():
     _seed_everything(20260301)
     model = _build_tiny_policy_model()
@@ -804,6 +842,16 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
 
     assert torch.isfinite(torch.tensor(loss))
     assert calls == [1, 1, 1, 1, 1]
+
+
+@pytest.mark.parametrize("rl_objective", ["policy_gradient", "first_policy_gradient"])
+def test_policy_rollout_tbptt_streaming_backward_smoke(rl_objective):
+    loss = _run_train_epoch_once_for_tbptt_smoke(
+        rl_objective=rl_objective,
+        n_samples=64,
+        tbptt_window=32,
+    )
+    assert np.isfinite(loss)
 
 
 def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch():

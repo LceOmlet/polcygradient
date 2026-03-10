@@ -1,0 +1,3 @@
+torch 2.0.1 cuda True
+base 0.0017034296334410707
+addmm_residual 0.0023329711325156192

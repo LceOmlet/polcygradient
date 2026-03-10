@@ -30,12 +30,15 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
-    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 1e6
+    assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 1.0,
         "max": 10.0,
     }
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,
@@ -55,7 +58,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
     assert cfg["optimizer"]["learning_rate"] == 4e-4
-    assert cfg["dataloader"]["batch_size"] == 1024
+    assert cfg["dataloader"]["batch_size"] == 8
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False

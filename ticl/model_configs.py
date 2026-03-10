@@ -576,7 +576,7 @@ def get_rlpfn_default_config():
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 1024
+    config['dataloader']['batch_size'] = 8
     config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
     config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
     config['prior']['environment']['lipschitz_enforce'] = False

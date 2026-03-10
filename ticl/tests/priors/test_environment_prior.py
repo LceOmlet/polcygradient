@@ -2447,6 +2447,113 @@ def test_environment_prior_reinforce_loss_uses_total_return_objective():
     assert torch.isfinite(log_probs.grad).all()
 
 
+def test_environment_prior_first_policy_gradient_loss_uses_mean_reward_objective():
+    prior = EnvironmentPrior({})
+    rewards = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 5.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss, stats = prior.first_policy_gradient_loss_from_rewards(rewards)
+
+    assert torch.isfinite(loss)
+    assert float(stats["objective"]) == pytest.approx(float(rewards.mean()))
+    assert float(loss) == pytest.approx(-float(rewards.mean()))
+
+
+def test_environment_prior_first_policy_gradient_rollout_gradients_are_finite():
+    _seed_everything(204)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+    assert torch.isfinite(loss)
+    assert torch.isfinite(rollout["rewards"]).all()
+    assert float(stats["objective"]) == pytest.approx(float(rollout["rewards"].mean()))
+    assert float(grad_sum) > 0.0
+    assert all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None)
+
+
+def test_environment_prior_first_policy_gradient_tbptt_sink_does_not_retain_graph():
+    _seed_everything(205)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t, action_t, reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    retain_graph_flags = []
+
+    def _sink(weighted_window_loss, *, retain_graph=False):
+        assert torch.isfinite(weighted_window_loss)
+        retain_graph_flags.append(bool(retain_graph))
+
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=2,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+        tbptt_window=4,
+        tbptt_loss_sink=_sink,
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    assert torch.isfinite(loss)
+    assert torch.isfinite(stats["objective"])
+    assert retain_graph_flags
+    assert retain_graph_flags[-1] is False
+    assert any(retain_graph_flags[:-1])
+
+
 def test_environment_prior_reinforce_stats_report_nonfinite_shares():
     prior = EnvironmentPrior()
     rewards = torch.tensor(
@@ -2508,6 +2615,184 @@ def test_environment_prior_reinforce_tanh_reward_transform_is_bounded_and_monoto
 
     assert torch.isfinite(loss)
     assert float(stats["reinforce_reward_used_abs_max"]) <= 10.0 + 1e-6
+
+
+def test_environment_prior_reinforce_clip_reward_transform_is_bounded():
+    prior = EnvironmentPrior(
+        {
+            "reinforce_reward_transform": "clip",
+            "reinforce_reward_tanh_bound": 10.0,
+        }
+    )
+    rewards = torch.tensor(
+        [
+            [-100.0, -2.0, 0.0, 2.0, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+    log_probs = torch.zeros_like(rewards, requires_grad=True)
+
+    transformed, meta = prior._transform_reinforce_rewards(rewards)
+    assert meta["mode"] == "clip"
+    assert float(transformed.abs().max()) <= 10.0 + 1e-6
+    assert float(transformed[0, 0]) == -10.0
+    assert float(transformed[0, -1]) == 10.0
+
+    loss, stats = prior.reinforce_loss_from_rewards(
+        rewards=transformed,
+        log_probs=log_probs,
+        discount=1.0,
+        baseline_mode="zero",
+    )
+
+    assert torch.isfinite(loss)
+    assert float(stats["reinforce_reward_used_abs_max"]) <= 10.0 + 1e-6
+
+
+def test_environment_prior_reinforce_rms_reward_transform_normalizes_rms():
+    prior = EnvironmentPrior(
+        {
+            "reinforce_reward_transform": "rms",
+            "reinforce_reward_rms_eps": 1e-6,
+        }
+    )
+    rewards = torch.tensor(
+        [
+            [-3.0, -1.0, 1.0, 3.0],
+            [-6.0, -2.0, 2.0, 6.0],
+        ],
+        dtype=torch.float32,
+    )
+    transformed, meta = prior._transform_reinforce_rewards(rewards)
+
+    assert meta["mode"] == "rms"
+    assert math.isclose(float(meta["rms_eps"]), 1e-6, rel_tol=0.0, abs_tol=0.0)
+    transformed_rms = torch.sqrt(transformed.square().mean())
+    assert torch.isfinite(transformed).all()
+    assert torch.all(torch.sign(transformed) == torch.sign(rewards))
+    assert math.isclose(float(transformed_rms), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+
+
+def test_environment_prior_reinforce_rms_action_transform_normalizes_active_dims_only():
+    action_raw = torch.tensor(
+        [
+            [3.0, 4.0, 7.0],
+            [0.0, -2.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [0.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    transformed = EnvironmentPrior._transform_reinforce_action(
+        action_raw,
+        mode="rms",
+        rms_eps=1e-6,
+        mask=mask,
+    )
+
+    assert torch.allclose(transformed[0, 2], torch.tensor(0.0))
+    assert torch.allclose(transformed[1, 0], torch.tensor(0.0))
+    assert torch.allclose(transformed[1, 2], torch.tensor(0.0))
+    rms_0 = torch.sqrt((transformed[0, :2].square().mean()))
+    rms_1 = torch.sqrt((transformed[1, 1:2].square().mean()))
+    assert math.isclose(float(rms_0), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+    assert math.isclose(float(rms_1), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+
+
+def test_environment_prior_state_full_rms_only_downscales_active_dims():
+    state_next = torch.tensor(
+        [
+            [3.0, 4.0, 100.0],
+            [0.2, 0.0, 100.0],
+        ],
+        dtype=torch.float32,
+    )
+    state_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 1.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    enabled = torch.tensor([True, False])
+
+    transformed = EnvironmentPrior._apply_state_full_rms(
+        state_next,
+        enabled=enabled,
+        target=1.0,
+        state_mask=state_mask,
+        eps=1e-6,
+    )
+
+    rms_0 = torch.sqrt(transformed[0, :2].square().mean())
+    rms_1 = torch.sqrt(transformed[1, :2].square().mean())
+    scale_0 = float(torch.sqrt(state_next[0, :2].square().mean()))
+    assert math.isclose(float(rms_0), 1.0, rel_tol=1e-5, abs_tol=1e-5)
+    assert math.isclose(float(rms_1), float(torch.sqrt(state_next[1, :2].square().mean())), rel_tol=1e-5, abs_tol=1e-5)
+    assert math.isclose(float(transformed[0, 2]), float(state_next[0, 2] / scale_0), rel_tol=1e-5, abs_tol=1e-5)
+    assert torch.allclose(transformed[1, 2], state_next[1, 2])
+
+
+def test_environment_prior_gaussian_log_prob_matches_clean_score_function_gradient():
+    action_mean = torch.tensor([0.3, -0.2], dtype=torch.float32, requires_grad=True)
+    action_std = torch.tensor([0.7, 0.5], dtype=torch.float32)
+    eps = torch.tensor([0.5, -1.0], dtype=torch.float32)
+    action_raw = action_mean + (eps * action_std)
+
+    log_prob = EnvironmentPrior._gaussian_log_prob(
+        action_raw.detach(),
+        action_mean,
+        action_std,
+    )
+    (grad_mean,) = torch.autograd.grad(log_prob, action_mean)
+    expected = (action_raw.detach() - action_mean.detach()) / action_std.square()
+    assert torch.allclose(grad_mean, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_rollout_with_policy_uses_rms_action_tokens_when_enabled():
+    _seed_everything(17)
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    cfg["batch_parallel_backend"] = "torch_vectorized"
+    cfg["state_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    cfg["obs_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["noise_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 0, "max": 0}
+    cfg["obs_slot_dim"] = 4
+    cfg["action_slot_dim"] = 2
+    cfg["strict_joint_transition_enabled"] = True
+    cfg["reinforce_action_transform"] = "rms"
+    cfg["reinforce_action_rms_eps"] = 1e-6
+    prior = EnvironmentPrior(cfg)
+
+    class FixedPolicy:
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            batch = obs_t.shape[0]
+            del action_t, reward_t, cache, step_idx, env_info
+            return torch.tensor([[3.0, 4.0]], dtype=torch.float32).expand(batch, -1)
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=FixedPolicy().step,
+        batch_size=2,
+        n_samples=3,
+        num_features=8,
+        device="cpu",
+        single_eval_pos=1,
+        collect_x=True,
+    )
+    x = rollout["x"]
+    action_start = int(cfg["obs_slot_dim"]) + 2
+    action_tokens = x[1, :, action_start: action_start + 2]
+    expected = torch.tensor([3.0, 4.0], dtype=torch.float32)
+    expected = expected / torch.sqrt(expected.square().mean())
+    assert torch.allclose(action_tokens, expected.unsqueeze(0).expand_as(action_tokens), atol=1e-6, rtol=1e-6)
 
 
 def test_environment_prior_squashed_gaussian_log_prob_matches_clean_score_function_gradient():
@@ -2947,11 +3232,20 @@ def _reference_scm_apply_weight_init(
     weight,
     *,
     init_std,
+    activation_name,
+    standard_init_enabled,
     prior_mlp_dropout_prob,
     block_wise_dropout,
     prior_mlp_scale_weights_sqrt,
     generator,
 ):
+    base_std = EnvironmentPrior._scm_linear_init_std(
+        weight.shape[0],
+        weight.shape[1],
+        activation_name=activation_name,
+        standard_init_enabled=standard_init_enabled,
+        init_std=init_std,
+    )
     if block_wise_dropout:
         weight.zero_()
         n_blocks = int(
@@ -2966,7 +3260,7 @@ def _reference_scm_apply_weight_init(
         block_w = max(1, weight.shape[1] // n_blocks)
         keep_prob = float((n_blocks * block_h * block_w) / max(1, weight.numel()))
         denom = keep_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0)
-        block_std = float(init_std) / max(denom, 1e-12)
+        block_std = float(base_std) / max(denom, 1e-12)
         for block_idx in range(n_blocks):
             h_start = block_h * block_idx
             h_end = min(weight.shape[0], block_h * (block_idx + 1))
@@ -2981,7 +3275,7 @@ def _reference_scm_apply_weight_init(
 
     dropout_prob = float(min(0.99, max(0.0, prior_mlp_dropout_prob)))
     denom = 1.0 - (dropout_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0))
-    init_scale = float(init_std) / max(denom, 1e-12)
+    init_scale = float(base_std) / max(denom, 1e-12)
     weight.copy_(torch.randn(weight.shape, generator=generator) * init_scale)
     if dropout_prob > 0:
         keep_mask = torch.bernoulli(
@@ -3013,11 +3307,15 @@ def _reference_scm_joint_eval(x, h, *, generator):
     sort_features = bool(h.get("sort_features", False))
     in_clique = bool(h.get("in_clique", False))
     random_feature_rotation = bool(h.get("random_feature_rotation", False))
+    standard_init_enabled = bool(h.get("scm_standard_linear_init_enabled", True))
+    activation_name = EnvironmentPrior._activation_name(h["prior_mlp_activations"])
 
     first_weight = torch.empty((in_dim, hidden_dim), dtype=x.dtype)
     _reference_scm_apply_weight_init(
         first_weight,
         init_std=init_std,
+        activation_name=activation_name,
+        standard_init_enabled=standard_init_enabled,
         prior_mlp_dropout_prob=0.0,
         block_wise_dropout=block_wise_dropout,
         prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3034,6 +3332,8 @@ def _reference_scm_joint_eval(x, h, *, generator):
         _reference_scm_apply_weight_init(
             weight,
             init_std=init_std,
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
             prior_mlp_dropout_prob=prior_mlp_dropout_prob,
             block_wise_dropout=block_wise_dropout,
             prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3202,6 +3502,7 @@ def test_environment_prior_strict_reference_scm_joint_transition_matches_referen
         num_layers=4,
     )
     h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = False
     h["noise_std"] = 0.0
     h["pre_sample_weights"] = False
     h["prior_mlp_dropout_prob"] = 0.0
@@ -3222,6 +3523,84 @@ def test_environment_prior_strict_reference_scm_joint_transition_matches_referen
 
     assert torch.allclose(state_actual, state_ref, atol=1e-6, rtol=1e-6)
     assert torch.allclose(reward_actual, reward_ref, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_strict_reference_scm_joint_transition_matches_reference_builder_with_standard_linear_init():
+    _seed_everything(20260309)
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=5,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=4,
+        zero_pad_dim=1,
+        num_layers=4,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = True
+    h["noise_std"] = 0.0
+    h["pre_sample_weights"] = False
+    h["prior_mlp_dropout_prob"] = 0.0
+    h["block_wise_dropout"] = False
+    h["random_feature_rotation"] = False
+
+    env = prior._sample_environment(h, device="cpu", rng_seed=321)
+    in_dim = int(env["env_input_dim"])
+    env_in = torch.linspace(-1.0, 1.0, steps=3 * in_dim, dtype=torch.float32).reshape(3, in_dim)
+    state_actual, reward_actual = env["transition_generator"](env_in)
+
+    ref_generator = torch.Generator(device="cpu")
+    ref_generator.manual_seed(321)
+    state_ref, reward_ref = _reference_scm_joint_eval(env_in, h, generator=ref_generator)
+
+    assert torch.allclose(state_actual, state_ref, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(reward_actual, reward_ref, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_strict_reference_scm_joint_transition_input_gradients_match_reference_builder():
+    _seed_everything(20260310)
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=5,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=4,
+        zero_pad_dim=1,
+        num_layers=4,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = False
+    h["noise_std"] = 0.0
+    h["pre_sample_weights"] = False
+    h["prior_mlp_dropout_prob"] = 0.0
+    h["block_wise_dropout"] = False
+    h["random_feature_rotation"] = False
+
+    seed = 777
+    env = prior._sample_environment(h, device="cpu", rng_seed=seed)
+    in_dim = int(env["env_input_dim"])
+    env_in_actual = torch.linspace(
+        -0.5, 0.75, steps=4 * in_dim, dtype=torch.float32
+    ).reshape(4, in_dim).requires_grad_(True)
+    env_in_ref = env_in_actual.detach().clone().requires_grad_(True)
+
+    state_actual, reward_actual = env["transition_generator"](env_in_actual)
+    scalar_actual = state_actual.square().sum() + reward_actual.square().sum()
+    scalar_actual.backward()
+
+    ref_generator = torch.Generator(device="cpu")
+    ref_generator.manual_seed(seed)
+    state_ref, reward_ref = _reference_scm_joint_eval(env_in_ref, h, generator=ref_generator)
+    scalar_ref = state_ref.square().sum() + reward_ref.square().sum()
+    scalar_ref.backward()
+
+    assert torch.allclose(state_actual.detach(), state_ref.detach(), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(reward_actual.detach(), reward_ref.detach(), atol=1e-6, rtol=1e-6)
+    assert env_in_actual.grad is not None
+    assert env_in_ref.grad is not None
+    assert torch.allclose(env_in_actual.grad, env_in_ref.grad, atol=1e-5, rtol=1e-5)
 
 
 def test_environment_prior_prefix_grouped_noise_matches_rowwise_on_homogeneous_prefix_case():

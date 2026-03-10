@@ -1,0 +1,29 @@
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/cuda/__init__.py:65: FutureWarning: The pynvml package is deprecated. Please install nvidia-ml-py instead. If you did not install pynvml directly, please report this to the maintainers of the package that installed pynvml for you.
+  import pynvml  # type: ignore[import]
+Seed set to 42
+/home/liangchen/miniconda3/envs/rlpfn/lib/python3.11/site-packages/torch/optim/lr_scheduler.py:1195: UserWarning: Detected call of `lr_scheduler.step()` before `optimizer.step()`. In PyTorch 1.1.0 and later, you should call them in the opposite order: `optimizer.step()` before `lr_scheduler.step()`.  Failure to do this will result in PyTorch skipping the first value of the learning rate schedule. See more details at https://pytorch.org/docs/stable/optim.html#how-to-adjust-learning-rate
+  scheduler.step()
+
+	Command being timed: "conda run -n rlpfn python -m ticl.fit_model rlpfn --seed-everything True -E 1 -n 1 --pg-tbptt-window 64 --pg-env-replay-steps 1"
+	User time (seconds): 93.66
+	System time (seconds): 3.60
+	Percent of CPU this job got: 107%
+	Elapsed (wall clock) time (h:mm:ss or m:ss): 1:30.09
+	Average shared text size (kbytes): 0
+	Average unshared data size (kbytes): 0
+	Average stack size (kbytes): 0
+	Average total size (kbytes): 0
+	Maximum resident set size (kbytes): 2143360
+	Average resident set size (kbytes): 0
+	Major (requiring I/O) page faults: 0
+	Minor (reclaiming a frame) page faults: 505125
+	Voluntary context switches: 31750
+	Involuntary context switches: 2705
+	Swaps: 0
+	File system inputs: 0
+	File system outputs: 203200
+	Socket messages sent: 0
+	Socket messages received: 0
+	Signals delivered: 0
+	Page size (bytes): 4096
+	Exit status: 0

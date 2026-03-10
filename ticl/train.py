@@ -1893,7 +1893,7 @@ def train_epoch(
 
     if grad_accum_steps > 0:
         optimizer.zero_grad(set_to_none=True)
-    _clear_policy_rollout_artifacts(env_prior=env_prior, policy_step_fn=policy_step_fn)
+    _clear_policy_rollout_artifacts()
 
     if valid_steps.item() == 0:
         print("[train-warn] all batches were skipped due to non-finite loss/grad.")
@@ -2854,7 +2854,7 @@ def train_epoch_policy_gradient(
                                     )
                                 )
 
-                            def _tbptt_backward_from_losses(window_losses_scaled):
+                            def _tbptt_backward_from_losses(window_losses_scaled, retain_graph=False):
                                 nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
                                 nonlocal backward_t_start_unix, backward_t_end_unix
                                 nonlocal batch_tbptt_stream_backward_launches, batch_tbptt_stream_backward_roots
@@ -2904,15 +2904,21 @@ def train_epoch_policy_gradient(
                                 ):
                                     if scaler is None:
                                         if num_roots == 1:
-                                            window_losses_scaled[0].backward()
+                                            window_losses_scaled[0].backward(retain_graph=bool(retain_graph))
                                         else:
-                                            torch.autograd.backward(window_losses_scaled)
+                                            torch.autograd.backward(
+                                                window_losses_scaled,
+                                                retain_graph=bool(retain_graph),
+                                            )
                                     else:
                                         scaled_losses = [scaler.scale(loss_root) for loss_root in window_losses_scaled]
                                         if num_roots == 1:
-                                            scaled_losses[0].backward()
+                                            scaled_losses[0].backward(retain_graph=bool(retain_graph))
                                         else:
-                                            torch.autograd.backward(scaled_losses)
+                                            torch.autograd.backward(
+                                                scaled_losses,
+                                                retain_graph=bool(retain_graph),
+                                            )
                                 if backward_cuda_start is not None:
                                     backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_end.record()
@@ -2930,23 +2936,31 @@ def train_epoch_policy_gradient(
                             def _tbptt_flush_pending_windows():
                                 if tbptt_pending_window_losses is None or (len(tbptt_pending_window_losses) == 0):
                                     return
-                                merged_losses = list(tbptt_pending_window_losses)
+                                merged_payloads = list(tbptt_pending_window_losses)
                                 tbptt_pending_window_losses.clear()
-                                _tbptt_backward_from_losses(merged_losses)
+                                merged_losses = [loss for loss, _ in merged_payloads]
+                                merged_retain_graph = any(bool(retain_graph) for _, retain_graph in merged_payloads)
+                                _tbptt_backward_from_losses(
+                                    merged_losses,
+                                    retain_graph=merged_retain_graph,
+                                )
 
-                            def _tbptt_chunk_loss_sink(weighted_window_loss):
+                            def _tbptt_chunk_loss_sink(weighted_window_loss, *, retain_graph=False):
                                 nonlocal batch_tbptt_stream_merge_guard_flushes
                                 window_loss_scaled = weighted_window_loss * backward_scale
                                 if tbptt_pending_window_losses is not None:
                                     if _tbptt_merge_guard_should_flush_pending():
                                         batch_tbptt_stream_merge_guard_flushes += 1
                                         _tbptt_flush_pending_windows()
-                                    tbptt_pending_window_losses.append(window_loss_scaled)
+                                    tbptt_pending_window_losses.append((window_loss_scaled, bool(retain_graph)))
                                     if len(tbptt_pending_window_losses) < int(tbptt_stream_merge_windows):
                                         return
                                     _tbptt_flush_pending_windows()
                                     return
-                                _tbptt_backward_from_losses([window_loss_scaled])
+                                _tbptt_backward_from_losses(
+                                    [window_loss_scaled],
+                                    retain_graph=bool(retain_graph),
+                                )
                         else:
                             _tbptt_chunk_loss_sink = None
                             _tbptt_flush_pending_windows = None
@@ -6361,7 +6375,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ):
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
-    if rl_objective not in {'supervised', 'policy_gradient', 'reinforce'}:
+    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce'}:
         raise ValueError(f"Unknown rl_objective: {rl_objective}")
     if rank == 0 and verbose:
         print(f'Using {device} device')
@@ -6372,7 +6386,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
 
     policy_tf32_prev = None
     if (
-        rl_objective in {'policy_gradient', 'reinforce'}
+        rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
         and ("cuda" in str(device))
         and torch.cuda.is_available()
     ):
@@ -6470,7 +6484,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"export_trace={kernel_profiler_cfg.export_trace}, "
                 f"summary_top_k={kernel_profiler_cfg.summary_top_k})"
             )
-    if rl_objective in {'policy_gradient', 'reinforce'}:
+    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
         if using_dist:
             raise ValueError(f"{rl_objective} objective does not support distributed training yet.")
         env_prior = _resolve_environment_prior(getattr(dl, "prior", None))
@@ -7043,7 +7057,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 torch.cuda.reset_peak_memory_stats()
                 gpu_start_time.record()
             
-            if rl_objective in {'policy_gradient', 'reinforce'}:
+            if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
                 new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
                     model=model,
                     aggregate_k_gradients=aggregate_k_gradients,
@@ -7116,7 +7130,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             else:
                 last_lr = scheduler.get_last_lr()[0]
             if (
-                rl_objective in {'policy_gradient', 'reinforce'}
+                rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
                 and (not pg_warmup_note_emitted)
                 and warmup_epochs > 0
                 and epoch <= warmup_epochs
@@ -7187,7 +7201,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     print(
                         f' peak gpu mem alloc/reserved {peak_alloc_gib:5.2f}GiB/{peak_reserved_gib:5.2f}GiB |',
                     )
-                if rl_objective in {'policy_gradient', 'reinforce'}:
+                if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce'}:
                     mean_loss_str = f"{float(total_loss):+.6e}"
                 else:
                     mean_loss_str = f"{float(total_loss):5.4f}"
@@ -7224,7 +7238,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print('-' * 89)
                 
             if (
-                rl_objective not in {'policy_gradient', 'reinforce'}
+                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce'}
                 and math.isfinite(prev_total_loss)
                 and new_loss > 1.5 * prev_total_loss
             ):

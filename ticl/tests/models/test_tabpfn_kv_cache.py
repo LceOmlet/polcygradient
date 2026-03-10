@@ -1,3 +1,5 @@
+import types
+
 import torch
 from torch.utils.checkpoint import checkpoint
 
@@ -290,6 +292,81 @@ def test_tbptt_detach_prefix_compaction_preserves_paged_cache_semantics():
             compact_k, compact_v = _materialize_kv_from_layer_cache(layer_compact)
             assert torch.allclose(base_k, compact_k, atol=1e-5, rtol=1e-4)
             assert torch.allclose(base_v, compact_v, atol=1e-5, rtol=1e-4)
+
+
+def test_tbptt_detach_prefix_compaction_with_cloned_tensors_keeps_paged_cache_valid():
+    torch.manual_seed(52)
+    model = _build_model()
+    model.train()
+
+    steps = 40
+    x_tokens = torch.randn(steps, 2, 12)
+    y_tokens = torch.randn(steps, 2)
+
+    cache = None
+    with torch.enable_grad():
+        for t in range(steps):
+            out, cache = model.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=3,
+                allow_grad_mutable_cache=True,
+            )
+            assert torch.isfinite(out).all()
+            if t == 31:
+                cache = EnvironmentPrior._detach_policy_cache(cache, clone_tensors=True)
+                for layer_cache in cache:
+                    assert layer_cache["cache_mode"] == "paged"
+                    assert isinstance(layer_cache["k_pages"], list)
+                    k_full, v_full = _materialize_kv_from_layer_cache(layer_cache)
+                    assert int(k_full.shape[2]) == int(layer_cache["valid_len"])
+                    assert int(v_full.shape[2]) == int(layer_cache["valid_len"])
+
+
+def test_paged_auto_mode_promotes_long_prefix_to_flash_prefix(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+    monkeypatch.setenv("TICL_POLICY_PAGED_ATTN_TRAIN_MODE", "auto")
+    monkeypatch.setenv("TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS", "4")
+
+    torch.manual_seed(53)
+    model = _build_model().cuda()
+    model.train()
+
+    flash_prefix_calls = {"count": 0}
+
+    for layer in model.transformer_encoder.layers:
+        original = layer._forward_step_attn_ff_paged_flash_prefix
+
+        def wrapped(self, *args, _original=original, **kwargs):
+            flash_prefix_calls["count"] += 1
+            return _original(*args, **kwargs)
+
+        layer._forward_step_attn_ff_paged_flash_prefix = types.MethodType(wrapped, layer)
+
+    steps = 12
+    x_tokens = torch.randn(steps, 2, 12, device="cuda")
+    y_tokens = torch.randn(steps, 2, device="cuda")
+
+    cache = None
+    with torch.enable_grad(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+        for t in range(steps):
+            _, cache = model.forward_policy_step(
+                x_tokens[t: t + 1],
+                y_tokens[t: t + 1],
+                kv_cache=cache,
+                max_cache_len=steps,
+                kv_cache_mode="paged",
+                kv_cache_page_size=2,
+                allow_grad_mutable_cache=True,
+            )
+            if t == 7:
+                cache = EnvironmentPrior._detach_policy_cache(cache, clone_tensors=True)
+
+    assert flash_prefix_calls["count"] > 0
 
 
 def test_forward_policy_step_finalize_compile_preserves_semantics(monkeypatch):

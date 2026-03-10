@@ -1,0 +1,1 @@
+{"gp_first_proj_ms": 1333.5974432411604, "gp_proj_calls": 64, "gp_second_proj_ms": 92.9291260545142, "transition_wall_ms": 1521.5013780398294, "wall_s": 2.4752454580157064}

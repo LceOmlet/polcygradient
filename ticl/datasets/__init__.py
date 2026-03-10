@@ -3,6 +3,7 @@ import openml
 import pandas as pd
 import torch
 from scipy.special import expit as sigmoid
+from pathlib import Path
 
 
 def linear_correlated_logistic_regression(
@@ -86,7 +87,67 @@ def _encode_if_category(column: pd.Series | np.ndarray) -> pd.Series | np.ndarra
     return column
 
 
+def _openml_processed_cache_root() -> Path:
+    return Path(openml.config.get_cache_directory()) / "ticl_processed"
+
+
+def _openml_processed_cache_path(did: int, classification: bool, multiclass: bool, shuffled: bool) -> Path:
+    mode = "cls" if classification else "reg"
+    multi = "multi" if multiclass else "binary"
+    order = "shuf" if shuffled else "ordered"
+    return _openml_processed_cache_root() / f"{did}_{mode}_{multi}_{order}.pt"
+
+
+def _torchify_cached_dataset(payload: dict, max_samples: int | None):
+    X = torch.tensor(payload["X"])
+    y = torch.tensor(payload["y"])
+    if max_samples:
+        X, y = X[:max_samples], y[:max_samples]
+    return X, y, payload["categorical_feats"], payload["attribute_names"], payload["name"]
+
+
+def _save_processed_openml_dataset(
+    did: int,
+    classification: bool,
+    multiclass: bool,
+    shuffled: bool,
+    X,
+    y,
+    categorical_feats,
+    attribute_names,
+    name,
+):
+    cache_path = _openml_processed_cache_path(did, classification, multiclass, shuffled)
+    cache_path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "did": did,
+            "classification": classification,
+            "multiclass": multiclass,
+            "shuffled": shuffled,
+            "X": np.asarray(X),
+            "y": np.asarray(y),
+            "categorical_feats": list(categorical_feats),
+            "attribute_names": list(attribute_names),
+            "name": name,
+        },
+        cache_path,
+    )
+
+
+def _load_processed_openml_dataset(did: int, classification: bool, multiclass: bool, shuffled: bool):
+    cache_path = _openml_processed_cache_path(did, classification, multiclass, shuffled)
+    if not cache_path.exists():
+        return None
+    return torch.load(cache_path, map_location="cpu", weights_only=False)
+
+
 def get_openml_regression(did, max_samples, shuffled=True):
+    cached = _load_processed_openml_dataset(did, classification=False, multiclass=False, shuffled=shuffled)
+    if cached is not None:
+        X, y, categorical_feats, attribute_names, _ = _torchify_cached_dataset(cached, max_samples)
+        return X, y, categorical_feats, attribute_names
+
     dataset = openml.datasets.get_dataset(did, download_data=False, download_qualities=False,
                                           download_features_meta_data=False)
     X, y, categorical_indicator, attribute_names = dataset.get_data(target=dataset.default_target_attribute,
@@ -107,12 +168,28 @@ def get_openml_regression(did, max_samples, shuffled=True):
         np.random.seed(13)
         np.random.shuffle(order)
         X, y = torch.tensor(X[order]), torch.tensor(y[order])
+    _save_processed_openml_dataset(
+        did=did,
+        classification=False,
+        multiclass=False,
+        shuffled=shuffled,
+        X=X.cpu().numpy(),
+        y=y.cpu().numpy(),
+        categorical_feats=list(np.where(categorical_indicator)[0]),
+        attribute_names=attribute_names,
+        name=dataset.name,
+    )
     if max_samples:
         X, y = X[:max_samples], y[:max_samples]
     return X, y, list(np.where(categorical_indicator)[0]), attribute_names
 
 
 def get_openml_classification(did, max_samples, multiclass=True, shuffled=True):
+    cached = _load_processed_openml_dataset(did, classification=True, multiclass=multiclass, shuffled=shuffled)
+    if cached is not None:
+        X, y, categorical_feats, attribute_names, _ = _torchify_cached_dataset(cached, max_samples)
+        return X, y, categorical_feats, attribute_names
+
     dataset = openml.datasets.get_dataset(did, download_data=False, download_qualities=False, download_features_meta_data=False)
     X, y, categorical_indicator, attribute_names = dataset.get_data(target=dataset.default_target_attribute, dataset_format="dataframe")
     X = np.array(X.apply(_encode_if_category), dtype=np.float32)
@@ -141,10 +218,52 @@ def get_openml_classification(did, max_samples, multiclass=True, shuffled=True):
         np.random.seed(13)
         np.random.shuffle(order)
         X, y = torch.tensor(X[order]), torch.tensor(y[order])
+    _save_processed_openml_dataset(
+        did=did,
+        classification=True,
+        multiclass=multiclass,
+        shuffled=shuffled,
+        X=X.cpu().numpy(),
+        y=y.cpu().numpy(),
+        categorical_feats=list(np.where(categorical_indicator)[0]),
+        attribute_names=attribute_names,
+        name=dataset.name,
+    )
     if max_samples:
         X, y = X[:max_samples], y[:max_samples]
 
     return X, y, list(np.where(categorical_indicator)[0]), attribute_names
+
+
+def _load_openml_entry_with_cache(did: int, classification: bool, multiclass: bool, shuffled: bool, max_samples: int):
+    cached = _load_processed_openml_dataset(did, classification=classification, multiclass=multiclass, shuffled=shuffled)
+    if cached is not None:
+        X, y, categorical_feats, attribute_names, name = _torchify_cached_dataset(cached, max_samples)
+        return name, X, y, categorical_feats, attribute_names
+
+    if classification:
+        X, y, categorical_feats, attribute_names = get_openml_classification(
+            int(did),
+            max_samples=max_samples,
+            multiclass=multiclass,
+            shuffled=shuffled,
+        )
+    else:
+        X, y, categorical_feats, attribute_names = get_openml_regression(
+            int(did),
+            max_samples=max_samples,
+            shuffled=shuffled,
+        )
+    cached = _load_processed_openml_dataset(did, classification=classification, multiclass=multiclass, shuffled=shuffled)
+    if cached is not None:
+        return cached["name"], X, y, categorical_feats, attribute_names
+    dataset = openml.datasets.get_dataset(
+        did,
+        download_data=False,
+        download_qualities=False,
+        download_features_meta_data=False,
+    )
+    return dataset.name, X, y, categorical_feats, attribute_names
 
 
 def load_openml_list(
@@ -161,26 +280,28 @@ def load_openml_list(
     verbose=0,
 ):
     datasets = []
-    openml_list = openml.datasets.list_datasets(dids)
-    print(f'Number of datasets: {len(openml_list)}')
+    datalist_rows = []
+    print(f'Number of datasets: {len(dids)}')
 
-    datalist = pd.DataFrame.from_dict(openml_list, orient="index")
-    if filter_for_nan:
-        datalist = datalist[datalist['NumberOfInstancesWithMissingValues'] == 0]
-        print(f'Number of datasets after Nan and feature number filtering: {len(datalist)}')
-
-    for ds in datalist.index:
+    for ds in dids:
         modifications = {'samples_capped': False, 'classes_capped': False, 'feats_capped': False}
-        entry = datalist.loc[ds]
         if verbose > 0:
-            print('Loading', entry['name'], entry.did, '..')
+            print('Loading', ds, '..')
 
-        if entry['NumberOfClasses'] == 0.0:
-            X, y, categorical_feats, attribute_names = get_openml_regression(int(entry.did), max_samples)
-        else:
-            X, y, categorical_feats, attribute_names = get_openml_classification(
-                int(entry.did), max_samples, multiclass=multiclass, shuffled=shuffled)
+        dataset_name, X, y, categorical_feats, attribute_names = _load_openml_entry_with_cache(
+            int(ds),
+            classification=classification,
+            multiclass=multiclass,
+            shuffled=shuffled,
+            max_samples=max_samples,
+        )
         if X is None:
+            continue
+
+        y_has_nan = bool(torch.isnan(y).any()) if torch.is_floating_point(y) else False
+        if filter_for_nan and (torch.isnan(X).any() or y_has_nan):
+            if verbose > 0:
+                print(f'Skipping {dataset_name} because cached data contains NaNs')
             continue
 
         if X.shape[1] > num_feats:
@@ -208,8 +329,18 @@ def load_openml_list(
                     print('Too many classes')
                     continue
 
-        datasets += [[entry['name'], X, y, categorical_feats, attribute_names, modifications]]
+        datasets += [[dataset_name, X, y, categorical_feats, attribute_names, modifications]]
+        datalist_rows.append(
+            {
+                "did": int(ds),
+                "name": dataset_name,
+                "NumberOfClasses": 0.0 if not classification else float(len(torch.unique(y))),
+                "NumberOfFeatures": int(X.shape[1]),
+                "NumberOfInstances": int(X.shape[0]),
+            }
+        )
 
+    datalist = pd.DataFrame(datalist_rows)
     return datasets, datalist
 
 

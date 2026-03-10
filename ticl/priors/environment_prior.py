@@ -1201,8 +1201,11 @@ class EnvironmentPrior:
         cfg.setdefault("state_full_rms_enabled", False)
         cfg.setdefault("state_full_rms_target", 1.0)
         cfg.setdefault("reinforce_reward_transform", "none")
+        cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
         cfg.setdefault("reinforce_reward_tanh_bound", 10.0)
+        cfg.setdefault("reinforce_action_transform", "tanh")
+        cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -1311,6 +1314,7 @@ class EnvironmentPrior:
             "prior_mlp_activations",
             {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity]},
         )
+        cfg.setdefault("scm_standard_linear_init_enabled", True)
         cfg.setdefault("init_std", {"distribution": "log_uniform", "min": 1e-3, "max": 1.0})
         cfg.setdefault("noise_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
 
@@ -1920,17 +1924,29 @@ class EnvironmentPrior:
         init_std = float(h["init_std"])
         noise_std = float(h["noise_std"])
         activation = self._resolve_activation(h["prior_mlp_activations"])
+        activation_name = self._activation_name(h["prior_mlp_activations"])
+        standard_init_enabled = self._scm_standard_linear_init_enabled(h)
         weight_cap = self._resolve_lipschitz_weight_cap(h)
 
         layer_dims = [in_dim] + [hidden] * (depth - 1) + [out_dim]
         weights = []
         biases = []
         for d_in, d_out in zip(layer_dims[:-1], layer_dims[1:]):
+            if bool(standard_init_enabled):
+                weight_std = self._scm_linear_init_std(
+                    d_in,
+                    d_out,
+                    activation_name=activation_name,
+                    standard_init_enabled=True,
+                    init_std=init_std,
+                )
+            else:
+                weight_std = float(init_std) / math.sqrt(max(1, d_in))
             if generator is None:
-                w = torch.randn(d_in, d_out, device=device) * (init_std / math.sqrt(max(1, d_in)))
+                w = torch.randn(d_in, d_out, device=device) * weight_std
                 b = torch.randn(d_out, device=device) * (init_std * 0.1)
             else:
-                w = torch.randn(d_in, d_out, device=device, generator=generator) * (init_std / math.sqrt(max(1, d_in)))
+                w = torch.randn(d_in, d_out, device=device, generator=generator) * weight_std
                 b = torch.randn(d_out, device=device, generator=generator) * (init_std * 0.1)
             w = self._project_matrix_fro_norm(w, weight_cap)
             weights.append(w)
@@ -2024,10 +2040,26 @@ class EnvironmentPrior:
         return int(draw.item())
 
     @staticmethod
+    def _scm_standard_linear_init_enabled(h):
+        return bool(h.get("scm_standard_linear_init_enabled", True))
+
+    @staticmethod
+    def _scm_linear_init_std(fan_in, fan_out, *, activation_name, standard_init_enabled, init_std):
+        fan_in = max(1, int(fan_in))
+        fan_out = max(1, int(fan_out))
+        if not bool(standard_init_enabled):
+            return float(init_std)
+        if str(activation_name).strip().lower() == "relu":
+            return math.sqrt(2.0 / float(fan_in))
+        return math.sqrt(2.0 / float(fan_in + fan_out))
+
+    @staticmethod
     def _reference_scm_apply_weight_init(
         weight,
         *,
         init_std,
+        activation_name,
+        standard_init_enabled,
         prior_mlp_dropout_prob,
         block_wise_dropout,
         prior_mlp_scale_weights_sqrt,
@@ -2035,6 +2067,13 @@ class EnvironmentPrior:
     ):
         if weight.ndim != 2:
             raise ValueError("reference SCM weight init expects a 2D tensor")
+        base_std = EnvironmentPrior._scm_linear_init_std(
+            weight.shape[0],
+            weight.shape[1],
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
+            init_std=init_std,
+        )
         if block_wise_dropout:
             nn.init.zeros_(weight)
             n_blocks = EnvironmentPrior._generator_randint(
@@ -2047,7 +2086,7 @@ class EnvironmentPrior:
             block_w = max(1, weight.shape[1] // n_blocks)
             keep_prob = float((n_blocks * block_h * block_w) / max(1, weight.numel()))
             denom = keep_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0)
-            block_std = float(init_std) / max(denom, 1e-12)
+            block_std = float(base_std) / max(denom, 1e-12)
             for block_idx in range(n_blocks):
                 h_start = block_h * block_idx
                 h_end = min(weight.shape[0], block_h * (block_idx + 1))
@@ -2070,7 +2109,7 @@ class EnvironmentPrior:
 
         dropout_prob = float(min(0.99, max(0.0, prior_mlp_dropout_prob)))
         denom = 1.0 - (dropout_prob ** (0.5 if prior_mlp_scale_weights_sqrt else 1.0))
-        init_scale = float(init_std) / max(denom, 1e-12)
+        init_scale = float(base_std) / max(denom, 1e-12)
         if generator is None:
             nn.init.normal_(weight, std=init_scale)
             if dropout_prob > 0:
@@ -2495,10 +2534,23 @@ class EnvironmentPrior:
             local_max_hidden_blocks = int(max(1, int(local_num_hidden_blocks.max().item())))
             bytes_f32 = 4
             total = 0
+            # Persistent builder tensors.
             total += local_bs * local_max_hidden_blocks * local_hidden_cap * local_hidden_cap * bytes_f32
             total += local_bs * local_in_cap * local_hidden_cap * bytes_f32
             total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
             total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
+            # Runtime tensors on the hot path:
+            # - outputs_layers
+            # - packed hidden noise
+            # - a small number of hidden work buffers
+            total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
+            total += local_bs * local_max_hidden_blocks * local_hidden_cap * bytes_f32
+            total += local_bs * local_hidden_cap * 4 * bytes_f32
+            # Be conservative for training/autograd and baddbmm workspace. The
+            # old estimate only counted parameter-like tensors and under-
+            # partitioned long-horizon rollout builders, which is exactly what
+            # caused first_policy_gradient to OOM at small batch sizes.
+            total *= 4
             return int(total), local_hidden_dims, local_num_hidden_blocks
 
         partition_budget = int(self.reference_scm_partition_max_bytes)
@@ -2515,6 +2567,8 @@ class EnvironmentPrior:
         )
         if (
             _allow_partition
+            and device.type == "cuda"
+            and generators is None
             and partition_budget > 0
             and estimated_builder_bytes > partition_budget
             and batch_size > 1
@@ -2568,9 +2622,8 @@ class EnvironmentPrior:
 
             def transition_fn(x, generator=None, generators_for_noise=None, x_input_is_packed=False):
                 x_device = x.device
-                x_dtype = x.dtype
-                state_out = torch.zeros((batch_size, state_cap_partition), device=x_device, dtype=x_dtype)
-                reward_out = torch.zeros((batch_size, 1), device=x_device, dtype=x_dtype)
+                state_out = None
+                reward_out = None
                 for idx_tensor, idx_list, sub_fn in zip(sub_index_tensors, sub_index_lists, sub_transition_fns):
                     idx_runtime = idx_tensor.to(device=x_device)
                     x_sub = x.index_select(0, idx_runtime)
@@ -2582,8 +2635,28 @@ class EnvironmentPrior:
                         generators_for_noise=sub_noise_generators,
                         x_input_is_packed=bool(x_input_is_packed),
                     )
+                    if state_out is None:
+                        state_out = torch.zeros(
+                            (batch_size, state_cap_partition),
+                            device=x_device,
+                            dtype=state_sub.dtype,
+                        )
+                    if reward_out is None:
+                        reward_out = torch.zeros(
+                            (batch_size, 1),
+                            device=x_device,
+                            dtype=reward_sub.dtype,
+                        )
+                    if state_sub.dtype != state_out.dtype:
+                        state_sub = state_sub.to(dtype=state_out.dtype)
+                    if reward_sub.dtype != reward_out.dtype:
+                        reward_sub = reward_sub.to(dtype=reward_out.dtype)
                     state_out[:, : state_sub.shape[1]].index_copy_(0, idx_runtime, state_sub)
                     reward_out.index_copy_(0, idx_runtime, reward_sub)
+                if state_out is None:
+                    state_out = torch.zeros((batch_size, state_cap_partition), device=x_device, dtype=x.dtype)
+                if reward_out is None:
+                    reward_out = torch.zeros((batch_size, 1), device=x_device, dtype=x.dtype)
                 return state_out, reward_out
 
             transition_fn._applies_output_tanh = False
@@ -2670,6 +2743,7 @@ class EnvironmentPrior:
             num_hidden_blocks_i = int(num_hidden_blocks[bi].item())
             init_std = float(h["init_std"])
             noise_std = float(h["noise_std"])
+            standard_init_enabled = self._scm_standard_linear_init_enabled(h)
             pre_sample_weights = bool(h.get("pre_sample_weights", False))
             prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
             block_wise_dropout = bool(h.get("block_wise_dropout", False))
@@ -2695,6 +2769,8 @@ class EnvironmentPrior:
             self._reference_scm_apply_weight_init(
                 first_weight_i,
                 init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
                 prior_mlp_dropout_prob=0.0,
                 block_wise_dropout=block_wise_dropout,
                 prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -2712,6 +2788,8 @@ class EnvironmentPrior:
                 self._reference_scm_apply_weight_init(
                     weight,
                     init_std=init_std,
+                    activation_name=activation_name,
+                    standard_init_enabled=standard_init_enabled,
                     prior_mlp_dropout_prob=prior_mlp_dropout_prob,
                     block_wise_dropout=block_wise_dropout,
                     prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3102,7 +3180,9 @@ class EnvironmentPrior:
             reward_dim + 2 * state_dim,
         )
         activation = self._resolve_activation(h["prior_mlp_activations"])
+        activation_name = self._activation_name(h["prior_mlp_activations"])
         init_std = float(h["init_std"])
+        standard_init_enabled = self._scm_standard_linear_init_enabled(h)
         noise_std = float(h["noise_std"])
         pre_sample_weights = bool(h.get("pre_sample_weights", False))
         prior_mlp_dropout_prob = float(h.get("prior_mlp_dropout_prob", 0.0))
@@ -3118,6 +3198,8 @@ class EnvironmentPrior:
         self._reference_scm_apply_weight_init(
             first_weight,
             init_std=init_std,
+            activation_name=activation_name,
+            standard_init_enabled=standard_init_enabled,
             prior_mlp_dropout_prob=0.0,
             block_wise_dropout=block_wise_dropout,
             prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -3134,6 +3216,8 @@ class EnvironmentPrior:
             self._reference_scm_apply_weight_init(
                 weight,
                 init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
                 prior_mlp_dropout_prob=prior_mlp_dropout_prob,
                 block_wise_dropout=block_wise_dropout,
                 prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
@@ -4146,9 +4230,16 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_reinforce_reward_transform(h):
         mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
-        if mode not in {"none", "tanh"}:
+        if mode not in {"none", "tanh", "rms", "clip"}:
             mode = "none"
         return mode
+
+    @staticmethod
+    def _resolve_reinforce_reward_rms_eps(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_rms_eps", 1e-6))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1e-6
+        return float(v)
 
     @staticmethod
     def _resolve_reinforce_reward_tanh_c(h):
@@ -4162,6 +4253,20 @@ class EnvironmentPrior:
         v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
         if (not math.isfinite(v)) or v <= 0.0:
             return 10.0
+        return float(v)
+
+    @staticmethod
+    def _resolve_reinforce_action_transform(h):
+        mode = str(h.get("reinforce_action_transform", "tanh")).strip().lower()
+        if mode not in {"tanh", "rms", "none"}:
+            mode = "tanh"
+        return mode
+
+    @staticmethod
+    def _resolve_reinforce_action_rms_eps(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
+        if (not math.isfinite(v)) or v <= 0.0:
+            return 1e-6
         return float(v)
 
     @staticmethod
@@ -4213,13 +4318,70 @@ class EnvironmentPrior:
             return torch.where(enabled_value.expand_as(state_next), state_scaled, state_next)
         return state_scaled
 
+    @staticmethod
+    def _transform_reinforce_action(action_raw, *, mode="tanh", rms_eps=1e-6, mask=None):
+        mode = str(mode).strip().lower()
+        if mode == "tanh":
+            action_next = torch.tanh(action_raw)
+        elif mode == "rms":
+            if mask is None:
+                mask_t = torch.ones_like(action_raw, dtype=action_raw.dtype)
+            else:
+                mask_t = mask.to(device=action_raw.device, dtype=action_raw.dtype)
+                while mask_t.ndim < action_raw.ndim:
+                    mask_t = mask_t.unsqueeze(0)
+                mask_t = mask_t.expand_as(action_raw)
+            denom = mask_t.sum(dim=-1).clamp_min(1.0)
+            eps_t = torch.as_tensor(rms_eps, device=action_raw.device, dtype=action_raw.dtype)
+            while eps_t.ndim < denom.ndim:
+                eps_t = eps_t.unsqueeze(0)
+            rms = torch.sqrt(((action_raw * mask_t) ** 2).sum(dim=-1) / denom + eps_t)
+            while rms.ndim < action_raw.ndim:
+                rms = rms.unsqueeze(-1)
+            action_next = (action_raw / rms) * mask_t
+        elif mode == "none":
+            action_next = action_raw
+            if mask is not None:
+                mask_t = mask.to(device=action_raw.device, dtype=action_raw.dtype)
+                while mask_t.ndim < action_raw.ndim:
+                    mask_t = mask_t.unsqueeze(0)
+                action_next = action_next * mask_t
+        else:
+            raise ValueError(f"Unknown reinforce action transform: {mode}")
+        return action_next
+
     def _transform_reinforce_rewards(self, rewards):
         mode = self._resolve_reinforce_reward_transform(self.config)
         if mode == "none":
             return rewards, {
                 "mode": "none",
+                "rms_eps": 1e-6,
                 "tanh_c": 1.0,
                 "tanh_bound": float("inf"),
+            }
+        if mode == "rms":
+            rms_eps = self._resolve_reinforce_reward_rms_eps(self.config)
+            finite_mask = torch.isfinite(rewards)
+            if bool(finite_mask.any().item()):
+                finite_rewards = rewards[finite_mask]
+                rms = torch.sqrt(finite_rewards.square().mean() + float(rms_eps))
+                rewards_t = rewards / rms
+            else:
+                rewards_t = rewards
+            return rewards_t, {
+                "mode": "rms",
+                "rms_eps": float(rms_eps),
+                "tanh_c": 1.0,
+                "tanh_bound": float("inf"),
+            }
+        if mode == "clip":
+            bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+            rewards_t = torch.clamp(rewards, min=-float(bound), max=float(bound))
+            return rewards_t, {
+                "mode": "clip",
+                "rms_eps": 1e-6,
+                "tanh_c": 1.0,
+                "tanh_bound": float(bound),
             }
         if mode == "tanh":
             c = self._resolve_reinforce_reward_tanh_c(self.config)
@@ -4227,6 +4389,7 @@ class EnvironmentPrior:
             rewards_t = float(bound) * torch.tanh(rewards / float(c))
             return rewards_t, {
                 "mode": "tanh",
+                "rms_eps": 1e-6,
                 "tanh_c": float(c),
                 "tanh_bound": float(bound),
             }
@@ -4237,12 +4400,26 @@ class EnvironmentPrior:
         reward,
         *,
         mode,
+        rms_eps,
         tanh_c,
         tanh_bound,
     ):
         mode = str(mode).strip().lower()
         if mode == "none":
             return reward
+        if mode == "rms":
+            eps_t = torch.as_tensor(rms_eps, device=reward.device, dtype=reward.dtype)
+            finite_mask = torch.isfinite(reward)
+            if bool(finite_mask.any().item()):
+                finite_reward = reward[finite_mask]
+                rms = torch.sqrt(finite_reward.square().mean() + eps_t)
+                return reward / rms
+            return reward
+        if mode == "clip":
+            b_t = torch.as_tensor(tanh_bound, device=reward.device, dtype=reward.dtype)
+            while b_t.ndim < reward.ndim:
+                b_t = b_t.unsqueeze(0)
+            return torch.clamp(reward, min=-b_t, max=b_t)
         if mode == "tanh":
             c_t = torch.as_tensor(tanh_c, device=reward.device, dtype=reward.dtype)
             b_t = torch.as_tensor(tanh_bound, device=reward.device, dtype=reward.dtype)
@@ -4253,11 +4430,16 @@ class EnvironmentPrior:
             return b_t * torch.tanh(reward / c_t)
         raise ValueError(f"Unknown reinforce reward transform mode: {mode}")
 
-    def _transform_rollout_reward(self, reward, *, mode=None, tanh_c=None, tanh_bound=None):
+    def _transform_rollout_reward(self, reward, *, mode=None, rms_eps=None, tanh_c=None, tanh_bound=None):
         mode_resolved = (
             self._resolve_reinforce_reward_transform(self.config)
             if mode is None
             else str(mode).strip().lower()
+        )
+        rms_eps_resolved = (
+            self._resolve_reinforce_reward_rms_eps(self.config)
+            if rms_eps is None
+            else rms_eps
         )
         tanh_c_resolved = (
             self._resolve_reinforce_reward_tanh_c(self.config)
@@ -4272,6 +4454,7 @@ class EnvironmentPrior:
         return self._transform_reward_with_params(
             reward,
             mode=mode_resolved,
+            rms_eps=rms_eps_resolved,
             tanh_c=tanh_c_resolved,
             tanh_bound=tanh_bound_resolved,
         )
@@ -4320,6 +4503,12 @@ class EnvironmentPrior:
         if isinstance(value, str):
             return value.strip().lower() not in {"0", "false", "no", "off", ""}
         return bool(value)
+
+    @staticmethod
+    def _tbptt_window_retain_graph(t, n_samples):
+        inplace_paged_kv_env = str(os.environ.get("TICL_POLICY_INPLACE_PAGED_KV", "auto")).strip().lower()
+        release_after_window = inplace_paged_kv_env in {"1", "true", "yes", "on"}
+        return bool((int(t) < (int(n_samples) - 1)) and (not release_after_window))
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -6279,8 +6468,11 @@ class EnvironmentPrior:
         state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
         state_full_rms_target = float(self._resolve_state_full_rms_target(h))
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(h)
+        reinforce_reward_rms_eps = float(self._resolve_reinforce_reward_rms_eps(h))
         reinforce_reward_tanh_c = float(self._resolve_reinforce_reward_tanh_c(h))
         reinforce_reward_tanh_bound = float(self._resolve_reinforce_reward_tanh_bound(h))
+        reinforce_action_transform = self._resolve_reinforce_action_transform(h)
+        reinforce_action_rms_eps = float(self._resolve_reinforce_action_rms_eps(h))
         state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
         state_highway_lambda = float(self._resolve_state_highway_lambda(h))
         reward_dropout_enabled = bool(h.get("reward_dropout_enabled", True))
@@ -6338,8 +6530,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": reinforce_reward_transform,
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": reinforce_action_transform,
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": bool(aev4_cfg.get("enabled", False)),
@@ -9270,6 +9465,16 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_reward_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_reward_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_action_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         reinforce_reward_tanh_c = torch.tensor(
             [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
             device=device,
@@ -9447,8 +9652,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -9778,6 +9986,26 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_reward_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_reward_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_action_rms_eps = torch.tensor(
+            [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_c = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_reward_tanh_bound = torch.tensor(
+            [float(self._resolve_reinforce_reward_tanh_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_highway_enabled = torch.tensor(
             [bool(self._resolve_state_highway_enabled(h)) for h in h_list],
             device=device,
@@ -9880,8 +10108,11 @@ class EnvironmentPrior:
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -11004,6 +11235,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -11610,6 +11842,8 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
+            action_transform_mode = env_info.get("reinforce_action_transform", "tanh")
+            action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -11660,16 +11894,31 @@ class EnvironmentPrior:
                             device=device,
                             dtype=torch.float32,
                         )
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = torch.tanh(action_pre_tanh)
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    action_std_t,
-                    action=action_next.detach(),
+                action_raw = action_mean + (action_eps_t * action_std_t[:, None])
+                action_next = self._transform_reinforce_action(
+                    action_raw,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
                 )
+                if str(action_transform_mode).strip().lower() == "tanh":
+                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        action_std_t,
+                        action=action_next.detach(),
+                    )
+                else:
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        action_std_t,
+                    )
             else:
-                action_next = torch.tanh(action_mean)
+                action_next = self._transform_reinforce_action(
+                    action_mean,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                )
                 if not reference_semantics_enabled:
                     # Keep legacy RNG consumption for action-noise streams, but
                     # do not perturb policy actions in the learned-policy rollout
@@ -11765,6 +12014,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -11868,11 +12118,11 @@ class EnvironmentPrior:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
-                        state_t = state_t.detach()
-                        action_t = action_t.detach()
-                        reward_t = reward_t.detach()
-                        reward_mask_t = reward_mask_t.detach()
-                        env_in = env_in.detach()
+                        state_t = state_t.detach().clone()
+                        action_t = action_t.detach().clone()
+                        reward_t = reward_t.detach().clone()
+                        reward_mask_t = reward_mask_t.detach().clone()
+                        env_in = env_in.detach().clone()
                         if aev2_prev_delta is not None:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
@@ -11881,7 +12131,13 @@ class EnvironmentPrior:
                             aev5_next_prev_delta = aev5_next_prev_delta.detach()
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
-                        cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
+                        # TBPTT windows must start from cache tensors that do not
+                        # share autograd-relevant storage with the previous
+                        # window. Reusing detached views is sufficient for the
+                        # non-streaming path, but the streaming backward path can
+                        # still end up traversing saved tensors from the previous
+                        # graph. Clone at the boundary to enforce a clean cut.
+                        cache = self._detach_policy_cache(cache, clone_tensors=True)
                     if tbptt_reward_sink is not None:
                         if (
                             aev2_streaming_sink
@@ -11952,11 +12208,20 @@ class EnvironmentPrior:
                                     aev5_next_cfg=aev5_next_cfg,
                                 )
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
-                                tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
+                                tbptt_reward_sink(
+                                    (rewards_window, payload_aux["aev2"]),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                             else:
-                                tbptt_reward_sink((rewards_window, payload_aux))
+                                tbptt_reward_sink(
+                                    (rewards_window, payload_aux),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                         else:
-                            tbptt_reward_sink(rewards_window)
+                            tbptt_reward_sink(
+                                rewards_window,
+                                retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                            )
 
         if collect_runtime_info:
             reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
@@ -12225,8 +12490,10 @@ class EnvironmentPrior:
         action_noise_eval_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_action_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -12385,8 +12652,10 @@ class EnvironmentPrior:
                 action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
                 reward_scale[group_idx] = env_batch["reward_scale"]
                 reward_clip[group_idx] = env_batch["reward_clip"]
+                reinforce_reward_rms_eps[group_idx] = env_batch["reinforce_reward_rms_eps"]
                 reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
                 reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
+                reinforce_action_rms_eps[group_idx] = env_batch["reinforce_action_rms_eps"]
                 alpha[group_idx] = env_batch["alpha"]
                 state_clip[group_idx] = env_batch["state_clip"]
                 state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
@@ -12556,12 +12825,16 @@ class EnvironmentPrior:
             action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
             reward_scale = reward_scale.index_select(0, perm)
             reward_clip = reward_clip.index_select(0, perm)
+            reinforce_reward_rms_eps = reinforce_reward_rms_eps.index_select(0, perm)
             reinforce_reward_tanh_c = reinforce_reward_tanh_c.index_select(0, perm)
             reinforce_reward_tanh_bound = reinforce_reward_tanh_bound.index_select(0, perm)
+            reinforce_action_rms_eps = reinforce_action_rms_eps.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
             state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
             state_input_scale = state_input_scale.index_select(0, perm)
+            state_full_rms_enabled = state_full_rms_enabled.index_select(0, perm)
+            state_full_rms_target = state_full_rms_target.index_select(0, perm)
             state_highway_enabled = state_highway_enabled.index_select(0, perm)
             state_highway_lambda = state_highway_lambda.index_select(0, perm)
             aev4_enabled = aev4_enabled.index_select(0, perm)
@@ -12873,6 +13146,12 @@ class EnvironmentPrior:
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
             "state_highway_enabled": state_highway_enabled,
             "state_highway_lambda": state_highway_lambda,
             "aev4_enabled": aev4_enabled,
@@ -13062,6 +13341,8 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
+            action_transform_mode = env_info.get("reinforce_action_transform", "tanh")
+            action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -13092,17 +13373,35 @@ class EnvironmentPrior:
                     else:
                         raise RuntimeError("reinforce rollout expected pre-sampled action_noise_eval")
                     action_std_t = action_noise_eval_std
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = torch.tanh(action_pre_tanh) * action_mask
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    action_std_t,
-                    action=action_next.detach(),
+                action_raw = action_mean + (action_eps_t * action_std_t[:, None])
+                action_next = self._transform_reinforce_action(
+                    action_raw,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
                     mask=action_mask,
                 )
+                if str(action_transform_mode).strip().lower() == "tanh":
+                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        action_std_t,
+                        action=action_next.detach(),
+                        mask=action_mask,
+                    )
+                else:
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        action_std_t,
+                        mask=action_mask,
+                    )
             else:
-                action_next = torch.tanh(action_mean) * action_mask
+                action_next = self._transform_reinforce_action(
+                    action_mean,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                    mask=action_mask,
+                )
                 # Preserve action-noise RNG draws for reproducible downstream
                 # transition/state noise, but keep the learned policy deterministic
                 # after a single tanh squash.
@@ -13217,22 +13516,25 @@ class EnvironmentPrior:
                     transition_packed_env_input_call_count += 1
                     packed_transition_input = group["packed_input"]
                     packed_transition_input.zero_()
-                    packed_transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
+                    packed_input_dtype = packed_transition_input.dtype
+                    packed_transition_input[:, :state_dim_g] = (
+                        state_in.to(dtype=packed_input_dtype) * group["packed_state_mask"].to(dtype=packed_input_dtype)
+                    )
                     packed_obs_rows = group.get("packed_obs_rows", None)
                     if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
                         packed_transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
                             packed_obs_rows, group["packed_obs_src_cols"]
-                        ]
+                        ].to(dtype=packed_input_dtype)
                     packed_action_rows = group.get("packed_action_rows", None)
                     if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
                         packed_transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
                             packed_action_rows, group["packed_action_src_cols"]
-                        ]
+                        ].to(dtype=packed_input_dtype)
                     packed_noise_rows = group.get("packed_noise_rows", None)
                     if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
                         packed_transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
                             packed_noise_rows, group["packed_noise_src_cols"]
-                        ]
+                        ].to(dtype=packed_input_dtype)
                 if packed_transition_input_enabled:
                     transition_input = packed_transition_input
                 else:
@@ -13422,6 +13724,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=self._resolve_reinforce_reward_transform(self.config),
+                rms_eps=reinforce_reward_rms_eps,
                 tanh_c=reinforce_reward_tanh_c,
                 tanh_bound=reinforce_reward_tanh_bound,
             )
@@ -13514,10 +13817,10 @@ class EnvironmentPrior:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
-                        state_t = state_t.detach()
-                        action_t = action_t.detach()
-                        reward_t = reward_t.detach()
-                        reward_mask_t = reward_mask_t.detach()
+                        state_t = state_t.detach().clone()
+                        action_t = action_t.detach().clone()
+                        reward_t = reward_t.detach().clone()
+                        reward_mask_t = reward_mask_t.detach().clone()
                         if aev2_prev_delta is not None:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
@@ -13527,8 +13830,8 @@ class EnvironmentPrior:
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
                         for group in transition_groups:
-                            group["env_in"] = group["env_in"].detach()
-                        cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
+                            group["env_in"] = group["env_in"].detach().clone()
+                        cache = self._detach_policy_cache(cache, clone_tensors=True)
                     if tbptt_reward_sink is not None:
                         if (
                             aev2_streaming_sink
@@ -13600,14 +13903,26 @@ class EnvironmentPrior:
                                 )
                             payload_rewards = rewards_window.index_select(1, inv_perm) if needs_unpermute else rewards_window
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
-                                tbptt_reward_sink((payload_rewards, payload_aux["aev2"]))
+                                tbptt_reward_sink(
+                                    (payload_rewards, payload_aux["aev2"]),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                             else:
-                                tbptt_reward_sink((payload_rewards, payload_aux))
+                                tbptt_reward_sink(
+                                    (payload_rewards, payload_aux),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                         else:
                             if needs_unpermute:
-                                tbptt_reward_sink(rewards_window.index_select(1, inv_perm))
+                                tbptt_reward_sink(
+                                    rewards_window.index_select(1, inv_perm),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                             else:
-                                tbptt_reward_sink(rewards_window)
+                                tbptt_reward_sink(
+                                    rewards_window,
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
 
         if needs_unpermute:
             if y_steps is not None:
@@ -13680,6 +13995,12 @@ class EnvironmentPrior:
                 "state_input_scale": state_input_scale_meta,
                 "state_full_rms_enabled": state_full_rms_enabled_meta,
                 "state_full_rms_target": state_full_rms_target_meta,
+                "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+                "reinforce_reward_rms_eps": reinforce_reward_rms_eps.index_select(0, inv_perm) if needs_unpermute else reinforce_reward_rms_eps,
+                "reinforce_reward_tanh_c": reinforce_reward_tanh_c.index_select(0, inv_perm) if needs_unpermute else reinforce_reward_tanh_c,
+                "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound.index_select(0, inv_perm) if needs_unpermute else reinforce_reward_tanh_bound,
+                "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+                "reinforce_action_rms_eps": reinforce_action_rms_eps.index_select(0, inv_perm) if needs_unpermute else reinforce_action_rms_eps,
                 "aev4_enabled": aev4_enabled_meta,
                 "aev4_highway_ratio": aev4_highway_ratio_meta,
                 "aev4_update_scale": aev4_update_scale_meta,
@@ -14182,6 +14503,8 @@ class EnvironmentPrior:
                     generator=transition_noise_generator,
                 )
 
+            action_transform_mode = env.get("reinforce_action_transform", "tanh")
+            action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
             if use_fast_env_in:
                 env_in_flat[:state_dim] = self._scale_state_env_input(state_t, env.get("state_input_scale", 1.0))
                 if env_obs_start is not None:
@@ -14278,17 +14601,32 @@ class EnvironmentPrior:
                                 dtype=state_t.dtype,
                                 generator=action_noise_eval_generator,
                             )
-                action_pre_tanh = action_mean + (action_eps_t * float(action_noise_std))
-                action_next = torch.tanh(action_pre_tanh)
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    float(action_noise_std),
-                    action=action_next.detach(),
+                action_raw = action_mean + (action_eps_t * float(action_noise_std))
+                action_next = self._transform_reinforce_action(
+                    action_raw,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
                 )
+                if str(action_transform_mode).strip().lower() == "tanh":
+                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        float(action_noise_std),
+                        action=action_next.detach(),
+                    )
+                else:
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_raw.detach(),
+                        action_mean,
+                        float(action_noise_std),
+                    )
             else:
                 if not use_fast_env_in:
-                    action_next = torch.tanh(action_mean)
+                    action_next = self._transform_reinforce_action(
+                        action_mean,
+                        mode=action_transform_mode,
+                        rms_eps=action_rms_eps,
+                    )
             if (not reinforce_enabled) and (not reference_semantics_enabled) and action_noise_std > 0:
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
@@ -14405,6 +14743,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -14498,10 +14837,10 @@ class EnvironmentPrior:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0).reshape(-1, 1)
                         tbptt_log_prob_buffer = []
                     if t < (n_samples - 1):
-                        state_t = state_t.detach()
-                        action_t = action_t.detach()
-                        reward_t = reward_t.detach()
-                        reward_mask_t = reward_mask_t.detach()
+                        state_t = state_t.detach().clone()
+                        action_t = action_t.detach().clone()
+                        reward_t = reward_t.detach().clone()
+                        reward_mask_t = reward_mask_t.detach().clone()
                         if aev2_prev_delta is not None:
                             aev2_prev_delta = aev2_prev_delta.detach()
                         if aev3_prev_delta is not None:
@@ -14510,7 +14849,7 @@ class EnvironmentPrior:
                             aev5_next_prev_delta = aev5_next_prev_delta.detach()
                         if aev4_prev_delta is not None:
                             aev4_prev_delta = aev4_prev_delta.detach()
-                        cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_reward_sink is None))
+                        cache = self._detach_policy_cache(cache, clone_tensors=True)
                     if tbptt_reward_sink is not None:
                         if (
                             aev2_streaming_sink
@@ -14583,11 +14922,20 @@ class EnvironmentPrior:
                                     aev5_next_cfg=aev5_next_cfg,
                                 )
                             if ("aev2" in payload_aux) and (len(payload_aux) == 1):
-                                tbptt_reward_sink((rewards_window, payload_aux["aev2"]))
+                                tbptt_reward_sink(
+                                    (rewards_window, payload_aux["aev2"]),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                             else:
-                                tbptt_reward_sink((rewards_window, payload_aux))
+                                tbptt_reward_sink(
+                                    (rewards_window, payload_aux),
+                                    retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                                )
                         else:
-                            tbptt_reward_sink(rewards_window)
+                            tbptt_reward_sink(
+                                rewards_window,
+                                retain_graph=EnvironmentPrior._tbptt_window_retain_graph(t, n_samples),
+                            )
 
         x = x_steps
         y = y_steps
@@ -14988,6 +15336,7 @@ class EnvironmentPrior:
             reward_next = self._transform_rollout_reward(
                 reward_next,
                 mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
                 tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
             )
@@ -15903,6 +16252,31 @@ class EnvironmentPrior:
         return log_prob_per_dim.sum(dim=-1)
 
     @staticmethod
+    def _gaussian_log_prob(sample, mean, std, *, mask=None, eps=1e-6):
+        if sample.shape != mean.shape:
+            raise ValueError(
+                "sample and mean must have identical shape, "
+                f"got {tuple(sample.shape)} and {tuple(mean.shape)}"
+            )
+        std_t = std
+        if not torch.is_tensor(std_t):
+            std_t = torch.as_tensor(std_t, device=sample.device, dtype=sample.dtype)
+        std_t = std_t.to(device=sample.device, dtype=sample.dtype)
+        while std_t.ndim < sample.ndim:
+            std_t = std_t.unsqueeze(-1)
+        std_t = std_t.expand_as(sample).clamp_min(float(max(1e-12, eps)))
+        centered = (sample - mean) / std_t
+        log_prob_per_dim = -0.5 * (
+            centered.square() + (2.0 * torch.log(std_t)) + math.log(2.0 * math.pi)
+        )
+        if mask is not None:
+            mask_t = mask.to(device=sample.device, dtype=sample.dtype)
+            while mask_t.ndim < sample.ndim:
+                mask_t = mask_t.unsqueeze(0)
+            log_prob_per_dim = log_prob_per_dim * mask_t
+        return log_prob_per_dim.sum(dim=-1)
+
+    @staticmethod
     def _returns_to_go(rewards, discount):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
@@ -15947,6 +16321,7 @@ class EnvironmentPrior:
         rewards_used = rewards
         reward_transform_stats = {
             "mode": self._resolve_reinforce_reward_transform(self.config),
+            "rms_eps": float(self._resolve_reinforce_reward_rms_eps(self.config)),
             "tanh_c": float(self._resolve_reinforce_reward_tanh_c(self.config)),
             "tanh_bound": float(self._resolve_reinforce_reward_tanh_bound(self.config)),
         }
@@ -16000,6 +16375,7 @@ class EnvironmentPrior:
             "reinforce_log_prob_inf_share": _share(torch.isinf(log_probs)),
             "reinforce_baseline_mode": baseline_mode,
             "reinforce_reward_transform": reward_transform_stats["mode"],
+            "reinforce_reward_rms_eps": float(reward_transform_stats["rms_eps"]),
             "reinforce_reward_tanh_c": float(reward_transform_stats["tanh_c"]),
             "reinforce_reward_tanh_bound": float(reward_transform_stats["tanh_bound"]),
         }
@@ -16036,10 +16412,11 @@ class EnvironmentPrior:
         aev5_cfg = self._resolve_aev5_config()
         aev5_next_cfg = self._resolve_aev5_next_config()
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(self.config)
+        reinforce_reward_rms_eps = self._resolve_reinforce_reward_rms_eps(self.config)
         reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
         objective_kind = str(objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "reinforce"}:
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
             objective_kind = "policy_gradient"
 
         return (
@@ -16076,6 +16453,7 @@ class EnvironmentPrior:
             f"|aev5nslo={_fmt_float(aev5_next_cfg.get('state_rms_lo', 0.0))}"
             f"|aev5nshi={_fmt_float(aev5_next_cfg.get('state_rms_hi', 0.0))}"
             f"|rrtx={reinforce_reward_transform}"
+            f"|rrte={_fmt_float(reinforce_reward_rms_eps)}"
             f"|rrtc={_fmt_float(reinforce_reward_tanh_c)}"
             f"|rrtb={_fmt_float(reinforce_reward_tanh_bound)}"
         )
@@ -16238,6 +16616,24 @@ class EnvironmentPrior:
             stats["aev5_next_bias_thermostat_upscale"] = torch.clamp(loss_scale_det - 1.0, min=0.0)
         return loss, stats
 
+    def first_policy_gradient_loss_from_rewards(self, rewards):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        objective_per_env = rewards.sum(dim=0) / float(max(1, rewards.shape[0]))
+        objective = objective_per_env.mean()
+        loss = -objective
+        stats = {
+            "objective": objective.detach(),
+            "reward_mean": rewards.mean().detach(),
+            "reward_std": rewards.std(unbiased=False).detach(),
+            "reward_min": rewards.min().detach(),
+            "reward_max": rewards.max().detach(),
+            "reward_abs_max": rewards.abs().max().detach(),
+            "reward_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+            "reward_norm_clip_hit_share": torch.zeros((), device=rewards.device, dtype=torch.float32),
+        }
+        return loss, stats
+
     def rollout_policy_gradient_loss(
         self,
         policy_step_fn,
@@ -16263,9 +16659,10 @@ class EnvironmentPrior:
         n_samples = int(n_samples)
         batch_size = int(batch_size)
         objective_kind = str(policy_objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "reinforce"}:
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
             raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
         reinforce_enabled = objective_kind == "reinforce"
+        first_pg_enabled = objective_kind == "first_policy_gradient"
         if normalize is None:
             normalize = bool(self.config.get("policy_gradient_normalize_rewards", False))
         tbptt_window_active = False
@@ -16319,6 +16716,11 @@ class EnvironmentPrior:
                     baseline_mode="leave_one_out",
                 )
                 stats["reinforce_enabled"] = 1
+            elif first_pg_enabled:
+                loss, stats = self.first_policy_gradient_loss_from_rewards(
+                    rewards=rollout["rewards"],
+                )
+                stats["first_policy_gradient_enabled"] = 1
             else:
                 loss, stats = self.policy_gradient_loss_from_rewards(
                     rewards=rollout["rewards"],
@@ -16330,7 +16732,7 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if aev2_enabled:
+            if (not first_pg_enabled) and aev2_enabled:
                 aev2_rollout = rollout.get("aev2", None)
                 aev2_penalty = None
                 if isinstance(aev2_rollout, dict):
@@ -16375,7 +16777,7 @@ class EnvironmentPrior:
                     stats["aev2_gain_std"] = zero_t
                     stats["aev2_gain_min"] = zero_t
                     stats["aev2_gain_max"] = zero_t
-            if aev3_enabled:
+            if (not first_pg_enabled) and aev3_enabled:
                 aev3_rollout = rollout.get("aev3", None)
                 aev3_penalty = None
                 aev3_penalty_drift = None
@@ -16454,7 +16856,7 @@ class EnvironmentPrior:
                     stats["aev3_gain_std"] = zero_t
                     stats["aev3_gain_min"] = zero_t
                     stats["aev3_gain_max"] = zero_t
-            if aev4_enabled:
+            if (not first_pg_enabled) and aev4_enabled:
                 aev4_rollout = rollout.get("aev4", None)
                 aev4_penalty = None
                 aev4_penalty_drift = None
@@ -16868,7 +17270,7 @@ class EnvironmentPrior:
         n_samples_f = float(max(1, n_samples))
         batch_size_f = float(max(1, batch_size))
 
-        def _tbptt_reward_sink(reward_payload):
+        def _tbptt_reward_sink(reward_payload, *, retain_graph=False):
             nonlocal reward_sum, reward_sumsq, reward_count
             nonlocal objective_accum, total_weight
             nonlocal reward_min_accum, reward_max_accum, reward_absmax_accum
@@ -16922,6 +17324,10 @@ class EnvironmentPrior:
                     discount=discount,
                     baseline_mode="leave_one_out",
                 )
+            elif first_pg_enabled:
+                loss_window, stats_window = self.first_policy_gradient_loss_from_rewards(
+                    rewards=rewards_window,
+                )
             else:
                 loss_window, stats_window = self.policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
@@ -16933,16 +17339,16 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if (not reinforce_enabled) and aev2_enabled and isinstance(aev2_window, dict):
+            if (not reinforce_enabled) and (not first_pg_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     if aev2_lambda > 0.0:
                         loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
-            if (not reinforce_enabled) and aev3_enabled and isinstance(aev3_window, dict):
+            if (not reinforce_enabled) and (not first_pg_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     loss_window = loss_window + aev3_penalty_window
-            if (not reinforce_enabled) and aev4_enabled and isinstance(aev4_window, dict):
+            if (not reinforce_enabled) and (not first_pg_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     loss_window = loss_window + aev4_penalty_window
@@ -16953,7 +17359,7 @@ class EnvironmentPrior:
             if tbptt_loss_sink is None:
                 weighted_losses.append(weighted_loss)
             else:
-                tbptt_loss_sink(weighted_loss)
+                tbptt_loss_sink(weighted_loss, retain_graph=bool(retain_graph))
 
             objective_term = stats_window["objective"] * window_weight
             if objective_accum is None:
@@ -16961,7 +17367,7 @@ class EnvironmentPrior:
             else:
                 objective_accum = objective_accum + objective_term.detach()
             total_weight += window_weight
-            if aev5_enabled:
+            if (not first_pg_enabled) and aev5_enabled:
                 aev5_scale_w = stats_window.get("aev5_scale", None)
                 if torch.is_tensor(aev5_scale_w):
                     aev5_scale_term = aev5_scale_w.detach() * float(window_weight)
@@ -16992,7 +17398,7 @@ class EnvironmentPrior:
                         if aev5_objective_scaled_accum is None
                         else (aev5_objective_scaled_accum + aev5_obj_scaled_term)
                     )
-            if aev5_next_enabled:
+            if (not first_pg_enabled) and aev5_next_enabled:
                 aev5_next_scale_w = stats_window.get("aev5_next_scale", None)
                 if torch.is_tensor(aev5_next_scale_w):
                     aev5_next_scale_term = aev5_next_scale_w.detach() * float(window_weight)
@@ -17025,7 +17431,7 @@ class EnvironmentPrior:
                         if aev5_next_objective_scaled_accum is None
                         else (aev5_next_objective_scaled_accum + aev5_next_obj_scaled_term)
                     )
-            if aev2_enabled and isinstance(aev2_window, dict):
+            if (not first_pg_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     penalty_term = aev2_penalty_window.detach() * float(window_weight)
@@ -17059,7 +17465,7 @@ class EnvironmentPrior:
                     aev2_gain_max_accum = (
                         gain_max_w if aev2_gain_max_accum is None else torch.maximum(aev2_gain_max_accum, gain_max_w)
                     )
-            if aev3_enabled and isinstance(aev3_window, dict):
+            if (not first_pg_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     penalty_term = aev3_penalty_window.detach() * float(window_weight)
@@ -17128,7 +17534,7 @@ class EnvironmentPrior:
                     aev3_gain_max_accum = (
                         gain_max_w if aev3_gain_max_accum is None else torch.maximum(aev3_gain_max_accum, gain_max_w)
                     )
-            if aev4_enabled and isinstance(aev4_window, dict):
+            if (not first_pg_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     penalty_term = aev4_penalty_window.detach() * float(window_weight)
@@ -17705,7 +18111,9 @@ class EnvironmentPrior:
                 if torch.is_tensor(log_probs_rollout):
                     stats["reinforce_log_prob_mean"] = log_probs_rollout.mean().detach()
                     stats["reinforce_log_prob_std"] = log_probs_rollout.std(unbiased=False).detach()
-        if aev2_enabled:
+        if first_pg_enabled:
+            stats["first_policy_gradient_enabled"] = 1
+        if (not first_pg_enabled) and aev2_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev2_penalty_mean is None:
                 aev2_penalty_mean = zero_t
@@ -17728,7 +18136,7 @@ class EnvironmentPrior:
             stats["aev2_gain_std"] = aev2_gain_std
             stats["aev2_gain_min"] = aev2_gain_min
             stats["aev2_gain_max"] = aev2_gain_max
-        if aev3_enabled:
+        if (not first_pg_enabled) and aev3_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev3_penalty_mean is None:
                 aev3_penalty_mean = zero_t

@@ -1,0 +1,897 @@
+\documentclass[11pt]{article}
+
+\usepackage[a4paper,margin=1in]{geometry}
+\usepackage[T1]{fontenc}
+\usepackage[utf8]{inputenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm,mathtools}
+\usepackage{bm}
+\usepackage{booktabs}
+\usepackage{hyperref}
+\usepackage{enumitem}
+\usepackage{xcolor}
+
+\hypersetup{
+  colorlinks=true,
+  linkcolor=blue!60!black,
+  citecolor=blue!60!black,
+  urlcolor=blue!60!black
+}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{corollary}{Corollary}
+\newtheorem{lemma}{Lemma}
+\newtheorem{assumption}{Assumption}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+
+\newcommand{\E}{\mathbb{E}}
+\newcommand{\Prob}{\mathbb{P}}
+\newcommand{\R}{\mathbb{R}}
+\newcommand{\1}{\mathbf{1}}
+\newcommand{\norm}[1]{\left\lVert #1 \right\rVert}
+\newcommand{\abs}[1]{\left\lvert #1 \right\rvert}
+\newcommand{\opnorm}[1]{\left\lVert #1 \right\rVert_{\mathrm{op}}}
+\newcommand{\frobnorm}[1]{\left\lVert #1 \right\rVert_{\mathrm{F}}}
+\newcommand{\TV}{\mathrm{TV}}
+\newcommand{\Lip}{\mathrm{Lip}}
+\newcommand{\argmin}{\mathop{\mathrm{arg\,min}}}
+
+\title{A Paper-Style Specification for \texttt{v5\_next} with Lipschitz-Enforced Environment Priors}
+\author{Project Note for RLPFN / TabPFN-style Differentiable Environment Priors}
+\date{March 8, 2026}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+This note gives a paper-level specification for the current \texttt{v5\_next + lipschitz\_enforce} design used in differentiable policy-gradient training with a TabPFN-style environment prior. The goal is not to claim unrealistic global guarantees, but to state a mathematically explicit, engineering-faithful method that addresses three questions simultaneously: (i) how gradient explosion is prevented along the policy-step and train-step paths, (ii) under what conditions gradient vanishing can be prevented rather than merely hoped away, and (iii) what bias is introduced by the stabilizing controls. The method consists of four coupled components: a Lipschitz-enforced prior projection on sampled environment generators, a full-state directional corridor on latent state increments, a detached loss thermostat driven by reward standard deviation, and a detached train-step gradient corridor on the policy parameter gradients. We prove unconditional upper bounds for the controlled through-time transport, conditional lower bounds for non-vanishing on an explicit activation set, a bias decomposition theorem, and a diversity-shift analysis for the induced prior after Lipschitz projection. The document is intentionally aligned with the implemented design rather than with unimplemented estimator-mixing variants.
+\end{abstract}
+
+\section{Introduction}
+Training a policy through a differentiable learned environment is a coupled stability problem. The policy gradient is not only affected by the variance of the reward signal, but also by the local Jacobian chain of the environment dynamics, the recurrent reuse of policy parameters across time, and the optimizer dynamics across training steps. In the present project, the failure mode of interest is not a small and benign instability. The observed problem is that a large-batch differentiable rollout can become numerically unsafe if the latent state transport becomes too steep, while overly conservative stabilizers can suppress the training signal so much that learning becomes ineffective.
+
+The design target of \texttt{v5\_next} is therefore narrower and more rigorous than the earlier informal versions:
+\begin{enumerate}[label=\arabic*.]
+  \item control gradient explosion with explicit and checkable upper bounds;
+  \item control gradient vanishing only conditionally, on events where learning should still occur;
+  \item keep the method uniform and maintainable, avoiding case-by-case time-step search or ad hoc exception-driven logic;
+  \item quantify the bias introduced by stabilizing the dynamics and the optimizer;
+  \item analyze whether Lipschitz constraints on the TabPFN-style prior reduce event diversity in a harmful way.
+\end{enumerate}
+
+This document is about the actually implemented \texttt{v5\_next} family. It does \emph{not} rely on the \texttt{v6/v7} estimator-mixing path, and it does \emph{not} assume access to explicit costates or global singular-value lower bounds that are not observable in the current system.
+
+\subsection{Relation to legacy \texttt{v5}}
+The name \texttt{v5\_next} is intentionally conservative. It is not a cosmetic rename of the old batch-level thermostat. The legacy \texttt{v5} implementation mainly rescales the rollout loss by a detached reward-standard-deviation multiplier. That mechanism is preserved here as Component III because it is useful, but it is no longer treated as a complete stability method. The present \texttt{v5\_next} adds two ingredients that the legacy \texttt{v5} did not provide:
+\begin{enumerate}[label=\arabic*.]
+  \item a prior-side hard upper bound through \texttt{lipschitz\_enforce};
+  \item a rollout-side and train-step-side corridor that acts on realized transport rather than on loss magnitude alone.
+\end{enumerate}
+Accordingly, this document should be read as a specification for a stricter and more complete method, not as a retrospective justification of the old \texttt{v5} thermostat by itself.
+
+\section{Problem Setup}
+\subsection{Differentiable environment prior}
+Let the sampled environment be parameterized by a random variable $\xi \sim p_0$. The prior draws a family label (\texttt{scm} or \texttt{gp}), state/action/observation dimensions, noise dimensions, reward-dropout settings, and generator parameters. The environment defines a one-step transition
+\begin{equation}
+  s_{t+1}^{\mathrm{raw}} = F_{\xi}(s_t, a_t, \zeta_t), \qquad
+  r_{t+1}^{\mathrm{raw}} = R_{\xi}(s_t, a_t, \zeta_t),
+\end{equation}
+where $\zeta_t$ collects stochastic transition noise and reward noise.
+
+The policy produces actions through a recurrent rollout,
+\begin{equation}
+  a_t = \pi_{\theta}(h_t),
+\end{equation}
+where $h_t$ denotes the policy-side token/state representation and $\theta$ denotes the policy parameters.
+
+\subsection{Training objective}
+We consider truncated backpropagation through time with horizon
+\begin{equation}
+  H = 32.
+\end{equation}
+The base rollout objective on one window is
+\begin{equation}
+  J_H(\theta;\xi) = \E\!\left[\sum_{t=1}^{H} r_t \,\middle|\, \xi \right],
+\end{equation}
+and the training procedure uses the batch objective
+\begin{equation}
+  J_H(\theta) = \E_{\xi \sim p_0}[J_H(\theta;\xi)].
+\end{equation}
+
+The important distinction in this note is between the \emph{raw} objective $J_H$ and the \emph{controlled} objective $J_H^c$, where $J_H^c$ is defined by the same rollout after environment projection, state-corridor transport, and detached training scalings are applied.
+
+\section{Method}
+\subsection{Component I: Lipschitz-enforced prior projection}
+The first component acts on the sampled environment generator itself. Its role is global high-side control: it bounds how steep a sampled world model is allowed to be before any rollout occurs.
+
+\paragraph{SCM family.}
+For the sampled SCM MLP layers with weights $\{W_\ell\}_{\ell=1}^{D}$, the implementation projects each matrix by a Frobenius cap
+\begin{equation}
+  \Pi_{L_W}(W) =
+  \begin{cases}
+    W, & \frobnorm{W} \le L_W, \\
+    \dfrac{L_W}{\frobnorm{W}} W, & \frobnorm{W} > L_W,
+  \end{cases}
+\end{equation}
+with $L_W = \texttt{lipschitz\_weight\_fro\_norm\_max}$.
+
+The nonlinearities are sampled from \texttt{tanh}, \texttt{relu}, or \texttt{identity}, and the output is finally passed through a \texttt{tanh}. All of these are $1$-Lipschitz with respect to the Euclidean norm.
+
+\paragraph{GP/RFF family.}
+For the random-feature GP generator, the sampled matrices $W$ and $A$ are Frobenius-projected as above, and the scalar output scale is clipped by
+\begin{equation}
+  \sigma_{\mathrm{out}} \leftarrow \mathrm{clip}\!\left(\sigma_{\mathrm{out}}, -L_{\sigma}, L_{\sigma}\right),
+\end{equation}
+where $L_{\sigma} = \texttt{lipschitz\_gp\_outputscale\_max}$.
+
+\paragraph{Motivation.}
+This component is deliberately one-sided. It is designed to prevent unbounded steepness of the sampled environment prior. It is \emph{not} intended to prove non-vanishing by itself. That separation is fundamental: generator-side caps should guarantee a uniform upper bound, while low-side protection should be expressed at the actual rollout-transport level rather than imposed as a fake global singular-value lower bound on every sampled matrix.
+
+\subsection{Component II: Full-state directional corridor}
+The second component acts on the realized state increments, not on a chosen subspace. This is the key design change relative to earlier highway-style formulations.
+
+Define the raw state increment
+\begin{equation}
+  \Delta_t^{\mathrm{raw}} = s_{t+1}^{\mathrm{raw}} - s_t.
+\end{equation}
+The controlled increment is
+\begin{equation}
+  \Delta_t = c_t^{\mathrm{state}} \Delta_t^{\mathrm{raw}}, \qquad
+  s_{t+1} = s_t + \Delta_t,
+\end{equation}
+where the scalar $c_t^{\mathrm{state}}$ is detached with respect to the current gradient graph and factorizes as
+\begin{equation}
+  c_t^{\mathrm{state}} = c_{t,\mathrm{hi}}^{\mathrm{state}} \, c_{t,\mathrm{lo}}^{\mathrm{state}}.
+\end{equation}
+
+We use the directional RMS proxy
+\begin{equation}
+  d_t^{\mathrm{raw}} = \sqrt{\frac{1}{n_s}\sum_{i=1}^{n_s} (\Delta_{t,i}^{\mathrm{raw}})^2 + \varepsilon},
+\end{equation}
+and the realized gain proxy
+\begin{equation}
+  \rho_t^{\mathrm{raw}} = \frac{d_t^{\mathrm{raw}}}{d_{t-1} + \varepsilon},
+\end{equation}
+where $d_{t-1}$ is the detached RMS of the previous controlled increment.
+
+\paragraph{High-side state control.}
+Given user parameters
+\[
+  \rho_{\mathrm{lo}},\ \rho_{\mathrm{hi}},\ d_{\mathrm{lo}},\ d_{\mathrm{hi}},
+\]
+the implementation sets
+\begin{equation}
+  c_{t,\mathrm{hi}}^{\mathrm{state}}
+  =
+  \min\!\left\{
+    1,\,
+    \frac{\rho_{\mathrm{hi}}}{\rho_t^{\mathrm{raw}} + \varepsilon},\,
+    \frac{d_{\mathrm{hi}}}{d_t^{\mathrm{raw}} + \varepsilon}
+  \right\}.
+\end{equation}
+
+\paragraph{Low-side state control.}
+Low-side protection is only activated on a gating event
+\begin{equation}
+  Q_t^{\mathrm{state}}
+  =
+  \1\!\left\{
+    \abs{r_t} \ge r_{\mathrm{gate}}^{\mathrm{state}},
+    \ d_{t-1} \ge d_{\mathrm{lo}},
+    \ c_{t,\mathrm{hi}}^{\mathrm{state}} = 1
+  \right\}.
+\end{equation}
+Conditioned on this event, the implementation sets
+\begin{equation}
+  c_{t,\mathrm{lo}}^{\mathrm{state}}
+  =
+  \min\!\left(
+    \kappa_{\mathrm{state}},
+    \max\!\left\{
+      1,\,
+      \frac{\rho_{\mathrm{lo}}}{\rho_t^{\mathrm{raw}} + \varepsilon},\,
+      \frac{d_{\mathrm{lo}}}{d_t^{\mathrm{raw}} + \varepsilon}
+    \right\}
+  \right),
+\end{equation}
+and otherwise $c_{t,\mathrm{lo}}^{\mathrm{state}} = 1$.
+
+\paragraph{Motivation.}
+The high-side factor is the actual anti-explosion control. The low-side factor is only a conditional anti-vanishing mechanism. It is triggered only when the reward magnitude indicates that the current regime is relevant and when the previous controlled increment is already large enough that boosting is not merely amplifying numerical dust. This makes the method much more conservative than a blanket lower-bound regularizer.
+
+\subsection{Component III: Detached loss thermostat}
+The third component is a detached scalar rescaling of the reward objective. It is inherited from the useful part of legacy \texttt{v5}, but here it is treated as one component among several rather than as the full method.
+
+Let the reward standard deviation of the current rollout batch be
+\begin{equation}
+  \sigma_r = \mathrm{Std}(r_{1:H}).
+\end{equation}
+Define the detached loss multiplier
+\begin{equation}
+  \tau_{\mathrm{loss}}
+  =
+  \mathrm{clip}\!\left(
+    \frac{\sigma_{\mathrm{target}}}{\sigma_r + \varepsilon},
+    s_{\mathrm{lo}},
+    s_{\mathrm{hi}}
+  \right),
+\end{equation}
+where all quantities on the right-hand side are detached when forming the multiplier.
+
+The loss used for backpropagation is
+\begin{equation}
+  \mathcal{L}_{\mathrm{pg}}^{c} = \tau_{\mathrm{loss}} \, \mathcal{L}_{\mathrm{pg}}.
+\end{equation}
+
+\paragraph{Motivation.}
+This thermostat does not fix through-time explosion. Its purpose is narrower: keep the scalar magnitude of the rollout objective in a workable band so that training-step gradients do not decay merely because the reward dispersion collapsed. Since the multiplier is detached and positive, it does not change the local gradient direction with respect to the controlled objective.
+
+\subsection{Component IV: Train-step gradient corridor}
+The fourth component acts after backpropagation and before the optimizer step.
+
+Let $g_k$ denote the parameter gradient at training step $k$, and define its RMS proxy
+\begin{equation}
+  \gamma_k = \sqrt{\frac{1}{N}\sum_{i=1}^{N} g_{k,i}^2}.
+\end{equation}
+The detached train-step scale is
+\begin{equation}
+  c_k^{\mathrm{step}} = c_{k,\mathrm{hi}}^{\mathrm{step}} \, c_{k,\mathrm{lo}}^{\mathrm{step}},
+\end{equation}
+with
+\begin{equation}
+  c_{k,\mathrm{hi}}^{\mathrm{step}}
+  =
+  \min\!\left\{1, \frac{\gamma_{\mathrm{hi}}}{\gamma_k + \varepsilon}\right\},
+\end{equation}
+and
+\begin{equation}
+  c_{k,\mathrm{lo}}^{\mathrm{step}}
+  =
+  \begin{cases}
+    \min\!\left(\kappa_{\mathrm{step}}, \dfrac{\gamma_{\mathrm{lo}}}{\gamma_k + \varepsilon}\right),
+      & Q_k^{\mathrm{step}} = 1, \\
+    1, & Q_k^{\mathrm{step}} = 0,
+  \end{cases}
+\end{equation}
+where
+\begin{equation}
+  Q_k^{\mathrm{step}}
+  =
+  \1\!\left\{
+    \sigma_r \ge r_{\mathrm{gate}}^{\mathrm{step}},
+    \ \gamma_k < \gamma_{\mathrm{lo}},
+    \ c_{k,\mathrm{hi}}^{\mathrm{step}} = 1
+  \right\}.
+\end{equation}
+
+The optimizer sees
+\begin{equation}
+  g_k' = c_k^{\mathrm{step}} g_k,
+\end{equation}
+followed by the usual global norm clip.
+
+\paragraph{Motivation.}
+This component is about train-step safety rather than policy-step safety. It prevents the update magnitude from exploding and, on selected batches, boosts weak but still meaningful gradients before they are swallowed by the optimizer noise floor. Because the scaling is global and detached, it remains a uniform control rather than a sample-wise or time-step-wise patch.
+
+\subsection{Combined algorithm}
+For one rollout window:
+\begin{enumerate}[label=\arabic*.]
+  \item sample environment parameters $\xi$ from the TabPFN-style prior;
+  \item project generator weights and GP output scales with the Lipschitz caps;
+  \item run the differentiable rollout, applying the full-state corridor to each realized state increment;
+  \item compute the policy-gradient loss and multiply by the detached loss thermostat;
+  \item backpropagate through the controlled rollout;
+  \item compute global gradient RMS and apply the detached train-step corridor;
+  \item apply the optimizer update.
+\end{enumerate}
+
+\section{Assumptions}
+The following assumptions are designed to be weaker and more engineering-faithful than the global singular-value assumptions used in earlier informal notes.
+
+\begin{assumption}[Bounded nonlinearities]
+All nonlinearities used inside the sampled SCM and GP generators are $1$-Lipschitz with respect to the Euclidean norm. This is satisfied by \texttt{tanh}, \texttt{relu}, and \texttt{identity}. The final generator output is also passed through \texttt{tanh}.
+\end{assumption}
+
+\begin{assumption}[Lipschitz prior caps]
+When \texttt{lipschitz\_enforce} is enabled, every sampled SCM layer weight satisfies
+\begin{equation}
+  \frobnorm{W_\ell} \le L_W,
+\end{equation}
+and every sampled GP/RFF output scale satisfies
+\begin{equation}
+  \abs{\sigma_{\mathrm{out}}} \le L_{\sigma}.
+\end{equation}
+\end{assumption}
+
+\begin{assumption}[Detached corridor scales]
+All state-corridor, loss-thermostat, and step-corridor scaling factors are detached with respect to the current infinitesimal perturbation used by autograd.
+\end{assumption}
+
+\begin{assumption}[Controlled objective smoothness]
+There exists a controlled objective $J_H^c$ associated with the projected-and-corridored rollout such that, on the actually visited safe region, $J_H^c$ is differentiable with locally Lipschitz gradient with respect to the realized state trajectory and the policy parameters.
+\end{assumption}
+
+\begin{assumption}[Conditional learnability event]
+There exists an activation event $Q_t^{\mathrm{learn}}$ such that on this event:
+\begin{enumerate}[label=(\alph*)]
+  \item the batch is not near a true stationary regime;
+  \item the previous controlled state increment is not numerically degenerate;
+  \item the local policy VJP on the active parameter subspace is not rank-degenerate.
+\end{enumerate}
+\end{assumption}
+
+\begin{assumption}[Optimizer preconditioner bounds]
+For the train-step theorem, the effective optimizer preconditioner $P_k$ satisfies
+\begin{equation}
+  0 < m_P \le \sigma_{\min}(P_k) \le \sigma_{\max}(P_k) \le M_P < \infty
+\end{equation}
+on the active parameter subspace. This assumption is exact for SGD with scalar learning rate, and is a controlled approximation for AdamW when second-moment estimates remain finite and non-degenerate.
+\end{assumption}
+
+\section{Theoretical Results}
+\subsection{Generator-side global upper bound}
+\begin{proposition}[SCM Jacobian bound under Frobenius caps]
+Consider a depth-$D$ SCM generator with weights $\{W_\ell\}_{\ell=1}^{D}$, $1$-Lipschitz activations between layers, and a final \texttt{tanh} output. If $\frobnorm{W_\ell} \le L_W$ for all $\ell$, then for every input $x$,
+\begin{equation}
+  \opnorm{\frac{\partial F_{\xi}(x)}{\partial x}} \le L_W^D.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+For every matrix $W$, $\opnorm{W} \le \frobnorm{W} \le L_W$. Since each activation is $1$-Lipschitz and the final \texttt{tanh} is also $1$-Lipschitz, the operator norm of the full Jacobian is bounded by the product of the layer operator norms. Hence
+\[
+  \opnorm{\frac{\partial F_{\xi}(x)}{\partial x}}
+  \le \prod_{\ell=1}^{D} \opnorm{W_\ell}
+  \le L_W^D.
+\]
+\end{proof}
+
+\begin{proposition}[GP/RFF Jacobian bound under Frobenius and output-scale caps]
+Consider the GP/RFF generator
+\begin{equation}
+  F_{\xi}(x) = \tanh\!\big(\sigma_{\mathrm{out}} \cos(xW+b) A\big),
+\end{equation}
+with $\frobnorm{W} \le L_W$, $\frobnorm{A} \le L_W$, and $\abs{\sigma_{\mathrm{out}}} \le L_{\sigma}$. Then for every input $x$,
+\begin{equation}
+  \opnorm{\frac{\partial F_{\xi}(x)}{\partial x}} \le L_{\sigma} L_W^2.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+The derivative of \texttt{tanh} has magnitude at most $1$, and the derivative of $\cos(\cdot)$ also has magnitude at most $1$. Therefore
+\[
+  \opnorm{\frac{\partial F_{\xi}(x)}{\partial x}}
+  \le \abs{\sigma_{\mathrm{out}}}\opnorm{W}\opnorm{A}
+  \le L_{\sigma} L_W^2.
+\]
+\end{proof}
+
+\begin{remark}
+These propositions formalize exactly what \texttt{lipschitz\_enforce} is meant to provide: a prior-side global upper bound on steepness. They do not provide a lower bound and therefore do not, by themselves, imply anti-vanishing.
+\end{remark}
+
+\subsection{Policy-step anti-explosion}
+\begin{definition}[Controlled directional proxies]
+Let
+\begin{equation}
+  d_t = \norm{\Delta_t}_2, \qquad
+  d_t^{\mathrm{raw}} = \norm{\Delta_t^{\mathrm{raw}}}_2, \qquad
+  \rho_t = \frac{d_t}{d_{t-1} + \varepsilon}.
+\end{equation}
+\end{definition}
+
+\begin{theorem}[State corridor enforces high-side directional bounds]
+Suppose the state corridor is applied with parameters $(\rho_{\mathrm{hi}}, d_{\mathrm{hi}})$. Then for every step $t$,
+\begin{equation}
+  d_t \le d_{\mathrm{hi}}, \qquad
+  d_t \le \rho_{\mathrm{hi}}(d_{t-1} + \varepsilon).
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By construction,
+\[
+  c_{t,\mathrm{hi}}^{\mathrm{state}}
+  \le \frac{d_{\mathrm{hi}}}{d_t^{\mathrm{raw}} + \varepsilon},
+  \qquad
+  c_{t,\mathrm{hi}}^{\mathrm{state}}
+  \le \frac{\rho_{\mathrm{hi}}}{\rho_t^{\mathrm{raw}} + \varepsilon}.
+\]
+Since $c_{t,\mathrm{lo}}^{\mathrm{state}} \ge 1$ is only active when $c_{t,\mathrm{hi}}^{\mathrm{state}} = 1$, the high-side bound is not undone by the low-side factor. Therefore the realized increment after applying the full corridor satisfies both bounds.
+\end{proof}
+
+\begin{corollary}[Window-level bound for TBPTT with $H=32$]
+If the high-side corridor is enforced on every step of a window of length $H=32$, then for any $1 \le s < t \le H$,
+\begin{equation}
+  d_t \le \rho_{\mathrm{hi}}^{\,t-s}(d_s + \varepsilon) + O(\varepsilon),
+\end{equation}
+and in particular
+\begin{equation}
+  d_t \le \rho_{\mathrm{hi}}^{32}(d_s + \varepsilon) + O(\varepsilon).
+\end{equation}
+\end{corollary}
+
+\begin{remark}
+This is the main anti-explosion guarantee for the policy-step transport. It is unconditional once the corridor is active; it does not require any lower-bound assumption.
+\end{remark}
+
+\subsection{Conditional policy-step anti-vanishing}
+\begin{theorem}[Recoverable low-side non-vanishing]
+Assume $Q_t^{\mathrm{state}}=1$. If
+\begin{equation}
+  d_t^{\mathrm{raw}} \ge \frac{d_{\mathrm{lo}}}{\kappa_{\mathrm{state}}},
+  \qquad
+  \rho_t^{\mathrm{raw}} \ge \frac{\rho_{\mathrm{lo}}}{\kappa_{\mathrm{state}}},
+\end{equation}
+then after applying the low-side corridor,
+\begin{equation}
+  d_t \ge d_{\mathrm{lo}},
+  \qquad
+  \rho_t \ge \rho_{\mathrm{lo}} - O(\varepsilon).
+\end{equation}
+If either recoverability condition fails, then the corridor still guarantees
+\begin{equation}
+  d_t \ge \kappa_{\mathrm{state}}^{-1} d_{\mathrm{lo}}
+  \quad\text{only when the raw increment is itself not below the cap-limited regime,}
+\end{equation}
+and otherwise it can do no more than multiply the raw increment by $\kappa_{\mathrm{state}}$.
+\end{theorem}
+
+\begin{proof}
+On $Q_t^{\mathrm{state}}=1$, the low-side factor is
+\[
+  c_{t,\mathrm{lo}}^{\mathrm{state}}
+  =
+  \min\!\left(\kappa_{\mathrm{state}},
+    \max\left\{
+      1,\,
+      \frac{\rho_{\mathrm{lo}}}{\rho_t^{\mathrm{raw}} + \varepsilon},\,
+      \frac{d_{\mathrm{lo}}}{d_t^{\mathrm{raw}} + \varepsilon}
+    \right\}
+  \right).
+\]
+If the target lower bound is reachable without hitting the cap, the scale equals the needed reciprocal factor and the lower corridor is achieved. If the target lower bound would require a factor larger than $\kappa_{\mathrm{state}}$, the cap binds and only partial recovery is possible.
+\end{proof}
+
+\begin{remark}
+This theorem is intentionally conditional. It states what the method can prove without pretending that an arbitrarily tiny raw signal can always be recovered.
+\end{remark}
+
+\subsection{Detached loss thermostat}
+\begin{proposition}[No directional bias of the detached loss thermostat]
+Let $\tau_{\mathrm{loss}} > 0$ be detached with respect to the current autograd graph. Then
+\begin{equation}
+  \nabla_{\theta}\!\left(\tau_{\mathrm{loss}} \mathcal{L}_{\mathrm{pg}}^{c}\right)
+  =
+  \tau_{\mathrm{loss}} \nabla_{\theta}\mathcal{L}_{\mathrm{pg}}^{c}.
+\end{equation}
+Hence the detached loss thermostat does not change the local gradient direction of the controlled objective.
+\end{proposition}
+
+\begin{proof}
+Since $\tau_{\mathrm{loss}}$ is detached, $\partial \tau_{\mathrm{loss}} / \partial \theta = 0$ inside the current graph. The result follows immediately.
+\end{proof}
+
+\begin{remark}
+This means the loss thermostat is not an estimator-bias term. It is an adaptive scalar learning-rate modulation at the batch-objective level.
+\end{remark}
+
+\subsection{Train-step anti-explosion and conditional anti-vanishing}
+\begin{theorem}[Train-step high-side bound]
+Let $\gamma_k$ be the pre-corridor gradient RMS at train step $k$, and let the high-side train-step corridor parameter be $\gamma_{\mathrm{hi}}$. Then the post-corridor gradient RMS $\gamma_k'$ satisfies
+\begin{equation}
+  \gamma_k' \le \gamma_{\mathrm{hi}}.
+\end{equation}
+If a global norm clip at level $C$ is applied afterwards, then
+\begin{equation}
+  \norm{g_k'}_2 \le C.
+\end{equation}
+\end{theorem}
+
+\begin{proof}
+By construction,
+\[
+  c_{k,\mathrm{hi}}^{\mathrm{step}} \le \frac{\gamma_{\mathrm{hi}}}{\gamma_k + \varepsilon}.
+\]
+Therefore $\gamma_k' = c_k^{\mathrm{step}}\gamma_k \le \gamma_{\mathrm{hi}}$. The global norm clip then gives the second bound.
+\end{proof}
+
+\begin{theorem}[Conditional train-step anti-vanishing]
+Suppose the low-side train-step event $Q_k^{\mathrm{step}}=1$ holds and
+\begin{equation}
+  \gamma_k \ge \frac{\gamma_{\mathrm{lo}}}{\kappa_{\mathrm{step}}}.
+\end{equation}
+Then the post-corridor gradient RMS satisfies
+\begin{equation}
+  \gamma_k' \ge \gamma_{\mathrm{lo}}.
+\end{equation}
+Furthermore, under Assumption 6 and learning rate $\eta_k \ge \eta_{\min} > 0$,
+\begin{equation}
+  \norm{\Delta \theta_k}_2
+  \ge
+  \eta_{\min} m_P \sqrt{N_{\mathrm{eff}}}\,\gamma_{\mathrm{lo}},
+\end{equation}
+where $N_{\mathrm{eff}}$ is the number of effectively active coordinates in the update subspace.
+\end{theorem}
+
+\begin{proof}
+The first claim follows exactly as in the policy-step recoverability theorem: if the required boost does not exceed $\kappa_{\mathrm{step}}$, then the corridor raises $\gamma_k$ to $\gamma_{\mathrm{lo}}$. The second claim follows from
+\[
+  \norm{\Delta \theta_k}_2
+  =
+  \eta_k \norm{P_k g_k'}_2
+  \ge
+  \eta_{\min} \sigma_{\min}(P_k)\norm{g_k'}_2
+  \ge
+  \eta_{\min} m_P \sqrt{N_{\mathrm{eff}}}\,\gamma_{\mathrm{lo}}.
+\]
+\end{proof}
+
+\begin{remark}
+This is the explicit closure that earlier notes lacked: train-step anti-vanishing requires a lower bound not only on the gradient signal, but also on the effective optimizer preconditioner and the actual learning rate.
+\end{remark}
+
+\section{Bias Analysis}
+\subsection{Bias decomposition}
+Let $\widehat{G}$ be the random gradient used by the implemented algorithm. Then
+\begin{equation}
+  \E[\widehat{G}] - \nabla J_H
+  =
+  \underbrace{\left(\E[\widehat{G}] - \nabla J_H^c\right)}_{\text{optimizer-side scaling and sanitization}}
+  +
+  \underbrace{\left(\nabla J_H^c - \nabla J_H\right)}_{\text{controlled-dynamics bias}}.
+\end{equation}
+
+The present \texttt{v5\_next} implementation has no \texttt{g0/g1} estimator mixing, so there is no arm-selection bias term. The bias sources are instead:
+\begin{enumerate}[label=\arabic*.]
+  \item \textbf{controlled-dynamics bias}: replacing the raw rollout with the Lipschitz-projected, corridor-controlled rollout;
+  \item \textbf{loss-thermostat scaling}: zero directional bias, positive scalar rescaling only;
+  \item \textbf{step-corridor scaling}: zero preconditioned-direction bias under scalar positive scaling, but optimizer-path bias through variable effective learning rate;
+  \item \textbf{sanitize/clip bias}: only active when non-finite or clipped gradients occur.
+\end{enumerate}
+
+\subsection{Controlled-dynamics bias}
+\begin{proposition}[Trajectory perturbation bound]
+Let
+\begin{equation}
+  e_t = \Delta_t - \Delta_t^{\mathrm{raw}} = (c_t^{\mathrm{state}} - 1)\Delta_t^{\mathrm{raw}}.
+\end{equation}
+If the return functional is $L_J$-Lipschitz in the realized state trajectory on the safe region, then
+\begin{equation}
+  \abs{J_H^c - J_H}
+  \le
+  L_J \sum_{t=1}^{H} \E \norm{e_t}_2.
+\end{equation}
+If the gradient map is $L_{\nabla}$-Lipschitz in trajectory, then
+\begin{equation}
+  \norm{\nabla J_H^c - \nabla J_H}_2
+  \le
+  L_{\nabla} \sum_{t=1}^{H} \E \norm{e_t}_2.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Both inequalities are direct applications of Lipschitz continuity with respect to the accumulated trajectory perturbation.
+\end{proof}
+
+\paragraph{Interpretation.}
+This is the principal bias of the method. It is not a numerical accident; it is the explicit price paid for keeping the rollout inside a stable transport corridor.
+
+\subsection{Loss-thermostat and step-corridor bias}
+\begin{proposition}[Scalar detached scaling preserves stationary points for plain gradient flow]
+Consider updates of the form
+\begin{equation}
+  \theta_{k+1}
+  =
+  \theta_k - \eta_k c_k \nabla J_H^c(\theta_k),
+\end{equation}
+where $c_k > 0$ is detached from the current gradient graph. Then the set of stationary points is unchanged:
+\begin{equation}
+  \nabla J_H^c(\theta^\star)=0
+  \quad\Longleftrightarrow\quad
+  c_k \nabla J_H^c(\theta^\star)=0.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+Because $c_k > 0$, multiplication by $c_k$ does not change whether the gradient vanishes.
+\end{proof}
+
+\begin{remark}
+For SGD this is exact: the detached scalar only changes the effective step size. For AdamW it remains direction-preserving before moment adaptation, but the full trajectory is no longer a simple time reparameterization. Thus optimizer-path bias exists, but not sign-flip bias.
+\end{remark}
+
+\subsection{Sanitization and clipping bias}
+If non-finite values are sanitized or if the final global norm clip becomes active, the resulting gradient is a truncated version of the pre-sanitized gradient. Let $G$ be the pre-sanitized gradient and $\widetilde{G}$ the post-sanitized gradient. Then
+\begin{equation}
+  \norm{\E[\widetilde{G}] - \E[G]}_2
+  \le
+  \E \norm{\widetilde{G} - G}_2.
+\end{equation}
+This bound is simple but useful: once the non-finite share and clip-hit share are logged, the remaining bias contribution can be explicitly monitored rather than guessed.
+
+\section{Does Lipschitz Enforcement Reduce TabPFN Prior Diversity?}
+\subsection{What changes under projection}
+Let $\Pi_L$ denote the projection/clipping operator induced by \texttt{lipschitz\_enforce}, and let
+\begin{equation}
+  p_L = (\Pi_L)_{\#} p_0
+\end{equation}
+be the pushforward prior. The prior is not unchanged: it is a projected version of the original TabPFN-style environment prior.
+
+\paragraph{What is preserved.}
+The projection does \emph{not} alter discrete structural draws:
+\begin{itemize}[leftmargin=1.2em]
+  \item family choice (\texttt{scm} vs.\ \texttt{gp});
+  \item sampled dimensions (\texttt{state\_dim}, \texttt{obs\_dim}, \texttt{action\_dim}, \texttt{noise\_dim});
+  \item sampled depth and activation family;
+  \item reward-dropout configuration;
+  \item RNG-driven structural variability.
+\end{itemize}
+
+\paragraph{What is reduced.}
+The projection does reduce the tail diversity of \emph{metric steepness}:
+\begin{itemize}[leftmargin=1.2em]
+  \item large operator-norm transitions;
+  \item very stiff local dynamics;
+  \item extreme GP output scales;
+  \item rare, very high-curvature event regimes.
+\end{itemize}
+
+\subsection{A projection-stability bound}
+\begin{definition}[Projection-stable event]
+A measurable event $\mathcal{E}$ in function space is projection-stable with respect to $\Pi_L$ if
+\begin{equation}
+  f \in \mathcal{E},\ f \in \mathcal{K}_L
+  \quad\Longleftrightarrow\quad
+  \Pi_L(f) \in \mathcal{E},
+\end{equation}
+where $\mathcal{K}_L$ is the feasible set already satisfying the Lipschitz caps.
+\end{definition}
+
+\begin{proposition}[Event-probability shift is bounded by clipped tail mass]
+For any projection-stable event $\mathcal{E}$,
+\begin{equation}
+  \abs{\Prob_{p_L}(\mathcal{E}) - \Prob_{p_0}(\mathcal{E})}
+  \le
+  \Prob_{p_0}(\mathcal{K}_L^c).
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+On $\mathcal{K}_L$, the projection is the identity, so the event probability changes only through the mass of samples lying outside the feasible set.
+\end{proof}
+
+\subsection{A metric diversity bound}
+\begin{proposition}[Shift of Lipschitz observables under projection]
+For any $1$-Lipschitz observable $\varphi$ on the function space,
+\begin{equation}
+  \abs{\E_{p_L}[\varphi] - \E_{p_0}[\varphi]}
+  \le
+  \E_{f \sim p_0}\norm{\Pi_L(f)-f}.
+\end{equation}
+\end{proposition}
+
+\begin{proof}
+By the definition of pushforward measure and the Lipschitz property,
+\[
+  \abs{\E_{p_L}[\varphi] - \E_{p_0}[\varphi]}
+  =
+  \abs{\E_{p_0}[\varphi(\Pi_L(f)) - \varphi(f)]}
+  \le
+  \E_{p_0}\norm{\Pi_L(f)-f}.
+\]
+\end{proof}
+
+\paragraph{Interpretation.}
+This proposition gives the correct answer to the diversity question: yes, \texttt{lipschitz\_enforce} can reduce prior diversity, but the reduction is concentrated in the clipped tail. It does not automatically collapse discrete event diversity. It primarily suppresses the magnitude of rare steep regimes.
+
+\subsection{When diversity reduction becomes harmful}
+The diversity loss becomes practically harmful when either of the following quantities is large:
+\begin{equation}
+  \delta_{\mathrm{clip}}
+  :=
+  \Prob_{p_0}(\mathcal{K}_L^c),
+\end{equation}
+\begin{equation}
+  \Delta_{\mathrm{clip}}
+  :=
+  \E_{f \sim p_0}\norm{\Pi_L(f)-f}.
+\end{equation}
+If $\delta_{\mathrm{clip}}$ is small, then the caps mainly remove pathological tails. If $\delta_{\mathrm{clip}}$ is large, the projected prior no longer behaves like a mild stabilization of the TabPFN prior; it becomes a different prior with significantly reduced extreme-event diversity.
+
+\paragraph{Practical conclusion.}
+Lipschitz enforcement should be viewed as a controlled prior shift, not as a free lunch. It is acceptable when the clipped tail mass is kept modest, and it is unacceptable when most sampled environments are projected heavily. The present implementation now logs matrix-level and outputscale-level clipping proxies, including clip share and projection magnitude. These are not exact function-space measurements of $\delta_{\mathrm{clip}}$ or $\Delta_{\mathrm{clip}}$, but they are the correct engineering observables for auditing whether the projected prior remains a mild stabilization rather than a severe prior rewrite.
+
+\section{Recommended Default Regime for the Current Implementation}
+For the implemented \texttt{v5\_next + lipschitz\_enforce} path with $H=32$, the current default regime is:
+\begin{center}
+\begin{tabular}{ll}
+\toprule
+Parameter & Value \\
+\midrule
+\texttt{state\_gain\_lo} & $0.985$ \\
+\texttt{state\_gain\_hi} & $1.035$ \\
+\texttt{state\_rms\_lo} & $4\times 10^{-3}$ \\
+\texttt{state\_rms\_hi} & $9\times 10^{-2}$ \\
+\texttt{state\_reward\_gate} & $0.05$ \\
+\texttt{state\_low\_boost\_cap} & $1.5$ \\
+\texttt{loss\_target\_std} & $0.25$ \\
+\texttt{loss\_scale\_lo}, \texttt{loss\_scale\_hi} & $0.5,\ 4.0$ \\
+\texttt{step\_grad\_rms\_lo} & $10^{-4}$ \\
+\texttt{step\_grad\_rms\_hi} & $3\times 10^{-2}$ \\
+\texttt{step\_reward\_std\_gate} & $0.05$ \\
+\texttt{step\_low\_boost\_cap} & $4.0$ \\
+\texttt{lipschitz\_weight\_fro\_norm\_max} & $1.0$ \\
+\texttt{lipschitz\_gp\_outputscale\_max} & $1.0$ \\
+\bottomrule
+\end{tabular}
+\end{center}
+
+These defaults are not claimed to be universally optimal. They are the original implementation defaults for the \texttt{v5\_next + lipschitz\_enforce} path and target a batch-$512$ / TBPTT-$32$ mainline rollout without enlarging the optimizer step size.
+
+\section{Implementation Correspondence}
+The theoretical objects in this note are intentionally chosen so that they map directly onto the current engineering implementation.
+
+\paragraph{Prior-side projection.}
+The Lipschitz projection $\Pi_L$ is implemented by Frobenius projection of sampled SCM and GP/RFF weights together with scalar clipping of GP output scale. This corresponds to the code path guarded by \texttt{lipschitz\_enforce}.
+
+\paragraph{State corridor.}
+The full-state corridor is implemented as a detached multiplicative rescaling of the realized state update before committing the next latent state. The logged quantities
+\begin{center}
+\begin{tabular}{c}
+\texttt{aev5n\_gain\_*}, \texttt{aev5n\_update\_rms\_*}, \\
+\texttt{aev5n\_high\_clip}, \texttt{aev5n\_low\_active}, \texttt{aev5n\_low\_boost}
+\end{tabular}
+\end{center}
+are precisely the implementation-side observables associated with the corridor quantities $\rho_t^{\mathrm{raw}}$, $d_t^{\mathrm{raw}}$, $c_{t,\mathrm{hi}}^{\mathrm{state}}$, and $c_{t,\mathrm{lo}}^{\mathrm{state}}$.
+
+\paragraph{Loss thermostat.}
+The detached scalar $\tau_{\mathrm{loss}}$ is implemented as a batch-level reward-standard-deviation multiplier, logged through \texttt{aev5n\_scale\_*} and \texttt{aev5n\_reward\_std\_ref}.
+
+\paragraph{Train-step corridor.}
+The detached post-backward scaling $c_k^{\mathrm{step}}$ is implemented immediately before the final global norm clip and optimizer update. Its runtime effect is reflected in \texttt{aev5n\_step\_scale}.
+
+\paragraph{Interpretation.}
+This correspondence matters because theorems in this document are intended to describe the actual code path, not a hypothetical estimator that has not been engineered. In particular, the present method has no \texttt{g0/g1} arm-mixing term, so the bias decomposition in Section 6 deliberately excludes arm-selection bias.
+
+\section{Certificate Definitions}
+The implemented method is accompanied by an explicit certificate layer. The purpose of this layer is not to re-prove the theorems numerically, but to expose the exact runtime observables that would falsify the assumptions or conclusions of the theory. Each certificate below corresponds to a theorem or motivation in the preceding sections.
+
+\subsection{Certificate I: Prior-Audit Certificate}
+\paragraph{Motivation.}
+Section 7 shows that \texttt{lipschitz\_enforce} is a controlled prior shift, not a free lunch. The right empirical question is therefore not merely whether the rollout stayed finite, but whether the projected prior remains close enough to the original TabPFN-style prior that diversity is reduced only in the pathological tail.
+
+\paragraph{Definition.}
+The \emph{prior-audit certificate} is the tuple
+\begin{equation}
+  \mathcal{C}_{\mathrm{prior}}
+  :=
+  \big(
+    s_{\mathrm{mat}},
+    \bar{\delta}_{\mathrm{mat}},
+    \bar{\Delta}_{\mathrm{mat}},
+    \Delta^{\max}_{\mathrm{mat}},
+    s_{\sigma},
+    \bar{\Delta}_{\sigma}
+  \big),
+\end{equation}
+where:
+\begin{align}
+  s_{\mathrm{mat}} &:= \texttt{lip\_mclip},\\
+  \bar{\delta}_{\mathrm{mat}} &:= \texttt{lip\_mtail},\\
+  \bar{\Delta}_{\mathrm{mat}} &:= \texttt{lip\_mproj},\\
+  \Delta^{\max}_{\mathrm{mat}} &:= \texttt{lip\_mproj\_max},\\
+  s_{\sigma} &:= \texttt{lip\_oclip},\\
+  \bar{\Delta}_{\sigma} &:= \texttt{lip\_oproj}.
+\end{align}
+
+\paragraph{Semantics.}
+Here $s_{\mathrm{mat}}$ is the share of sampled matrix draws that hit the Frobenius cap, $\bar{\delta}_{\mathrm{mat}}$ is the mean relative tail mass above the cap, $\bar{\Delta}_{\mathrm{mat}}$ is the mean relative projection distance, and $\Delta^{\max}_{\mathrm{mat}}$ is the worst observed matrix projection ratio. Likewise $s_{\sigma}$ and $\bar{\Delta}_{\sigma}$ are the corresponding outputscale-level clipping and projection statistics.
+
+\paragraph{Relation to theory.}
+This certificate corresponds directly to Propositions 1--2 and to the diversity-shift analysis of Section 7. It is not an exact measurement of $\delta_{\mathrm{clip}}$ or $\Delta_{\mathrm{clip}}$ in function space, but it is a faithful operational proxy. Large values of $\mathcal{C}_{\mathrm{prior}}$ indicate that the assumptions underlying the ``mild prior shift'' interpretation are no longer believable.
+
+\paragraph{Acceptance rule.}
+A build passes the prior-audit certificate if the fields above are finite and exposed at runtime. A training configuration is interpreted as \emph{mildly projected} only when $s_{\mathrm{mat}}$, $\bar{\Delta}_{\mathrm{mat}}$, and $s_{\sigma}$ remain well below $1$ and when $\Delta^{\max}_{\mathrm{mat}}$ is not systematically close to $1$. This is a monitoring certificate rather than a universal threshold theorem.
+
+\subsection{Certificate II: Bias-Audit Certificate}
+\paragraph{Motivation.}
+Sections 5 and 6 prove unconditional anti-explosion, conditional anti-vanishing, and explicit bias accounting. The corresponding engineering requirement is to log \emph{how often} each control activates and \emph{how far} it moves the effective update away from the uncontrolled path.
+
+\paragraph{Definition.}
+The \emph{bias-audit certificate} is the tuple
+\begin{equation}
+  \mathcal{C}_{\mathrm{bias}}
+  :=
+  \big(
+    s_{\mathrm{state}},
+    \delta_{\mathrm{therm}},
+    \delta_{\mathrm{step}},
+    q_{\mathrm{step}}
+  \big),
+\end{equation}
+with
+\begin{align}
+  s_{\mathrm{state}} &:= \texttt{aev5n\_bias\_state},\\
+  \delta_{\mathrm{therm}} &:= \texttt{aev5n\_bias\_therm} = \abs{\tau_{\mathrm{loss}}-1},\\
+  \delta_{\mathrm{step}} &:= \texttt{aev5n\_bias\_step} = \abs{c_k^{\mathrm{step}}-1},\\
+  q_{\mathrm{step}} &:= \texttt{aev5n\_step\_trigger}\in\{0,1\}.
+\end{align}
+
+\paragraph{State-corridor semantics.}
+The quantity $s_{\mathrm{state}}$ is the realized corridor-trigger share for the policy-step state transport. It operationalizes Theorem 3 and Theorem 4: when this share is near zero, the controlled and uncontrolled trajectories are close in the sense of Section 6; when it is large, the method is leaning heavily on state-side intervention, and the controlled-dynamics bias term is correspondingly important.
+
+\paragraph{Thermostat semantics.}
+The quantity $\delta_{\mathrm{therm}}$ operationalizes Proposition 3 and Section 6.2. Because the thermostat is detached and positive, this term is not a directional bias of the controlled gradient, but it is a batch-level step-size distortion relative to the raw rollout objective. Large $\delta_{\mathrm{therm}}$ means the optimizer path is substantially re-timed.
+
+\paragraph{Step-corridor semantics.}
+The pair $(\delta_{\mathrm{step}}, q_{\mathrm{step}})$ operationalizes Theorem 5 and Theorem 6. If $q_{\mathrm{step}}=0$, the train-step corridor is inactive and the train-step bias contribution is locally absent. If $q_{\mathrm{step}}=1$, then $\delta_{\mathrm{step}}$ records the magnitude of the optimizer-side intervention.
+
+\paragraph{Acceptance rule.}
+A build passes the bias-audit certificate if all four fields are finite and exposed at runtime. A run is interpreted as being in a \emph{low-bias regime} only when $s_{\mathrm{state}}$, $\delta_{\mathrm{therm}}$, and $\delta_{\mathrm{step}}$ remain small on average. Again, this is an audit certificate, not a claim that the quantities are uniformly small.
+
+\subsection{Certificate III: Semantic and Acceptance Certificates}
+\paragraph{Motivation.}
+Theorems and observables are not enough if implementation drift silently changes the meaning of logged fields. The semantic certificate therefore pins the runtime observables to identities that must hold under the implemented method.
+
+\paragraph{Definition.}
+The \emph{semantic acceptance certificate} requires, at minimum, the following relations on real training runs:
+\begin{enumerate}[label=\arabic*.]
+  \item \texttt{objective\_total\_v5n} must equal the window-aggregated thermostatted objective rather than silently collapsing to the raw objective.
+  \item \texttt{aev5n\_loss\_mul} and \texttt{aev5n\_scale} must agree up to log-format tolerance.
+  \item \texttt{aev5n\_std\_ref} must agree with the reward-standard-deviation reference used by the thermostat.
+  \item all prior-audit and bias-audit fields must be finite and present in the phase log.
+\end{enumerate}
+
+\paragraph{Relation to theory.}
+This certificate ties Section 6 to the real CLI path. Items (1)--(3) protect Proposition 3 from silent implementation regressions, while item (4) ensures that the audit layer remains available whenever the theory is invoked operationally.
+
+\paragraph{Runtime observables.}
+The implemented phase-log fields are
+\begin{center}
+\begin{tabular}{c}
+\texttt{objective\_total\_v5n}, \texttt{aev5n\_loss\_mul}, \texttt{aev5n\_scale}, \texttt{aev5n\_std\_ref},\\
+\texttt{aev5n\_bias\_state}, \texttt{aev5n\_bias\_therm}, \texttt{aev5n\_bias\_step}, \texttt{aev5n\_step\_trigger},\\
+\texttt{lip\_mclip}, \texttt{lip\_mtail}, \texttt{lip\_mproj}, \texttt{lip\_mproj\_max}, \texttt{lip\_oclip}, \texttt{lip\_oproj}
+\end{tabular}
+\end{center}
+and constitute the logged certificate surface of the current implementation.
+
+\section{Limitations}
+\begin{enumerate}[label=\arabic*.]
+  \item The anti-vanishing results are conditional and recoverability-limited. They do not claim to resurrect arbitrarily tiny or rank-degenerate signals.
+  \item The train-step theorem requires bounds on the optimizer preconditioner. This is exact for SGD, approximate for AdamW.
+  \item The method still optimizes a controlled objective $J_H^c$ rather than the raw objective $J_H$; the dynamics bias is real and must be monitored.
+  \item The present prior-audit certificate logs matrix-level and outputscale-level projection proxies, not exact function-space estimates of $\delta_{\mathrm{clip}}$ or $\Delta_{\mathrm{clip}}$.
+\end{enumerate}
+
+\section{Conclusion}
+The \texttt{v5\_next + lipschitz\_enforce} design is stronger than the old detached-\texttt{v5} thermostat because it addresses both policy-step and train-step safety in a single uniform scheme. It is also more honest than earlier global-singular-value formulations because it proves only what can actually be supported by the implemented controls: unconditional anti-explosion, conditional anti-vanishing, and explicit bias accounting. The correct conceptual picture is not that Lipschitz enforcement magically solves all stability problems. Rather, the global prior projection provides a hard upper bound, the full-state corridor controls the realized transport, the detached thermostat preserves usable scalar magnitude, and the step corridor keeps the optimizer update in a safe band. This is the right level of rigor for an engineering-faithful stability method.
+
+\begin{thebibliography}{9}
+
+\bibitem{pascanu2013}
+R. Pascanu, T. Mikolov, and Y. Bengio.
+\newblock On the Difficulty of Training Recurrent Neural Networks.
+\newblock In \emph{Proceedings of ICML}, 2013.
+
+\bibitem{loshchilov2019}
+I. Loshchilov and F. Hutter.
+\newblock Decoupled Weight Decay Regularization.
+\newblock In \emph{Proceedings of ICLR}, 2019.
+
+\bibitem{brock2021}
+A. Brock, S. De, S. L. Smith, and K. Simonyan.
+\newblock High-Performance Large-Scale Image Recognition Without Normalization.
+\newblock In \emph{Proceedings of ICML}, 2021.
+
+\bibitem{hollmann2023}
+N. Hollmann, S. Mueller, K. Eggensperger, and F. Hutter.
+\newblock TabPFN: A Transformer That Solves Small Tabular Classification Problems in a Second.
+\newblock In \emph{Proceedings of ICLR}, 2023.
+
+\end{thebibliography}
+
+\end{document}

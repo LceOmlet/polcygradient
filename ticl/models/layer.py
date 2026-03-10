@@ -1077,11 +1077,37 @@ class TransformerEncoderLayer(Module):
             stats["paged_prefix_len_sum"] += int(prefix_k.shape[2]) if prefix_k is not None else 0
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
         train_mode = self._resolve_paged_attn_train_mode(q_bhld)
+        if (
+            self.paged_attn_train_mode == "auto"
+            and train_mode == "dense"
+            and q_bhld.device.type == "cuda"
+        ):
+            dense_token_cap = int(max(0, self.paged_attn_flashprefix_dense_max_tokens))
+            if int(valid_len) > dense_token_cap and attn_dropout <= 0.0 and (not bool(clone_kv_for_grad)):
+                train_mode = "flash_prefix"
 
         # Fast path: single-page cache can directly dispatch to SDPA.
         # This is important for no-grad/inference runs where we keep one large
         # page and avoid the per-page python loop entirely.
         if len(k_pages) == 1:
+            if (prefix_k is not None) and (prefix_v is not None):
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+                if bool(clone_kv_for_grad) and torch.is_grad_enabled():
+                    k_all = k_all.clone()
+                    v_all = v_all.clone()
+                if stats is not None:
+                    prefix_len = int(min(int(valid_len), int(prefix_k.shape[2])))
+                    stats["paged_path_single_page"] += 1
+                    stats["dense_valid_tokens_sum"] += int(valid_len)
+                    stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                    stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - prefix_len))
+                return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
             if (
                 bool(self.force_flash_single_page)
                 and
@@ -1215,7 +1241,16 @@ class TransformerEncoderLayer(Module):
                     stats["dense_prefix_tokens_sum"] += int(prefix_len)
                     stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
                 return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
-            k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
+            if (prefix_k is not None) and (prefix_v is not None):
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+            else:
+                k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if bool(clone_kv_for_grad):
                 # Multi-page fallback for in-place paged-grad mode.
                 k_all = k_all.clone()
@@ -1223,17 +1258,28 @@ class TransformerEncoderLayer(Module):
             if stats is not None:
                 stats["paged_path_dense"] += 1
                 stats["dense_valid_tokens_sum"] += int(valid_len)
-                stats["dense_prefix_tokens_sum"] += 0
-                stats["dense_tail_tokens_sum"] += int(valid_len)
+                prefix_len = int(min(int(valid_len), int(prefix_k.shape[2]))) if (prefix_k is not None) else 0
+                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - prefix_len))
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         if attn_dropout > 0.0:
-            k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
+            if (prefix_k is not None) and (prefix_v is not None):
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+            else:
+                k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
             if stats is not None:
                 stats["paged_path_dense"] += 1
                 stats["dense_valid_tokens_sum"] += int(valid_len)
-                stats["dense_prefix_tokens_sum"] += 0
-                stats["dense_tail_tokens_sum"] += int(valid_len)
+                prefix_len = int(min(int(valid_len), int(prefix_k.shape[2]))) if (prefix_k is not None) else 0
+                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - prefix_len))
             return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
 
         scale = 1.0 / math.sqrt(float(q_bhld.shape[-1]))
@@ -1712,10 +1758,12 @@ class TransformerEncoderLayer(Module):
             raise ValueError(f"kv_cache_mode={cache_mode} requires max_cache_len.")
         if max_cache_len is not None:
             max_cache_len = int(max_cache_len)
+        paged_train_mode_resolved = None
         if cache_mode == "paged":
             if kv_cache_page_size is None:
                 kv_cache_page_size = 128
             kv_cache_page_size = int(max(1, kv_cache_page_size))
+            paged_train_mode_resolved = self._resolve_paged_attn_train_mode(q_bhld)
         mutable_paged_grad = (
             cache_mode == "paged"
             and torch.is_grad_enabled()
@@ -1953,7 +2001,7 @@ class TransformerEncoderLayer(Module):
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
+            and paged_train_mode_resolved in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):
