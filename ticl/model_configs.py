@@ -142,7 +142,10 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         'heterogeneous_batches': False,
         'multiclass_loss_type': 'nono',  # 'compatible'
         'prior_type': 'prior_bag',
-        'prior_bag': {'prior_bag_exp_weights_1': {'distribution': 'uniform', 'min': 2.0, 'max': 10.0}}}
+        'prior_bag': {
+            'prior_bag_exp_weights_1': {'distribution': 'uniform', 'min': 2.0, 'max': 10.0},
+            'prior_weights': {'mlp': 0.961, 'gp': 0.039},
+        }}
 
     mlp_prior_config = {"pre_sample_causes": True,
                         "sampling": 'normal',  # hp.choice('sampling', ['mixed', 'normal']), # uniform
@@ -343,8 +346,8 @@ def get_prior_config(max_features=100, n_samples=1024+128):
     prior['classification'] = classsification_prior
 
     dataloader = {
-        "batch_size": 8 * 16* 2 ,
-        "num_steps": 8 ,
+        "batch_size": 8 * 16,
+        "num_steps": 128 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
         'n_test_samples': 0,
@@ -454,6 +457,7 @@ def get_perceiver_default_config():
 
 def get_tabpfn_default_config():
     config = get_shared_defaults()
+    config['prior']['prior_bag']['prior_weights'] = {'mlp': 1.0, 'gp': 0.0}
     return config
 
 def get_rlpfn_default_config():
@@ -479,8 +483,11 @@ def get_rlpfn_default_config():
         "state_full_rms_enabled": True,
         "state_full_rms_target": 1.0,
         "reinforce_reward_transform": "tanh",
-        "reinforce_reward_tanh_c": 1e6,
+        "reinforce_reward_rms_eps": 1e-6,
+        "reinforce_reward_tanh_c": 10.0,
         "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 1.0, "max": 10.0},
+        "reinforce_action_transform": "tanh",
+        "reinforce_action_rms_eps": 1e-6,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,

@@ -95,8 +95,10 @@ def get_dataloader(prior_config, dataloader_config, device, model = None):
 
     if prior_type == 'prior_bag':
         # Prior bag combines priors
+        prior_bag_cfg = prior_config.get('prior_bag', {})
+        prior_weights = prior_bag_cfg.get('prior_weights', {'mlp': 0.961, 'gp': 0.039})
         prior = BagPrior(base_priors={'gp': gp_flexible, 'mlp': mlp_flexible},
-                         prior_weights={'mlp': 0.961, 'gp': 0.039})
+                         prior_weights=prior_weights)
     elif prior_type == "environment_only":
         prior = env_flexible
     elif prior_type == "step_function":

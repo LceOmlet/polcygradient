@@ -49,14 +49,17 @@ def test_get_dataloader_base_config():
     first_zero_idx = int(zero_mask.int().argmax().item())
     assert bool(zero_mask[first_zero_idx:].all())
 
-    x, y, y_, info = dataloader.prior.get_batch(batch_size=batch_size, n_samples=n_samples, num_features=n_features, device="cpu")
-    zero_mask = (x[:, :, :] == 0).reshape(-1, x.shape[-1]).all(axis=0)
-    assert bool(zero_mask.any())
-    first_zero_idx = int(zero_mask.int().argmax().item())
-    assert bool(zero_mask[first_zero_idx:].all())
-    # assert config_sample['noise_std'] == 0.0004896957955177838
-    # assert config_sample['sort_features'] == True
-    # assert config_sample['is_causal'] == False
+
+def test_get_dataloader_uses_configured_prior_bag_weights():
+    L.seed_everything(42)
+    config = get_prior_config()
+    prior_config = config['prior']
+    dataloader_config = config['dataloader']
+    prior_config['prior_bag']['prior_weights'] = {'mlp': 1.0, 'gp': 0.0}
+    dataloader = get_dataloader(prior_config=prior_config, dataloader_config=dataloader_config, device="cpu")
+
+    assert isinstance(dataloader.prior, BagPrior)
+    assert dataloader.prior.prior_weights == {'mlp': 1.0, 'gp': 0.0}
 
 
 @pytest.mark.parametrize("batch_size", [16, 32])

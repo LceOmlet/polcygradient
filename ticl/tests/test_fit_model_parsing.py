@@ -124,6 +124,17 @@ def test_rlpfn_parser_accepts_reinforce_objective():
     assert args.optimizer.rl_objective == "reinforce"
 
 
+def test_rlpfn_parser_accepts_first_policy_gradient_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "first_policy_gradient",
+        ]
+    )
+    assert args.optimizer.rl_objective == "first_policy_gradient"
+
+
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
@@ -140,12 +151,15 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
-    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 1e6
+    assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 1.0,
         "max": 10.0,
     }
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,
@@ -155,6 +169,16 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
         "distribution": "log_uniform",
         "min": 1e-2,
         "max": 0.1,
+    }
+
+
+def test_tabpfn_defaults_use_pure_mlp_prior_bag():
+    cfg = get_model_default_config("tabpfn")
+
+    assert cfg["prior"]["prior_type"] == "prior_bag"
+    assert cfg["prior"]["prior_bag"]["prior_weights"] == {
+        "mlp": 1.0,
+        "gp": 0.0,
     }
 
 
