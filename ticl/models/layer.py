@@ -1103,17 +1103,8 @@ class TransformerEncoderLayer(Module):
                     clone_kv_for_grad=bool(clone_kv_for_grad),
                     clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
-            if (prefix_k is not None) and (prefix_v is not None):
-                k_all, v_all = self._combine_prefix_with_paged_tail(
-                    prefix_k,
-                    prefix_v,
-                    k_pages,
-                    v_pages,
-                    valid_len,
-                )
-            else:
-                k_all = k_pages[0][:, :, :remaining, :]
-                v_all = v_pages[0][:, :, :remaining, :]
+            k_all = k_pages[0][:, :, :remaining, :]
+            v_all = v_pages[0][:, :, :remaining, :]
             if bool(clone_kv_for_grad) and torch.is_grad_enabled():
                 # In in-place paged-grad mode, cache pages are mutated every step.
                 # Clone read views so backward does not observe version bumps.
@@ -1729,9 +1720,6 @@ class TransformerEncoderLayer(Module):
             and torch.is_grad_enabled()
             and bool(allow_grad_mutable_cache)
         )
-        resolved_paged_attn_train_mode = (
-            self._resolve_paged_attn_train_mode(q_bhld) if cache_mode == "paged" else None
-        )
         inplace_paged_grad = bool(mutable_paged_grad and bool(allow_grad_inplace_paged_cache))
         if cache_mode == "paged":
             # Throughput route:
@@ -1964,7 +1952,7 @@ class TransformerEncoderLayer(Module):
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and resolved_paged_attn_train_mode in {"flash_prefix", "dense"}
+            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):
