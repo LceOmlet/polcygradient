@@ -16272,22 +16272,23 @@ class EnvironmentPrior:
                                     "action_mask": group_action_mask,
                                 }
                             )
-                            if policy_action_mean_root_steps is None:
-                                policy_action_mean_root_steps = [
-                                    torch.zeros(
-                                        (batch_size, int(root.shape[-1])),
-                                        device=root.device,
-                                        dtype=root.dtype,
-                                    )
-                                    for root in group_action_roots
-                                ]
-                            elif len(policy_action_mean_root_steps) != len(group_action_roots):
-                                raise RuntimeError("alpha_grad action roots time dimension mismatch across rollout groups")
-                            for t_idx, root in enumerate(group_action_roots):
-                                full_root = policy_action_mean_root_steps[t_idx]
-                                if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
-                                    raise RuntimeError("alpha_grad action roots width mismatch across rollout groups")
-                                full_root[group_indices] = root
+                            if not alpha_grad_trace_roots_only:
+                                if policy_action_mean_root_steps is None:
+                                    policy_action_mean_root_steps = [
+                                        torch.zeros(
+                                            (batch_size, int(root.shape[-1])),
+                                            device=root.device,
+                                            dtype=root.dtype,
+                                        )
+                                        for root in group_action_roots
+                                    ]
+                                elif len(policy_action_mean_root_steps) != len(group_action_roots):
+                                    raise RuntimeError("alpha_grad action roots time dimension mismatch across rollout groups")
+                                for t_idx, root in enumerate(group_action_roots):
+                                    full_root = policy_action_mean_root_steps[t_idx]
+                                    if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
+                                        raise RuntimeError("alpha_grad action roots width mismatch across rollout groups")
+                                    full_root[group_indices] = root
                 for local_idx, global_idx in enumerate(group_indices):
                     infos[global_idx] = infos_group[local_idx]
                 group_v2 = self.last_rollout_v2

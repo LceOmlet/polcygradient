@@ -2524,6 +2524,81 @@ def test_environment_prior_alpha_grad_matches_manual_action_space_mixing():
     assert float(stats["alpha_grad_valid_share"]) > 0.0
 
 
+def test_environment_prior_alpha_grad_group_traces_match_dense_manual_gradient():
+    prior = EnvironmentPrior({"discount": 1.0})
+    action_mean_dense = torch.tensor(
+        [
+            [[0.2, -0.3], [0.4, 0.1], [-0.2, 0.5]],
+            [[0.6, -0.4], [0.1, 0.7], [0.3, -0.6]],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    action_mask = torch.tensor(
+        [
+            [[True, True], [True, True], [True, False]],
+            [[True, True], [True, True], [True, False]],
+        ],
+        dtype=torch.bool,
+    )
+
+    rewards_dense = (1.5 * action_mean_dense[..., 0]) - (0.25 * action_mean_dense[..., 1])
+    log_probs_dense = (0.7 * action_mean_dense[..., 0]) + (0.2 * action_mean_dense[..., 1])
+    loss_dense, _ = prior.alpha_grad_loss_from_rollout_tensors(
+        rewards=rewards_dense,
+        log_probs=log_probs_dense,
+        action_mean=action_mean_dense,
+        action_mask=action_mask,
+        discount=1.0,
+        variance_eps=1e-6,
+    )
+    grad_dense = torch.autograd.grad(loss_dense, action_mean_dense, retain_graph=True)[0]
+
+    group0_roots = (
+        action_mean_dense.detach()[0, [0, 2]].clone().requires_grad_(),
+        action_mean_dense.detach()[1, [0, 2]].clone().requires_grad_(),
+    )
+    group1_roots = (
+        action_mean_dense.detach()[0, [1]].clone().requires_grad_(),
+        action_mean_dense.detach()[1, [1]].clone().requires_grad_(),
+    )
+    action_mean_grouped = (
+        {
+            "indices": (0, 2),
+            "action_mean_roots": group0_roots,
+            "action_mask": action_mask[:, [0, 2]],
+        },
+        {
+            "indices": (1,),
+            "action_mean_roots": group1_roots,
+            "action_mask": action_mask[:, [1]],
+        },
+    )
+    action_mean_rebuilt = torch.zeros_like(action_mean_dense)
+    action_mean_rebuilt[0, [0, 2]] = group0_roots[0]
+    action_mean_rebuilt[1, [0, 2]] = group0_roots[1]
+    action_mean_rebuilt[0, [1]] = group1_roots[0]
+    action_mean_rebuilt[1, [1]] = group1_roots[1]
+    rewards_grouped = (1.5 * action_mean_rebuilt[..., 0]) - (0.25 * action_mean_rebuilt[..., 1])
+    log_probs_grouped = (0.7 * action_mean_rebuilt[..., 0]) + (0.2 * action_mean_rebuilt[..., 1])
+    loss_grouped, stats_grouped = prior.alpha_grad_loss_from_rollout_tensors(
+        rewards=rewards_grouped,
+        log_probs=log_probs_grouped,
+        action_mean=action_mean_grouped,
+        action_mask=action_mask,
+        discount=1.0,
+        variance_eps=1e-6,
+    )
+    grad_group0 = torch.autograd.grad(loss_grouped, group0_roots, retain_graph=True)
+    grad_group1 = torch.autograd.grad(loss_grouped, group1_roots, retain_graph=True)
+
+    assert int(stats_grouped["alpha_grad_enabled"]) == 1
+    assert torch.allclose(grad_group0[0], grad_dense[0, [0, 2]], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group0[1], grad_dense[1, [0, 2]], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group1[0], grad_dense[0, [1]], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group1[1], grad_dense[1, [1]], atol=1e-6, rtol=1e-5)
+
+
 def test_environment_prior_first_policy_gradient_shares_reinforce_rollout_rewards():
     _seed_everything(204)
     config = get_prior_config()
