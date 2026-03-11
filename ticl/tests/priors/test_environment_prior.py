@@ -3041,6 +3041,44 @@ def test_environment_prior_state_grad_clip_norm_clips_per_row_global_norm():
     )
 
 
+def test_environment_prior_action_grad_clip_value_clamps_elementwise():
+    action_next = torch.tensor(
+        [
+            [1.0, -2.0, 3.0],
+            [4.0, 0.0, -3.0],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    action_clipped = EnvironmentPrior._clip_tensor_grad_by_value(
+        action_next,
+        max_abs=2.5,
+    )
+    incoming = torch.tensor(
+        [
+            [6.0, -8.0, 0.0],
+            [0.0, -9.0, 12.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    loss = (action_clipped * incoming).sum()
+    loss.backward()
+
+    assert torch.allclose(
+        action_next.grad,
+        torch.tensor(
+            [
+                [2.5, -2.5, 0.0],
+                [0.0, -2.5, 2.5],
+            ],
+            dtype=torch.float32,
+        ),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_environment_prior_reference_scm_partition_aligns_autocast_dtype_before_index_copy():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for reference SCM autocast partition regression")

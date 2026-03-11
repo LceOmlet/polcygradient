@@ -146,6 +146,19 @@ def test_rlpfn_parser_accepts_alpha_grad_objective():
     assert args.optimizer.rl_objective == "alpha_grad"
 
 
+def test_rlpfn_parser_accepts_first_pg_action_grad_clip_options():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--first-policy-gradient-action-grad-clip-value", "2.5",
+            "--first-policy-gradient-action-grad-clip-norm", "1.5",
+        ]
+    )
+    assert args.prior.environment.first_policy_gradient_action_grad_clip_value == 2.5
+    assert args.prior.environment.first_policy_gradient_action_grad_clip_norm == 1.5
+
+
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
@@ -172,6 +185,8 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 4.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 0.0
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,

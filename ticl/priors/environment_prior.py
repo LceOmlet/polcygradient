@@ -1207,6 +1207,8 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_action_transform", "rms")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
+        cfg.setdefault("first_policy_gradient_action_grad_clip_value", 0.0)
+        cfg.setdefault("first_policy_gradient_action_grad_clip_norm", 0.0)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -4250,6 +4252,20 @@ class EnvironmentPrior:
         return float(max(0.0, v))
 
     @staticmethod
+    def _resolve_first_policy_gradient_action_grad_clip_value(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("first_policy_gradient_action_grad_clip_value", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(max(0.0, v))
+
+    @staticmethod
+    def _resolve_first_policy_gradient_action_grad_clip_norm(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("first_policy_gradient_action_grad_clip_norm", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(max(0.0, v))
+
+    @staticmethod
     def _apply_state_full_rms(
         state_next,
         *,
@@ -4332,6 +4348,35 @@ class EnvironmentPrior:
             while scale.ndim < grad.ndim:
                 scale = scale.unsqueeze(-1)
             return grad * scale
+
+        tensor.register_hook(_hook)
+        return tensor
+
+    @staticmethod
+    def _clip_tensor_grad_by_value(tensor, *, max_abs=0.0):
+        if (not torch.is_tensor(tensor)) or (not bool(tensor.requires_grad)):
+            return tensor
+        if torch.is_tensor(max_abs):
+            max_abs_t = max_abs.to(device=tensor.device, dtype=tensor.dtype)
+            if max_abs_t.numel() != 1:
+                raise ValueError("max_abs tensor must be scalar")
+            max_abs_value = float(max_abs_t.detach().item())
+        else:
+            max_abs_value = float(max_abs)
+            max_abs_t = torch.as_tensor(max_abs_value, device=tensor.device, dtype=tensor.dtype)
+        if (not math.isfinite(max_abs_value)) or max_abs_value <= 0.0:
+            return tensor
+
+        def _hook(grad):
+            if grad is None:
+                return grad
+            grad = torch.nan_to_num(
+                grad,
+                nan=0.0,
+                posinf=max_abs_value,
+                neginf=-max_abs_value,
+            )
+            return torch.clamp(grad, min=-max_abs_t, max=max_abs_t)
 
         tensor.register_hook(_hook)
         return tensor
@@ -11663,6 +11708,16 @@ class EnvironmentPrior:
             if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
+        first_pg_action_grad_clip_value = (
+            self._resolve_first_policy_gradient_action_grad_clip_value(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
+        first_pg_action_grad_clip_norm = (
+            self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
@@ -12132,6 +12187,16 @@ class EnvironmentPrior:
             if env_obs_start is not None:
                 env_in[:, env_obs_start: env_obs_start + obs_dim] = obs_t
             action_env = action_next.detach() if detach_action_in_env else action_next
+            if first_pg_action_grad_clip_value > 0.0:
+                action_env = self._clip_tensor_grad_by_value(
+                    action_env,
+                    max_abs=first_pg_action_grad_clip_value,
+                )
+            if first_pg_action_grad_clip_norm > 0.0:
+                action_env = self._clip_tensor_grad_by_global_norm(
+                    action_env,
+                    max_norm=first_pg_action_grad_clip_norm,
+                )
             env_in[:, env_action_start: env_action_start + action_dim] = action_env
             env_in[:, env_noise_start: env_noise_start + noise_dim] = noise_t
 
@@ -13123,6 +13188,16 @@ class EnvironmentPrior:
             if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
+        first_pg_action_grad_clip_value = (
+            self._resolve_first_policy_gradient_action_grad_clip_value(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
+        first_pg_action_grad_clip_norm = (
+            self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
@@ -13644,7 +13719,17 @@ class EnvironmentPrior:
             reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
-            action_env = action_next.detach() if reinforce_enabled else action_next
+            action_env = action_next.detach() if detach_action_in_env else action_next
+            if first_pg_action_grad_clip_value > 0.0:
+                action_env = self._clip_tensor_grad_by_value(
+                    action_env,
+                    max_abs=first_pg_action_grad_clip_value,
+                )
+            if first_pg_action_grad_clip_norm > 0.0:
+                action_env = self._clip_tensor_grad_by_global_norm(
+                    action_env,
+                    max_norm=first_pg_action_grad_clip_norm,
+                )
 
             transition_cuda_start = None
             transition_wall_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -14552,6 +14637,16 @@ class EnvironmentPrior:
             if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
+        first_pg_action_grad_clip_value = (
+            self._resolve_first_policy_gradient_action_grad_clip_value(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
+        first_pg_action_grad_clip_norm = (
+            self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
+            else 0.0
+        )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
@@ -14962,11 +15057,22 @@ class EnvironmentPrior:
                                 generator=action_noise_eval_generator,
                             )
 
+            action_env = action_next.detach() if detach_action_in_env else action_next
+            if first_pg_action_grad_clip_value > 0.0:
+                action_env = self._clip_tensor_grad_by_value(
+                    action_env,
+                    max_abs=first_pg_action_grad_clip_value,
+                )
+            if first_pg_action_grad_clip_norm > 0.0:
+                action_env = self._clip_tensor_grad_by_global_norm(
+                    action_env,
+                    max_norm=first_pg_action_grad_clip_norm,
+                )
+
             if use_fast_env_in:
-                env_in_flat[env_action_start: env_action_start + action_dim] = action_next
+                env_in_flat[env_action_start: env_action_start + action_dim] = action_env
                 env_in = env_in_flat.unsqueeze(0)
             else:
-                action_env = action_next.detach() if detach_action_in_env else action_next
                 env_in = self._pack_env_input(
                     state_t,
                     obs_t,
@@ -14976,9 +15082,6 @@ class EnvironmentPrior:
                     reference_semantics_enabled=reference_semantics_enabled,
                     state_input_scale=env.get("state_input_scale", 1.0),
                 ).unsqueeze(0)
-            if use_fast_env_in:
-                action_env = action_next
-
             transition_generator = env.get("transition_generator", None)
             if callable(transition_generator):
                 x_next, reward_unit = transition_generator(env_in, generator=local_generator)

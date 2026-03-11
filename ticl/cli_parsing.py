@@ -347,6 +347,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
     environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')
+    environment_prior.add_argument('--first-policy-gradient-state-grad-clip-norm', type=float,
+                                   help='Per-sample global-norm clip applied to environment state adjoints for first_policy_gradient/alpha_grad.')
+    environment_prior.add_argument('--first-policy-gradient-action-grad-clip-value', type=float,
+                                   help='Elementwise absolute clip applied to environment action adjoints for first_policy_gradient/alpha_grad.')
+    environment_prior.add_argument('--first-policy-gradient-action-grad-clip-norm', type=float,
+                                   help='Per-sample global-norm clip applied to environment action adjoints for first_policy_gradient/alpha_grad.')
     environment_prior.add_argument('--anti-explosion-vanishing-v2-enabled', type=str2bool,
                                    help='Enable anti-explosion&vanishing-v2 (two-sided state-gain corridor regularization).')
     environment_prior.add_argument('--anti-explosion-vanishing-v2-lambda', type=float,
