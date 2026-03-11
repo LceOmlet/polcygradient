@@ -15981,6 +15981,7 @@ class EnvironmentPrior:
         store_rewards = bool(store_rewards)
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         sample_action = bool(objective_flags["sample_action"])
+        alpha_grad_trace_roots_only = bool(objective_flags.get("alpha_grad", False))
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
         collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
@@ -16058,17 +16059,16 @@ class EnvironmentPrior:
                 policy_trace_window = aux.get("policy_trace", None)
                 if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires reinforce log_probs in every group payload")
-                if (
-                    not isinstance(policy_trace_window, dict)
-                    or (not torch.is_tensor(policy_trace_window.get("action_mean", None)))
-                    or (not torch.is_tensor(policy_trace_window.get("action_mask", None)))
-                ):
+                if not isinstance(policy_trace_window, dict) or (not torch.is_tensor(policy_trace_window.get("action_mask", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires policy trace in every group payload")
                 if int(tbptt_alpha_expected_group_count) <= 0:
                     raise RuntimeError("alpha_grad TBPTT outer merge was not initialized with a valid group count")
-                action_mean_window = policy_trace_window["action_mean"]
                 action_mask_window = policy_trace_window["action_mask"]
                 log_probs_window = reinforce_window["log_probs"]
+                action_mean_window = policy_trace_window.get("action_mean", None)
+                group_roots = policy_trace_window.get("action_mean_roots", None)
+                if (not torch.is_tensor(action_mean_window)) and (not isinstance(group_roots, tuple)):
+                    raise RuntimeError("alpha_grad TBPTT outer merge requires action roots or dense action_mean")
                 bucket = tbptt_alpha_window_buckets.get(local_window_idx, None)
                 if bucket is None:
                     bucket = {
@@ -16083,10 +16083,14 @@ class EnvironmentPrior:
                             device=log_probs_window.device,
                             dtype=log_probs_window.dtype,
                         ),
-                        "action_mean": torch.zeros(
-                            (int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])),
-                            device=action_mean_window.device,
-                            dtype=action_mean_window.dtype,
+                        "action_mean": (
+                            torch.zeros(
+                                (int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])),
+                                device=action_mean_window.device,
+                                dtype=action_mean_window.dtype,
+                            )
+                            if torch.is_tensor(action_mean_window)
+                            else None
                         ),
                         "action_mask": torch.zeros(
                             (int(action_mask_window.shape[0]), batch_size, int(action_mask_window.shape[-1])),
@@ -16099,16 +16103,23 @@ class EnvironmentPrior:
                 elif (
                     tuple(bucket["rewards"].shape) != tuple((int(rewards_window.shape[0]), batch_size))
                     or tuple(bucket["log_probs"].shape) != tuple((int(log_probs_window.shape[0]), batch_size))
-                    or tuple(bucket["action_mean"].shape) != tuple((int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])))
                     or tuple(bucket["action_mask"].shape) != tuple((int(action_mask_window.shape[0]), batch_size, int(action_mask_window.shape[-1])))
+                    or (
+                        torch.is_tensor(action_mean_window)
+                        and (
+                            (bucket["action_mean"] is None)
+                            or tuple(bucket["action_mean"].shape)
+                            != tuple((int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])))
+                        )
+                    )
                 ):
                     raise RuntimeError("alpha_grad TBPTT outer merge encountered inconsistent window shapes across rollout groups")
                 idx_list = list(idx_tuple)
                 bucket["rewards"][:, idx_list] = rewards_window
                 bucket["log_probs"][:, idx_list] = log_probs_window
-                bucket["action_mean"][:, idx_list] = action_mean_window
+                if torch.is_tensor(action_mean_window):
+                    bucket["action_mean"][:, idx_list] = action_mean_window
                 bucket["action_mask"][:, idx_list] = action_mask_window
-                group_roots = policy_trace_window.get("action_mean_roots", None)
                 if isinstance(group_roots, tuple):
                     bucket["group_traces"].append(
                         {
@@ -16232,24 +16243,33 @@ class EnvironmentPrior:
                         reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
                 if collect_action_trace:
                     group_policy_trace = self.last_rollout_policy_trace
-                    if (
-                        isinstance(group_policy_trace, dict)
-                        and torch.is_tensor(group_policy_trace.get("action_mean", None))
-                        and torch.is_tensor(group_policy_trace.get("action_mask", None))
-                    ):
-                        if policy_action_mean is None:
-                            action_shape = tuple(group_policy_trace["action_mean"].shape)
-                            policy_action_mean = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=group_policy_trace["action_mean"].dtype)
-                            policy_action_mask = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=torch.bool)
-                        policy_action_mean[:, group_indices] = group_policy_trace["action_mean"]
-                        policy_action_mask[:, group_indices] = group_policy_trace["action_mask"]
+                    if isinstance(group_policy_trace, dict) and torch.is_tensor(group_policy_trace.get("action_mask", None)):
+                        group_action_mean = group_policy_trace.get("action_mean", None)
+                        group_action_mask = group_policy_trace["action_mask"]
+                        if policy_action_mask is None:
+                            action_shape = tuple(group_action_mask.shape)
+                            policy_action_mask = torch.empty(
+                                action_shape[:1] + (batch_size, action_shape[2]),
+                                device=device,
+                                dtype=torch.bool,
+                            )
+                        policy_action_mask[:, group_indices] = group_action_mask
+                        if torch.is_tensor(group_action_mean) and (not alpha_grad_trace_roots_only):
+                            if policy_action_mean is None:
+                                action_shape = tuple(group_action_mean.shape)
+                                policy_action_mean = torch.empty(
+                                    action_shape[:1] + (batch_size, action_shape[2]),
+                                    device=device,
+                                    dtype=group_action_mean.dtype,
+                                )
+                            policy_action_mean[:, group_indices] = group_action_mean
                         group_action_roots = group_policy_trace.get("action_mean_roots", None)
                         if isinstance(group_action_roots, tuple):
                             policy_action_group_traces.append(
                                 {
                                     "indices": tuple(int(i) for i in group_indices),
                                     "action_mean_roots": group_action_roots,
-                                    "action_mask": group_policy_trace["action_mask"],
+                                    "action_mask": group_action_mask,
                                 }
                             )
                             if policy_action_mean_root_steps is None:
@@ -16605,7 +16625,15 @@ class EnvironmentPrior:
                     "action_mask": policy_action_mask,
                     "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
                 }
-                if (collect_action_trace and policy_action_mean is not None and policy_action_mask is not None)
+                if (
+                    collect_action_trace
+                    and policy_action_mask is not None
+                    and (
+                        (policy_action_mean is not None)
+                        or (policy_action_mean_roots is not None)
+                        or bool(policy_action_group_traces)
+                    )
+                )
                 else None
             )
             self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
@@ -16810,7 +16838,15 @@ class EnvironmentPrior:
                 "action_mask": policy_action_mask,
                 "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
             }
-            if (collect_action_trace and policy_action_mean is not None and policy_action_mask is not None)
+            if (
+                collect_action_trace
+                and policy_action_mask is not None
+                and (
+                    (policy_action_mean is not None)
+                    or (policy_action_mean_roots is not None)
+                    or bool(policy_action_group_traces)
+                )
+            )
             else None
         )
         self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
@@ -17283,6 +17319,8 @@ class EnvironmentPrior:
             raise ValueError(f"log_probs must have shape (T, B), got {tuple(log_probs.shape)}")
         action_group_entries = None
         action_mean_inputs = None
+        action_mean_shape = None
+        action_mean_device = None
         if (
             isinstance(action_mean, (list, tuple))
             and len(action_mean) > 0
@@ -17301,30 +17339,56 @@ class EnvironmentPrior:
                 raise ValueError("action_mean step list must be non-empty")
             else:
                 action_mean_inputs = tuple(action_mean)
-                action_mean = torch.stack(action_mean_inputs, dim=0)
-                if action_mean.ndim == 2:
-                    action_mean = action_mean.unsqueeze(1)
-        if action_group_entries is None and action_mean.ndim != 3:
-            raise ValueError(f"action_mean must have shape (T, B, C), got {tuple(action_mean.shape)}")
+        if action_group_entries is None:
+            if action_mean_inputs is None:
+                if action_mean.ndim != 3:
+                    raise ValueError(f"action_mean must have shape (T, B, C), got {tuple(action_mean.shape)}")
+                action_mean_shape = tuple(action_mean.shape)
+                action_mean_device = action_mean.device
+            else:
+                first_root = action_mean_inputs[0]
+                if first_root.ndim == 1:
+                    root_shape = tuple(first_root.shape)
+                    batch_dim = 1
+                    action_dim = int(first_root.shape[0])
+                elif first_root.ndim == 2:
+                    root_shape = tuple(first_root.shape)
+                    batch_dim = int(first_root.shape[0])
+                    action_dim = int(first_root.shape[1])
+                else:
+                    raise ValueError(
+                        "action_mean roots must have shape (C,) or (B, C), "
+                        f"got {tuple(first_root.shape)}"
+                    )
+                action_mean_device = first_root.device
+                for root in action_mean_inputs[1:]:
+                    if tuple(root.shape) != root_shape:
+                        raise ValueError(
+                            "action_mean roots must share shape, "
+                            f"got {tuple(root.shape)} and {root_shape}"
+                        )
+                    if root.device != action_mean_device:
+                        raise ValueError("action_mean roots must all live on the same device")
+                action_mean_shape = (len(action_mean_inputs), batch_dim, action_dim)
         if tuple(rewards.shape) != tuple(log_probs.shape):
             raise ValueError(
                 "rewards and log_probs must share shape, "
                 f"got {tuple(rewards.shape)} and {tuple(log_probs.shape)}"
             )
-        if action_group_entries is None and tuple(action_mean.shape[:2]) != tuple(rewards.shape):
+        if action_group_entries is None and tuple(action_mean_shape[:2]) != tuple(rewards.shape):
             raise ValueError(
                 "action_mean must align with rewards on (T, B), "
-                f"got {tuple(action_mean.shape[:2])} and {tuple(rewards.shape)}"
+                f"got {tuple(action_mean_shape[:2])} and {tuple(rewards.shape)}"
             )
         if action_group_entries is None:
             if action_mask is None:
-                action_mask = torch.ones_like(action_mean, dtype=torch.bool)
+                action_mask = torch.ones(action_mean_shape, device=action_mean_device, dtype=torch.bool)
             else:
-                action_mask = action_mask.to(device=action_mean.device, dtype=torch.bool)
-                if tuple(action_mask.shape) != tuple(action_mean.shape):
+                action_mask = action_mask.to(device=action_mean_device, dtype=torch.bool)
+                if tuple(action_mask.shape) != tuple(action_mean_shape):
                     raise ValueError(
                         "action_mask must match action_mean shape, "
-                        f"got {tuple(action_mask.shape)} and {tuple(action_mean.shape)}"
+                        f"got {tuple(action_mask.shape)} and {tuple(action_mean_shape)}"
                     )
         else:
             if action_mask is None:
@@ -17456,7 +17520,11 @@ class EnvironmentPrior:
         elif action_mean_inputs is None:
             surrogate = ((action_mean - action_mean.detach()) * gmix_det.to(dtype=action_mean.dtype)).sum()
         else:
-            surrogate = torch.zeros((), device=action_mean.device, dtype=action_mean.dtype)
+            surrogate = torch.zeros(
+                (),
+                device=action_mean_inputs[0].device,
+                dtype=action_mean_inputs[0].dtype,
+            )
             for t, root in enumerate(action_mean_inputs):
                 target_grad = gmix_det[t].to(dtype=root.dtype)
                 if root.ndim == 1:
@@ -17632,8 +17700,12 @@ class EnvironmentPrior:
                     raise RuntimeError("alpha_grad rollout did not return reinforce log_probs")
                 if (
                     not isinstance(policy_trace, dict)
-                    or (not torch.is_tensor(policy_trace.get("action_mean", None)))
                     or (not torch.is_tensor(policy_trace.get("action_mask", None)))
+                    or (
+                        (not torch.is_tensor(policy_trace.get("action_mean", None)))
+                        and (not isinstance(policy_trace.get("action_mean_roots", None), tuple))
+                        and (not isinstance(policy_trace.get("group_traces", None), tuple))
+                    )
                 ):
                     raise RuntimeError("alpha_grad rollout did not return policy action trace")
                 action_mean_inputs = policy_trace.get("group_traces", None)
@@ -18262,8 +18334,12 @@ class EnvironmentPrior:
                     raise RuntimeError("TBPTT alpha_grad rollout did not provide log_probs window")
                 if (
                     not isinstance(policy_trace_window, dict)
-                    or (not torch.is_tensor(policy_trace_window.get("action_mean", None)))
                     or (not torch.is_tensor(policy_trace_window.get("action_mask", None)))
+                    or (
+                        (not torch.is_tensor(policy_trace_window.get("action_mean", None)))
+                        and (not isinstance(policy_trace_window.get("action_mean_roots", None), tuple))
+                        and (not isinstance(policy_trace_window.get("group_traces", None), tuple))
+                    )
                 ):
                     raise RuntimeError("TBPTT alpha_grad rollout did not provide action trace window")
                 action_mean_inputs = policy_trace_window.get("group_traces", None)
