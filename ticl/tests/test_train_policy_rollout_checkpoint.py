@@ -1576,6 +1576,39 @@ def test_first_policy_gradient_tbptt_matches_full_horizon_loss_and_stats_for_sma
     assert all(torch.isfinite(g).all() for g in grads_tbptt)
 
 
+def test_alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics():
+    loss_full, stats_full, grads_full = _run_chunk(
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        batch_size=2,
+        n_samples=12,
+        single_eval_pos=6,
+        pg_tbptt_window=None,
+        rl_objective="alpha_grad",
+    )
+    loss_tbptt, stats_tbptt, grads_tbptt = _run_chunk(
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        batch_size=2,
+        n_samples=12,
+        single_eval_pos=6,
+        pg_tbptt_window=12,
+        rl_objective="alpha_grad",
+    )
+
+    assert torch.allclose(loss_full, loss_tbptt, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["objective"], stats_tbptt["objective"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["reward_mean"], stats_tbptt["reward_mean"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_full["reward_std"], stats_tbptt["reward_std"], atol=1e-6, rtol=1e-5)
+    assert len(grads_full) == len(grads_tbptt)
+    for g_full, g_tbptt in zip(grads_full, grads_tbptt):
+        assert torch.allclose(g_full, g_tbptt, atol=1e-6, rtol=1e-5)
+
+
 def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg():
     _seed_everything(7)
     full_cfg = get_model_default_config("rlpfn")

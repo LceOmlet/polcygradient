@@ -135,6 +135,17 @@ def test_rlpfn_parser_accepts_first_policy_gradient_objective():
     assert args.optimizer.rl_objective == "first_policy_gradient"
 
 
+def test_rlpfn_parser_accepts_alpha_grad_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "alpha_grad",
+        ]
+    )
+    assert args.optimizer.rl_objective == "alpha_grad"
+
+
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 

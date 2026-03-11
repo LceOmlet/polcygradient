@@ -1334,6 +1334,7 @@ class EnvironmentPrior:
         self.last_rollout_v4 = None
         self.last_rollout_v5_next = None
         self.last_rollout_reinforce = None
+        self.last_rollout_policy_trace = None
         self.last_rollout_lipschitz_audit = None
         self.last_rollout_env_semantics = None
         self._rollout_executor = None
@@ -1598,6 +1599,7 @@ class EnvironmentPrior:
         self.last_rollout_v4 = None
         self.last_rollout_v5_next = None
         self.last_rollout_reinforce = None
+        self.last_rollout_policy_trace = None
         self.last_rollout_lipschitz_audit = None
         self.last_rollout_env_semantics = None
 
@@ -4524,7 +4526,7 @@ class EnvironmentPrior:
     @staticmethod
     def _normalize_policy_objective_kind(policy_objective_kind):
         objective_kind = str(policy_objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce", "alpha_grad"}:
             raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
         return objective_kind
 
@@ -4534,12 +4536,18 @@ class EnvironmentPrior:
         return {
             "objective_kind": objective_kind,
             # Future 0th/1th fusion can share this stochastic rollout path.
-            "sample_action": objective_kind in {"first_policy_gradient", "reinforce"},
-            "collect_log_probs": objective_kind == "reinforce",
+            "sample_action": objective_kind in {"first_policy_gradient", "reinforce", "alpha_grad"},
+            "collect_log_probs": objective_kind in {"reinforce", "alpha_grad"},
             "detach_action_in_env": objective_kind == "reinforce",
             "first_policy_gradient": objective_kind == "first_policy_gradient",
             "reinforce": objective_kind == "reinforce",
+            "alpha_grad": objective_kind == "alpha_grad",
         }
+
+    @staticmethod
+    def _resolve_alpha_grad_variance_eps(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_variance_eps", 1e-6))
+        return max(float(v), 0.0)
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -11558,6 +11566,7 @@ class EnvironmentPrior:
         store_rewards=True,
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
+        _policy_collect_action_trace=False,
         _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
@@ -11651,10 +11660,11 @@ class EnvironmentPrior:
         sample_action = bool(objective_flags["sample_action"])
         first_pg_state_grad_clip_norm = (
             self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
-            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
         detach_action_in_env = bool(objective_flags["detach_action_in_env"])
@@ -11670,8 +11680,12 @@ class EnvironmentPrior:
             if collect_log_probs and (not tbptt_window_active)
             else None
         )
+        action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
+        action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
+        tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -11999,6 +12013,13 @@ class EnvironmentPrior:
             action_transform_mode = env.get("reinforce_action_transform", "rms")
             action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
+            if collect_action_trace:
+                if tbptt_window_active:
+                    tbptt_action_mean_buffer.append(action_mean)
+                    tbptt_action_mask_buffer.append(torch.ones_like(action_mean, dtype=torch.bool))
+                else:
+                    action_mean_steps.append(action_mean)
+                    action_mask_steps.append(torch.ones_like(action_mean, dtype=torch.bool))
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             noise_block_idx = None
@@ -12270,6 +12291,16 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
+                    action_mean_window = None
+                    action_mean_window_roots = None
+                    action_mask_window = None
+                    if tbptt_action_mean_buffer is not None:
+                        action_mean_window_roots = tuple(tbptt_action_mean_buffer)
+                        action_mean_window = torch.stack(tbptt_action_mean_buffer, dim=0)
+                        tbptt_action_mean_buffer = []
+                    if tbptt_action_mask_buffer is not None:
+                        action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
+                        tbptt_action_mask_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -12296,6 +12327,12 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                            if action_mean_window is not None:
+                                payload_aux["policy_trace"] = {
+                                    "action_mean": action_mean_window,
+                                    "action_mean_roots": action_mean_window_roots,
+                                    "action_mask": action_mask_window,
+                                }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -12409,6 +12446,13 @@ class EnvironmentPrior:
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
+        self.last_rollout_policy_trace = None
+        if collect_action_trace and isinstance(action_mean_steps, list) and isinstance(action_mask_steps, list):
+            self.last_rollout_policy_trace = {
+                "action_mean": torch.stack(action_mean_steps, dim=0),
+                "action_mean_roots": tuple(action_mean_steps),
+                "action_mask": torch.stack(action_mask_steps, dim=0),
+            }
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -12501,6 +12545,7 @@ class EnvironmentPrior:
         store_rewards=True,
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
+        _policy_collect_action_trace=False,
         _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
@@ -13075,10 +13120,11 @@ class EnvironmentPrior:
         sample_action = bool(objective_flags["sample_action"])
         first_pg_state_grad_clip_norm = (
             self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
-            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
             if _policy_detach_action_in_env is None
@@ -13091,6 +13137,8 @@ class EnvironmentPrior:
             if collect_log_probs and (not tbptt_window_active)
             else None
         )
+        action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
+        action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -13109,6 +13157,8 @@ class EnvironmentPrior:
 
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
+        tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -13497,6 +13547,14 @@ class EnvironmentPrior:
             action_transform_mode = env_info.get("reinforce_action_transform", "rms")
             action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
+            if collect_action_trace:
+                action_mask_bool = action_mask.to(dtype=torch.bool)
+                if tbptt_window_active:
+                    tbptt_action_mean_buffer.append(action_mean)
+                    tbptt_action_mask_buffer.append(action_mask_bool)
+                else:
+                    action_mean_steps.append(action_mean)
+                    action_mask_steps.append(action_mask_bool)
 
             noise_timing_t0 = time.perf_counter() if profile_rollout_timing else None
             noise_block_idx = None
@@ -13987,6 +14045,16 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
+                    action_mean_window = None
+                    action_mean_window_roots = None
+                    action_mask_window = None
+                    if tbptt_action_mean_buffer is not None:
+                        action_mean_window_roots = tuple(tbptt_action_mean_buffer)
+                        action_mean_window = torch.stack(tbptt_action_mean_buffer, dim=0)
+                        tbptt_action_mean_buffer = []
+                    if tbptt_action_mask_buffer is not None:
+                        action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
+                        tbptt_action_mask_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -14014,6 +14082,12 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                            if action_mean_window is not None:
+                                payload_aux["policy_trace"] = {
+                                    "action_mean": action_mean_window,
+                                    "action_mean_roots": action_mean_window_roots,
+                                    "action_mask": action_mask_window,
+                                }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -14310,6 +14384,13 @@ class EnvironmentPrior:
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
+        self.last_rollout_policy_trace = None
+        if collect_action_trace and isinstance(action_mean_steps, list) and isinstance(action_mask_steps, list):
+            self.last_rollout_policy_trace = {
+                "action_mean": torch.stack(action_mean_steps, dim=0),
+                "action_mean_roots": tuple(action_mean_steps),
+                "action_mask": torch.stack(action_mask_steps, dim=0),
+            }
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -14407,6 +14488,7 @@ class EnvironmentPrior:
         store_rewards=True,
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
+        _policy_collect_action_trace=False,
         _policy_detach_action_in_env=None,
     ):
         n_samples = int(n_samples)
@@ -14467,10 +14549,11 @@ class EnvironmentPrior:
         sample_action = bool(objective_flags["sample_action"])
         first_pg_state_grad_clip_norm = (
             self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
-            if str(policy_objective_kind).strip().lower() == "first_policy_gradient"
+            if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
             if _policy_detach_action_in_env is None
@@ -14493,8 +14576,12 @@ class EnvironmentPrior:
             if collect_log_probs and (not tbptt_window_active)
             else None
         )
+        action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
+        action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
+        tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_prev_delta = None
@@ -14719,6 +14806,13 @@ class EnvironmentPrior:
                     )
                 action_mean = action_next
                 reinforce_log_prob_t = None
+                if collect_action_trace:
+                    if tbptt_window_active:
+                        tbptt_action_mean_buffer.append(action_mean)
+                        tbptt_action_mask_buffer.append(torch.ones_like(action_mean, dtype=torch.bool))
+                    else:
+                        action_mean_steps.append(action_mean)
+                        action_mask_steps.append(torch.ones_like(action_mean, dtype=torch.bool))
 
             action_noise_std = env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
             if sample_action:
@@ -15025,6 +15119,16 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0).reshape(-1, 1)
                         tbptt_log_prob_buffer = []
+                    action_mean_window = None
+                    action_mean_window_roots = None
+                    action_mask_window = None
+                    if tbptt_action_mean_buffer is not None:
+                        action_mean_window_roots = tuple(tbptt_action_mean_buffer)
+                        action_mean_window = torch.stack(tbptt_action_mean_buffer, dim=0).reshape(-1, 1, action_dim)
+                        tbptt_action_mean_buffer = []
+                    if tbptt_action_mask_buffer is not None:
+                        action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0).reshape(-1, 1, action_dim)
+                        tbptt_action_mask_buffer = []
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -15050,6 +15154,12 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                            if action_mean_window is not None:
+                                payload_aux["policy_trace"] = {
+                                    "action_mean": action_mean_window,
+                                    "action_mean_roots": action_mean_window_roots,
+                                    "action_mask": action_mask_window,
+                                }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
                                     aev2_acc,
@@ -15154,6 +15264,13 @@ class EnvironmentPrior:
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
+        self.last_rollout_policy_trace = None
+        if collect_action_trace and isinstance(action_mean_steps, list) and isinstance(action_mask_steps, list):
+            self.last_rollout_policy_trace = {
+                "action_mean": torch.stack(action_mean_steps, dim=0).reshape(n_samples, 1, action_dim),
+                "action_mean_roots": tuple(action_mean_steps),
+                "action_mask": torch.stack(action_mask_steps, dim=0).reshape(n_samples, 1, action_dim),
+            }
         if aev2_enabled:
             if aev2_streaming_sink:
                 self.last_rollout_v2 = self._aev2_finalize_accumulator(
@@ -15739,6 +15856,7 @@ class EnvironmentPrior:
         store_rewards=True,
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
+        _policy_collect_action_trace=False,
         _policy_detach_action_in_env=None,
     ):
         """
@@ -15761,6 +15879,7 @@ class EnvironmentPrior:
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         sample_action = bool(objective_flags["sample_action"])
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
         tbptt_window_active = False
@@ -15780,6 +15899,11 @@ class EnvironmentPrior:
             if collect_log_probs and (tbptt_reward_sink is None) and (not tbptt_window_active)
             else None
         )
+        policy_action_mean = None
+        policy_action_mask = None
+        policy_action_mean_roots = None
+        policy_action_mean_root_steps = None
+        policy_action_group_traces = []
         infos = [None] * batch_size
 
         backend = self._resolve_batch_parallel_backend()
@@ -15803,6 +15927,117 @@ class EnvironmentPrior:
             rollout_seeds = [int(s) for s in rollout_seeds_override]
         else:
             rollout_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
+        alpha_grad_outer_tbptt_merge = bool(
+            objective_flags.get("alpha_grad", False)
+            and tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+        )
+        tbptt_alpha_window_buckets = {} if alpha_grad_outer_tbptt_merge else None
+        tbptt_alpha_next_flush = 0
+        tbptt_alpha_expected_group_count = 0
+
+        def _make_alpha_grad_tbptt_group_sink(group_indices):
+            if not alpha_grad_outer_tbptt_merge:
+                return tbptt_reward_sink
+            idx_tuple = tuple(int(i) for i in group_indices)
+            local_window_idx = 0
+
+            def _sink(payload):
+                nonlocal tbptt_alpha_next_flush
+                nonlocal local_window_idx
+                if (not isinstance(payload, tuple)) or len(payload) != 2:
+                    raise RuntimeError("alpha_grad TBPTT outer merge requires payload auxiliary data")
+                rewards_window, aux = payload
+                if not isinstance(aux, dict):
+                    raise RuntimeError("alpha_grad TBPTT outer merge requires dict auxiliary data")
+                reinforce_window = aux.get("reinforce", None)
+                policy_trace_window = aux.get("policy_trace", None)
+                if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
+                    raise RuntimeError("alpha_grad TBPTT outer merge requires reinforce log_probs in every group payload")
+                if (
+                    not isinstance(policy_trace_window, dict)
+                    or (not torch.is_tensor(policy_trace_window.get("action_mean", None)))
+                    or (not torch.is_tensor(policy_trace_window.get("action_mask", None)))
+                ):
+                    raise RuntimeError("alpha_grad TBPTT outer merge requires policy trace in every group payload")
+                if int(tbptt_alpha_expected_group_count) <= 0:
+                    raise RuntimeError("alpha_grad TBPTT outer merge was not initialized with a valid group count")
+                action_mean_window = policy_trace_window["action_mean"]
+                action_mask_window = policy_trace_window["action_mask"]
+                log_probs_window = reinforce_window["log_probs"]
+                bucket = tbptt_alpha_window_buckets.get(local_window_idx, None)
+                if bucket is None:
+                    bucket = {
+                        "received": 0,
+                        "rewards": torch.zeros(
+                            (int(rewards_window.shape[0]), batch_size),
+                            device=rewards_window.device,
+                            dtype=rewards_window.dtype,
+                        ),
+                        "log_probs": torch.zeros(
+                            (int(log_probs_window.shape[0]), batch_size),
+                            device=log_probs_window.device,
+                            dtype=log_probs_window.dtype,
+                        ),
+                        "action_mean": torch.zeros(
+                            (int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])),
+                            device=action_mean_window.device,
+                            dtype=action_mean_window.dtype,
+                        ),
+                        "action_mask": torch.zeros(
+                            (int(action_mask_window.shape[0]), batch_size, int(action_mask_window.shape[-1])),
+                            device=action_mask_window.device,
+                            dtype=torch.bool,
+                        ),
+                        "group_traces": [],
+                    }
+                    tbptt_alpha_window_buckets[local_window_idx] = bucket
+                elif (
+                    tuple(bucket["rewards"].shape) != tuple((int(rewards_window.shape[0]), batch_size))
+                    or tuple(bucket["log_probs"].shape) != tuple((int(log_probs_window.shape[0]), batch_size))
+                    or tuple(bucket["action_mean"].shape) != tuple((int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])))
+                    or tuple(bucket["action_mask"].shape) != tuple((int(action_mask_window.shape[0]), batch_size, int(action_mask_window.shape[-1])))
+                ):
+                    raise RuntimeError("alpha_grad TBPTT outer merge encountered inconsistent window shapes across rollout groups")
+                idx_list = list(idx_tuple)
+                bucket["rewards"][:, idx_list] = rewards_window
+                bucket["log_probs"][:, idx_list] = log_probs_window
+                bucket["action_mean"][:, idx_list] = action_mean_window
+                bucket["action_mask"][:, idx_list] = action_mask_window
+                group_roots = policy_trace_window.get("action_mean_roots", None)
+                if isinstance(group_roots, tuple):
+                    bucket["group_traces"].append(
+                        {
+                            "indices": idx_tuple,
+                            "action_mean_roots": group_roots,
+                            "action_mask": action_mask_window,
+                        }
+                    )
+                bucket["received"] += 1
+                while True:
+                    ready = tbptt_alpha_window_buckets.get(tbptt_alpha_next_flush, None)
+                    if ready is None or int(ready["received"]) < int(tbptt_alpha_expected_group_count):
+                        break
+                    tbptt_reward_sink(
+                        (
+                            ready["rewards"],
+                            {
+                                "reinforce": {"log_probs": ready["log_probs"]},
+                                "policy_trace": {
+                                    "action_mean": ready["action_mean"],
+                                    "action_mean_roots": None,
+                                    "action_mask": ready["action_mask"],
+                                    "group_traces": tuple(ready["group_traces"]) if ready["group_traces"] else None,
+                                },
+                            },
+                        )
+                    )
+                    del tbptt_alpha_window_buckets[tbptt_alpha_next_flush]
+                    tbptt_alpha_next_flush += 1
+                local_window_idx += 1
+
+            return _sink
 
         if backend == "torch_vectorized":
             effective_grouping_mode = str(grouping_mode)
@@ -15814,6 +16049,8 @@ class EnvironmentPrior:
             for b, h in enumerate(h_list):
                 sig = self._environment_group_signature(h, effective_grouping_mode)
                 grouped.setdefault(sig, []).append((b, h))
+            if alpha_grad_outer_tbptt_merge:
+                tbptt_alpha_expected_group_count = int(len(grouped))
             rollout_profile_acc = None
             rollout_v2_acc = None
             rollout_v3_acc = None
@@ -15834,6 +16071,7 @@ class EnvironmentPrior:
                     if rollout_seeds is not None
                     else None
                 )
+                group_tbptt_reward_sink = _make_alpha_grad_tbptt_group_sink(group_indices)
                 if effective_grouping_mode == "family":
                     x_group, y_group, infos_group = self._rollout_family_group_vectorized_with_policy(
                         h_list=group_h_list,
@@ -15847,11 +16085,12 @@ class EnvironmentPrior:
                         env_rng_seeds=group_env_seeds,
                         rollout_rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
-                        tbptt_reward_sink=tbptt_reward_sink,
+                        tbptt_reward_sink=group_tbptt_reward_sink,
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
                         policy_objective_kind=policy_objective_kind,
                         _policy_collect_log_probs=_policy_collect_log_probs,
+                        _policy_collect_action_trace=_policy_collect_action_trace,
                         _policy_detach_action_in_env=_policy_detach_action_in_env,
                     )
                 else:
@@ -15872,11 +16111,12 @@ class EnvironmentPrior:
                         collect_runtime_info=collect_runtime_info,
                         rng_seeds=group_rollout_seeds,
                         tbptt_window=tbptt_window,
-                        tbptt_reward_sink=tbptt_reward_sink,
+                        tbptt_reward_sink=group_tbptt_reward_sink,
                         tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                         store_rewards=store_rewards,
                         policy_objective_kind=policy_objective_kind,
                         _policy_collect_log_probs=_policy_collect_log_probs,
+                        _policy_collect_action_trace=_policy_collect_action_trace,
                         _policy_detach_action_in_env=_policy_detach_action_in_env,
                     )
                 if collect_x:
@@ -15887,6 +16127,44 @@ class EnvironmentPrior:
                     group_reinforce = self.last_rollout_reinforce
                     if isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
                         reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
+                if collect_action_trace:
+                    group_policy_trace = self.last_rollout_policy_trace
+                    if (
+                        isinstance(group_policy_trace, dict)
+                        and torch.is_tensor(group_policy_trace.get("action_mean", None))
+                        and torch.is_tensor(group_policy_trace.get("action_mask", None))
+                    ):
+                        if policy_action_mean is None:
+                            action_shape = tuple(group_policy_trace["action_mean"].shape)
+                            policy_action_mean = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=group_policy_trace["action_mean"].dtype)
+                            policy_action_mask = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=torch.bool)
+                        policy_action_mean[:, group_indices] = group_policy_trace["action_mean"]
+                        policy_action_mask[:, group_indices] = group_policy_trace["action_mask"]
+                        group_action_roots = group_policy_trace.get("action_mean_roots", None)
+                        if isinstance(group_action_roots, tuple):
+                            policy_action_group_traces.append(
+                                {
+                                    "indices": tuple(int(i) for i in group_indices),
+                                    "action_mean_roots": group_action_roots,
+                                    "action_mask": group_policy_trace["action_mask"],
+                                }
+                            )
+                            if policy_action_mean_root_steps is None:
+                                policy_action_mean_root_steps = [
+                                    torch.zeros(
+                                        (batch_size, int(root.shape[-1])),
+                                        device=root.device,
+                                        dtype=root.dtype,
+                                    )
+                                    for root in group_action_roots
+                                ]
+                            elif len(policy_action_mean_root_steps) != len(group_action_roots):
+                                raise RuntimeError("alpha_grad action roots time dimension mismatch across rollout groups")
+                            for t_idx, root in enumerate(group_action_roots):
+                                full_root = policy_action_mean_root_steps[t_idx]
+                                if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
+                                    raise RuntimeError("alpha_grad action roots width mismatch across rollout groups")
+                                full_root[group_indices] = root
                 for local_idx, global_idx in enumerate(group_indices):
                     infos[global_idx] = infos_group[local_idx]
                 group_v2 = self.last_rollout_v2
@@ -16215,6 +16493,18 @@ class EnvironmentPrior:
                 if reinforce_log_probs is not None
                 else None
             )
+            if policy_action_mean_root_steps is not None:
+                policy_action_mean_roots = tuple(policy_action_mean_root_steps)
+            self.last_rollout_policy_trace = (
+                {
+                    "action_mean": policy_action_mean,
+                    "action_mean_roots": policy_action_mean_roots,
+                    "action_mask": policy_action_mask,
+                    "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
+                }
+                if (collect_action_trace and policy_action_mean is not None and policy_action_mask is not None)
+                else None
+            )
             self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
                 rollout_lipschitz_acc
                 if rollout_lipschitz_acc is not None
@@ -16222,6 +16512,8 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             )
+            if alpha_grad_outer_tbptt_merge and tbptt_alpha_window_buckets:
+                raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete window buckets")
             self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
             return {
                 "x": x,
@@ -16234,6 +16526,7 @@ class EnvironmentPrior:
                 "aev4": self.last_rollout_v4,
                 "aev5_next": self.last_rollout_v5_next,
                 "reinforce": self.last_rollout_reinforce,
+                "policy_trace": self.last_rollout_policy_trace,
                 "lipschitz_audit": self.last_rollout_lipschitz_audit,
             }
 
@@ -16244,6 +16537,8 @@ class EnvironmentPrior:
         rollout_v5_next_acc = None
         rollout_lipschitz_acc = None
         rollout_env_semantics_acc = None
+        if alpha_grad_outer_tbptt_merge:
+            tbptt_alpha_expected_group_count = int(batch_size)
         for b, h in enumerate(h_list):
             env = self._sample_environment(
                 h=h,
@@ -16261,11 +16556,12 @@ class EnvironmentPrior:
                 collect_runtime_info=collect_runtime_info,
                 rng_seed=(rollout_seeds[b] if rollout_seeds is not None else None),
                 tbptt_window=tbptt_window,
-                tbptt_reward_sink=tbptt_reward_sink,
+                tbptt_reward_sink=_make_alpha_grad_tbptt_group_sink((b,)),
                 tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
                 store_rewards=store_rewards,
                 policy_objective_kind=policy_objective_kind,
                 _policy_collect_log_probs=_policy_collect_log_probs,
+                _policy_collect_action_trace=_policy_collect_action_trace,
                 _policy_detach_action_in_env=_policy_detach_action_in_env,
             )
             if collect_x:
@@ -16276,6 +16572,44 @@ class EnvironmentPrior:
                 rollout_reinforce_one = self.last_rollout_reinforce
                 if isinstance(rollout_reinforce_one, dict) and torch.is_tensor(rollout_reinforce_one.get("log_probs", None)):
                     reinforce_log_probs[:, b] = rollout_reinforce_one["log_probs"].reshape(n_samples)
+            if collect_action_trace:
+                rollout_policy_one = self.last_rollout_policy_trace
+                if (
+                    isinstance(rollout_policy_one, dict)
+                    and torch.is_tensor(rollout_policy_one.get("action_mean", None))
+                    and torch.is_tensor(rollout_policy_one.get("action_mask", None))
+                ):
+                    if policy_action_mean is None:
+                        action_shape = tuple(rollout_policy_one["action_mean"].shape)
+                        policy_action_mean = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=rollout_policy_one["action_mean"].dtype)
+                        policy_action_mask = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=torch.bool)
+                    policy_action_mean[:, b:b + 1] = rollout_policy_one["action_mean"]
+                    policy_action_mask[:, b:b + 1] = rollout_policy_one["action_mask"]
+                    rollout_action_roots = rollout_policy_one.get("action_mean_roots", None)
+                    if isinstance(rollout_action_roots, tuple):
+                        policy_action_group_traces.append(
+                            {
+                                "indices": (int(b),),
+                                "action_mean_roots": rollout_action_roots,
+                                "action_mask": rollout_policy_one["action_mask"],
+                            }
+                        )
+                        if policy_action_mean_root_steps is None:
+                            policy_action_mean_root_steps = [
+                                torch.zeros(
+                                    (batch_size, int(root.shape[-1])),
+                                    device=root.device,
+                                    dtype=root.dtype,
+                                )
+                                for root in rollout_action_roots
+                            ]
+                        elif len(policy_action_mean_root_steps) != len(rollout_action_roots):
+                            raise RuntimeError("alpha_grad action roots time dimension mismatch across serial rollouts")
+                        for t_idx, root in enumerate(rollout_action_roots):
+                            full_root = policy_action_mean_root_steps[t_idx]
+                            if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
+                                raise RuntimeError("alpha_grad action roots width mismatch across serial rollouts")
+                            full_root[b] = root
             infos[b] = info
             rollout_v2_acc = self._aev2_merge_rollout_summary(
                 rollout_v2_acc,
@@ -16364,6 +16698,18 @@ class EnvironmentPrior:
             if reinforce_log_probs is not None
             else None
         )
+        if policy_action_mean_root_steps is not None:
+            policy_action_mean_roots = tuple(policy_action_mean_root_steps)
+        self.last_rollout_policy_trace = (
+            {
+                "action_mean": policy_action_mean,
+                "action_mean_roots": policy_action_mean_roots,
+                "action_mask": policy_action_mask,
+                "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
+            }
+            if (collect_action_trace and policy_action_mean is not None and policy_action_mask is not None)
+            else None
+        )
         self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
             rollout_lipschitz_acc
             if rollout_lipschitz_acc is not None
@@ -16371,6 +16717,8 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        if alpha_grad_outer_tbptt_merge and tbptt_alpha_window_buckets:
+            raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete serial window buckets")
         return {
             "x": x,
             "rewards": rewards,
@@ -16382,6 +16730,7 @@ class EnvironmentPrior:
             "aev4": self.last_rollout_v4,
             "aev5_next": self.last_rollout_v5_next,
             "reinforce": self.last_rollout_reinforce,
+            "policy_trace": self.last_rollout_policy_trace,
             "lipschitz_audit": self.last_rollout_lipschitz_audit,
         }
 
@@ -16796,6 +17145,296 @@ class EnvironmentPrior:
         }
         return loss, stats
 
+    @staticmethod
+    def _masked_batch_mean_and_var(values, valid_mask):
+        if values.ndim != 3:
+            raise ValueError(f"values must have shape (T, B, C), got {tuple(values.shape)}")
+        if valid_mask.shape != values.shape:
+            raise ValueError(
+                "valid_mask must match values shape, "
+                f"got {tuple(valid_mask.shape)} and {tuple(values.shape)}"
+            )
+        mask_f = valid_mask.to(device=values.device, dtype=values.dtype)
+        counts = mask_f.sum(dim=1)
+        counts_safe = counts.clamp_min(1.0)
+        mean = (values * mask_f).sum(dim=1) / counts_safe
+        centered = values - mean.unsqueeze(1)
+        var = (centered.square() * mask_f).sum(dim=1) / counts_safe
+        mean = torch.where(counts > 0, mean, torch.zeros_like(mean))
+        var = torch.where(counts > 0, var, torch.zeros_like(var))
+        return mean, var, counts
+
+    def alpha_grad_loss_from_rollout_tensors(
+        self,
+        *,
+        rewards,
+        log_probs,
+        action_mean,
+        action_mask=None,
+        discount=None,
+        variance_eps=None,
+    ):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        if log_probs.ndim != 2:
+            raise ValueError(f"log_probs must have shape (T, B), got {tuple(log_probs.shape)}")
+        action_group_entries = None
+        action_mean_inputs = None
+        if (
+            isinstance(action_mean, (list, tuple))
+            and len(action_mean) > 0
+            and isinstance(action_mean[0], dict)
+        ):
+            action_group_entries = tuple(action_mean)
+        if isinstance(action_mean, (list, tuple)):
+            if action_group_entries is not None:
+                action_mean_inputs = None
+            elif len(action_mean) != int(rewards.shape[0]):
+                raise ValueError(
+                    "action_mean step list must match rewards time dimension, "
+                    f"got {len(action_mean)} and {int(rewards.shape[0])}"
+                )
+            elif len(action_mean) <= 0:
+                raise ValueError("action_mean step list must be non-empty")
+            else:
+                action_mean_inputs = tuple(action_mean)
+                action_mean = torch.stack(action_mean_inputs, dim=0)
+                if action_mean.ndim == 2:
+                    action_mean = action_mean.unsqueeze(1)
+        if action_group_entries is None and action_mean.ndim != 3:
+            raise ValueError(f"action_mean must have shape (T, B, C), got {tuple(action_mean.shape)}")
+        if tuple(rewards.shape) != tuple(log_probs.shape):
+            raise ValueError(
+                "rewards and log_probs must share shape, "
+                f"got {tuple(rewards.shape)} and {tuple(log_probs.shape)}"
+            )
+        if action_group_entries is None and tuple(action_mean.shape[:2]) != tuple(rewards.shape):
+            raise ValueError(
+                "action_mean must align with rewards on (T, B), "
+                f"got {tuple(action_mean.shape[:2])} and {tuple(rewards.shape)}"
+            )
+        if action_group_entries is None:
+            if action_mask is None:
+                action_mask = torch.ones_like(action_mean, dtype=torch.bool)
+            else:
+                action_mask = action_mask.to(device=action_mean.device, dtype=torch.bool)
+                if tuple(action_mask.shape) != tuple(action_mean.shape):
+                    raise ValueError(
+                        "action_mask must match action_mean shape, "
+                        f"got {tuple(action_mask.shape)} and {tuple(action_mean.shape)}"
+                    )
+        else:
+            if action_mask is None:
+                raise ValueError("grouped alpha_grad action traces require a full action_mask")
+            action_mask = action_mask.to(dtype=torch.bool)
+            if tuple(action_mask.shape[:2]) != (int(rewards.shape[0]), int(rewards.shape[1])):
+                raise ValueError(
+                    "grouped action_mask must align with rewards on (T, B), "
+                    f"got {tuple(action_mask.shape[:2])} and {tuple(rewards.shape)}"
+                )
+        if variance_eps is None:
+            variance_eps = self._resolve_alpha_grad_variance_eps(self.config)
+        variance_eps = float(max(variance_eps, 0.0))
+
+        first_loss, first_stats = self.first_policy_gradient_loss_from_rewards(rewards)
+        reinforce_loss, reinforce_stats = self.reinforce_loss_from_rewards(
+            rewards=rewards,
+            log_probs=log_probs,
+            discount=discount,
+            baseline_mode="leave_one_out",
+        )
+
+        def _grad_parts_or_zeros(loss_value, grad_inputs):
+            grad_inputs = tuple(grad_inputs)
+            if len(grad_inputs) <= 0:
+                return tuple()
+            if (not torch.is_tensor(loss_value)) or (not bool(loss_value.requires_grad)):
+                return tuple(torch.zeros_like(inp) for inp in grad_inputs)
+            grad_parts = torch.autograd.grad(
+                loss_value,
+                grad_inputs,
+                retain_graph=True,
+                create_graph=False,
+                allow_unused=True,
+            )
+            return tuple(
+                part if part is not None else torch.zeros_like(inp)
+                for part, inp in zip(grad_parts, grad_inputs)
+            )
+
+        if action_group_entries is not None:
+            root_records = []
+            flat_roots = []
+            for group_entry in action_group_entries:
+                if not isinstance(group_entry, dict):
+                    raise ValueError("grouped alpha_grad action traces must be dict entries")
+                group_indices = tuple(int(i) for i in group_entry.get("indices", ()))
+                group_roots = group_entry.get("action_mean_roots", None)
+                if (not group_indices) or (not isinstance(group_roots, tuple)):
+                    continue
+                if len(group_roots) != int(rewards.shape[0]):
+                    raise ValueError("grouped alpha_grad roots must match rewards time dimension")
+                for t_idx, root in enumerate(group_roots):
+                    root_orig = root
+                    if root.ndim == 1:
+                        if len(group_indices) != 1:
+                            raise ValueError("single-sample grouped alpha_grad roots require exactly one batch index")
+                        root_view = root.unsqueeze(0)
+                    else:
+                        root_view = root
+                    if root_view.ndim != 2 or root_view.shape[0] != len(group_indices):
+                        raise ValueError("grouped alpha_grad roots must have shape (Bg, C)")
+                    flat_roots.append(root_orig)
+                    root_records.append((t_idx, group_indices, root_orig, root_view))
+            if not flat_roots:
+                raise RuntimeError("alpha_grad rollout did not preserve differentiable action roots")
+            g1_parts = _grad_parts_or_zeros(first_loss, flat_roots)
+            g0_parts = _grad_parts_or_zeros(reinforce_loss, flat_roots)
+            g_shape = tuple(action_mask.shape)
+            g_dtype = flat_roots[0].dtype
+            g_device = flat_roots[0].device
+            g1 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+            g0 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+            for (t_idx, group_indices, root_orig, root_view), g1_part, g0_part in zip(root_records, g1_parts, g0_parts):
+                width = int(root_view.shape[-1])
+                if width > int(g1.shape[-1]):
+                    raise RuntimeError("alpha_grad grouped root width exceeds action mask width")
+                idx_list = list(group_indices)
+                if g1_part is not None and g1_part.ndim == 1:
+                    g1_part = g1_part.unsqueeze(0)
+                if g0_part is not None and g0_part.ndim == 1:
+                    g0_part = g0_part.unsqueeze(0)
+                if g1_part is not None:
+                    g1[t_idx, idx_list, :width] = g1_part
+                if g0_part is not None:
+                    g0[t_idx, idx_list, :width] = g0_part
+        elif action_mean_inputs is None:
+            g1 = _grad_parts_or_zeros(first_loss, (action_mean,))[0]
+            g0 = _grad_parts_or_zeros(reinforce_loss, (action_mean,))[0]
+        else:
+            g1_parts = _grad_parts_or_zeros(first_loss, action_mean_inputs)
+            g0_parts = _grad_parts_or_zeros(reinforce_loss, action_mean_inputs)
+            g1 = torch.stack(
+                list(g1_parts),
+                dim=0,
+            )
+            g0 = torch.stack(
+                list(g0_parts),
+                dim=0,
+            )
+            if g1.ndim == 2:
+                g1 = g1.unsqueeze(1)
+            if g0.ndim == 2:
+                g0 = g0.unsqueeze(1)
+
+        g1_det = g1.detach().to(dtype=torch.float32)
+        g0_det = g0.detach().to(dtype=torch.float32)
+        valid_mask = action_mask & torch.isfinite(g0_det) & torch.isfinite(g1_det)
+        _, v0, counts = self._masked_batch_mean_and_var(g0_det, valid_mask)
+        _, v1, _ = self._masked_batch_mean_and_var(g1_det, valid_mask)
+        denom = v0 + v1 + float(variance_eps)
+        alpha = torch.where(denom > 0, v0 / denom, torch.zeros_like(v0))
+        alpha = torch.where(counts > 0, alpha, torch.zeros_like(alpha))
+        gmix_det = ((1.0 - alpha).unsqueeze(1) * g0_det) + (alpha.unsqueeze(1) * g1_det)
+        gmix_det = torch.where(valid_mask, gmix_det, torch.zeros_like(gmix_det))
+        if action_group_entries is not None:
+            surrogate = torch.zeros((), device=g1.device, dtype=g1.dtype)
+            for t_idx, group_indices, root_orig, root_view in root_records:
+                width = int(root_view.shape[-1])
+                target_grad = gmix_det[t_idx, list(group_indices), :width].to(dtype=root_view.dtype)
+                if root_orig.ndim == 1:
+                    target_grad = target_grad.squeeze(0)
+                    root_term = root_orig
+                else:
+                    root_term = root_view
+                surrogate = surrogate + (
+                    (root_term - root_term.detach()) * target_grad
+                ).sum()
+        elif action_mean_inputs is None:
+            surrogate = ((action_mean - action_mean.detach()) * gmix_det.to(dtype=action_mean.dtype)).sum()
+        else:
+            surrogate = torch.zeros((), device=action_mean.device, dtype=action_mean.dtype)
+            for t, root in enumerate(action_mean_inputs):
+                target_grad = gmix_det[t].to(dtype=root.dtype)
+                if root.ndim == 1:
+                    target_grad = target_grad.squeeze(0)
+                surrogate = surrogate + (
+                    (root - root.detach()) * target_grad
+                ).sum()
+        if action_group_entries is not None:
+            objective_device = g1.device
+            objective_dtype = g1.dtype
+        elif action_mean_inputs is None:
+            objective_device = action_mean.device
+            objective_dtype = action_mean.dtype
+        else:
+            objective_device = action_mean_inputs[0].device
+            objective_dtype = action_mean_inputs[0].dtype
+        objective = reinforce_stats["objective"].detach().to(device=objective_device, dtype=objective_dtype)
+        loss = surrogate - objective
+
+        valid_share = valid_mask.to(dtype=torch.float32).mean().detach()
+        stats = {
+            "objective": reinforce_stats["objective"].detach(),
+            "reward_mean": first_stats["reward_mean"].detach(),
+            "reward_std": first_stats["reward_std"].detach(),
+            "reward_min": first_stats["reward_min"].detach(),
+            "reward_max": first_stats["reward_max"].detach(),
+            "reward_abs_max": first_stats["reward_abs_max"].detach(),
+            "reward_clip_hit_share": first_stats["reward_clip_hit_share"].detach(),
+            "reward_norm_clip_hit_share": first_stats["reward_norm_clip_hit_share"].detach(),
+            "reward_nonfinite_share": reinforce_stats.get(
+                "reward_nonfinite_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reward_nan_share": reinforce_stats.get(
+                "reward_nan_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reward_inf_share": reinforce_stats.get(
+                "reward_inf_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "alpha_grad_enabled": 1,
+            "alpha_grad_first_objective": first_stats["objective"].detach(),
+            "alpha_grad_reinforce_objective": reinforce_stats["objective"].detach(),
+            "alpha_grad_alpha_mean": alpha.mean().detach(),
+            "alpha_grad_alpha_std": alpha.std(unbiased=False).detach(),
+            "alpha_grad_alpha_min": alpha.min().detach(),
+            "alpha_grad_alpha_max": alpha.max().detach(),
+            "alpha_grad_v0_mean": v0.mean().detach(),
+            "alpha_grad_v1_mean": v1.mean().detach(),
+            "alpha_grad_valid_share": valid_share,
+            "alpha_grad_count_min": counts.min().detach(),
+            "alpha_grad_count_max": counts.max().detach(),
+            "alpha_grad_g0_abs_max": g0_det.abs().max().detach(),
+            "alpha_grad_g1_abs_max": g1_det.abs().max().detach(),
+            "alpha_grad_mix_abs_max": gmix_det.abs().max().detach(),
+            "alpha_grad_g0_nonfinite_share": (~torch.isfinite(g0)).to(dtype=torch.float32).mean().detach(),
+            "alpha_grad_g1_nonfinite_share": (~torch.isfinite(g1)).to(dtype=torch.float32).mean().detach(),
+            "reinforce_return_nonfinite_share": reinforce_stats.get(
+                "reinforce_return_nonfinite_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reinforce_log_prob_nonfinite_share": reinforce_stats.get(
+                "reinforce_log_prob_nonfinite_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reinforce_adv_nonfinite_share": reinforce_stats.get(
+                "reinforce_adv_nonfinite_share",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reinforce_log_prob_mean": reinforce_stats.get(
+                "reinforce_log_prob_mean",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+            "reinforce_log_prob_std": reinforce_stats.get(
+                "reinforce_log_prob_std",
+                torch.zeros((), device=rewards.device, dtype=torch.float32),
+            ),
+        }
+        return loss, stats
+
     def rollout_policy_gradient_loss(
         self,
         policy_step_fn,
@@ -16823,6 +17462,7 @@ class EnvironmentPrior:
         objective_kind = self._normalize_policy_objective_kind(policy_objective_kind)
         reinforce_enabled = objective_kind == "reinforce"
         first_pg_enabled = objective_kind == "first_policy_gradient"
+        alpha_grad_enabled = objective_kind == "alpha_grad"
         if normalize is None:
             normalize = bool(self.config.get("policy_gradient_normalize_rewards", False))
         tbptt_window_active = False
@@ -16859,11 +17499,12 @@ class EnvironmentPrior:
                 single_eval_pos=single_eval_pos,
                 collect_x=collect_x,
                 collect_runtime_info=False,
-                tbptt_reward_sink_supports_aux=bool(reinforce_enabled),
+                tbptt_reward_sink_supports_aux=bool(reinforce_enabled or alpha_grad_enabled),
                 h_list_override=h_list_override,
                 env_seeds_override=env_seeds_override,
                 rollout_seeds_override=rollout_seeds_override,
                 policy_objective_kind=objective_kind,
+                _policy_collect_action_trace=bool(alpha_grad_enabled),
             )
             if reinforce_enabled:
                 reinforce_rollout = rollout.get("reinforce", None)
@@ -16881,6 +17522,29 @@ class EnvironmentPrior:
                     rewards=rollout["rewards"],
                 )
                 stats["first_policy_gradient_enabled"] = 1
+            elif alpha_grad_enabled:
+                reinforce_rollout = rollout.get("reinforce", None)
+                policy_trace = rollout.get("policy_trace", None)
+                if not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
+                    raise RuntimeError("alpha_grad rollout did not return reinforce log_probs")
+                if (
+                    not isinstance(policy_trace, dict)
+                    or (not torch.is_tensor(policy_trace.get("action_mean", None)))
+                    or (not torch.is_tensor(policy_trace.get("action_mask", None)))
+                ):
+                    raise RuntimeError("alpha_grad rollout did not return policy action trace")
+                action_mean_inputs = policy_trace.get("group_traces", None)
+                if action_mean_inputs is None:
+                    action_mean_inputs = policy_trace.get("action_mean_roots", None)
+                if action_mean_inputs is None:
+                    action_mean_inputs = policy_trace["action_mean"]
+                loss, stats = self.alpha_grad_loss_from_rollout_tensors(
+                    rewards=rollout["rewards"],
+                    log_probs=reinforce_rollout["log_probs"],
+                    action_mean=action_mean_inputs,
+                    action_mask=policy_trace["action_mask"],
+                    discount=discount,
+                )
             else:
                 loss, stats = self.policy_gradient_loss_from_rewards(
                     rewards=rollout["rewards"],
@@ -16892,7 +17556,7 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if (not first_pg_enabled) and aev2_enabled:
+            if (not first_pg_enabled) and (not alpha_grad_enabled) and aev2_enabled:
                 aev2_rollout = rollout.get("aev2", None)
                 aev2_penalty = None
                 if isinstance(aev2_rollout, dict):
@@ -16937,7 +17601,7 @@ class EnvironmentPrior:
                     stats["aev2_gain_std"] = zero_t
                     stats["aev2_gain_min"] = zero_t
                     stats["aev2_gain_max"] = zero_t
-            if (not first_pg_enabled) and aev3_enabled:
+            if (not first_pg_enabled) and (not alpha_grad_enabled) and aev3_enabled:
                 aev3_rollout = rollout.get("aev3", None)
                 aev3_penalty = None
                 aev3_penalty_drift = None
@@ -17016,7 +17680,7 @@ class EnvironmentPrior:
                     stats["aev3_gain_std"] = zero_t
                     stats["aev3_gain_min"] = zero_t
                     stats["aev3_gain_max"] = zero_t
-            if (not first_pg_enabled) and aev4_enabled:
+            if (not first_pg_enabled) and (not alpha_grad_enabled) and aev4_enabled:
                 aev4_rollout = rollout.get("aev4", None)
                 aev4_penalty = None
                 aev4_penalty_drift = None
@@ -17113,7 +17777,7 @@ class EnvironmentPrior:
                     stats["aev4_update_rms_mean"] = zero_t
                     stats["aev4_update_rms_std"] = zero_t
                     stats["aev4_clip_hit_share"] = zero_t
-            if (not first_pg_enabled) and aev5_enabled:
+            if (not first_pg_enabled) and (not alpha_grad_enabled) and aev5_enabled:
                 zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
                 stats["aev5_enabled"] = int(aev5_enabled)
                 stats["aev5_target_std"] = float(aev5_cfg.get("target_std", 0.25))
@@ -17129,7 +17793,7 @@ class EnvironmentPrior:
                     stats["aev5_reward_std_ref"] = stats.get("reward_std", zero_t)
                 if "objective_with_aev5" not in stats:
                     stats["objective_with_aev5"] = stats["objective"] * stats["aev5_loss_mul"]
-            if (not first_pg_enabled) and aev5_next_enabled:
+            if (not first_pg_enabled) and (not alpha_grad_enabled) and aev5_next_enabled:
                 zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
                 stats["aev5_next_enabled"] = int(aev5_next_enabled)
                 stats["aev5_next_state_gain_lo"] = float(aev5_next_cfg.get("state_gain_lo", 0.0))
@@ -17459,11 +18123,13 @@ class EnvironmentPrior:
             aev3_window = None
             aev4_window = None
             reinforce_window = None
+            policy_trace_window = None
             rewards_window = reward_payload
             if isinstance(reward_payload, tuple) and len(reward_payload) == 2:
                 rewards_window, aux = reward_payload
                 if isinstance(aux, dict):
                     reinforce_window = aux.get("reinforce", None)
+                    policy_trace_window = aux.get("policy_trace", None)
                 if isinstance(aux, dict) and (("aev2" in aux) or ("aev3" in aux) or ("aev4" in aux)):
                     aev2_window = aux.get("aev2", None)
                     aev3_window = aux.get("aev3", None)
@@ -17488,6 +18154,27 @@ class EnvironmentPrior:
                 loss_window, stats_window = self.first_policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
                 )
+            elif alpha_grad_enabled:
+                if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
+                    raise RuntimeError("TBPTT alpha_grad rollout did not provide log_probs window")
+                if (
+                    not isinstance(policy_trace_window, dict)
+                    or (not torch.is_tensor(policy_trace_window.get("action_mean", None)))
+                    or (not torch.is_tensor(policy_trace_window.get("action_mask", None)))
+                ):
+                    raise RuntimeError("TBPTT alpha_grad rollout did not provide action trace window")
+                action_mean_inputs = policy_trace_window.get("group_traces", None)
+                if action_mean_inputs is None:
+                    action_mean_inputs = policy_trace_window.get("action_mean_roots", None)
+                if action_mean_inputs is None:
+                    action_mean_inputs = policy_trace_window["action_mean"]
+                loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
+                    rewards=rewards_window,
+                    log_probs=reinforce_window["log_probs"],
+                    action_mean=action_mean_inputs,
+                    action_mask=policy_trace_window["action_mask"],
+                    discount=discount,
+                )
             else:
                 loss_window, stats_window = self.policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
@@ -17499,16 +18186,16 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if (not first_pg_enabled) and (not reinforce_enabled) and aev2_enabled and isinstance(aev2_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     if aev2_lambda > 0.0:
                         loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
-            if (not first_pg_enabled) and (not reinforce_enabled) and aev3_enabled and isinstance(aev3_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     loss_window = loss_window + aev3_penalty_window
-            if (not first_pg_enabled) and (not reinforce_enabled) and aev4_enabled and isinstance(aev4_window, dict):
+            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     loss_window = loss_window + aev4_penalty_window
@@ -17909,12 +18596,13 @@ class EnvironmentPrior:
             tbptt_window=tbptt_window_size,
             tbptt_reward_sink=_tbptt_reward_sink,
             tbptt_reward_sink_supports_aux=bool(
-                reinforce_enabled or aev2_enabled or aev3_enabled or aev4_enabled or aev5_next_enabled
+                reinforce_enabled or alpha_grad_enabled or aev2_enabled or aev3_enabled or aev4_enabled or aev5_next_enabled
             ),
             h_list_override=h_list_override,
             env_seeds_override=env_seeds_override,
             rollout_seeds_override=rollout_seeds_override,
             policy_objective_kind=objective_kind,
+            _policy_collect_action_trace=bool(alpha_grad_enabled),
         )
 
         if tbptt_loss_sink is None:
@@ -18273,7 +18961,9 @@ class EnvironmentPrior:
                     stats["reinforce_log_prob_std"] = log_probs_rollout.std(unbiased=False).detach()
         if first_pg_enabled:
             stats["first_policy_gradient_enabled"] = 1
-        if (not first_pg_enabled) and aev2_enabled:
+        if alpha_grad_enabled:
+            stats["alpha_grad_enabled"] = 1
+        if (not first_pg_enabled) and (not alpha_grad_enabled) and aev2_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev2_penalty_mean is None:
                 aev2_penalty_mean = zero_t
@@ -18296,7 +18986,7 @@ class EnvironmentPrior:
             stats["aev2_gain_std"] = aev2_gain_std
             stats["aev2_gain_min"] = aev2_gain_min
             stats["aev2_gain_max"] = aev2_gain_max
-        if (not first_pg_enabled) and aev3_enabled:
+        if (not first_pg_enabled) and (not alpha_grad_enabled) and aev3_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev3_penalty_mean is None:
                 aev3_penalty_mean = zero_t
@@ -18338,7 +19028,7 @@ class EnvironmentPrior:
             stats["aev3_gain_std"] = aev3_gain_std
             stats["aev3_gain_min"] = aev3_gain_min
             stats["aev3_gain_max"] = aev3_gain_max
-        if (not first_pg_enabled) and aev4_enabled:
+        if (not first_pg_enabled) and (not alpha_grad_enabled) and aev4_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev4_penalty_mean is None:
                 aev4_penalty_mean = zero_t
