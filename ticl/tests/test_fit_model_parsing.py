@@ -79,6 +79,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
     assert args.optimizer.pg_saved_tensors_cpu_offload is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "all"
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
 
@@ -106,10 +107,12 @@ def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
         [
             "rlpfn",
             "--pg-saved-tensors-cpu-offload", "true",
+            "--pg-saved-tensors-cpu-offload-scope", "policy",
             "--pg-saved-tensors-pin-memory", "false",
         ]
     )
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
 
 

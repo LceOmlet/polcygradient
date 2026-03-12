@@ -185,3 +185,58 @@ Interpretation:
 - The largest remaining headroom is still `g1 / first_policy_gradient`.
 - The strongest already-tested low-risk candidates did not deliver significant gains.
 - No new code change is retained from this round; only benchmark evidence is kept.
+
+### Accepted Memory Control: Policy-Only Saved-Tensors CPU Offload
+
+Hypothesis:
+
+- The biggest GPU memory head is the shared transformer/policy saved-tensor path, not `g1`-specific SCM state.
+- If CPU offload is limited to `policy_step_fn` only, it should recover most of the GPU-memory benefit of full saved-tensor offload while avoiding most of the host-memory and wall-time penalty.
+
+Implementation:
+
+- Added `pg_saved_tensors_cpu_offload_scope` with choices:
+  - `all`: existing behavior, offload all saved tensors during policy-gradient rollout
+  - `policy`: only offload tensors saved during `policy_step_fn`
+- Default remains `all` when offload is enabled, so existing CLI/config behavior is preserved.
+
+Risky-load evidence, fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family`:
+
+#### `first_policy_gradient`
+
+| scope | batch wall (s) | peak alloc (MiB) | peak reserved (MiB) | RSS (GiB) | objective | reward mean | reward std |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `none` | 179.344 | 3227.543 | 3292.0 | 1.738 | -0.089595 | -0.089595 | 2.360374 |
+| `policy` | 284.605 | 1112.434 | 1168.0 | 7.339 | -0.089595 | -0.089595 | 2.360374 |
+| `all` | 439.609 | 1088.646 | 1142.0 | 15.874 | -0.089595 | -0.089595 | 2.360374 |
+
+Interpretation:
+
+- `policy` recovers almost all of the GPU reduction of full offload:
+  - `3227.543 -> 1112.434 MiB` vs full `1088.646 MiB`
+- but is much cheaper than full offload:
+  - wall `284.605s` vs `439.609s`
+  - RSS `7.339 GiB` vs `15.874 GiB`
+- objective and reward stats are unchanged.
+
+#### `alpha_grad`
+
+| scope | batch wall (s) | peak alloc (MiB) | peak reserved (MiB) | RSS (GiB) | objective | reward mean | reward std |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `none` | 270.688 | 3229.130 | 3328.0 | 1.758 | -2.867032 | -0.089595 | 2.360374 |
+| `policy` | 400.780 | 1118.526 | 1176.0 | 7.422 | -2.867032 | -0.089595 | 2.360374 |
+
+Interpretation:
+
+- The same shared-memory control works for `alpha_grad`.
+- GPU peak drops by about `2.11 GiB` while preserving alpha objective/reward statistics.
+- The time cost is material, but still much smaller than expected from full-offload behavior.
+
+Decision:
+
+- This is the first memory-control change in this line that clears the “significant and evidence-backed” bar.
+- Keep it as an opt-in control, not a default behavior change.
+- For larger effective batch via lower GPU memory, prefer:
+  - `--pg-saved-tensors-cpu-offload true`
+  - `--pg-saved-tensors-cpu-offload-scope policy`
+  - `--pg-saved-tensors-pin-memory false`

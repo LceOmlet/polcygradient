@@ -91,6 +91,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_oom_fail_fast"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "all"
     assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_enabled"] is False
     assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_enabled"] is False
     assert cfg["prior"]["environment"]["lipschitz_enforce"] is False

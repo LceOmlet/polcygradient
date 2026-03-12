@@ -6,6 +6,7 @@ import random
 import gc
 import traceback
 from contextlib import nullcontext
+from functools import wraps
 
 import torch
 import numpy as np
@@ -336,6 +337,22 @@ def _saved_tensors_cpu_offload_context(enabled: bool, pin_memory: bool):
     if graph_mod is None or not hasattr(graph_mod, "save_on_cpu"):
         return nullcontext()
     return graph_mod.save_on_cpu(pin_memory=bool(pin_memory))
+
+
+def _wrap_policy_step_fn_saved_tensors_offload(policy_step_fn, *, enabled: bool, pin_memory: bool):
+    if (not bool(enabled)) or policy_step_fn is None:
+        return policy_step_fn
+
+    @wraps(policy_step_fn)
+    def _wrapped(*args, **kwargs):
+        with _saved_tensors_cpu_offload_context(enabled=True, pin_memory=bool(pin_memory)):
+            return policy_step_fn(*args, **kwargs)
+
+    try:
+        _wrapped.__dict__.update(getattr(policy_step_fn, "__dict__", {}))
+    except Exception:
+        pass
+    return _wrapped
 
 
 def _is_oom_exception(exc: BaseException) -> bool:
@@ -997,6 +1014,7 @@ def _compute_policy_rollout_chunk_loss(
     policy_rollout_checkpoint=False,
     policy_rollout_checkpoint_reentrant=True,
     pg_saved_tensors_cpu_offload=False,
+    pg_saved_tensors_cpu_offload_scope="all",
     pg_saved_tensors_pin_memory=True,
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
@@ -1005,6 +1023,15 @@ def _compute_policy_rollout_chunk_loss(
     rollout_seeds_override=None,
     rl_objective="policy_gradient",
 ):
+    offload_scope = str(pg_saved_tensors_cpu_offload_scope or "all").strip().lower()
+    if offload_scope not in {"all", "policy"}:
+        offload_scope = "all"
+    full_offload_enabled = bool(pg_saved_tensors_cpu_offload) and (offload_scope == "all")
+    policy_step_fn = _wrap_policy_step_fn_saved_tensors_offload(
+        policy_step_fn,
+        enabled=bool(pg_saved_tensors_cpu_offload) and (offload_scope == "policy"),
+        pin_memory=pg_saved_tensors_pin_memory,
+    )
     rollout_kwargs = {}
     if h_list_override is not None:
         rollout_kwargs["h_list_override"] = h_list_override
@@ -1018,7 +1045,7 @@ def _compute_policy_rollout_chunk_loss(
         # This keeps memory bounded by one TBPTT window and is incompatible with
         # outer rollout checkpointing.
         with _saved_tensors_cpu_offload_context(
-            enabled=pg_saved_tensors_cpu_offload,
+            enabled=full_offload_enabled,
             pin_memory=pg_saved_tensors_pin_memory,
         ):
             return env_prior.rollout_policy_gradient_loss(
@@ -1037,7 +1064,7 @@ def _compute_policy_rollout_chunk_loss(
 
     if not policy_rollout_checkpoint:
         with _saved_tensors_cpu_offload_context(
-            enabled=pg_saved_tensors_cpu_offload,
+            enabled=full_offload_enabled,
             pin_memory=pg_saved_tensors_pin_memory,
         ):
             return env_prior.rollout_policy_gradient_loss(
@@ -1061,7 +1088,7 @@ def _compute_policy_rollout_chunk_loss(
         del _dummy
         _restore_rng_state(rng_state)
         with _saved_tensors_cpu_offload_context(
-            enabled=pg_saved_tensors_cpu_offload,
+            enabled=full_offload_enabled,
             pin_memory=pg_saved_tensors_pin_memory,
         ):
             pg_loss_inner, _, pg_stats_inner = env_prior.rollout_policy_gradient_loss(
@@ -1925,6 +1952,7 @@ def train_epoch_policy_gradient(
     policy_rollout_checkpoint_reentrant=True,
     pg_grad_mutable_kv_cache=False,
     pg_saved_tensors_cpu_offload=False,
+    pg_saved_tensors_cpu_offload_scope="all",
     pg_saved_tensors_pin_memory=True,
     pg_oom_debug_raise=False,
     pg_oom_fail_fast=False,
@@ -2692,6 +2720,7 @@ def train_epoch_policy_gradient(
                                             policy_rollout_checkpoint=False,
                                             policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
                                             pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                                            pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                                             pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
                                             pg_tbptt_window=current_tbptt_window,
                                             tbptt_loss_sink=None,
@@ -2985,6 +3014,7 @@ def train_epoch_policy_gradient(
                                         policy_rollout_checkpoint=bool(policy_rollout_checkpoint) and (not tbptt_stream_backward_active),
                                         policy_rollout_checkpoint_reentrant=checkpoint_reentrant_active,
                                         pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                                        pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                                         pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
                                         pg_tbptt_window=current_tbptt_window,
                                         tbptt_loss_sink=_tbptt_chunk_loss_sink,
@@ -6339,6 +6369,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           policy_rollout_checkpoint_reentrant=True,
           pg_grad_mutable_kv_cache=False,
           pg_saved_tensors_cpu_offload=False,
+          pg_saved_tensors_cpu_offload_scope="all",
           pg_saved_tensors_pin_memory=True,
           pg_oom_debug_raise=False,
           pg_oom_fail_fast=False,
@@ -6639,6 +6670,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     "is not reentrant-safe; using non-reentrant checkpoint for autograd safety."
                 )
             print("Policy saved-tensors CPU offload:", bool(pg_saved_tensors_cpu_offload))
+            print("Policy saved-tensors CPU offload scope:", str(pg_saved_tensors_cpu_offload_scope))
             print("Policy OOM debug re-raise:", bool(pg_oom_debug_raise))
             if pg_tbptt_window is None:
                 print("Policy TBPTT window: disabled(full-horizon)")
@@ -7061,6 +7093,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     policy_rollout_checkpoint_reentrant=policy_rollout_checkpoint_reentrant,
                     pg_grad_mutable_kv_cache=pg_grad_mutable_kv_cache,
                     pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
+                    pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                     pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
                     pg_oom_debug_raise=pg_oom_debug_raise,
                     pg_oom_fail_fast=pg_oom_fail_fast,

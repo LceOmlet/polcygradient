@@ -105,6 +105,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Allow grad-enabled mutable KV cache during policy-gradient rollout (typically with paged mode). Only active with rollout checkpoint.')
     optimizer.add_argument('--pg-saved-tensors-cpu-offload', type=str2bool,
                            help='Offload autograd saved tensors to CPU during policy-gradient rollout (lower GPU memory, slower).')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-scope', type=str, choices=['all', 'policy'],
+                           help='Scope for saved-tensors CPU offload during policy-gradient rollout: all saved tensors or only policy forward tensors.')
     optimizer.add_argument('--pg-saved-tensors-pin-memory', type=str2bool,
                            help='When CPU-offloading saved tensors, use pinned host memory for faster H2D transfers.')
     optimizer.add_argument('--pg-oom-debug-raise', type=str2bool,

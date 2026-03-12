@@ -15,6 +15,7 @@ def get_optimizer_config():
         "policy_rollout_chunk_grow_factor": 2.0,
         "pg_grad_mutable_kv_cache": False,
         "pg_saved_tensors_cpu_offload": False,
+        "pg_saved_tensors_cpu_offload_scope": "all",
         "pg_saved_tensors_pin_memory": True,
         "pg_oom_debug_raise": False,
         "pg_oom_fail_fast": False,
