@@ -310,3 +310,58 @@ Interpretation:
   - `first_policy_gradient sink_backward - reinforce sink_backward = +70.927s`
 - `alpha_grad` still carries a larger extra `non-sink` cost than `first_policy_gradient`, but that overhead is still `g1`-related alpha logic, not a fresh GPU-memory problem.
 - Under the new default, the next optimization target remains time, not memory.
+
+### Accepted: Planned Rowwise Noise for Strict SCM
+
+Hypothesis:
+
+- After the accepted no-copy hidden grad-fused update, the largest remaining shared forward head inside strict SCM `transition_generator` was rowwise hidden-noise sampling.
+- The current implementation recomputed `nonzero(scale > 0)` per sample on every layer and every step.
+- If those active indices are precomputed once per layer and reused, while preserving the exact per-sample/per-layer `torch.randn(..., generator=g)` call order, the optimization should be semantics-safe and should reduce risky-load wall time without increasing memory.
+
+Evidence before code:
+
+- Risky-load shared forward split (`B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`) showed:
+  - `transition_generator_s ≈ 97.610s`
+  - `rowwise_noise_s ≈ 45.346s`
+  - `hidden_update_grad_fused_s ≈ 22.536s`
+  - `batch_affine_s ≈ 2.332s`
+- A microbenchmark on the real risky-batch hidden-noise scales, preserving exact sub-batch generator mapping, showed:
+  - current helper: `45.223 ms`
+  - indices-only planned helper: `21.053 ms`
+  - `same_output = true`
+  - `same_tail = true`
+- A previous “batched big draw then slice” candidate was rejected because it changed CUDA generator consumption order; this accepted variant does not.
+
+Implementation:
+
+- Added `_build_rowwise_scaled_noise_plan(...)`
+- Added `_sample_rowwise_scaled_noise_with_plan(...)`
+- Precompute per-layer active-index plans once in strict SCM reference builder
+- Use the planned helper only on the `noise_generators is not None` path, keeping the same generator call order as the original rowwise implementation
+
+Focused checks:
+
+- rowwise-noise plan helper matches unplanned helper exactly on CUDA
+- strict SCM grad-fused update equivalence still passes
+- `alpha_grad` finite-gradient focused test passes
+- `test_mlp_prior.py` passes
+
+Risky-load evidence, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`:
+
+| objective | before wall (s) | after wall (s) | delta | before peak alloc (MiB) | after peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 271.181 | 255.523 | -15.658 | 1113.152 | 1113.661 | +0.509 |
+| `alpha_grad` | 369.806 | 344.818 | -24.988 | 1119.268 | 1119.777 | +0.509 |
+
+In-situ risky-load split for `first_policy_gradient` after the change:
+
+- `transition_generator_s: 97.610 -> 81.268s`
+- `policy_step_s: 54.843 -> 54.288s`
+- `hidden_update_grad_fused_s: 22.536 -> 23.252s`
+
+Interpretation:
+
+- The measured win lands exactly where expected: strict SCM shared forward, not policy forward and not `g1` sink backward.
+- GPU memory is unchanged within noise.
+- This is a semantics-safe shared optimization that benefits both `first_policy_gradient` and `alpha_grad`.

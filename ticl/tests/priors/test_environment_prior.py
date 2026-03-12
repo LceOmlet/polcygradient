@@ -4526,6 +4526,59 @@ def test_environment_prior_strict_reference_scm_hidden_update_grad_fused_matches
     assert torch.allclose(grad_off, grad_on, atol=2e-5, rtol=2e-5)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for rowwise noise plan semantics check")
+def test_environment_prior_rowwise_scaled_noise_with_plan_matches_unplanned_on_cuda():
+    device = "cuda"
+    dtype = torch.float32
+    prior = EnvironmentPrior(get_prior_config()["prior"]["environment"])
+    scale = torch.zeros((4, 9), device=device, dtype=dtype)
+    scale[0, :3] = torch.tensor([0.5, 1.0, 0.25], device=device, dtype=dtype)
+    scale[1, 4:7] = torch.tensor([0.2, 0.4, 0.6], device=device, dtype=dtype)
+    scale[2, :5] = 0.3
+    scale[3, :2] = torch.tensor([1.0, 2.0], device=device, dtype=dtype)
+
+    plan = prior._build_rowwise_scaled_noise_plan(scale, device=device)
+
+    seeds = [1701, 1702, 1703, 1704]
+    generators_a = []
+    generators_b = []
+    for seed in seeds:
+        g_a = torch.Generator(device=device)
+        g_a.manual_seed(seed)
+        generators_a.append(g_a)
+        g_b = torch.Generator(device=device)
+        g_b.manual_seed(seed)
+        generators_b.append(g_b)
+
+    eps_ref = prior._sample_rowwise_scaled_noise(
+        scale,
+        generators=generators_a,
+        device=device,
+        dtype=dtype,
+    )
+    eps_plan = prior._sample_rowwise_scaled_noise_with_plan(
+        scale,
+        plan,
+        generators=generators_b,
+        device=device,
+        dtype=dtype,
+    )
+
+    assert eps_ref is not None
+    assert eps_plan is not None
+    assert torch.allclose(eps_plan, eps_ref, atol=0.0, rtol=0.0)
+
+    tail_a = torch.stack(
+        [torch.randn((11,), device=device, dtype=dtype, generator=g) for g in generators_a],
+        dim=0,
+    )
+    tail_b = torch.stack(
+        [torch.randn((11,), device=device, dtype=dtype, generator=g) for g in generators_b],
+        dim=0,
+    )
+    assert torch.allclose(tail_a, tail_b, atol=0.0, rtol=0.0)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for multilayer fused semantics check")
 def test_environment_prior_strict_reference_scm_hidden_multilayer_fused_matches_unfused_on_cuda(monkeypatch):
     _seed_everything(20260309)

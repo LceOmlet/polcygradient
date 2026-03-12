@@ -2393,6 +2393,46 @@ class EnvironmentPrior:
         return eps
 
     @staticmethod
+    def _build_rowwise_scaled_noise_plan(scale, *, device):
+        scale_t = torch.as_tensor(scale, device=device, dtype=torch.float32)
+        if scale_t.ndim != 2:
+            raise ValueError("rowwise scaled noise plan expects a rank-2 scale tensor")
+        batch_size = int(scale_t.shape[0])
+        if batch_size <= 0:
+            return tuple()
+        plan = []
+        for bi in range(batch_size):
+            active = torch.nonzero(scale_t[bi] > 0, as_tuple=False).squeeze(1)
+            plan.append(active)
+        return tuple(plan)
+
+    @staticmethod
+    def _sample_rowwise_scaled_noise_with_plan(scale, plan, *, generators, device, dtype):
+        scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+        if scale_t.ndim != 2:
+            raise ValueError("rowwise scaled noise with plan expects a rank-2 scale tensor")
+        batch_size = int(scale_t.shape[0])
+        width = int(scale_t.shape[1])
+        if batch_size <= 0 or width <= 0 or len(plan) != batch_size:
+            return None
+        if not bool(torch.any(scale_t > 0)):
+            return None
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        generators_list = None if generators is None else list(generators)
+        for bi, active in enumerate(plan):
+            count = int(active.numel())
+            if count <= 0:
+                continue
+            g = None if generators_list is None or bi >= len(generators_list) else generators_list[bi]
+            draw_shape = (count,)
+            if g is None:
+                e_b = torch.randn(draw_shape, device=device, dtype=dtype)
+            else:
+                e_b = torch.randn(draw_shape, device=device, dtype=dtype, generator=g)
+            eps[bi, active] = e_b * scale_t[bi, active]
+        return eps
+
+    @staticmethod
     def _sample_prefix_grouped_scaled_noise_without_generators(scale, *, device, dtype):
         scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
         if scale_t.ndim != 2:
@@ -2907,6 +2947,7 @@ class EnvironmentPrior:
         activation_codes = []
         hidden_noise_plans = []
         hidden_noise_present = []
+        hidden_rowwise_noise_plans = []
 
         for bi, h in enumerate(h_list):
             g = None if generators is None else generators[bi]
@@ -3054,6 +3095,12 @@ class EnvironmentPrior:
         for layer_idx in range(max_hidden_blocks):
             hidden_noise_plans.append(
                 self._build_prefix_grouped_scale_plan(
+                    hidden_noise_scale_stack[:, layer_idx, :],
+                    device=device,
+                )
+            )
+            hidden_rowwise_noise_plans.append(
+                self._build_rowwise_scaled_noise_plan(
                     hidden_noise_scale_stack[:, layer_idx, :],
                     device=device,
                 )
@@ -3255,8 +3302,15 @@ class EnvironmentPrior:
                                     dtype=z.dtype,
                                 )
                         else:
+                            noise_rowwise_plan = hidden_rowwise_noise_plans[layer_idx]
                             noise_eps = self._sample_rowwise_scaled_noise(
                                 noise_scale,
+                                generators=noise_generators,
+                                device=z.device,
+                                dtype=z.dtype,
+                            ) if not noise_rowwise_plan else self._sample_rowwise_scaled_noise_with_plan(
+                                noise_scale,
+                                noise_rowwise_plan,
                                 generators=noise_generators,
                                 device=z.device,
                                 dtype=z.dtype,
