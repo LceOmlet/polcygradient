@@ -3153,7 +3153,23 @@ class EnvironmentPrior:
                 "hidden_prefix_sizes_runtime": [s.to(device=device_obj, dtype=torch.long) for s in hidden_prefix_sizes],
                 "hidden_prefix_out_tile_batch_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_batch],
                 "hidden_prefix_out_tile_offsets_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_offsets],
+                "input_mask_runtime": input_mask_t.to(device=device_obj, dtype=dtype_obj),
+                "state_mask_runtime": state_mask.to(device=device_obj, dtype=dtype_obj),
+                "state_select_idx_runtime": state_select_idx.to(device=device_obj, dtype=torch.long),
+                "reward_select_idx_runtime": reward_select_idx.to(device=device_obj, dtype=torch.long),
             }
+            cached["hidden_weights_runtime"] = [
+                cached["hidden_weights_stack_runtime"][:, layer_idx, :, :]
+                for layer_idx in range(max_hidden_blocks)
+            ]
+            cached["hidden_biases_runtime"] = [
+                cached["hidden_biases_stack_runtime"][:, layer_idx, :]
+                for layer_idx in range(max_hidden_blocks)
+            ]
+            cached["hidden_noise_scales_runtime"] = [
+                cached["hidden_noise_scale_stack_runtime"][:, layer_idx, :]
+                for layer_idx in range(max_hidden_blocks)
+            ]
             runtime_tensor_cache[cache_key] = cached
             return cached
 
@@ -3223,11 +3239,11 @@ class EnvironmentPrior:
                         outputs_flat = outputs_layers.reshape(batch_size, outputs_flat_cap)
                         state_out = outputs_flat.gather(
                             1,
-                            state_select_idx.to(device=outputs_flat.device),
-                        ) * state_mask.to(device=outputs_flat.device, dtype=outputs_flat.dtype)
+                            runtime_cached["state_select_idx_runtime"],
+                        ) * runtime_cached["state_mask_runtime"]
                         reward_out = outputs_flat.gather(
                             1,
-                            reward_select_idx.to(device=outputs_flat.device),
+                            runtime_cached["reward_select_idx_runtime"],
                         )
                         return state_out, reward_out
             else:
@@ -3239,7 +3255,7 @@ class EnvironmentPrior:
                     first_bias_runtime,
                 )
             else:
-                x_in = x[:, :in_cap] * input_mask_t.to(device=x_device, dtype=x_dtype)
+                x_in = x[:, :in_cap] * runtime_cached["input_mask_runtime"]
                 z = self._batch_affine(
                     x_in,
                     first_weight_runtime,
@@ -3249,9 +3265,9 @@ class EnvironmentPrior:
             activation_relu_mask_runtime = runtime_cached["activation_relu_mask_runtime"]
             activation_identity_mask_runtime = runtime_cached["activation_identity_mask_runtime"]
             hidden_active_masks_runtime = runtime_cached["hidden_active_masks_runtime"]
-            hidden_weights_runtime = [hidden_weights_stack_runtime[:, layer_idx, :, :] for layer_idx in range(max_hidden_blocks)]
-            hidden_biases_runtime = [hidden_biases_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
-            hidden_noise_scales_runtime = [hidden_noise_scale_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
+            hidden_weights_runtime = runtime_cached["hidden_weights_runtime"]
+            hidden_biases_runtime = runtime_cached["hidden_biases_runtime"]
+            hidden_noise_scales_runtime = runtime_cached["hidden_noise_scales_runtime"]
             hidden_prefix_sizes_runtime = runtime_cached["hidden_prefix_sizes_runtime"]
             hidden_prefix_out_tile_batch_runtime = runtime_cached["hidden_prefix_out_tile_batch_runtime"]
             hidden_prefix_out_tile_offsets_runtime = runtime_cached["hidden_prefix_out_tile_offsets_runtime"]
@@ -3373,7 +3389,7 @@ class EnvironmentPrior:
                             hidden_mask=hidden_mask_runtime,
                             in_sizes=hidden_prefix_sizes_runtime[layer_idx],
                             out_sizes=hidden_prefix_sizes_runtime[layer_idx],
-                            activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                            activation_codes=activation_codes_runtime,
                             block_o=int(self.reference_scm_hidden_affine_block_o),
                             block_k=int(self.reference_scm_hidden_affine_block_k),
                             num_warps=int(self.reference_scm_hidden_affine_num_warps),
@@ -3394,7 +3410,7 @@ class EnvironmentPrior:
                                 hidden_mask=hidden_mask_runtime,
                                 in_sizes=hidden_prefix_sizes_runtime[layer_idx],
                                 out_sizes=hidden_prefix_sizes_runtime[layer_idx],
-                                activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                                activation_codes=activation_codes_runtime,
                                 out_tile_batch=hidden_prefix_out_tile_batch_runtime[layer_idx],
                                 out_tile_offsets=hidden_prefix_out_tile_offsets_runtime[layer_idx],
                                 block_o=int(self.reference_scm_hidden_affine_block_o),
@@ -3409,7 +3425,7 @@ class EnvironmentPrior:
                                 hidden_biases_runtime[layer_idx],
                                 in_sizes=hidden_prefix_sizes_runtime[layer_idx],
                                 out_sizes=hidden_prefix_sizes_runtime[layer_idx],
-                                activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                                activation_codes=activation_codes_runtime,
                                 out_tile_batch=hidden_prefix_out_tile_batch_runtime[layer_idx],
                                 out_tile_offsets=hidden_prefix_out_tile_offsets_runtime[layer_idx],
                                 block_o=int(self.reference_scm_hidden_affine_block_o),
@@ -3442,11 +3458,11 @@ class EnvironmentPrior:
             outputs_flat = outputs_layers.reshape(batch_size, outputs_flat_cap)
             state_out = outputs_flat.gather(
                 1,
-                state_select_idx.to(device=outputs_flat.device),
-            ) * state_mask.to(device=outputs_flat.device, dtype=outputs_flat.dtype)
+                runtime_cached["state_select_idx_runtime"],
+            ) * runtime_cached["state_mask_runtime"]
             reward_out = outputs_flat.gather(
                 1,
-                reward_select_idx.to(device=outputs_flat.device),
+                runtime_cached["reward_select_idx_runtime"],
             )
             return state_out, reward_out
 
