@@ -48,3 +48,39 @@ Interpretation:
 - Risky-load GPU memory is effectively unchanged.
 - Runtime is also effectively unchanged.
 - This change is therefore correctness-oriented, not a measurable performance optimization.
+
+### Cross-Objective Risky-Load Comparison
+
+Setup:
+
+- worktree: `/tmp/rlpfn_alpha_grad_bridge_20260312`
+- backend: `torch_vectorized`
+- grouping: `family`
+- `batch_size=64`
+- `n_samples=1024`
+- `single_eval_pos=697`
+- `pg_tbptt_window=32`
+- `kv_cache_mode=paged`
+- guard: fail if peak allocated or reserved GPU memory exceeds `10 GiB`
+- fixed overrides across runs: same `h_list`, `env_seeds`, `rollout_seeds`
+
+Results:
+
+| objective | status | batch wall (s) | peak alloc (MiB) | peak reserved (MiB) | RSS (GiB) | objective | reward mean | reward std |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `reinforce` | ok | 121.753 | 3177.008 | 3226.0 | 1.612 | -2.818624 | -0.088082 | 2.362865 |
+| `first_policy_gradient` | ok | 190.881 | 3227.543 | 3292.0 | 1.768 | -0.089595 | -0.089595 | 2.360374 |
+| `alpha_grad` | ok | 247.793 | 3229.130 | 3328.0 | 1.758 | -2.867032 | -0.089595 | 2.360374 |
+
+Derived deltas:
+
+- `first_policy_gradient - reinforce`: `+69.128s`, `+50.535 MiB`
+- `alpha_grad - first_policy_gradient`: `+56.912s`, `+1.586 MiB`
+- `alpha_grad - reinforce`: `+126.040s`, `+52.122 MiB`
+
+Interpretation:
+
+- The largest remaining optimization headroom is on the `g1` / `first_policy_gradient` branch, not on `g0`.
+- GPU memory is nearly identical across all three objectives on this fixed risky load, so the dominant problem is time, not an alpha-specific memory spike.
+- The extra alpha cost over `first_policy_gradient` is smaller than the extra `first_policy_gradient` cost over `reinforce`, which matches earlier diagnostics that `g0` is already relatively cheap and the main expensive path is `g1`.
+- Coarse `nvidia-smi` utilization sampling is not used as a decision signal here; these conclusions are based on fixed-override batch wall and guarded peak memory only.
