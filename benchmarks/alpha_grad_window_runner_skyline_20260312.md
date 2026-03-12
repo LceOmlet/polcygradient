@@ -235,8 +235,37 @@ Interpretation:
 Decision:
 
 - This is the first memory-control change in this line that clears the “significant and evidence-backed” bar.
-- Keep it as an opt-in control, not a default behavior change.
+- It was first accepted as an opt-in control and later promoted to the experimental default after additional risky-load validation.
 - For larger effective batch via lower GPU memory, prefer:
   - `--pg-saved-tensors-cpu-offload true`
   - `--pg-saved-tensors-cpu-offload-scope policy`
   - `--pg-saved-tensors-pin-memory false`
+
+### Promoted Default: Policy-Only Offload
+
+The experimental branch now promotes the following `rlpfn` defaults:
+
+- `pg_saved_tensors_cpu_offload = true`
+- `pg_saved_tensors_cpu_offload_scope = policy`
+- `pg_saved_tensors_pin_memory = false`
+
+Reason:
+
+- On the maintained risky load this is the best demonstrated memory control so far.
+- It lowers GPU memory by about `2.1 GiB` relative to the no-offload baseline while avoiding the much larger host-memory and wall-time penalty of full-rollout offload.
+
+Default-risky-load evidence after promotion, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family`:
+
+| objective | batch wall (s) | sink backward (s) | non-sink (s) | peak alloc (MiB) | peak reserved (MiB) | RSS (GiB) |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `reinforce` | 201.570 | 62.046 | 139.524 | 1089.750 | 1144.0 | 7.253 |
+| `first_policy_gradient` | 284.605 | 132.973 | 151.633 | 1112.434 | 1168.0 | 7.339 |
+| `alpha_grad` | 400.780 | 125.626 | 275.154 | 1118.526 | 1176.0 | 7.422 |
+
+Interpretation:
+
+- GPU memory is now tightly controlled across all three objectives on the risky load.
+- The direct `g1` shared-backward gap remains large:
+  - `first_policy_gradient sink_backward - reinforce sink_backward = +70.927s`
+- `alpha_grad` still carries a larger extra `non-sink` cost than `first_policy_gradient`, but that overhead is still `g1`-related alpha logic, not a fresh GPU-memory problem.
+- Under the new default, the next optimization target remains time, not memory.

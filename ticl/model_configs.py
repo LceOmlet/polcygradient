@@ -557,9 +557,12 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     config['optimizer']['train_kernel_profiler_export_trace'] = True
     config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
-    # With reentrant rollout checkpoint defaulted on, saved-tensor CPU offload is
-    # not needed by default and can otherwise shift pressure to host RAM.
-    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
+    # Default to policy-only CPU offload: it captures most of the shared
+    # transformer memory reduction while keeping host/RSS and wall-time below
+    # full rollout offload on the maintained risky-load benchmark.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
+    config['optimizer']['pg_saved_tensors_pin_memory'] = False
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32
     # Keep one rollout->update cycle per batch by default for throughput-first
