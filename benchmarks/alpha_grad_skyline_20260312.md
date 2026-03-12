@@ -48,7 +48,7 @@
   - `gpu_util_avg = 91.09`
   - `gpu_util_max = 99`
 
-### Alpha Grad Current Accepted Implementation
+### Alpha Grad Previous Accepted Implementation
 
 - Status: `ok`
 - Summary: `/tmp/alpha_guard_alphagrad_b64_ns1024_sep697_20260312.summary.json`
@@ -64,6 +64,22 @@
   - `gpu_util_avg = 91.84`
   - `gpu_util_max = 99`
 
+### Alpha Grad Current Accepted Implementation
+
+- Status: `ok`
+- Summary: `/tmp/alpha_guard_alphagrad_b64_ns1024_sep697_after_analyticg0_forced_20260312.summary.json`
+- Log: `/tmp/alpha_guard_alphagrad_b64_ns1024_sep697_after_analyticg0_forced_20260312.log`
+- Train profiler: `/tmp/rlpfn_alpha_grad_20260311/alpha_guard_alphagrad_b64_ns1024_sep697_after_analyticg0_forced_20260312.train_profiler.jsonl`
+- Batch metrics:
+  - `rollout_s = 274.553`
+  - `backward_s = 95.476`
+  - `batch_wall_excl_compile_s = 370.029`
+  - `peak_alloc_gib = 4.810`
+  - `peak_reserved_gib = 4.860`
+  - `gpu_peak_mib = 5454`
+  - `gpu_util_avg = 25.20`
+  - `gpu_util_max = 91`
+
 ## Diagnosis
 
 - Current dominant alpha-specific slowdown is in `alpha_grad_loss_from_rollout_tensors(...)`, not in shared rollout/SCM forward.
@@ -76,6 +92,24 @@
 - This ruled out grouped merge as the main runtime hotspot at the risky load.
 
 ## Optimization Steps
+
+### Accepted: Analytic `g0` From Reinforce Score Trace
+
+- Change:
+  - collect a detached `log_prob_score = d log_prob / d action_mean` trace during alpha rollout
+  - compute `g0` analytically from `advantages.detach() * log_prob_score`
+  - keep `g1` as the only remaining `autograd.grad` branch
+- Semantic checks:
+  - helper score matches autograd for `_squashed_gaussian_log_prob`
+  - `alpha_grad_loss_from_rollout_tensors(..., log_prob_score=...)` matches the pre-change autograd gradient
+  - alpha env tests, alpha TBPTT checkpoint, strict SCM baseline, and `mlp.py` tests all pass
+- Result versus previous accepted alpha:
+  - `rollout_s`: `356.183 -> 274.553` (`-81.630s`, `-22.9%`)
+  - `batch_wall_excl_compile_s`: `448.059 -> 370.029` (`-78.030s`, `-17.4%`)
+  - `peak_alloc_gib`: effectively unchanged at `~4.81 GiB`
+- Interpretation:
+  - this confirms one of the two alpha-specific `autograd.grad` calls was a real runtime head
+  - the remaining alpha-specific head is now the `g1` path, not the shared rollout/SCM forward
 
 ### Action Trace Memory Trim
 

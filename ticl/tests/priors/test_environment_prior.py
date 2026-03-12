@@ -2599,6 +2599,78 @@ def test_environment_prior_alpha_grad_group_traces_match_dense_manual_gradient()
     assert torch.allclose(grad_group1[1], grad_dense[1, [1]], atol=1e-6, rtol=1e-5)
 
 
+def test_environment_prior_alpha_grad_log_prob_score_matches_autograd_g0_path():
+    prior = EnvironmentPrior({"discount": 1.0})
+    action_mean = torch.tensor(
+        [
+            [[0.2, -0.3], [0.4, 0.1], [-0.2, 0.5]],
+            [[0.6, -0.4], [0.1, 0.7], [0.3, -0.6]],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    action_mask = torch.tensor(
+        [
+            [[True, True], [True, True], [True, False]],
+            [[True, True], [True, True], [True, False]],
+        ],
+        dtype=torch.bool,
+    )
+    action_std = torch.tensor([[0.7, 0.5, 0.4], [0.7, 0.5, 0.4]], dtype=torch.float32)
+    eps = torch.tensor(
+        [
+            [[0.5, -0.25], [0.2, 0.1], [-0.3, 0.8]],
+            [[-0.1, 0.2], [0.4, -0.6], [0.7, -0.5]],
+        ],
+        dtype=torch.float32,
+    )
+    pre_tanh_action = action_mean + (eps * action_std.unsqueeze(-1))
+    action = torch.tanh(pre_tanh_action)
+    rewards = (1.5 * action_mean[..., 0]) - (0.25 * action_mean[..., 1])
+    log_probs = torch.stack(
+        [
+            EnvironmentPrior._squashed_gaussian_log_prob(
+                pre_tanh_action[t].detach(),
+                action_mean[t],
+                action_std[t],
+                action=action[t].detach(),
+                mask=action_mask[t],
+            )
+            for t in range(action_mean.shape[0])
+        ],
+        dim=0,
+    )
+    log_prob_score = EnvironmentPrior._reinforce_log_prob_score_wrt_action_mean(
+        pre_tanh_action.detach(),
+        action_mean.detach(),
+        action_std.unsqueeze(-1),
+        mask=action_mask,
+    )
+
+    loss_ref, _ = prior.alpha_grad_loss_from_rollout_tensors(
+        rewards=rewards,
+        log_probs=log_probs,
+        action_mean=action_mean,
+        action_mask=action_mask,
+        discount=1.0,
+        variance_eps=1e-6,
+    )
+    grad_ref = torch.autograd.grad(loss_ref, action_mean, retain_graph=True)[0]
+
+    loss_score, _ = prior.alpha_grad_loss_from_rollout_tensors(
+        rewards=rewards,
+        log_probs=log_probs,
+        action_mean=action_mean,
+        action_mask=action_mask,
+        log_prob_score=log_prob_score,
+        discount=1.0,
+        variance_eps=1e-6,
+    )
+    grad_score = torch.autograd.grad(loss_score, action_mean)[0]
+
+    assert torch.allclose(grad_score, grad_ref, atol=1e-6, rtol=1e-5)
+
+
 def test_environment_prior_first_policy_gradient_shares_reinforce_rollout_rewards():
     _seed_everything(204)
     config = get_prior_config()
@@ -3295,6 +3367,31 @@ def test_environment_prior_squashed_gaussian_log_prob_matches_clean_score_functi
     (grad_mean,) = torch.autograd.grad(log_prob, action_mean)
     expected = (pre_tanh_action.detach() - action_mean.detach()) / (action_std ** 2)
     assert torch.allclose(grad_mean, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_reinforce_log_prob_score_matches_autograd_gradient():
+    action_mean = torch.tensor([[0.3, -0.2]], dtype=torch.float32, requires_grad=True)
+    action_std = torch.tensor([0.7], dtype=torch.float32)
+    eps = torch.tensor([[0.5, -0.25]], dtype=torch.float32)
+    mask = torch.tensor([[True, False]], dtype=torch.bool)
+    pre_tanh_action = action_mean + (eps * action_std.unsqueeze(-1))
+    action = torch.tanh(pre_tanh_action)
+
+    log_prob = EnvironmentPrior._squashed_gaussian_log_prob(
+        pre_tanh_action.detach(),
+        action_mean,
+        action_std,
+        action=action.detach(),
+        mask=mask,
+    )
+    (grad_mean,) = torch.autograd.grad(log_prob, action_mean)
+    score = EnvironmentPrior._reinforce_log_prob_score_wrt_action_mean(
+        pre_tanh_action.detach(),
+        action_mean.detach(),
+        action_std,
+        mask=mask,
+    )
+    assert torch.allclose(score, grad_mean, atol=1e-6, rtol=1e-6)
 
 
 def test_environment_prior_pack_env_input_scales_only_state_block():

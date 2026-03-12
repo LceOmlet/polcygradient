@@ -11719,6 +11719,7 @@ class EnvironmentPrior:
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
@@ -11735,10 +11736,16 @@ class EnvironmentPrior:
             if collect_log_probs and (not tbptt_window_active)
             else None
         )
+        log_prob_score_steps = (
+            torch.empty((n_samples, batch_size, action_dim), device=device, dtype=torch.float32)
+            if collect_log_prob_score and (not tbptt_window_active)
+            else None
+        )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_log_prob_score_buffer = [] if (tbptt_window_active and collect_log_prob_score) else None
         tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
@@ -12068,6 +12075,7 @@ class EnvironmentPrior:
             action_transform_mode = env.get("reinforce_action_transform", "rms")
             action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
+            reinforce_log_prob_score_t = None
             if collect_action_trace:
                 if tbptt_window_active:
                     tbptt_action_mean_buffer.append(action_mean)
@@ -12137,6 +12145,13 @@ class EnvironmentPrior:
                         action_std_t,
                         action=action_next.detach(),
                     )
+                    if collect_log_prob_score:
+                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                            action_pre_tanh.detach(),
+                            action_mean.detach(),
+                            action_std_t,
+                        ).detach().to(dtype=torch.float32)
+                        reinforce_log_prob_t = reinforce_log_prob_t.detach()
             else:
                 action_next = self._transform_reinforce_action(
                     action_mean,
@@ -12333,11 +12348,15 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
                 if tbptt_log_prob_buffer is not None:
                     tbptt_log_prob_buffer.append(reinforce_log_prob_t)
+                if tbptt_log_prob_score_buffer is not None:
+                    tbptt_log_prob_score_buffer.append(reinforce_log_prob_score_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
                 if log_prob_steps is not None and reinforce_log_prob_t is not None:
                     log_prob_steps[t] = reinforce_log_prob_t
+                if log_prob_score_steps is not None and reinforce_log_prob_score_t is not None:
+                    log_prob_score_steps[t] = reinforce_log_prob_score_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
@@ -12356,6 +12375,10 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
+                    log_prob_score_window = None
+                    if tbptt_log_prob_score_buffer is not None:
+                        log_prob_score_window = torch.stack(tbptt_log_prob_score_buffer, dim=0)
+                        tbptt_log_prob_score_buffer = []
                     action_mean_window = None
                     action_mean_window_roots = None
                     action_mask_window = None
@@ -12392,6 +12415,8 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                                if log_prob_score_window is not None:
+                                    payload_aux["reinforce"]["log_prob_score"] = log_prob_score_window
                             if action_mean_window is not None:
                                 payload_aux["policy_trace"] = {
                                     "action_mean": action_mean_window,
@@ -12507,7 +12532,10 @@ class EnvironmentPrior:
             )
         }
         self.last_rollout_reinforce = (
-            {"log_probs": log_prob_steps}
+            {
+                "log_probs": log_prob_steps,
+                "log_prob_score": log_prob_score_steps,
+            }
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
@@ -13199,6 +13227,7 @@ class EnvironmentPrior:
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
@@ -13210,6 +13239,11 @@ class EnvironmentPrior:
         log_prob_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_log_probs and (not tbptt_window_active)
+            else None
+        )
+        log_prob_score_steps = (
+            torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            if collect_log_prob_score and (not tbptt_window_active)
             else None
         )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
@@ -13232,6 +13266,7 @@ class EnvironmentPrior:
 
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_log_prob_score_buffer = [] if (tbptt_window_active and collect_log_prob_score) else None
         tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
@@ -13622,6 +13657,7 @@ class EnvironmentPrior:
             action_transform_mode = env_info.get("reinforce_action_transform", "rms")
             action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
+            reinforce_log_prob_score_t = None
             if collect_action_trace:
                 action_mask_bool = action_mask.to(dtype=torch.bool)
                 if tbptt_window_active:
@@ -13677,6 +13713,14 @@ class EnvironmentPrior:
                     action=action_next.detach(),
                     mask=action_mask,
                 )
+                if collect_log_prob_score:
+                    reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                        action_pre_tanh.detach(),
+                        action_mean.detach(),
+                        action_std_t,
+                        mask=action_mask,
+                    ).detach().to(dtype=torch.float32)
+                    reinforce_log_prob_t = reinforce_log_prob_t.detach()
             else:
                 action_next = self._transform_reinforce_action(
                     action_mean,
@@ -14107,11 +14151,15 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
                 if tbptt_log_prob_buffer is not None:
                     tbptt_log_prob_buffer.append(reinforce_log_prob_t)
+                if tbptt_log_prob_score_buffer is not None:
+                    tbptt_log_prob_score_buffer.append(reinforce_log_prob_score_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
                 if log_prob_steps is not None and reinforce_log_prob_t is not None:
                     log_prob_steps[t] = reinforce_log_prob_t
+                if log_prob_score_steps is not None and reinforce_log_prob_score_t is not None:
+                    log_prob_score_steps[t] = reinforce_log_prob_score_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
@@ -14130,6 +14178,10 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0)
                         tbptt_log_prob_buffer = []
+                    log_prob_score_window = None
+                    if tbptt_log_prob_score_buffer is not None:
+                        log_prob_score_window = torch.stack(tbptt_log_prob_score_buffer, dim=0)
+                        tbptt_log_prob_score_buffer = []
                     action_mean_window = None
                     action_mean_window_roots = None
                     action_mask_window = None
@@ -14167,6 +14219,8 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                                if log_prob_score_window is not None:
+                                    payload_aux["reinforce"]["log_prob_score"] = log_prob_score_window
                             if action_mean_window is not None:
                                 payload_aux["policy_trace"] = {
                                     "action_mean": action_mean_window,
@@ -14249,6 +14303,8 @@ class EnvironmentPrior:
                 x_steps = x_steps.index_select(1, inv_perm)
             if log_prob_steps is not None:
                 log_prob_steps = log_prob_steps.index_select(1, inv_perm)
+            if log_prob_score_steps is not None:
+                log_prob_score_steps = log_prob_score_steps.index_select(1, inv_perm)
 
         if collect_runtime_info:
             if needs_unpermute:
@@ -14465,7 +14521,10 @@ class EnvironmentPrior:
             )
         }
         self.last_rollout_reinforce = (
-            {"log_probs": log_prob_steps}
+            {
+                "log_probs": log_prob_steps,
+                "log_prob_score": log_prob_score_steps,
+            }
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
@@ -14648,6 +14707,7 @@ class EnvironmentPrior:
             else 0.0
         )
         collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
@@ -14671,10 +14731,16 @@ class EnvironmentPrior:
             if collect_log_probs and (not tbptt_window_active)
             else None
         )
+        log_prob_score_steps = (
+            torch.empty((n_samples, action_dim), device=device, dtype=torch.float32)
+            if collect_log_prob_score and (not tbptt_window_active)
+            else None
+        )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         tbptt_reward_buffer = [] if tbptt_window_active else None
         tbptt_log_prob_buffer = [] if (tbptt_window_active and collect_log_probs) else None
+        tbptt_log_prob_score_buffer = [] if (tbptt_window_active and collect_log_prob_score) else None
         tbptt_action_mean_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         tbptt_action_mask_buffer = [] if (tbptt_window_active and collect_action_trace) else None
         aev2_cfg = self._resolve_aev2_config()
@@ -14901,6 +14967,7 @@ class EnvironmentPrior:
                     )
                 action_mean = action_next
                 reinforce_log_prob_t = None
+                reinforce_log_prob_score_t = None
                 if collect_action_trace:
                     if tbptt_window_active:
                         tbptt_action_mean_buffer.append(action_mean)
@@ -14977,6 +15044,13 @@ class EnvironmentPrior:
                         float(action_noise_std),
                         action=action_next.detach(),
                     )
+                    if collect_log_prob_score:
+                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                            action_pre_tanh.detach(),
+                            action_mean.detach(),
+                            float(action_noise_std),
+                        ).detach().to(dtype=torch.float32)
+                        reinforce_log_prob_t = reinforce_log_prob_t.detach()
             else:
                 if not use_fast_env_in:
                     action_next = self._transform_reinforce_action(
@@ -15199,11 +15273,15 @@ class EnvironmentPrior:
                 tbptt_reward_buffer.append(reward_next)
                 if tbptt_log_prob_buffer is not None:
                     tbptt_log_prob_buffer.append(reinforce_log_prob_t)
+                if tbptt_log_prob_score_buffer is not None:
+                    tbptt_log_prob_score_buffer.append(reinforce_log_prob_score_t)
             else:
                 if y_steps is not None:
                     y_steps[t] = reward_next
                 if log_prob_steps is not None and reinforce_log_prob_t is not None:
                     log_prob_steps[t] = reinforce_log_prob_t
+                if log_prob_score_steps is not None and reinforce_log_prob_score_t is not None:
+                    log_prob_score_steps[t] = reinforce_log_prob_score_t
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = torch.abs(state_next).max().detach()
@@ -15222,6 +15300,10 @@ class EnvironmentPrior:
                     if tbptt_log_prob_buffer is not None:
                         log_probs_window = torch.stack(tbptt_log_prob_buffer, dim=0).reshape(-1, 1)
                         tbptt_log_prob_buffer = []
+                    log_prob_score_window = None
+                    if tbptt_log_prob_score_buffer is not None:
+                        log_prob_score_window = torch.stack(tbptt_log_prob_score_buffer, dim=0).reshape(-1, 1, action_dim)
+                        tbptt_log_prob_score_buffer = []
                     action_mean_window = None
                     action_mean_window_roots = None
                     action_mask_window = None
@@ -15257,6 +15339,8 @@ class EnvironmentPrior:
                             payload_aux = {}
                             if reinforce_streaming_sink and (log_probs_window is not None):
                                 payload_aux["reinforce"] = {"log_probs": log_probs_window}
+                                if log_prob_score_window is not None:
+                                    payload_aux["reinforce"]["log_prob_score"] = log_prob_score_window
                             if action_mean_window is not None:
                                 payload_aux["policy_trace"] = {
                                     "action_mean": action_mean_window,
@@ -15363,7 +15447,14 @@ class EnvironmentPrior:
         else:
             info = None
         self.last_rollout_reinforce = (
-            {"log_probs": log_prob_steps.reshape(n_samples, 1)}
+            {
+                "log_probs": log_prob_steps.reshape(n_samples, 1),
+                "log_prob_score": (
+                    log_prob_score_steps.reshape(n_samples, 1, action_dim)
+                    if log_prob_score_steps is not None
+                    else None
+                ),
+            }
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
@@ -16003,6 +16094,7 @@ class EnvironmentPrior:
             if collect_log_probs and (tbptt_reward_sink is None) and (not tbptt_window_active)
             else None
         )
+        reinforce_log_prob_scores = None
         policy_action_mean = None
         policy_action_mask = None
         policy_action_mean_roots = None
@@ -16059,6 +16151,7 @@ class EnvironmentPrior:
                 policy_trace_window = aux.get("policy_trace", None)
                 if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires reinforce log_probs in every group payload")
+                log_prob_score_window = reinforce_window.get("log_prob_score", None)
                 if not isinstance(policy_trace_window, dict) or (not torch.is_tensor(policy_trace_window.get("action_mask", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires policy trace in every group payload")
                 if int(tbptt_alpha_expected_group_count) <= 0:
@@ -16083,6 +16176,15 @@ class EnvironmentPrior:
                             device=log_probs_window.device,
                             dtype=log_probs_window.dtype,
                         ),
+                        "log_prob_score": (
+                            torch.zeros(
+                                (int(log_prob_score_window.shape[0]), batch_size, int(log_prob_score_window.shape[-1])),
+                                device=log_prob_score_window.device,
+                                dtype=log_prob_score_window.dtype,
+                            )
+                            if torch.is_tensor(log_prob_score_window)
+                            else None
+                        ),
                         "action_mean": (
                             torch.zeros(
                                 (int(action_mean_window.shape[0]), batch_size, int(action_mean_window.shape[-1])),
@@ -16103,6 +16205,14 @@ class EnvironmentPrior:
                 elif (
                     tuple(bucket["rewards"].shape) != tuple((int(rewards_window.shape[0]), batch_size))
                     or tuple(bucket["log_probs"].shape) != tuple((int(log_probs_window.shape[0]), batch_size))
+                    or (
+                        torch.is_tensor(log_prob_score_window)
+                        and (
+                            (bucket["log_prob_score"] is None)
+                            or tuple(bucket["log_prob_score"].shape)
+                            != tuple((int(log_prob_score_window.shape[0]), batch_size, int(log_prob_score_window.shape[-1])))
+                        )
+                    )
                     or tuple(bucket["action_mask"].shape) != tuple((int(action_mask_window.shape[0]), batch_size, int(action_mask_window.shape[-1])))
                     or (
                         torch.is_tensor(action_mean_window)
@@ -16117,6 +16227,8 @@ class EnvironmentPrior:
                 idx_list = list(idx_tuple)
                 bucket["rewards"][:, idx_list] = rewards_window
                 bucket["log_probs"][:, idx_list] = log_probs_window
+                if torch.is_tensor(log_prob_score_window):
+                    bucket["log_prob_score"][:, idx_list] = log_prob_score_window
                 if torch.is_tensor(action_mean_window):
                     bucket["action_mean"][:, idx_list] = action_mean_window
                 bucket["action_mask"][:, idx_list] = action_mask_window
@@ -16137,7 +16249,10 @@ class EnvironmentPrior:
                         (
                             ready["rewards"],
                             {
-                                "reinforce": {"log_probs": ready["log_probs"]},
+                                "reinforce": {
+                                    "log_probs": ready["log_probs"],
+                                    "log_prob_score": ready["log_prob_score"],
+                                },
                                 "policy_trace": {
                                     "action_mean": ready["action_mean"],
                                     "action_mean_roots": None,
@@ -16241,6 +16356,15 @@ class EnvironmentPrior:
                     group_reinforce = self.last_rollout_reinforce
                     if isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
                         reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
+                        group_log_prob_score = group_reinforce.get("log_prob_score", None)
+                        if torch.is_tensor(group_log_prob_score):
+                            if reinforce_log_prob_scores is None:
+                                reinforce_log_prob_scores = torch.empty(
+                                    (int(group_log_prob_score.shape[0]), batch_size, int(group_log_prob_score.shape[-1])),
+                                    device=group_log_prob_score.device,
+                                    dtype=group_log_prob_score.dtype,
+                                )
+                            reinforce_log_prob_scores[:, group_indices] = group_log_prob_score
                 if collect_action_trace:
                     group_policy_trace = self.last_rollout_policy_trace
                     if isinstance(group_policy_trace, dict) and torch.is_tensor(group_policy_trace.get("action_mask", None)):
@@ -16613,7 +16737,10 @@ class EnvironmentPrior:
                 dtype=torch.float32,
             )
             self.last_rollout_reinforce = (
-                {"log_probs": reinforce_log_probs}
+                {
+                    "log_probs": reinforce_log_probs,
+                    "log_prob_score": reinforce_log_prob_scores,
+                }
                 if reinforce_log_probs is not None
                 else None
             )
@@ -16704,6 +16831,15 @@ class EnvironmentPrior:
                 rollout_reinforce_one = self.last_rollout_reinforce
                 if isinstance(rollout_reinforce_one, dict) and torch.is_tensor(rollout_reinforce_one.get("log_probs", None)):
                     reinforce_log_probs[:, b] = rollout_reinforce_one["log_probs"].reshape(n_samples)
+                    rollout_log_prob_score_one = rollout_reinforce_one.get("log_prob_score", None)
+                    if torch.is_tensor(rollout_log_prob_score_one):
+                        if reinforce_log_prob_scores is None:
+                            reinforce_log_prob_scores = torch.empty(
+                                (int(rollout_log_prob_score_one.shape[0]), batch_size, int(rollout_log_prob_score_one.shape[-1])),
+                                device=rollout_log_prob_score_one.device,
+                                dtype=rollout_log_prob_score_one.dtype,
+                            )
+                        reinforce_log_prob_scores[:, b:b + 1] = rollout_log_prob_score_one
             if collect_action_trace:
                 rollout_policy_one = self.last_rollout_policy_trace
                 if (
@@ -16826,7 +16962,10 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         self.last_rollout_reinforce = (
-            {"log_probs": reinforce_log_probs}
+            {
+                "log_probs": reinforce_log_probs,
+                "log_prob_score": reinforce_log_prob_scores,
+            }
             if reinforce_log_probs is not None
             else None
         )
@@ -16931,6 +17070,28 @@ class EnvironmentPrior:
                 mask_t = mask_t.unsqueeze(0)
             log_prob_per_dim = log_prob_per_dim * mask_t
         return log_prob_per_dim.sum(dim=-1)
+
+    @staticmethod
+    def _reinforce_log_prob_score_wrt_action_mean(pre_tanh_action, action_mean, action_std, *, mask=None, eps=1e-6):
+        if pre_tanh_action.shape != action_mean.shape:
+            raise ValueError(
+                "pre_tanh_action and action_mean must have identical shape, "
+                f"got {tuple(pre_tanh_action.shape)} and {tuple(action_mean.shape)}"
+            )
+        std = action_std
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+        std = std.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+        while std.ndim < pre_tanh_action.ndim:
+            std = std.unsqueeze(-1)
+        std = std.expand_as(pre_tanh_action).clamp_min(float(max(1e-12, eps)))
+        score = (pre_tanh_action - action_mean) / std.square()
+        if mask is not None:
+            mask_t = mask.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+            while mask_t.ndim < score.ndim:
+                mask_t = mask_t.unsqueeze(0)
+            score = score * mask_t
+        return score
 
     @staticmethod
     def _returns_to_go(rewards, discount):
@@ -17311,6 +17472,7 @@ class EnvironmentPrior:
         log_probs,
         action_mean,
         action_mask=None,
+        log_prob_score=None,
         discount=None,
         variance_eps=None,
     ):
@@ -17400,9 +17562,23 @@ class EnvironmentPrior:
                     "grouped action_mask must align with rewards on (T, B), "
                     f"got {tuple(action_mask.shape[:2])} and {tuple(rewards.shape)}"
                 )
+        if log_prob_score is not None:
+            if tuple(log_prob_score.shape[:2]) != tuple(rewards.shape):
+                raise ValueError(
+                    "log_prob_score must align with rewards on (T, B), "
+                    f"got {tuple(log_prob_score.shape[:2])} and {tuple(rewards.shape)}"
+                )
+            if tuple(log_prob_score.shape) != tuple(action_mask.shape):
+                raise ValueError(
+                    "log_prob_score must match action_mask shape, "
+                    f"got {tuple(log_prob_score.shape)} and {tuple(action_mask.shape)}"
+                )
         if variance_eps is None:
             variance_eps = self._resolve_alpha_grad_variance_eps(self.config)
         variance_eps = float(max(variance_eps, 0.0))
+        if discount is None:
+            discount = self._resolve_scalar(self.config.get("discount", 1.0))
+        discount = float(max(0.0, min(1.0, discount)))
 
         first_loss, first_stats = self.first_policy_gradient_loss_from_rewards(rewards)
         reinforce_loss, reinforce_stats = self.reinforce_loss_from_rewards(
@@ -17429,6 +17605,16 @@ class EnvironmentPrior:
                 part if part is not None else torch.zeros_like(inp)
                 for part, inp in zip(grad_parts, grad_inputs)
             )
+
+        g0_analytic = None
+        if log_prob_score is not None:
+            returns = self._returns_to_go(rewards, discount=discount)
+            baseline = self._leave_one_out_baseline(returns).detach()
+            advantages = (returns - baseline).detach()
+            g0_analytic = (
+                -advantages.unsqueeze(-1).to(dtype=log_prob_score.dtype, device=log_prob_score.device)
+                * log_prob_score.detach()
+            ) / float(max(1, rewards.numel()))
 
         if action_group_entries is not None:
             root_records = []
@@ -17457,12 +17643,16 @@ class EnvironmentPrior:
             if not flat_roots:
                 raise RuntimeError("alpha_grad rollout did not preserve differentiable action roots")
             g1_parts = _grad_parts_or_zeros(first_loss, flat_roots)
-            g0_parts = _grad_parts_or_zeros(reinforce_loss, flat_roots)
             g_shape = tuple(action_mask.shape)
             g_dtype = flat_roots[0].dtype
             g_device = flat_roots[0].device
             g1 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
-            g0 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+            if g0_analytic is not None:
+                g0 = g0_analytic.to(device=g_device, dtype=g_dtype)
+                g0_parts = (None,) * len(root_records)
+            else:
+                g0 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+                g0_parts = _grad_parts_or_zeros(reinforce_loss, flat_roots)
             for (t_idx, group_indices, root_orig, root_view), g1_part, g0_part in zip(root_records, g1_parts, g0_parts):
                 width = int(root_view.shape[-1])
                 if width > int(g1.shape[-1]):
@@ -17474,26 +17664,33 @@ class EnvironmentPrior:
                     g0_part = g0_part.unsqueeze(0)
                 if g1_part is not None:
                     g1[t_idx, idx_list, :width] = g1_part
-                if g0_part is not None:
+                if (g0_analytic is None) and (g0_part is not None):
                     g0[t_idx, idx_list, :width] = g0_part
         elif action_mean_inputs is None:
             g1 = _grad_parts_or_zeros(first_loss, (action_mean,))[0]
-            g0 = _grad_parts_or_zeros(reinforce_loss, (action_mean,))[0]
+            if g0_analytic is not None:
+                g0 = g0_analytic.to(device=action_mean.device, dtype=action_mean.dtype)
+            else:
+                g0 = _grad_parts_or_zeros(reinforce_loss, (action_mean,))[0]
         else:
             g1_parts = _grad_parts_or_zeros(first_loss, action_mean_inputs)
-            g0_parts = _grad_parts_or_zeros(reinforce_loss, action_mean_inputs)
             g1 = torch.stack(
                 list(g1_parts),
                 dim=0,
             )
-            g0 = torch.stack(
-                list(g0_parts),
-                dim=0,
-            )
             if g1.ndim == 2:
                 g1 = g1.unsqueeze(1)
-            if g0.ndim == 2:
-                g0 = g0.unsqueeze(1)
+            if g0_analytic is not None:
+                root0 = action_mean_inputs[0]
+                g0 = g0_analytic.to(device=root0.device, dtype=root0.dtype)
+            else:
+                g0_parts = _grad_parts_or_zeros(reinforce_loss, action_mean_inputs)
+                g0 = torch.stack(
+                    list(g0_parts),
+                    dim=0,
+                )
+                if g0.ndim == 2:
+                    g0 = g0.unsqueeze(1)
 
         g1_det = g1.detach().to(dtype=torch.float32)
         g0_det = g0.detach().to(dtype=torch.float32)
@@ -17719,6 +17916,7 @@ class EnvironmentPrior:
                     log_probs=reinforce_rollout["log_probs"],
                     action_mean=action_mean_inputs,
                     action_mask=policy_trace["action_mask"],
+                    log_prob_score=reinforce_rollout.get("log_prob_score", None),
                     discount=discount,
                 )
             else:
@@ -18353,6 +18551,7 @@ class EnvironmentPrior:
                     log_probs=reinforce_window["log_probs"],
                     action_mean=action_mean_inputs,
                     action_mask=policy_trace_window["action_mask"],
+                    log_prob_score=reinforce_window.get("log_prob_score", None),
                     discount=discount,
                 )
             else:
