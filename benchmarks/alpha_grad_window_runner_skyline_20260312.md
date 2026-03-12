@@ -365,3 +365,58 @@ Interpretation:
 - The measured win lands exactly where expected: strict SCM shared forward, not policy forward and not `g1` sink backward.
 - GPU memory is unchanged within noise.
 - This is a semantics-safe shared optimization that benefits both `first_policy_gradient` and `alpha_grad`.
+
+## Accepted: cache strict-SCM runtime tensors inside the joint transition closure
+
+Hypothesis:
+
+- After the accepted rowwise-noise planning change, `transition_other` still contained a measurable shared-forward head from repeated `.to(...)` materialization inside the strict SCM joint transition closure.
+- If those runtime tensors are cached once per `(device, dtype)` at builder scope, the shared forward path should improve without changing rollout, `g0`, `g1`, or SCM semantics.
+
+Evidence before touching code:
+
+- Risky-load `first_policy_gradient` split after the rowwise-noise change still showed:
+  - `transition_generator_s ≈ 89.17s`
+  - `rowwise_noise_plan_s ≈ 30.60s`
+  - `hidden_update_grad_fused_s ≈ 25.05s`
+  - `tensor_to_s ≈ 9.00s` over `1,156,096` calls
+  - `transition_residual_s ≈ 16.96s`
+- This singled out repeated runtime tensor/materialization churn as the next safest shared head to attack.
+
+Implementation:
+
+- Add a closure-level cache in `_build_reference_scm_joint_transition_padded_batch_fn(...)`, keyed by `(device, dtype)`
+- Precompute and reuse:
+  - first affine weights/biases
+  - hidden weights/biases/noise-scale stacks
+  - hidden masks and activation masks
+  - prefix/tile metadata tensors used by the strict SCM layer-step helpers
+- Leave all stochastic paths, `g0/g1`, and SCM math unchanged
+
+Focused checks:
+
+- `strict_reference_scm_hidden_update_grad_fused_matches_unfused_on_cuda`
+- `rowwise_scaled_noise_with_plan_matches_unplanned_on_cuda`
+- `alpha_grad_rollout_gradients_are_finite`
+- `alpha_grad` TBPTT checkpoint subset
+- `test_mlp_prior.py`
+
+Risky-load evidence, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`:
+
+| objective | before wall (s) | after wall (s) | delta | before peak alloc (MiB) | after peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 255.523 | 250.071 | -5.452 | 1113.661 | 1113.661 | +0.000 |
+| `alpha_grad` | 344.818 | 339.817 | -5.001 | 1119.777 | 1119.777 | +0.000 |
+
+In-situ risky-load split for `first_policy_gradient` after the change:
+
+- `transition_generator_s: 89.170 -> 81.944s`
+- `tensor_to_s: 9.00 -> 7.40s`
+- `tensor_to_calls: 1,156,096 -> 538,204`
+- `policy_step_s: 52.30s` unchanged within noise
+
+Interpretation:
+
+- The win is shared-forward only and lands where the profiler predicted.
+- GPU memory is flat within noise; no new host-memory pressure was introduced.
+- This is a semantics-safe runtime-cache cleanup, not a mathematical change.

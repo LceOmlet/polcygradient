@@ -3129,6 +3129,33 @@ class EnvironmentPrior:
             hidden_prefix_out_tile_batch.append(out_tile_batch)
             hidden_prefix_out_tile_offsets.append(out_tile_offsets)
         hidden_noise_stack_present = bool(torch.any(hidden_noise_scale_stack > 0).item())
+        runtime_tensor_cache = {}
+
+        def _get_runtime_cached(device_obj, dtype_obj):
+            cache_key = (str(device_obj), str(dtype_obj))
+            cached = runtime_tensor_cache.get(cache_key, None)
+            if cached is not None:
+                return cached
+            cached = {
+                "first_bias_runtime": first_bias.to(device=device_obj, dtype=dtype_obj),
+                "first_weight_runtime": first_weight.to(device=device_obj, dtype=dtype_obj),
+                "first_weight_packed_runtime": None if first_weight_packed is None else first_weight_packed.to(device=device_obj, dtype=dtype_obj),
+                "hidden_weights_stack_runtime": hidden_weights_stack.to(device=device_obj, dtype=dtype_obj),
+                "hidden_biases_stack_runtime": hidden_biases_stack.to(device=device_obj, dtype=dtype_obj),
+                "hidden_noise_scale_stack_runtime": hidden_noise_scale_stack.to(device=device_obj, dtype=dtype_obj),
+                "hidden_mask_runtime": hidden_mask.to(device=device_obj, dtype=dtype_obj),
+                "hidden_dims_runtime": hidden_dims.to(device=device_obj, dtype=torch.long),
+                "num_hidden_blocks_runtime": num_hidden_blocks.to(device=device_obj, dtype=torch.long),
+                "activation_codes_runtime": activation_codes_t.to(device=device_obj, dtype=torch.long),
+                "activation_relu_mask_runtime": activation_relu_mask.to(device=device_obj),
+                "activation_identity_mask_runtime": activation_identity_mask.to(device=device_obj),
+                "hidden_active_masks_runtime": [mask.to(device=device_obj) for mask in hidden_active_masks],
+                "hidden_prefix_sizes_runtime": [s.to(device=device_obj, dtype=torch.long) for s in hidden_prefix_sizes],
+                "hidden_prefix_out_tile_batch_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_batch],
+                "hidden_prefix_out_tile_offsets_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_offsets],
+            }
+            runtime_tensor_cache[cache_key] = cached
+            return cached
 
         def transition_fn(x, generator=None, generators_for_noise=None, x_input_is_packed=False):
             noise_generators = generators_for_noise
@@ -3136,18 +3163,20 @@ class EnvironmentPrior:
                 noise_generators = [generator] * batch_size
             x_dtype = x.dtype
             x_device = x.device
-            first_bias_runtime = first_bias.to(device=x_device, dtype=x_dtype)
+            runtime_cached = _get_runtime_cached(x_device, x_dtype)
+            first_bias_runtime = runtime_cached["first_bias_runtime"]
+            first_weight_runtime = runtime_cached["first_weight_runtime"]
             first_weight_packed_runtime = (
-                first_weight.to(device=x_device, dtype=x_dtype)
-                if first_weight_packed is None
-                else first_weight_packed.to(device=x_device, dtype=x_dtype)
+                first_weight_runtime
+                if runtime_cached["first_weight_packed_runtime"] is None
+                else runtime_cached["first_weight_packed_runtime"]
             )
-            hidden_weights_stack_runtime = hidden_weights_stack.to(device=x_device, dtype=x_dtype)
-            hidden_biases_stack_runtime = hidden_biases_stack.to(device=x_device, dtype=x_dtype)
-            hidden_noise_scale_stack_runtime = hidden_noise_scale_stack.to(device=x_device, dtype=x_dtype)
-            hidden_dims_runtime = hidden_dims.to(device=x_device, dtype=torch.long)
-            num_hidden_blocks_runtime = num_hidden_blocks.to(device=x_device, dtype=torch.long)
-            activation_codes_runtime = activation_codes_t.to(device=x_device, dtype=torch.long)
+            hidden_weights_stack_runtime = runtime_cached["hidden_weights_stack_runtime"]
+            hidden_biases_stack_runtime = runtime_cached["hidden_biases_stack_runtime"]
+            hidden_noise_scale_stack_runtime = runtime_cached["hidden_noise_scale_stack_runtime"]
+            hidden_dims_runtime = runtime_cached["hidden_dims_runtime"]
+            num_hidden_blocks_runtime = runtime_cached["num_hidden_blocks_runtime"]
+            activation_codes_runtime = runtime_cached["activation_codes_runtime"]
             hidden_noise_eps_all = None
             hidden_noise_bytes = int(hidden_noise_scale_stack_runtime.numel() * hidden_noise_scale_stack_runtime.element_size())
             if (
@@ -3213,19 +3242,19 @@ class EnvironmentPrior:
                 x_in = x[:, :in_cap] * input_mask_t.to(device=x_device, dtype=x_dtype)
                 z = self._batch_affine(
                     x_in,
-                    first_weight.to(device=x_device, dtype=x_dtype),
+                    first_weight_runtime,
                     first_bias_runtime,
                 )
-            hidden_mask_runtime = hidden_mask.to(device=z.device, dtype=z.dtype)
-            activation_relu_mask_runtime = activation_relu_mask.to(device=z.device)
-            activation_identity_mask_runtime = activation_identity_mask.to(device=z.device)
-            hidden_active_masks_runtime = [mask.to(device=z.device) for mask in hidden_active_masks]
+            hidden_mask_runtime = runtime_cached["hidden_mask_runtime"]
+            activation_relu_mask_runtime = runtime_cached["activation_relu_mask_runtime"]
+            activation_identity_mask_runtime = runtime_cached["activation_identity_mask_runtime"]
+            hidden_active_masks_runtime = runtime_cached["hidden_active_masks_runtime"]
             hidden_weights_runtime = [hidden_weights_stack_runtime[:, layer_idx, :, :] for layer_idx in range(max_hidden_blocks)]
             hidden_biases_runtime = [hidden_biases_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
             hidden_noise_scales_runtime = [hidden_noise_scale_stack_runtime[:, layer_idx, :] for layer_idx in range(max_hidden_blocks)]
-            hidden_prefix_sizes_runtime = [s.to(device=z.device, dtype=torch.long) for s in hidden_prefix_sizes]
-            hidden_prefix_out_tile_batch_runtime = [t.to(device=z.device, dtype=torch.int32) for t in hidden_prefix_out_tile_batch]
-            hidden_prefix_out_tile_offsets_runtime = [t.to(device=z.device, dtype=torch.int32) for t in hidden_prefix_out_tile_offsets]
+            hidden_prefix_sizes_runtime = runtime_cached["hidden_prefix_sizes_runtime"]
+            hidden_prefix_out_tile_batch_runtime = runtime_cached["hidden_prefix_out_tile_batch_runtime"]
+            hidden_prefix_out_tile_offsets_runtime = runtime_cached["hidden_prefix_out_tile_offsets_runtime"]
             z = z * hidden_mask_runtime
             layer_step_runner_without_noise = self._get_reference_scm_layer_step_runner(
                 batch_size=batch_size,
