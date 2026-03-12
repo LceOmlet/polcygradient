@@ -17804,6 +17804,1064 @@ class EnvironmentPrior:
         }
         return loss, stats
 
+    def _rollout_alpha_grad_family_tbptt_windowed_loss(
+        self,
+        *,
+        policy_step_fn,
+        batch_size,
+        n_samples,
+        num_features,
+        device,
+        epoch=None,
+        single_eval_pos=None,
+        discount=None,
+        collect_x=False,
+        tbptt_window=None,
+        tbptt_loss_sink=None,
+        h_list_override=None,
+        env_seeds_override=None,
+        rollout_seeds_override=None,
+    ):
+        del epoch, num_features
+        if collect_x:
+            raise ValueError("alpha family TBPTT window runner only supports collect_x=False")
+        n_samples = int(n_samples)
+        batch_size = int(batch_size)
+        single_eval_pos = self._sample_single_eval_pos(int(n_samples), single_eval_pos)
+        if tbptt_window is None:
+            raise ValueError("alpha family TBPTT window runner requires an active tbptt_window")
+        tbptt_window_size = int(tbptt_window)
+        if tbptt_window_size <= 0 or tbptt_window_size >= n_samples:
+            raise ValueError("alpha family TBPTT window runner requires 0 < tbptt_window < n_samples")
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        self.clear_rollout_artifacts()
+
+        if h_list_override is not None:
+            if len(h_list_override) != batch_size:
+                raise ValueError("h_list_override length must match batch_size")
+            h_list = list(h_list_override)
+        else:
+            h_list = self._sample_batch_hypers(batch_size)
+        if env_seeds_override is not None:
+            if len(env_seeds_override) != batch_size:
+                raise ValueError("env_seeds_override length must match batch_size")
+            env_seeds = [int(s) for s in env_seeds_override]
+        else:
+            env_seeds = None
+        if rollout_seeds_override is not None:
+            if len(rollout_seeds_override) != batch_size:
+                raise ValueError("rollout_seeds_override length must match batch_size")
+            rollout_seeds = [int(s) for s in rollout_seeds_override]
+        else:
+            rollout_seeds = None
+
+        h_list_effective = []
+        for h in h_list:
+            h_eff = dict(h)
+            if bool(h_eff.get("reward_dropout_enabled", True)) and bool(h_eff.get("reward_dropout_randomize", True)):
+                sampled_ratio = float(self._sample_reward_dropout_ratio(h_eff))
+                h_eff["reward_dropout_randomize"] = False
+                h_eff["reward_dropout_ratio"] = sampled_ratio
+            h_list_effective.append(h_eff)
+
+        family_groups = {}
+        transition_inner_grouping = str(getattr(self, "transition_inner_grouping", "family")).strip().lower()
+        if transition_inner_grouping not in {"family", "structure", "pow2", "pow2_no_depth"}:
+            transition_inner_grouping = "family"
+        transition_inner_min_bucket = int(max(0, int(getattr(self, "transition_inner_min_bucket", 0) or 0)))
+        for bi, h in enumerate(h_list_effective):
+            family = self._normalize_family(h.get("family", "scm"))
+            sig = (family, bool(self._resolve_reference_semantics_enabled(h)))
+            family_groups.setdefault(sig, []).append((bi, h))
+
+        rollout_generators = self._make_generators_from_seeds(rollout_seeds, batch_size, device)
+
+        state_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        obs_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        action_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        noise_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        zero_pad_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        obs_slot_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+        action_slot_dims = torch.empty((batch_size,), device=device, dtype=torch.long)
+
+        init_state_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        init_action_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_noise_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        action_noise_train_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        action_noise_eval_std = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reward_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reward_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_action_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_input_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_full_rms_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_full_rms_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_highway_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_highway_lambda = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reward_dropout_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        reward_dropout_impute_zero = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        reward_dropout_ratio = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reference_semantics = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        family_list = [None] * batch_size
+
+        transition_groups = []
+        for family_group in family_groups.values():
+            transition_bucket_groups = {}
+            balanced_bucket_count = self._resolve_transition_balanced_bucket_count(transition_inner_grouping)
+            if balanced_bucket_count is not None:
+                raw_transition_bucket_groups = self._build_balanced_transition_bucket_groups(
+                    family_group=family_group,
+                    bucket_count=balanced_bucket_count,
+                )
+                if transition_inner_min_bucket > 1:
+                    family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                    merged_family_bucket = []
+                    for sig, bucket_group in raw_transition_bucket_groups.items():
+                        if len(bucket_group) >= transition_inner_min_bucket:
+                            transition_bucket_groups[sig] = bucket_group
+                        else:
+                            merged_family_bucket.extend(bucket_group)
+                    if merged_family_bucket:
+                        transition_bucket_groups[(family, "__fallback__")] = merged_family_bucket
+                else:
+                    transition_bucket_groups = raw_transition_bucket_groups
+            elif transition_inner_grouping != "family":
+                raw_transition_bucket_groups = {}
+                for global_idx, h in family_group:
+                    sig = self._environment_transition_bucket_signature(h, transition_inner_grouping)
+                    raw_transition_bucket_groups.setdefault(sig, []).append((global_idx, h))
+                if transition_inner_min_bucket > 1:
+                    family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                    merged_family_bucket = []
+                    for sig, bucket_group in raw_transition_bucket_groups.items():
+                        if len(bucket_group) >= transition_inner_min_bucket:
+                            transition_bucket_groups[sig] = bucket_group
+                        else:
+                            merged_family_bucket.extend(bucket_group)
+                    if merged_family_bucket:
+                        transition_bucket_groups[(family, "__fallback__")] = merged_family_bucket
+                else:
+                    transition_bucket_groups = raw_transition_bucket_groups
+            else:
+                family = self._normalize_family(family_group[0][1].get("family", "scm"))
+                transition_bucket_groups[(family,)] = list(family_group)
+
+            for group in transition_bucket_groups.values():
+                group_indices = [idx for idx, _ in group]
+                group_h_list = [h for _, h in group]
+                group_env_seeds = [env_seeds[idx] for idx in group_indices] if env_seeds is not None else None
+                env_batch = self._sample_environment_family_coarse_batch(
+                    h_list=group_h_list,
+                    device=device,
+                    rng_seeds=group_env_seeds,
+                    build_x_generator=True,
+                    build_y_generator=True,
+                    build_policy_generator=False,
+                    prefer_transition_only=False,
+                    preserve_skipped_generator_rng=True,
+                )
+                group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
+                group_bs = int(group_idx.numel())
+
+                state_dims_group = env_batch.get("state_dim_per_sample", None)
+                obs_dims_group = env_batch.get("obs_dim_per_sample", None)
+                action_dims_group = env_batch.get("action_dim_per_sample", None)
+                noise_dims_group = env_batch.get("noise_dim_per_sample", None)
+                zero_pad_dims_group = env_batch.get("zero_pad_dim_per_sample", None)
+                obs_slot_dims_group = env_batch.get("obs_slot_dim_per_sample", None)
+                action_slot_dims_group = env_batch.get("action_slot_dim_per_sample", None)
+                if state_dims_group is None:
+                    state_dims_group = torch.full((group_bs,), int(env_batch["state_dim"]), device=device, dtype=torch.long)
+                if obs_dims_group is None:
+                    obs_dims_group = torch.full((group_bs,), int(env_batch["obs_dim"]), device=device, dtype=torch.long)
+                if action_dims_group is None:
+                    action_dims_group = torch.full((group_bs,), int(env_batch["action_dim"]), device=device, dtype=torch.long)
+                if noise_dims_group is None:
+                    noise_dims_group = torch.full((group_bs,), int(env_batch["noise_dim"]), device=device, dtype=torch.long)
+                if zero_pad_dims_group is None:
+                    zero_pad_dims_group = torch.full((group_bs,), int(env_batch["zero_pad_dim"]), device=device, dtype=torch.long)
+                if obs_slot_dims_group is None:
+                    obs_slot_dims_group = torch.full((group_bs,), int(env_batch["obs_slot_dim"]), device=device, dtype=torch.long)
+                if action_slot_dims_group is None:
+                    action_slot_dims_group = torch.full((group_bs,), int(env_batch["action_slot_dim"]), device=device, dtype=torch.long)
+
+                state_dim_g = int(state_dims_group.max().item())
+                obs_dim_g = int(obs_dims_group.max().item())
+                action_dim_g = int(action_dims_group.max().item())
+                noise_dim_g = int(noise_dims_group.max().item())
+                zero_pad_dim_g = int(zero_pad_dims_group.max().item())
+
+                state_dims[group_idx] = state_dims_group
+                obs_dims[group_idx] = obs_dims_group
+                action_dims[group_idx] = action_dims_group
+                noise_dims[group_idx] = noise_dims_group
+                zero_pad_dims[group_idx] = zero_pad_dims_group
+                obs_slot_dims[group_idx] = obs_slot_dims_group
+                action_slot_dims[group_idx] = action_slot_dims_group
+                init_state_std[group_idx] = env_batch["init_state_std"]
+                init_action_std[group_idx] = env_batch["init_action_std"]
+                state_noise_std[group_idx] = env_batch["state_noise_std"]
+                action_noise_train_std[group_idx] = env_batch["action_noise_train_std"]
+                action_noise_eval_std[group_idx] = env_batch["action_noise_eval_std"]
+                reward_scale[group_idx] = env_batch["reward_scale"]
+                reward_clip[group_idx] = env_batch["reward_clip"]
+                reinforce_reward_rms_eps[group_idx] = env_batch["reinforce_reward_rms_eps"]
+                reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
+                reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
+                reinforce_action_rms_eps[group_idx] = env_batch["reinforce_action_rms_eps"]
+                alpha[group_idx] = env_batch["alpha"]
+                state_clip[group_idx] = env_batch["state_clip"]
+                state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
+                state_input_scale[group_idx] = env_batch["state_input_scale"]
+                state_full_rms_enabled[group_idx] = env_batch["state_full_rms_enabled"]
+                state_full_rms_target[group_idx] = env_batch["state_full_rms_target"]
+                state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
+                state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
+                reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
+                reward_dropout_impute_zero[group_idx] = env_batch["reward_dropout_impute_zero"]
+                reward_dropout_ratio[group_idx] = env_batch["reward_dropout_ratio"]
+                ref_value = env_batch.get("reference_semantics_enabled", False)
+                if torch.is_tensor(ref_value):
+                    reference_semantics[group_idx] = ref_value.to(device=device, dtype=torch.bool)
+                else:
+                    reference_semantics[group_idx] = bool(ref_value)
+                for global_idx in group_indices:
+                    family_list[global_idx] = str(env_batch["family"])
+
+                group_rollout_generators = None
+                if rollout_generators is not None:
+                    group_rollout_generators = [rollout_generators[idx] for idx in group_indices]
+                transition_generator = env_batch.get("transition_generator", None)
+                use_fused_transition = bool(callable(transition_generator))
+                reference_semantics_group = env_batch.get("reference_semantics_enabled", False)
+                if torch.is_tensor(reference_semantics_group):
+                    reference_semantics_group = bool(reference_semantics_group.any().item())
+                else:
+                    reference_semantics_group = bool(reference_semantics_group)
+                obs_input_dims_group = env_batch.get("env_obs_input_dim_per_sample", obs_dims_group)
+                if not torch.is_tensor(obs_input_dims_group):
+                    obs_input_dims_group = torch.as_tensor(obs_input_dims_group, device=device, dtype=torch.long)
+                obs_input_dim_g = int(obs_input_dims_group.max().item()) if int(obs_input_dims_group.numel()) > 0 else 0
+                group_env_total_dim = state_dim_g + obs_input_dim_g + action_dim_g + noise_dim_g + zero_pad_dim_g
+                packed_input_enabled = bool(
+                    use_fused_transition
+                    and bool(getattr(transition_generator, "_prefers_packed_env_input", False))
+                )
+                packed_input_cap = int(
+                    max(
+                        1,
+                        int(
+                            getattr(
+                                transition_generator,
+                                "_packed_input_cap",
+                                int((state_dims_group + obs_input_dims_group + action_dims_group + noise_dims_group).max().item()),
+                            )
+                        ),
+                    )
+                )
+                packed_state_mask = None
+                packed_obs_rows = None
+                packed_obs_dst_cols = None
+                packed_obs_src_cols = None
+                packed_action_rows = None
+                packed_action_dst_cols = None
+                packed_action_src_cols = None
+                packed_noise_rows = None
+                packed_noise_dst_cols = None
+                packed_noise_src_cols = None
+                packed_input_buf = None
+                if packed_input_enabled:
+                    state_cols = torch.arange(state_dim_g, device=device, dtype=torch.long).unsqueeze(0)
+                    packed_state_mask = (state_cols < state_dims_group.unsqueeze(1)).to(dtype=torch.float32)
+                    packed_obs_rows, packed_obs_dst_cols, packed_obs_src_cols = self._build_segment_write_map(
+                        state_dims_group,
+                        obs_input_dims_group,
+                        obs_input_dim_g,
+                    )
+                    packed_action_rows, packed_action_dst_cols, packed_action_src_cols = self._build_segment_write_map(
+                        state_dims_group + obs_input_dims_group,
+                        action_dims_group,
+                        action_dim_g,
+                    )
+                    packed_noise_rows, packed_noise_dst_cols, packed_noise_src_cols = self._build_segment_write_map(
+                        state_dims_group + obs_input_dims_group + action_dims_group,
+                        noise_dims_group,
+                        noise_dim_g,
+                    )
+                    packed_input_buf = torch.zeros((group_bs, packed_input_cap), device=device, dtype=torch.float32)
+
+                transition_groups.append(
+                    {
+                        "indices": group_idx,
+                        "env": env_batch,
+                        "batch_size": group_bs,
+                        "state_dim": state_dim_g,
+                        "obs_dim": obs_dim_g,
+                        "action_dim": action_dim_g,
+                        "noise_dim": noise_dim_g,
+                        "reference_semantics_enabled": reference_semantics_group,
+                        "env_obs_start": (state_dim_g if obs_input_dim_g > 0 else None),
+                        "env_action_start": state_dim_g + obs_input_dim_g,
+                        "env_noise_start": state_dim_g + obs_input_dim_g + action_dim_g,
+                        "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
+                        "state_input_scale_view": state_input_scale[group_idx],
+                        "packed_input_enabled": packed_input_enabled,
+                        "packed_input": packed_input_buf,
+                        "packed_state_mask": packed_state_mask,
+                        "packed_obs_rows": packed_obs_rows,
+                        "packed_obs_dst_cols": packed_obs_dst_cols,
+                        "packed_obs_src_cols": packed_obs_src_cols,
+                        "packed_action_rows": packed_action_rows,
+                        "packed_action_dst_cols": packed_action_dst_cols,
+                        "packed_action_src_cols": packed_action_src_cols,
+                        "packed_noise_rows": packed_noise_rows,
+                        "packed_noise_dst_cols": packed_noise_dst_cols,
+                        "packed_noise_src_cols": packed_noise_src_cols,
+                        "rollout_generators": group_rollout_generators,
+                        "reward_scale_view": reward_scale[group_idx],
+                        "alpha_view": alpha[group_idx].unsqueeze(1),
+                        "transition_generator": transition_generator,
+                        "use_fused_transition": use_fused_transition,
+                    }
+                )
+
+        identity_perm = torch.arange(batch_size, device=device, dtype=torch.long)
+        perm = torch.cat([g["indices"] for g in transition_groups], dim=0)
+        if int(perm.numel()) != batch_size:
+            raise RuntimeError("alpha family TBPTT internal permutation size mismatch")
+        keep_policy_order = bool(len(transition_groups) > 2)
+        needs_unpermute = False
+        inv_perm = identity_perm
+        if (not keep_policy_order) and (not bool(torch.equal(perm, identity_perm))):
+            needs_unpermute = True
+            inv_perm = torch.empty_like(perm)
+            inv_perm.scatter_(0, perm, identity_perm)
+            perm_cpu = perm.detach().cpu().tolist()
+            state_dims = state_dims.index_select(0, perm)
+            obs_dims = obs_dims.index_select(0, perm)
+            action_dims = action_dims.index_select(0, perm)
+            noise_dims = noise_dims.index_select(0, perm)
+            zero_pad_dims = zero_pad_dims.index_select(0, perm)
+            obs_slot_dims = obs_slot_dims.index_select(0, perm)
+            action_slot_dims = action_slot_dims.index_select(0, perm)
+            init_state_std = init_state_std.index_select(0, perm)
+            init_action_std = init_action_std.index_select(0, perm)
+            state_noise_std = state_noise_std.index_select(0, perm)
+            action_noise_train_std = action_noise_train_std.index_select(0, perm)
+            action_noise_eval_std = action_noise_eval_std.index_select(0, perm)
+            reward_scale = reward_scale.index_select(0, perm)
+            reward_clip = reward_clip.index_select(0, perm)
+            reinforce_reward_rms_eps = reinforce_reward_rms_eps.index_select(0, perm)
+            reinforce_reward_tanh_c = reinforce_reward_tanh_c.index_select(0, perm)
+            reinforce_reward_tanh_bound = reinforce_reward_tanh_bound.index_select(0, perm)
+            reinforce_action_rms_eps = reinforce_action_rms_eps.index_select(0, perm)
+            alpha = alpha.index_select(0, perm)
+            state_clip = state_clip.index_select(0, perm)
+            state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
+            state_input_scale = state_input_scale.index_select(0, perm)
+            state_full_rms_enabled = state_full_rms_enabled.index_select(0, perm)
+            state_full_rms_target = state_full_rms_target.index_select(0, perm)
+            state_highway_enabled = state_highway_enabled.index_select(0, perm)
+            state_highway_lambda = state_highway_lambda.index_select(0, perm)
+            reward_dropout_enabled = reward_dropout_enabled.index_select(0, perm)
+            reward_dropout_impute_zero = reward_dropout_impute_zero.index_select(0, perm)
+            reward_dropout_ratio = reward_dropout_ratio.index_select(0, perm)
+            reference_semantics = reference_semantics.index_select(0, perm)
+            family_list = [family_list[int(i)] for i in perm_cpu]
+            if rollout_generators is not None:
+                rollout_generators = [rollout_generators[int(i)] for i in perm_cpu]
+
+        group_cursor = 0
+        for group in transition_groups:
+            group_bs = int(group["indices"].numel())
+            group["start"] = int(group_cursor)
+            group["end"] = int(group_cursor + group_bs)
+            if (not keep_policy_order) and rollout_generators is not None:
+                group["rollout_generators"] = rollout_generators[group_cursor: group_cursor + group_bs]
+            elif not keep_policy_order:
+                group["rollout_generators"] = None
+            group_cursor += group_bs
+        if group_cursor != batch_size:
+            raise RuntimeError("alpha family TBPTT internal subgroup cursor mismatch")
+
+        max_state_dim = int(state_dims.max().item())
+        max_obs_dim = int(obs_dims.max().item())
+        max_action_dim = int(action_dims.max().item())
+        max_noise_dim = int(noise_dims.max().item())
+
+        for group in transition_groups:
+            if keep_policy_order:
+                group["slice"] = None
+                group["reward_scale_view"] = reward_scale.index_select(0, group["indices"])
+                group["alpha_view"] = alpha.index_select(0, group["indices"]).unsqueeze(1)
+            else:
+                start = int(group["start"])
+                end = int(group["end"])
+                group["slice"] = slice(start, end)
+                group["reward_scale_view"] = reward_scale[start:end]
+                group["alpha_view"] = alpha[start:end].unsqueeze(1)
+
+        state_idx = torch.arange(max_state_dim, device=device, dtype=torch.long)
+        obs_idx = torch.arange(max_obs_dim, device=device, dtype=torch.long)
+        action_idx = torch.arange(max_action_dim, device=device, dtype=torch.long)
+        noise_idx = torch.arange(max_noise_dim, device=device, dtype=torch.long)
+        state_mask = (state_idx.unsqueeze(0) < state_dims.unsqueeze(1)).to(dtype=torch.float32)
+        obs_mask = (obs_idx.unsqueeze(0) < obs_dims.unsqueeze(1)).to(dtype=torch.float32)
+        action_mask = (action_idx.unsqueeze(0) < action_dims.unsqueeze(1)).to(dtype=torch.float32)
+        noise_mask = (noise_idx.unsqueeze(0) < noise_dims.unsqueeze(1)).to(dtype=torch.float32)
+        action_mask_bool = action_mask.to(dtype=torch.bool)
+        dropout_active = reward_dropout_enabled & (reward_dropout_ratio > 0.0)
+
+        state_t = self._stack_randn_with_generators(
+            rollout_generators,
+            (batch_size, max_state_dim),
+            device=device,
+            dtype=torch.float32,
+        ) * init_state_std[:, None]
+        state_t = state_t * state_mask
+        action_t = self._stack_randn_with_generators(
+            rollout_generators,
+            (batch_size, max_action_dim),
+            device=device,
+            dtype=torch.float32,
+        ) * init_action_std[:, None]
+        action_t = action_t * action_mask
+        reward_t = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        reward_mask_t = torch.ones((batch_size,), device=device, dtype=torch.float32)
+        cache = None
+
+        strict_seed_mode = rollout_generators is not None
+        noise_block_size = 0
+        noise_streaming_mode = False
+        noise_block_start = 0
+        noise_block_end = 0
+        transition_noise_block = None
+        action_noise_train_block = None
+        action_noise_eval_block = None
+        state_noise_block = None
+        dropout_draws_block = None
+        if not strict_seed_mode:
+            noise_block_size = self._resolve_rollout_noise_block_size(n_samples)
+            noise_streaming_mode = bool(noise_block_size > 0)
+
+        transition_noise = None
+        action_noise_train = None
+        action_noise_eval = None
+        state_noise = None
+        dropout_draws = None
+
+        def _refresh_noise_block(block_start_idx):
+            nonlocal noise_block_start, noise_block_end
+            nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
+            nonlocal state_noise_block, dropout_draws_block
+            block_start_idx = int(block_start_idx)
+            block_len = int(min(noise_block_size, n_samples - block_start_idx))
+            noise_block_start = block_start_idx
+            noise_block_end = block_start_idx + block_len
+            transition_noise_block = self._stack_randn_with_generators(
+                rollout_generators,
+                (batch_size, block_len, max_noise_dim),
+                device=device,
+                dtype=torch.float32,
+            ).transpose(0, 1) * noise_mask.unsqueeze(0)
+            if torch.any(action_noise_train_std > 0):
+                action_noise_train_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            else:
+                action_noise_train_block = None
+            if torch.any(action_noise_eval_std > 0):
+                action_noise_eval_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            else:
+                action_noise_eval_block = None
+            if torch.any(state_noise_std > 0):
+                state_noise_block = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len, max_state_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * state_mask.unsqueeze(0)
+            else:
+                state_noise_block = None
+            if torch.any(dropout_active):
+                dropout_draws_block = self._stack_rand_with_generators(
+                    rollout_generators,
+                    (batch_size, block_len),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1)
+            else:
+                dropout_draws_block = None
+
+        if noise_streaming_mode:
+            _refresh_noise_block(0)
+        else:
+            transition_noise = self._stack_randn_with_generators(
+                rollout_generators,
+                (batch_size, n_samples, max_noise_dim),
+                device=device,
+                dtype=torch.float32,
+            ).transpose(0, 1) * noise_mask.unsqueeze(0)
+            if torch.any(action_noise_train_std > 0):
+                action_noise_train = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            if torch.any(action_noise_eval_std > 0):
+                action_noise_eval = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_action_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * action_mask.unsqueeze(0)
+            if torch.any(state_noise_std > 0):
+                state_noise = self._stack_randn_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples, max_state_dim),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1) * state_mask.unsqueeze(0)
+            if torch.any(dropout_active):
+                dropout_draws = self._stack_rand_with_generators(
+                    rollout_generators,
+                    (batch_size, n_samples),
+                    device=device,
+                    dtype=torch.float32,
+                ).transpose(0, 1)
+
+        policy_accepts_reward_mask = self._policy_step_accepts_reward_mask(policy_step_fn)
+        env_info = {
+            "family": family_list,
+            "state_dim": state_dims,
+            "obs_dim": obs_dims,
+            "action_dim": int(max_action_dim),
+            "action_dim_per_sample": action_dims,
+            "noise_dim": noise_dims,
+            "zero_pad_dim": zero_pad_dims,
+            "obs_slot_dim": int(obs_slot_dims.max().item()),
+            "action_slot_dim": int(action_slot_dims.max().item()),
+            "reward_dropout_ratio": reward_dropout_ratio,
+            "reward_dropout_enabled": reward_dropout_enabled,
+            "reward_dropout_impute_zero": reward_dropout_impute_zero,
+            "state_input_scale_enabled": state_input_scale_enabled,
+            "state_input_scale": state_input_scale,
+            "state_full_rms_enabled": state_full_rms_enabled,
+            "state_full_rms_target": state_full_rms_target,
+            "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
+            "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
+            "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
+            "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
+            "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
+            "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "state_highway_enabled": state_highway_enabled,
+            "state_highway_lambda": state_highway_lambda,
+        }
+
+        objective_accum = None
+        total_weight = 0.0
+        reward_sum = None
+        reward_sumsq = None
+        reward_count = 0
+        reward_min_accum = None
+        reward_max_accum = None
+        reward_absmax_accum = None
+        reward_clip_hit_accum = None
+        reward_norm_clip_hit_accum = None
+        reward_nonfinite_share_accum = None
+        reward_nan_share_accum = None
+        reward_inf_share_accum = None
+        reinforce_return_nonfinite_share_accum = None
+        reinforce_log_prob_nonfinite_share_accum = None
+        reinforce_adv_nonfinite_share_accum = None
+        weighted_losses = []
+        store_rewards_tensor = (
+            str(os.environ.get("TICL_POLICY_TBPTT_STORE_REWARDS", "0")).strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
+        stored_reward_windows = [] if store_rewards_tensor else None
+
+        first_pg_state_grad_clip_norm = self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
+        first_pg_action_grad_clip_value = self._resolve_first_policy_gradient_action_grad_clip_value(self.config)
+        first_pg_action_grad_clip_norm = self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
+        action_transform_mode = env_info.get("reinforce_action_transform", "rms")
+        action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
+        sample_action = True
+        collect_log_probs = True
+        collect_log_prob_score = True
+
+        for window_start in range(0, n_samples, tbptt_window_size):
+            window_end = min(n_samples, window_start + tbptt_window_size)
+            reward_buffer = []
+            log_prob_buffer = []
+            log_prob_score_buffer = []
+            action_mean_buffer = []
+            action_mask_buffer = []
+            for t in range(window_start, window_end):
+                obs_t = state_t[:, :max_obs_dim] * obs_mask
+                if policy_accepts_reward_mask:
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        reward_mask_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env_info,
+                    )
+                else:
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env_info,
+                    )
+                if isinstance(policy_out, tuple):
+                    action_next, cache = policy_out
+                else:
+                    action_next = policy_out
+                if action_next.ndim == 1:
+                    action_next = action_next.reshape(batch_size, 1)
+                if action_next.ndim != 2 or action_next.shape[0] != batch_size:
+                    raise ValueError(
+                        f"policy action batch mismatch: expected ({batch_size}, {max_action_dim}), got {tuple(action_next.shape)}"
+                    )
+                if action_next.shape[-1] != max_action_dim:
+                    raise ValueError(
+                        f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
+                    )
+                action_mean = action_next
+                action_mean_buffer.append(action_mean)
+                action_mask_buffer.append(action_mask_bool)
+
+                noise_block_idx = None
+                if noise_streaming_mode:
+                    if t >= noise_block_end:
+                        _refresh_noise_block(t)
+                    noise_block_idx = int(t - noise_block_start)
+                if t < single_eval_pos:
+                    if torch.any(action_noise_train_std <= 0):
+                        raise ValueError(
+                            "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
+                        )
+                    if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_train_block[noise_block_idx]
+                    elif action_noise_train is not None:
+                        action_eps_t = action_noise_train[t]
+                    else:
+                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
+                    action_std_t = action_noise_train_std
+                else:
+                    if torch.any(action_noise_eval_std <= 0):
+                        raise ValueError(
+                            "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
+                        )
+                    if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                        action_eps_t = action_noise_eval_block[noise_block_idx]
+                    elif action_noise_eval is not None:
+                        action_eps_t = action_noise_eval[t]
+                    else:
+                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
+                    action_std_t = action_noise_eval_std
+                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
+                action_next = self._transform_reinforce_action(
+                    action_pre_tanh,
+                    mode=action_transform_mode,
+                    rms_eps=action_rms_eps,
+                    mask=action_mask,
+                )
+                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                    action_pre_tanh.detach(),
+                    action_mean,
+                    action_std_t,
+                    action=action_next.detach(),
+                    mask=action_mask,
+                ).detach()
+                reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                    action_pre_tanh.detach(),
+                    action_mean.detach(),
+                    action_std_t,
+                    mask=action_mask,
+                ).detach().to(dtype=torch.float32)
+
+                if noise_streaming_mode and noise_block_idx is not None:
+                    noise_t = transition_noise_block[noise_block_idx]
+                    state_noise_t = None if state_noise_block is None else state_noise_block[noise_block_idx]
+                    dropout_draw_t = None if dropout_draws_block is None else dropout_draws_block[noise_block_idx]
+                else:
+                    noise_t = transition_noise[t]
+                    state_noise_t = None if state_noise is None else state_noise[t]
+                    dropout_draw_t = None if dropout_draws is None else dropout_draws[t]
+
+                reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
+                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+                state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
+                action_env = action_next
+                if first_pg_action_grad_clip_value > 0.0:
+                    action_env = self._clip_tensor_grad_by_value(action_env, max_abs=first_pg_action_grad_clip_value)
+                if first_pg_action_grad_clip_norm > 0.0:
+                    action_env = self._clip_tensor_grad_by_global_norm(action_env, max_norm=first_pg_action_grad_clip_norm)
+
+                for group in transition_groups:
+                    group_slice = group["slice"]
+                    group_indices = group["indices"]
+                    env_g = group["env"]
+                    state_dim_g = int(group["state_dim"])
+                    obs_dim_g = int(group["obs_dim"])
+                    action_dim_g = int(group["action_dim"])
+                    noise_dim_g = int(group["noise_dim"])
+                    if group_slice is None:
+                        state_in = state_t.index_select(0, group_indices)[:, :state_dim_g]
+                        obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
+                        action_in = action_env.index_select(0, group_indices)[:, :action_dim_g]
+                        noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
+                    else:
+                        state_in = state_t[group_slice, :state_dim_g]
+                        obs_in = obs_t[group_slice, :obs_dim_g]
+                        action_in = action_env[group_slice, :action_dim_g]
+                        noise_in = noise_t[group_slice, :noise_dim_g]
+                    state_in = self._scale_state_env_input(state_in, group.get("state_input_scale_view", 1.0))
+                    env_obs_start = group["env_obs_start"]
+                    env_action_start = int(group["env_action_start"])
+                    env_noise_start = int(group["env_noise_start"])
+                    transition_input_grad_active = bool(
+                        torch.is_grad_enabled()
+                        and (
+                            state_in.requires_grad
+                            or obs_in.requires_grad
+                            or action_in.requires_grad
+                            or noise_in.requires_grad
+                        )
+                    )
+                    if bool(group.get("packed_input_enabled", False)):
+                        if transition_input_grad_active:
+                            transition_input = torch.zeros_like(group["packed_input"])
+                        else:
+                            transition_input = group["packed_input"]
+                            transition_input.zero_()
+                        transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
+                        packed_obs_rows = group.get("packed_obs_rows", None)
+                        if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
+                            transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
+                                packed_obs_rows, group["packed_obs_src_cols"]
+                            ]
+                        packed_action_rows = group.get("packed_action_rows", None)
+                        if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
+                            transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
+                                packed_action_rows, group["packed_action_src_cols"]
+                            ]
+                        packed_noise_rows = group.get("packed_noise_rows", None)
+                        if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
+                            transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
+                                packed_noise_rows, group["packed_noise_src_cols"]
+                            ]
+                    else:
+                        env_in = torch.zeros_like(group["env_in"]) if transition_input_grad_active else group["env_in"]
+                        env_in[:, :state_dim_g] = state_in
+                        if env_obs_start is not None:
+                            env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                        env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                        env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                        transition_input = env_in
+
+                    transition_generator_g = group.get("transition_generator", None)
+                    if bool(group.get("use_fused_transition", False)) and callable(transition_generator_g):
+                        if bool(group.get("packed_input_enabled", False)):
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                                x_is_dual_packed=False,
+                                x_input_is_packed=True,
+                            )
+                        else:
+                            x_next_g, reward_next_raw_g = transition_generator_g(
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                                x_is_dual_packed=False,
+                            )
+                        reward_next_raw_g = group["reward_scale_view"] * reward_next_raw_g.reshape(-1)
+                    else:
+                        reward_next_raw_g = group["reward_scale_view"] * env_g["y_generator"](
+                            transition_input,
+                            generators_for_noise=group["rollout_generators"],
+                        ).reshape(-1)
+                        x_next_g = env_g["x_generator"](
+                            transition_input,
+                            generators_for_noise=group["rollout_generators"],
+                        )
+                    state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
+                    if group_slice is None:
+                        reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
+                        state_next[group_indices, :state_dim_g] = state_next_g
+                    else:
+                        reward_next_raw[group_slice] = reward_next_raw_g
+                        state_next[group_slice, :state_dim_g] = state_next_g
+
+                reward_next = torch.maximum(torch.minimum(reward_next_raw, reward_clip), -reward_clip)
+                if dropout_draw_t is not None:
+                    drop_mask = dropout_active & (dropout_draw_t < reward_dropout_ratio)
+                    reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
+                    impute_mask = drop_mask & reward_dropout_impute_zero
+                    reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                reward_next = self._transform_rollout_reward(
+                    reward_next,
+                    mode=self._resolve_reinforce_reward_transform(self.config),
+                    rms_eps=reinforce_reward_rms_eps,
+                    tanh_c=reinforce_reward_tanh_c,
+                    tanh_bound=reinforce_reward_tanh_bound,
+                )
+                if state_noise_t is not None:
+                    state_next = state_next + state_noise_t * state_noise_std[:, None]
+                if not bool(reference_semantics.all().item()):
+                    state_next_post = self._apply_state_postprocess(
+                        state_next_raw=state_next,
+                        state_prev=state_t,
+                        state_clip=state_clip,
+                        state_highway_enabled=state_highway_enabled,
+                        state_highway_lambda=state_highway_lambda,
+                    )
+                    state_next = torch.where(reference_semantics[:, None], state_next, state_next_post)
+                state_next = self._apply_state_full_rms(
+                    state_next,
+                    enabled=state_full_rms_enabled,
+                    target=state_full_rms_target,
+                    state_mask=state_mask,
+                )
+                state_next = state_next * state_mask
+                if first_pg_state_grad_clip_norm > 0.0:
+                    state_next = self._clip_tensor_grad_by_global_norm(
+                        state_next,
+                        max_norm=first_pg_state_grad_clip_norm,
+                    )
+                action_next = action_next * action_mask
+                reward_buffer.append(reward_next)
+                log_prob_buffer.append(reinforce_log_prob_t)
+                log_prob_score_buffer.append(reinforce_log_prob_score_t)
+                state_t = state_next
+                action_t = action_env
+                reward_t = reward_next
+                reward_mask_t = reward_mask_next
+
+            rewards_window = torch.stack(reward_buffer, dim=0)
+            log_probs_window = torch.stack(log_prob_buffer, dim=0)
+            log_prob_score_window = torch.stack(log_prob_score_buffer, dim=0)
+            action_mean_roots = tuple(action_mean_buffer)
+            action_mask_window = torch.stack(action_mask_buffer, dim=0)
+            if needs_unpermute:
+                rewards_window = rewards_window.index_select(1, inv_perm)
+                log_probs_window = log_probs_window.index_select(1, inv_perm)
+                log_prob_score_window = log_prob_score_window.index_select(1, inv_perm)
+                action_mask_window = action_mask_window.index_select(1, inv_perm)
+                action_mean_roots = tuple(root.index_select(0, inv_perm) for root in action_mean_roots)
+
+            loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
+                rewards=rewards_window,
+                log_probs=log_probs_window,
+                action_mean=action_mean_roots,
+                action_mask=action_mask_window,
+                log_prob_score=log_prob_score_window,
+                discount=discount,
+            )
+            window_weight = float(window_end - window_start) / float(max(1, n_samples))
+            weighted_loss = loss_window * window_weight
+            if tbptt_loss_sink is None:
+                weighted_losses.append(weighted_loss)
+            else:
+                tbptt_loss_sink(weighted_loss)
+
+            objective_term = stats_window["objective"].detach() * float(window_weight)
+            objective_accum = objective_term if objective_accum is None else (objective_accum + objective_term)
+            total_weight += float(window_weight)
+
+            rewards_det = rewards_window.detach().to(dtype=torch.float64)
+            reward_sum = rewards_det.sum() if reward_sum is None else (reward_sum + rewards_det.sum())
+            reward_sumsq = (
+                (rewards_det * rewards_det).sum()
+                if reward_sumsq is None
+                else (reward_sumsq + (rewards_det * rewards_det).sum())
+            )
+            reward_count += int(rewards_det.numel())
+            reward_min_w = stats_window.get("reward_min", None)
+            if reward_min_w is not None:
+                reward_min_w = reward_min_w.detach()
+                reward_min_accum = reward_min_w if reward_min_accum is None else torch.minimum(reward_min_accum, reward_min_w)
+            reward_max_w = stats_window.get("reward_max", None)
+            if reward_max_w is not None:
+                reward_max_w = reward_max_w.detach()
+                reward_max_accum = reward_max_w if reward_max_accum is None else torch.maximum(reward_max_accum, reward_max_w)
+            reward_absmax_w = stats_window.get("reward_abs_max", None)
+            if reward_absmax_w is not None:
+                reward_absmax_w = reward_absmax_w.detach()
+                reward_absmax_accum = reward_absmax_w if reward_absmax_accum is None else torch.maximum(reward_absmax_accum, reward_absmax_w)
+            reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
+            if reward_clip_hit_w is not None:
+                reward_clip_hit_w = reward_clip_hit_w.detach() * float(window_weight)
+                reward_clip_hit_accum = (
+                    reward_clip_hit_w
+                    if reward_clip_hit_accum is None
+                    else (reward_clip_hit_accum + reward_clip_hit_w)
+                )
+            reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
+            if reward_norm_clip_hit_w is not None:
+                reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * float(window_weight)
+                reward_norm_clip_hit_accum = (
+                    reward_norm_clip_hit_w
+                    if reward_norm_clip_hit_accum is None
+                    else (reward_norm_clip_hit_accum + reward_norm_clip_hit_w)
+                )
+            reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
+            if reward_nonfinite_share_w is not None:
+                reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * float(window_weight)
+                reward_nonfinite_share_accum = (
+                    reward_nonfinite_share_w
+                    if reward_nonfinite_share_accum is None
+                    else (reward_nonfinite_share_accum + reward_nonfinite_share_w)
+                )
+            reward_nan_share_w = stats_window.get("reward_nan_share", None)
+            if reward_nan_share_w is not None:
+                reward_nan_share_w = reward_nan_share_w.detach() * float(window_weight)
+                reward_nan_share_accum = (
+                    reward_nan_share_w
+                    if reward_nan_share_accum is None
+                    else (reward_nan_share_accum + reward_nan_share_w)
+                )
+            reward_inf_share_w = stats_window.get("reward_inf_share", None)
+            if reward_inf_share_w is not None:
+                reward_inf_share_w = reward_inf_share_w.detach() * float(window_weight)
+                reward_inf_share_accum = (
+                    reward_inf_share_w
+                    if reward_inf_share_accum is None
+                    else (reward_inf_share_accum + reward_inf_share_w)
+                )
+            reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
+            if reinforce_return_nonfinite_share_w is not None:
+                reinforce_return_nonfinite_share_w = (
+                    reinforce_return_nonfinite_share_w.detach() * float(window_weight)
+                )
+                reinforce_return_nonfinite_share_accum = (
+                    reinforce_return_nonfinite_share_w
+                    if reinforce_return_nonfinite_share_accum is None
+                    else (reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w)
+                )
+            reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
+            if reinforce_log_prob_nonfinite_share_w is not None:
+                reinforce_log_prob_nonfinite_share_w = (
+                    reinforce_log_prob_nonfinite_share_w.detach() * float(window_weight)
+                )
+                reinforce_log_prob_nonfinite_share_accum = (
+                    reinforce_log_prob_nonfinite_share_w
+                    if reinforce_log_prob_nonfinite_share_accum is None
+                    else (reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w)
+                )
+            reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
+            if reinforce_adv_nonfinite_share_w is not None:
+                reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * float(window_weight)
+                reinforce_adv_nonfinite_share_accum = (
+                    reinforce_adv_nonfinite_share_w
+                    if reinforce_adv_nonfinite_share_accum is None
+                    else (reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w)
+                )
+
+            if stored_reward_windows is not None:
+                stored_reward_windows.append(rewards_window.detach())
+
+            if window_end < n_samples:
+                state_t = state_t.detach()
+                action_t = action_t.detach()
+                reward_t = reward_t.detach()
+                reward_mask_t = reward_mask_t.detach()
+                for group in transition_groups:
+                    group["env_in"] = group["env_in"].detach()
+                cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_loss_sink is None))
+
+        rewards_device = device if isinstance(device, torch.device) else torch.device(str(device))
+        if tbptt_loss_sink is None:
+            if not weighted_losses:
+                raise RuntimeError("alpha family TBPTT window runner produced no window losses")
+            loss = torch.stack(weighted_losses).sum()
+        else:
+            loss = torch.zeros((), device=rewards_device, dtype=torch.float32)
+        if objective_accum is None:
+            objective = torch.zeros((), device=rewards_device, dtype=torch.float32)
+        elif total_weight > 0.0:
+            objective = (objective_accum / float(total_weight)).detach()
+        else:
+            objective = objective_accum.detach()
+        if reward_count <= 0 or reward_sum is None or reward_sumsq is None:
+            reward_mean = torch.zeros((), device=rewards_device, dtype=torch.float32)
+            reward_std = torch.zeros((), device=rewards_device, dtype=torch.float32)
+        else:
+            reward_mean64 = reward_sum / float(reward_count)
+            reward_var64 = (reward_sumsq / float(reward_count)) - (reward_mean64 * reward_mean64)
+            reward_std64 = torch.sqrt(torch.clamp(reward_var64, min=0.0))
+            reward_mean = reward_mean64.to(dtype=torch.float32).detach()
+            reward_std = reward_std64.to(dtype=torch.float32).detach()
+        if stored_reward_windows is not None:
+            rewards_out = torch.cat(stored_reward_windows, dim=0) if stored_reward_windows else torch.empty((0, batch_size), device=rewards_device, dtype=torch.float32)
+        else:
+            rewards_out = torch.empty((0, batch_size), device=rewards_device, dtype=torch.float32)
+        zero_t = torch.zeros((), device=rewards_device, dtype=torch.float32)
+        stats = {
+            "objective": objective,
+            "reward_mean": reward_mean,
+            "reward_std": reward_std,
+            "reward_min": reward_min_accum if reward_min_accum is not None else zero_t,
+            "reward_max": reward_max_accum if reward_max_accum is not None else zero_t,
+            "reward_abs_max": reward_absmax_accum if reward_absmax_accum is not None else zero_t,
+            "reward_clip_hit_share": (
+                (reward_clip_hit_accum / float(total_weight))
+                if (reward_clip_hit_accum is not None and total_weight > 0.0)
+                else zero_t
+            ),
+            "reward_norm_clip_hit_share": (
+                (reward_norm_clip_hit_accum / float(total_weight))
+                if (reward_norm_clip_hit_accum is not None and total_weight > 0.0)
+                else zero_t
+            ),
+            "reward_nonfinite_share": (
+                reward_nonfinite_share_accum if reward_nonfinite_share_accum is not None else zero_t
+            ),
+            "reward_nan_share": reward_nan_share_accum if reward_nan_share_accum is not None else zero_t,
+            "reward_inf_share": reward_inf_share_accum if reward_inf_share_accum is not None else zero_t,
+            "reinforce_return_nonfinite_share": (
+                reinforce_return_nonfinite_share_accum
+                if reinforce_return_nonfinite_share_accum is not None
+                else zero_t
+            ),
+            "reinforce_log_prob_nonfinite_share": (
+                reinforce_log_prob_nonfinite_share_accum
+                if reinforce_log_prob_nonfinite_share_accum is not None
+                else zero_t
+            ),
+            "reinforce_adv_nonfinite_share": (
+                reinforce_adv_nonfinite_share_accum
+                if reinforce_adv_nonfinite_share_accum is not None
+                else zero_t
+            ),
+            "alpha_grad_enabled": 1,
+        }
+        rollout = {
+            "rewards": rewards_out,
+            "info": [None] * batch_size,
+        }
+        return loss, rollout, stats
+
     def rollout_policy_gradient_loss(
         self,
         policy_step_fn,
@@ -17841,6 +18899,33 @@ class EnvironmentPrior:
             if 0 < w < n_samples:
                 tbptt_window_active = True
                 tbptt_window_size = w
+        backend = self._resolve_batch_parallel_backend()
+        grouping_mode = self._resolve_batch_vectorized_grouping()
+        strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
+        if (
+            alpha_grad_enabled
+            and tbptt_window_active
+            and (not collect_x)
+            and backend == "torch_vectorized"
+            and str(grouping_mode) == "family"
+            and (not bool(strict_rng_match))
+        ):
+            return self._rollout_alpha_grad_family_tbptt_windowed_loss(
+                policy_step_fn=policy_step_fn,
+                batch_size=batch_size,
+                n_samples=n_samples,
+                num_features=num_features,
+                device=device,
+                epoch=epoch,
+                single_eval_pos=single_eval_pos,
+                discount=discount,
+                collect_x=collect_x,
+                tbptt_window=tbptt_window_size,
+                tbptt_loss_sink=tbptt_loss_sink,
+                h_list_override=h_list_override,
+                env_seeds_override=env_seeds_override,
+                rollout_seeds_override=rollout_seeds_override,
+            )
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_lambda = float(aev2_cfg.get("lambda", 0.0))

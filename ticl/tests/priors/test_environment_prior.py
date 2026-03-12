@@ -3060,6 +3060,53 @@ def test_environment_prior_alpha_grad_tbptt_multi_group_rollout_gradients_are_fi
     assert all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None)
 
 
+def test_environment_prior_alpha_grad_tbptt_nonfinal_family_window_gradients_are_finite():
+    _seed_everything(2081)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["obs_slot_dim"] = {"distribution": "meta_choice", "choice_values": [400, 401, 402]}
+    env_cfg["action_slot_dim"] = {"distribution": "meta_choice", "choice_values": [30, 31, 32]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=6,
+        n_samples=9,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=4,
+        collect_x=False,
+        policy_objective_kind="alpha_grad",
+        tbptt_window=8,
+    )
+
+    loss.backward()
+    grad_sum = sum(p.grad.abs().sum() for p in policy.parameters() if p.grad is not None)
+    assert torch.isfinite(loss)
+    assert int(stats["alpha_grad_enabled"]) == 1
+    assert float(grad_sum) > 0.0
+    assert all(torch.isfinite(p.grad).all() for p in policy.parameters() if p.grad is not None)
+    assert tuple(rollout["rewards"].shape) == (0, 6)
+
+
 def test_environment_prior_reinforce_stats_report_nonfinite_shares():
     prior = EnvironmentPrior()
     rewards = torch.tensor(

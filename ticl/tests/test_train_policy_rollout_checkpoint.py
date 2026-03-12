@@ -1670,6 +1670,33 @@ def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend
     assert all(torch.isfinite(g).all() for g in grads_family)
 
 
+def test_alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case():
+    _seed_everything(11)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+
+    stats_family, grads_family, roots_family = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        batch_size=2,
+        n_samples=9,
+        single_eval_pos=4,
+        rl_objective="alpha_grad",
+    )
+
+    assert len(roots_family) > 0
+    assert int(stats_family["alpha_grad_enabled"]) == 1
+    assert torch.isfinite(stats_family["objective"])
+    assert torch.isfinite(stats_family["reward_mean"])
+    assert torch.isfinite(stats_family["reward_std"])
+    assert len(grads_family) > 0
+    assert all(torch.isfinite(g).all() for g in grads_family)
+
+
 def test_tbptt_window_reduces_saved_tensor_bytes_trend():
     mem_full = _run_train_epoch_once_for_memory_probe(
         policy_rollout_checkpoint=False,
