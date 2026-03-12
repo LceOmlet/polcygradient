@@ -84,3 +84,24 @@ Interpretation:
 - GPU memory is nearly identical across all three objectives on this fixed risky load, so the dominant problem is time, not an alpha-specific memory spike.
 - The extra alpha cost over `first_policy_gradient` is smaller than the extra `first_policy_gradient` cost over `reinforce`, which matches earlier diagnostics that `g0` is already relatively cheap and the main expensive path is `g1`.
 - Coarse `nvidia-smi` utilization sampling is not used as a decision signal here; these conclusions are based on fixed-override batch wall and guarded peak memory only.
+
+### Backward Time Split
+
+Using the same fixed risky load, the guarded harness also split wall time into:
+
+- `sink_backward_s`: time spent inside the TBPTT sink `loss.backward()`
+- `non_sink_s`: everything else in `_compute_policy_rollout_chunk_loss(...)`
+
+Results:
+
+| objective | batch wall (s) | sink backward (s) | non-sink (s) | sink share |
+| --- | ---: | ---: | ---: | ---: |
+| `reinforce` | 114.171 | 15.796 | 98.375 | 13.8% |
+| `first_policy_gradient` | 194.036 | 86.704 | 107.332 | 44.7% |
+| `alpha_grad` | 258.235 | 76.274 | 181.961 | 29.5% |
+
+Interpretation:
+
+- `first_policy_gradient` lifts the direct sink backward cost sharply over `reinforce`; this is the clearest evidence that the `g1` shared backward path is the main remaining time head.
+- `alpha_grad` does not further increase sink backward over `first_policy_gradient`; its extra time mostly lands in `non_sink`, consistent with the earlier accepted diagnosis that alpha-specific overhead sits in the internal `g1`-related computation rather than the final `loss.backward()`.
+- The next meaningful optimization should therefore target the `g1` path itself, not `g0`, and not generic rollout sharing.
