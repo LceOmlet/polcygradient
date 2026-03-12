@@ -541,3 +541,58 @@ Interpretation:
 - This is the largest accepted shared-forward win so far after the policy-offload baseline.
 - The gain lands primarily in `hidden_update_grad_fused`, exactly where the probe predicted.
 - GPU memory improves slightly; there is no host-memory regression.
+
+## Accepted: prepack rowwise-noise runtime plan with active-scale slices
+
+Hypothesis:
+
+- After the accepted hidden-update metadata packing change, shared forward was dominated again by `rowwise_noise_plan`.
+- Focused risky-load evidence showed that the biggest costs inside the helper were not the RNG itself:
+  - `rowwise_total_s ≈ 25.87s`
+  - `rowwise_mul_assign_s ≈ 13.58s`
+  - `rowwise_any_s ≈ 4.68s`
+  - `rowwise_randn_s ≈ 4.53s`
+- So the safest next shared-forward optimization was to cache the deterministic parts of the rowwise plan:
+  - whether the layer has any active noise at all
+  - per-row active scale slices
+- This preserves generator consumption order because the code still issues the exact same per-row `torch.randn(..., generator=g)` calls with the same shapes and in the same order.
+
+Implementation:
+
+- Add `_build_rowwise_scaled_noise_runtime_plan(...)`
+- Extend the strict SCM `(device, dtype)` runtime cache with per-layer rowwise runtime plans containing:
+  - `active`
+  - `scale_slices`
+  - `has_any`
+  - `batch_size`
+  - `width`
+- Update `_sample_rowwise_scaled_noise_with_plan(...)` to consume that runtime plan directly
+- Keep the original fallback path for the legacy tuple-form plan
+
+Focused checks:
+
+- `rowwise_scaled_noise_with_plan_matches_unplanned_on_cuda`
+- `strict_reference_scm_hidden_update_grad_fused_matches_unfused_on_cuda`
+- `alpha_grad_rollout_gradients_are_finite`
+- `alpha_grad` TBPTT checkpoint subset
+- `test_mlp_prior.py`
+
+Risky-load evidence, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`:
+
+| objective | before wall (s) | after wall (s) | delta | before peak alloc (MiB) | after peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 228.414 | 219.663 | -8.751 | 1108.717 | 1109.218 | +0.501 |
+| `alpha_grad` | 328.151 | 324.985 | -3.166 | 1114.904 | 1115.174 | +0.270 |
+
+In-situ risky-load split for `first_policy_gradient` after the change:
+
+- `transition_generator_s: 68.502 -> 59.696s`
+- `rowwise_noise_plan_s: 26.469 -> 15.853s`
+- `hidden_update_grad_fused_s: 16.266s` unchanged within noise
+- `policy_step_s: 53.203s` unchanged within noise
+
+Interpretation:
+
+- This is a semantics-safe shared-forward win that lands almost entirely in the expected `rowwise_noise_plan` hotspot.
+- GPU memory remains flat within noise.
+- The remaining top heads are now `g1 autograd.grad` on the alpha side and the still-large strict-SCM shared forward remainder, not rowwise plan bookkeeping itself.

@@ -2407,19 +2407,59 @@ class EnvironmentPrior:
         return tuple(plan)
 
     @staticmethod
-    def _sample_rowwise_scaled_noise_with_plan(scale, plan, *, generators, device, dtype):
-        scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+    def _build_rowwise_scaled_noise_runtime_plan(scale, plan):
+        scale_t = torch.as_tensor(scale)
         if scale_t.ndim != 2:
-            raise ValueError("rowwise scaled noise with plan expects a rank-2 scale tensor")
+            raise ValueError("rowwise scaled noise runtime plan expects a rank-2 scale tensor")
         batch_size = int(scale_t.shape[0])
         width = int(scale_t.shape[1])
         if batch_size <= 0 or width <= 0 or len(plan) != batch_size:
-            return None
-        if not bool(torch.any(scale_t > 0)):
-            return None
-        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
-        generators_list = None if generators is None else list(generators)
+            return {"active": tuple(plan), "scale_slices": tuple(), "has_any": False, "batch_size": batch_size, "width": width}
+        scale_slices = []
+        has_any = False
         for bi, active in enumerate(plan):
+            count = int(active.numel())
+            if count <= 0:
+                scale_slices.append(scale_t.new_empty((0,)))
+                continue
+            has_any = True
+            scale_slices.append(scale_t[bi].index_select(0, active))
+        return {
+            "active": tuple(plan),
+            "scale_slices": tuple(scale_slices),
+            "has_any": bool(has_any),
+            "batch_size": batch_size,
+            "width": width,
+        }
+
+    @staticmethod
+    def _sample_rowwise_scaled_noise_with_plan(scale, plan, *, generators, device, dtype):
+        if isinstance(plan, dict):
+            active_plan = plan.get("active", ())
+            scale_slices = plan.get("scale_slices", ())
+            has_any = bool(plan.get("has_any", False))
+            batch_size = int(plan.get("batch_size", 0))
+            width = int(plan.get("width", 0))
+            scale_t = None
+            if batch_size <= 0 or width <= 0 or len(active_plan) != batch_size:
+                return None
+            if not has_any:
+                return None
+        else:
+            scale_t = torch.as_tensor(scale, device=device, dtype=dtype)
+            if scale_t.ndim != 2:
+                raise ValueError("rowwise scaled noise with plan expects a rank-2 scale tensor")
+            batch_size = int(scale_t.shape[0])
+            width = int(scale_t.shape[1])
+            active_plan = plan
+            scale_slices = None
+            if batch_size <= 0 or width <= 0 or len(active_plan) != batch_size:
+                return None
+            if not bool(torch.any(scale_t > 0)):
+                return None
+        eps = torch.zeros((batch_size, width), device=device, dtype=dtype)
+        generators_list = None if generators is None else (generators if isinstance(generators, (list, tuple)) else list(generators))
+        for bi, active in enumerate(active_plan):
             count = int(active.numel())
             if count <= 0:
                 continue
@@ -2429,7 +2469,8 @@ class EnvironmentPrior:
                 e_b = torch.randn(draw_shape, device=device, dtype=dtype)
             else:
                 e_b = torch.randn(draw_shape, device=device, dtype=dtype, generator=g)
-            eps[bi, active] = e_b * scale_t[bi, active]
+            scale_active = scale_slices[bi] if scale_slices is not None else scale_t[bi, active]
+            eps[bi, active] = e_b * scale_active
         return eps
 
     @staticmethod
@@ -3173,6 +3214,13 @@ class EnvironmentPrior:
                 cached["hidden_noise_scale_stack_runtime"][:, layer_idx, :]
                 for layer_idx in range(max_hidden_blocks)
             ]
+            cached["hidden_rowwise_noise_runtime_plans"] = [
+                self._build_rowwise_scaled_noise_runtime_plan(
+                    cached["hidden_noise_scales_runtime"][layer_idx],
+                    hidden_rowwise_noise_plans[layer_idx],
+                )
+                for layer_idx in range(max_hidden_blocks)
+            ]
             runtime_tensor_cache[cache_key] = cached
             return cached
 
@@ -3276,6 +3324,7 @@ class EnvironmentPrior:
             hidden_prefix_sizes_runtime_i32 = runtime_cached["hidden_prefix_sizes_runtime_i32"]
             hidden_prefix_out_tile_batch_runtime = runtime_cached["hidden_prefix_out_tile_batch_runtime"]
             hidden_prefix_out_tile_offsets_runtime = runtime_cached["hidden_prefix_out_tile_offsets_runtime"]
+            hidden_rowwise_noise_runtime_plans = runtime_cached["hidden_rowwise_noise_runtime_plans"]
             z = z * hidden_mask_runtime
             layer_step_runner_without_noise = self._get_reference_scm_layer_step_runner(
                 batch_size=batch_size,
@@ -3352,7 +3401,7 @@ class EnvironmentPrior:
                                     dtype=z.dtype,
                                 )
                         else:
-                            noise_rowwise_plan = hidden_rowwise_noise_plans[layer_idx]
+                            noise_rowwise_plan = hidden_rowwise_noise_runtime_plans[layer_idx]
                             noise_eps = self._sample_rowwise_scaled_noise(
                                 noise_scale,
                                 generators=noise_generators,
