@@ -478,3 +478,66 @@ Interpretation:
 - The measured win again lands exactly in shared forward, not in `g1` sink backward.
 - GPU memory stays flat within noise.
 - This is another semantics-safe strict-SCM runtime-preparation cleanup that benefits both `first_policy_gradient` and `alpha_grad`.
+
+## Accepted: feed hidden-update grad-fused path prepacked int32 metadata
+
+Hypothesis:
+
+- After the previous accepted shared-forward cleanups, `hidden_update_grad_fused` still consumed a large block of `transition_generator` time.
+- A focused risky-load probe showed a real internal prep head:
+  - `hidden_update_grad_fused_s ≈ 17.56s`
+  - inside it, `tensor_to_s ≈ 4.75s`
+  - `clone_s ≈ 1.35s`
+  - `contiguous_s ≈ 0.26s`
+- If the strict SCM runtime cache also stores the `int32` metadata that this path needs, and the helper fast-path accepts already-`int32` contiguous inputs, the gain should land entirely in shared forward without touching SCM math.
+
+Implementation:
+
+- Extend the strict SCM `(device, dtype)` runtime cache with:
+  - `activation_codes_runtime_i32`
+  - `hidden_active_masks_runtime_i32`
+  - `hidden_prefix_sizes_runtime_i32`
+- Route the grad-fused hidden update call through those cached tensors
+- Add a no-op fast-path in `_PrefixSampleInputActivatedAffineUpdateGradInputFn.forward(...)` when `active_mask`, `in_sizes`, `out_sizes`, and `activation_codes` already arrive as contiguous `int32`
+- Leave kernels, rollout order, stochasticity, `g0/g1`, and SCM semantics unchanged
+
+Focused checks:
+
+- `rowwise_scaled_noise_with_plan_matches_unplanned_on_cuda`
+- `strict_reference_scm_hidden_update_grad_fused_matches_unfused_on_cuda`
+- `alpha_grad_rollout_gradients_are_finite`
+- `alpha_grad` TBPTT checkpoint subset
+- `test_mlp_prior.py`
+
+Focused internal evidence on risky-load `first_policy_gradient`:
+
+- before:
+  - `hidden_update_grad_fused_s = 17.56s`
+  - `hudf_tensor_to_s = 4.75s`
+  - `hudf_contiguous_s = 0.26s`
+  - `hudf_clone_s = 1.35s`
+- after:
+  - `hidden_update_grad_fused_s = 13.10s`
+  - `hudf_tensor_to_s = 0.00s`
+  - `hudf_contiguous_s = 0.00s`
+  - `hudf_clone_s = 2.07s`
+
+Risky-load evidence, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`:
+
+| objective | before wall (s) | after wall (s) | delta | before peak alloc (MiB) | after peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 245.492 | 228.414 | -17.078 | 1113.430 | 1108.717 | -4.713 |
+| `alpha_grad` | 332.320 | 328.151 | -4.169 | 1119.777 | 1114.904 | -4.873 |
+
+In-situ risky-load split for `first_policy_gradient` after the change:
+
+- `transition_generator_s: 78.271 -> 68.502s`
+- `hidden_update_grad_fused_s: 23.254 -> 16.266s`
+- `rowwise_noise_plan_s: 28.170 -> 26.469s`
+- `policy_step_s: 52.645 -> 50.893s`
+
+Interpretation:
+
+- This is the largest accepted shared-forward win so far after the policy-offload baseline.
+- The gain lands primarily in `hidden_update_grad_fused`, exactly where the probe predicted.
+- GPU memory improves slightly; there is no host-memory regression.

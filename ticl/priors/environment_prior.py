@@ -1228,10 +1228,10 @@ class _PrefixSampleInputActivatedAffineUpdateGradInputFn(torch.autograd.Function
         num_warps = int(num_warps)
         if not bool(z_old.is_contiguous()):
             z_old = z_old.contiguous()
-        active_mask_i32 = active_mask.to(dtype=torch.int32).contiguous()
-        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
-        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
-        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        active_mask_i32 = active_mask if active_mask.dtype == torch.int32 and bool(active_mask.is_contiguous()) else active_mask.to(dtype=torch.int32).contiguous()
+        in_sizes_i32 = in_sizes if in_sizes.dtype == torch.int32 and bool(in_sizes.is_contiguous()) else in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes if out_sizes.dtype == torch.int32 and bool(out_sizes.is_contiguous()) else out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes if activation_codes.dtype == torch.int32 and bool(activation_codes.is_contiguous()) else activation_codes.to(dtype=torch.int32).contiguous()
         out = z_old.clone()
         if int(z_old.shape[0]) > 0:
             grid = (int(z_old.shape[0]),)
@@ -3147,10 +3147,13 @@ class EnvironmentPrior:
                 "hidden_dims_runtime": hidden_dims.to(device=device_obj, dtype=torch.long),
                 "num_hidden_blocks_runtime": num_hidden_blocks.to(device=device_obj, dtype=torch.long),
                 "activation_codes_runtime": activation_codes_t.to(device=device_obj, dtype=torch.long),
+                "activation_codes_runtime_i32": activation_codes_t.to(device=device_obj, dtype=torch.int32),
                 "activation_relu_mask_runtime": activation_relu_mask.to(device=device_obj),
                 "activation_identity_mask_runtime": activation_identity_mask.to(device=device_obj),
                 "hidden_active_masks_runtime": [mask.to(device=device_obj) for mask in hidden_active_masks],
+                "hidden_active_masks_runtime_i32": [mask.to(device=device_obj, dtype=torch.int32).contiguous() for mask in hidden_active_masks],
                 "hidden_prefix_sizes_runtime": [s.to(device=device_obj, dtype=torch.long) for s in hidden_prefix_sizes],
+                "hidden_prefix_sizes_runtime_i32": [s.to(device=device_obj, dtype=torch.int32).contiguous() for s in hidden_prefix_sizes],
                 "hidden_prefix_out_tile_batch_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_batch],
                 "hidden_prefix_out_tile_offsets_runtime": [t.to(device=device_obj, dtype=torch.int32) for t in hidden_prefix_out_tile_offsets],
                 "input_mask_runtime": input_mask_t.to(device=device_obj, dtype=dtype_obj),
@@ -3265,10 +3268,12 @@ class EnvironmentPrior:
             activation_relu_mask_runtime = runtime_cached["activation_relu_mask_runtime"]
             activation_identity_mask_runtime = runtime_cached["activation_identity_mask_runtime"]
             hidden_active_masks_runtime = runtime_cached["hidden_active_masks_runtime"]
+            hidden_active_masks_runtime_i32 = runtime_cached["hidden_active_masks_runtime_i32"]
             hidden_weights_runtime = runtime_cached["hidden_weights_runtime"]
             hidden_biases_runtime = runtime_cached["hidden_biases_runtime"]
             hidden_noise_scales_runtime = runtime_cached["hidden_noise_scales_runtime"]
             hidden_prefix_sizes_runtime = runtime_cached["hidden_prefix_sizes_runtime"]
+            hidden_prefix_sizes_runtime_i32 = runtime_cached["hidden_prefix_sizes_runtime_i32"]
             hidden_prefix_out_tile_batch_runtime = runtime_cached["hidden_prefix_out_tile_batch_runtime"]
             hidden_prefix_out_tile_offsets_runtime = runtime_cached["hidden_prefix_out_tile_offsets_runtime"]
             z = z * hidden_mask_runtime
@@ -3382,14 +3387,14 @@ class EnvironmentPrior:
                     if use_hidden_affine_grad_fused:
                         z_grad_fused = self._batch_affine_prefix_tiled_input_activated_update_grad_fused(
                             z,
-                            active_mask,
+                            hidden_active_masks_runtime_i32[layer_idx],
                             hidden_weights_runtime[layer_idx],
                             hidden_biases_runtime[layer_idx],
                             noise_eps=noise_eps,
                             hidden_mask=hidden_mask_runtime,
-                            in_sizes=hidden_prefix_sizes_runtime[layer_idx],
-                            out_sizes=hidden_prefix_sizes_runtime[layer_idx],
-                            activation_codes=activation_codes_runtime,
+                            in_sizes=hidden_prefix_sizes_runtime_i32[layer_idx],
+                            out_sizes=hidden_prefix_sizes_runtime_i32[layer_idx],
+                            activation_codes=runtime_cached["activation_codes_runtime_i32"],
                             block_o=int(self.reference_scm_hidden_affine_block_o),
                             block_k=int(self.reference_scm_hidden_affine_block_k),
                             num_warps=int(self.reference_scm_hidden_affine_num_warps),
