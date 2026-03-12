@@ -4449,6 +4449,83 @@ def test_environment_prior_strict_reference_scm_hidden_update_fused_matches_unfu
     assert torch.allclose(reward_off, reward_on, atol=1e-6, rtol=1e-6)
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for grad-fused update semantics check")
+def test_environment_prior_strict_reference_scm_hidden_update_grad_fused_matches_unfused_on_cuda(monkeypatch):
+    _seed_everything(20260312)
+    h_list = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=12,
+            obs_dim=8,
+            action_dim=4,
+            noise_dim=5,
+            zero_pad_dim=2,
+            num_layers=4,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=10,
+            obs_dim=7,
+            action_dim=3,
+            noise_dim=4,
+            zero_pad_dim=3,
+            num_layers=5,
+        ),
+    ]
+    h_list[0]["prior_mlp_activations"] = "relu"
+    h_list[1]["prior_mlp_activations"] = "identity"
+    for h in h_list:
+        h["strict_joint_transition_enabled"] = True
+        h["noise_std"] = 0.0
+        h["pre_sample_weights"] = False
+        h["prior_mlp_dropout_prob"] = 0.0
+        h["block_wise_dropout"] = False
+        h["random_feature_rotation"] = False
+        h["init_std"] = 0.05
+        h["prior_mlp_hidden_dim"] = 64
+
+    in_dims = [
+        int(h["state_dim"]) + int(h["obs_dim"]) + int(h["action_dim"]) + int(h["noise_dim"]) + int(h["zero_pad_dim"])
+        for h in h_list
+    ]
+    state_dims = [int(h["state_dim"]) for h in h_list]
+    in_cap = max(in_dims)
+    x_base = torch.linspace(-0.5, 0.7, steps=len(h_list) * in_cap, dtype=torch.float32, device="cuda").reshape(len(h_list), in_cap)
+
+    def _build(flag: str):
+        _seed_everything(20260312)
+        monkeypatch.setenv("TICL_POLICY_REFERENCE_SCM_HIDDEN_AFFINE_FUSED", "1")
+        monkeypatch.setenv("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_FUSED", "1")
+        monkeypatch.setenv("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_SAMPLE_FUSED", "1")
+        monkeypatch.setenv("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_GRAD_FUSED", flag)
+        prior = EnvironmentPrior({})
+        return prior._build_reference_scm_joint_transition_padded_batch_fn(
+            in_dims,
+            state_dims,
+            h_list,
+            torch.device("cuda"),
+            generators=None,
+            input_mask=None,
+        )
+
+    fn_off = _build("0")
+    fn_on = _build("1")
+
+    x_off = x_base.clone().requires_grad_(True)
+    state_off, reward_off = fn_off(x_off, generators_for_noise=None)
+    loss_off = state_off.sum() + reward_off.sum()
+    grad_off = torch.autograd.grad(loss_off, x_off)[0]
+
+    x_on = x_base.clone().requires_grad_(True)
+    state_on, reward_on = fn_on(x_on, generators_for_noise=None)
+    loss_on = state_on.sum() + reward_on.sum()
+    grad_on = torch.autograd.grad(loss_on, x_on)[0]
+
+    assert torch.allclose(state_off, state_on, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(reward_off, reward_on, atol=1e-5, rtol=1e-5)
+    assert torch.allclose(grad_off, grad_on, atol=2e-5, rtol=2e-5)
+
+
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for multilayer fused semantics check")
 def test_environment_prior_strict_reference_scm_hidden_multilayer_fused_matches_unfused_on_cuda(monkeypatch):
     _seed_everything(20260309)

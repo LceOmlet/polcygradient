@@ -796,6 +796,72 @@ if triton is not None:
 
 
     @triton.jit
+    def _prefix_sample_input_activated_affine_update_bwd_input_kernel(
+        grad_out_ptr,
+        z_ptr,
+        w_ptr,
+        hidden_mask_ptr,
+        active_mask_ptr,
+        in_sizes_ptr,
+        out_sizes_ptr,
+        activation_code_ptr,
+        grad_x_ptr,
+        stride_gob,
+        stride_goi,
+        stride_zb,
+        stride_zi,
+        stride_wb,
+        stride_wi,
+        stride_wo,
+        stride_hmb,
+        stride_hmi,
+        stride_ab,
+        stride_sb,
+        stride_gxb,
+        stride_gxi,
+        BLOCK_O: tl.constexpr,
+        BLOCK_K: tl.constexpr,
+    ):
+        pid_b = tl.program_id(0)
+        in_size = tl.load(in_sizes_ptr + pid_b * stride_sb).to(tl.int32)
+        out_size = tl.load(out_sizes_ptr + pid_b * stride_sb).to(tl.int32)
+        if in_size <= 0 or out_size <= 0:
+            return
+        active_flag = tl.load(active_mask_ptr + pid_b * stride_ab).to(tl.int32)
+        if active_flag == 0:
+            return
+        grad_out_base = grad_out_ptr + pid_b * stride_gob
+        z_base = z_ptr + pid_b * stride_zb
+        w_base = w_ptr + pid_b * stride_wb
+        hidden_mask_base = hidden_mask_ptr + pid_b * stride_hmb
+        grad_x_base = grad_x_ptr + pid_b * stride_gxb
+        activation_code = tl.load(activation_code_ptr + pid_b * stride_ab).to(tl.int32)
+        for k_start in tl.range(0, in_size, BLOCK_K):
+            offs_k = k_start + tl.arange(0, BLOCK_K)
+            k_mask = offs_k < in_size
+            acc = tl.zeros((BLOCK_K,), dtype=tl.float32)
+            for o_start in tl.range(0, out_size, BLOCK_O):
+                offs_o = o_start + tl.arange(0, BLOCK_O)
+                out_mask = offs_o < out_size
+                grad_vals = tl.load(grad_out_base + offs_o * stride_goi, mask=out_mask, other=0.0).to(tl.float32)
+                hidden_vals = tl.load(hidden_mask_base + offs_o * stride_hmi, mask=out_mask, other=0.0).to(tl.float32)
+                grad_vals = grad_vals * hidden_vals
+                w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
+                w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
+                acc += tl.sum(w_vals * grad_vals[None, :], axis=1)
+            z_vals = tl.load(z_base + offs_k * stride_zi, mask=k_mask, other=0.0).to(tl.float32)
+            if activation_code == 0:
+                tanh_vals = tl_libdevice.tanh(z_vals)
+                acc = acc * (1.0 - tanh_vals * tanh_vals)
+            elif activation_code == 1:
+                acc = acc * (z_vals > 0).to(tl.float32)
+            elif activation_code == 3:
+                acc = acc * (-tl_libdevice.sin(z_vals))
+            grad_x_ptrs = grad_x_base + offs_k * stride_gxi
+            tl.store(grad_x_ptrs, acc, mask=k_mask)
+
+
+    @triton.jit
     def _prefix_sample_input_activated_affine_multilayer_fwd_kernel(
         z_work_ptr,
         z_scratch_ptr,
@@ -1137,6 +1203,129 @@ class _PrefixTiledBatchAffineFn(torch.autograd.Function):
             )
         return grad_x, None, None, None, None, None, None, None, None, None, None, None, None
 
+
+class _PrefixSampleInputActivatedAffineUpdateGradInputFn(torch.autograd.Function):
+    @staticmethod
+    def forward(
+        ctx,
+        z_old,
+        active_mask,
+        w,
+        b,
+        noise_eps,
+        hidden_mask,
+        in_sizes,
+        out_sizes,
+        activation_codes,
+        block_o,
+        block_k,
+        num_warps,
+    ):
+        if triton is None:
+            raise RuntimeError("sample update grad-fused Triton path requested but Triton is unavailable")
+        block_o = int(block_o)
+        block_k = int(block_k)
+        num_warps = int(num_warps)
+        if not bool(z_old.is_contiguous()):
+            z_old = z_old.contiguous()
+        active_mask_i32 = active_mask.to(dtype=torch.int32).contiguous()
+        in_sizes_i32 = in_sizes.to(dtype=torch.int32).contiguous()
+        out_sizes_i32 = out_sizes.to(dtype=torch.int32).contiguous()
+        activation_codes_i32 = activation_codes.to(dtype=torch.int32).contiguous()
+        out = z_old.clone()
+        if int(z_old.shape[0]) > 0:
+            grid = (int(z_old.shape[0]),)
+            _prefix_sample_input_activated_affine_update_fwd_kernel[grid](
+                z_old,
+                w,
+                b,
+                noise_eps,
+                hidden_mask,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                out,
+                z_old.stride(0),
+                z_old.stride(1),
+                w.stride(0),
+                w.stride(1),
+                w.stride(2),
+                0 if b is None else b.stride(0),
+                0 if b is None else b.stride(1),
+                0 if noise_eps is None else noise_eps.stride(0),
+                0 if noise_eps is None else noise_eps.stride(1),
+                hidden_mask.stride(0),
+                hidden_mask.stride(1),
+                in_sizes_i32.stride(0),
+                activation_codes_i32.stride(0),
+                out.stride(0),
+                out.stride(1),
+                BLOCK_O=block_o,
+                BLOCK_K=block_k,
+                HAS_BIAS=bool(b is not None),
+                HAS_NOISE=bool(noise_eps is not None),
+                num_warps=num_warps,
+            )
+        ctx.save_for_backward(
+            z_old,
+            active_mask_i32,
+            w,
+            hidden_mask,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+        )
+        ctx.block_o = block_o
+        ctx.block_k = block_k
+        ctx.num_warps = num_warps
+        return out
+
+    @staticmethod
+    def backward(ctx, grad_out):
+        if triton is None:
+            raise RuntimeError("sample update grad-fused Triton backward requested but Triton is unavailable")
+        (
+            z_old,
+            active_mask_i32,
+            w,
+            hidden_mask,
+            in_sizes_i32,
+            out_sizes_i32,
+            activation_codes_i32,
+        ) = ctx.saved_tensors
+        grad_out_contig = grad_out.contiguous()
+        grad_x = grad_out_contig.clone()
+        if int(grad_out_contig.shape[0]) > 0:
+            grid = (int(grad_out_contig.shape[0]),)
+            _prefix_sample_input_activated_affine_update_bwd_input_kernel[grid](
+                grad_out_contig,
+                z_old,
+                w,
+                hidden_mask,
+                active_mask_i32,
+                in_sizes_i32,
+                out_sizes_i32,
+                activation_codes_i32,
+                grad_x,
+                grad_out_contig.stride(0),
+                grad_out_contig.stride(1),
+                z_old.stride(0),
+                z_old.stride(1),
+                w.stride(0),
+                w.stride(1),
+                w.stride(2),
+                hidden_mask.stride(0),
+                hidden_mask.stride(1),
+                active_mask_i32.stride(0),
+                in_sizes_i32.stride(0),
+                grad_x.stride(0),
+                grad_x.stride(1),
+                BLOCK_O=int(ctx.block_o),
+                BLOCK_K=int(ctx.block_k),
+                num_warps=int(ctx.num_warps),
+            )
+        return grad_x, None, None, None, None, None, None, None, None, None, None, None
+
 class EnvironmentPrior:
     """
     Environment prior with explicit SCM/GP input partition:
@@ -1451,6 +1640,15 @@ class EnvironmentPrior:
             os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_SAMPLE_FUSED", "1")
         ).strip().lower()
         self.reference_scm_hidden_update_sample_fused = reference_scm_hidden_update_sample_fused_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        reference_scm_hidden_update_grad_fused_flag = str(
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_GRAD_FUSED", "1")
+        ).strip().lower()
+        self.reference_scm_hidden_update_grad_fused = reference_scm_hidden_update_grad_fused_flag not in {
             "0",
             "false",
             "no",
@@ -3073,7 +3271,37 @@ class EnvironmentPrior:
                         and z.dtype == torch.float32
                         and (not bool(z.requires_grad))
                     )
-                    if use_hidden_affine_fused:
+                    use_hidden_affine_grad_fused = bool(
+                        self.reference_scm_hidden_affine_fused
+                        and self.reference_scm_hidden_update_fused
+                        and self.reference_scm_hidden_update_sample_fused
+                        and self.reference_scm_hidden_update_grad_fused
+                        and z.device.type == "cuda"
+                        and z.dtype == torch.float32
+                        and bool(z.requires_grad)
+                    )
+                    if use_hidden_affine_grad_fused:
+                        z_grad_fused = self._batch_affine_prefix_tiled_input_activated_update_grad_fused(
+                            z,
+                            active_mask,
+                            hidden_weights_runtime[layer_idx],
+                            hidden_biases_runtime[layer_idx],
+                            noise_eps=noise_eps,
+                            hidden_mask=hidden_mask_runtime,
+                            in_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                            out_sizes=hidden_prefix_sizes_runtime[layer_idx],
+                            activation_codes=activation_codes_t.to(device=z.device, dtype=torch.long),
+                            block_o=int(self.reference_scm_hidden_affine_block_o),
+                            block_k=int(self.reference_scm_hidden_affine_block_k),
+                            num_warps=int(self.reference_scm_hidden_affine_num_warps),
+                        )
+                        if z_grad_fused is not None:
+                            z = z_grad_fused
+                        else:
+                            use_hidden_affine_grad_fused = False
+                    if use_hidden_affine_grad_fused:
+                        pass
+                    elif use_hidden_affine_fused:
                         if bool(self.reference_scm_hidden_update_fused):
                             z = self._batch_affine_prefix_tiled_input_activated_update_forward(
                                 z,
@@ -10770,6 +10998,66 @@ class EnvironmentPrior:
                 num_warps=num_warps,
             )
         return out
+
+    def _batch_affine_prefix_tiled_input_activated_update_grad_fused(
+        self,
+        z_old,
+        active_mask,
+        w,
+        b=None,
+        noise_eps=None,
+        hidden_mask=None,
+        in_sizes=None,
+        out_sizes=None,
+        activation_codes=None,
+        block_o=32,
+        block_k=32,
+        num_warps=4,
+    ):
+        if not (
+            triton is not None
+            and torch.is_tensor(z_old)
+            and torch.is_tensor(active_mask)
+            and torch.is_tensor(w)
+            and torch.is_tensor(hidden_mask)
+            and torch.is_tensor(in_sizes)
+            and torch.is_tensor(out_sizes)
+            and torch.is_tensor(activation_codes)
+            and z_old.device.type == "cuda"
+            and active_mask.device.type == "cuda"
+            and w.device.type == "cuda"
+            and hidden_mask.device.type == "cuda"
+            and in_sizes.device.type == "cuda"
+            and out_sizes.device.type == "cuda"
+            and activation_codes.device.type == "cuda"
+            and z_old.dtype == torch.float32
+            and w.dtype == torch.float32
+            and hidden_mask.dtype == torch.float32
+            and z_old.ndim == 2
+            and active_mask.ndim == 1
+            and w.ndim == 3
+            and int(z_old.shape[0]) == int(w.shape[0]) == int(active_mask.shape[0])
+            and int(in_sizes.shape[0]) == int(z_old.shape[0])
+            and int(out_sizes.shape[0]) == int(z_old.shape[0])
+            and bool(z_old.requires_grad)
+            and (b is None or (torch.is_tensor(b) and b.device.type == "cuda" and b.dtype == torch.float32))
+            and (noise_eps is None or (torch.is_tensor(noise_eps) and noise_eps.device.type == "cuda" and noise_eps.dtype == torch.float32))
+        ):
+            return None
+        return _PrefixSampleInputActivatedAffineUpdateGradInputFn.apply(
+            z_old,
+            active_mask,
+            w,
+            b,
+            noise_eps,
+            hidden_mask,
+            in_sizes,
+            out_sizes,
+            activation_codes,
+            int(block_o),
+            int(block_k),
+            int(num_warps),
+        )
 
     def _reference_scm_hidden_multilayer_fused_forward(
         self,

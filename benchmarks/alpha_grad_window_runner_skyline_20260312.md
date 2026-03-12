@@ -186,6 +186,47 @@ Interpretation:
 - The strongest already-tested low-risk candidates did not deliver significant gains.
 - No new code change is retained from this round; only benchmark evidence is kept.
 
+### Accepted: No-Copy Strict SCM Grad-Fused Hidden Update
+
+Hypothesis:
+
+- The earlier strict SCM grad-fused candidate was faster, but its memory regression came from saving step-local contiguous copies of per-layer hidden `w/b` tensors.
+- If the grad-fused path keeps the original layer views and only computes `dL/dz`, it should preserve the time win without the multi-GiB GPU regression.
+
+Implementation:
+
+- Added a CUDA-only grad-fused sample-update path for strict SCM hidden layers.
+- Forward still uses the existing sample-fused update kernel.
+- Backward only returns `dL/dz`.
+- Crucially, it saves the original hidden-layer `w/b` views instead of step-local `.contiguous()` copies.
+- Enabled by default through `TICL_POLICY_REFERENCE_SCM_HIDDEN_UPDATE_GRAD_FUSED=1` semantics on this experimental branch.
+
+Semantic checks:
+
+- strict SCM CUDA forward/gradient equivalence vs unfused path passed
+- `alpha_grad` family/TBPTT finite-gradient checks passed
+- `test_mlp_prior.py` passed
+
+Risky-load evidence, fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family, policy offload`:
+
+| objective | baseline wall (s) | new wall (s) | delta | baseline peak alloc (MiB) | new peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 284.605 | 271.181 | -13.424 | 1112.434 | 1113.152 | +0.718 |
+| `alpha_grad` | 400.780 | 369.806 | -30.974 | 1118.526 | 1119.268 | +0.742 |
+
+Derived split changes:
+
+- `first_policy_gradient sink_backward`: `132.973s -> 114.028s`
+- `alpha_grad sink_backward`: `139.667s -> 108.692s`
+
+Interpretation:
+
+- This is the first `g1` optimization on this branch that clears the acceptance bar:
+  - meaningful risky-load wall reduction
+  - essentially flat GPU peak memory
+  - semantic checks still pass
+- The evidence supports the prior diagnosis: the old regression source was step-local hidden-weight copies, not `WhereBackward` by itself.
+
 ### Accepted Memory Control: Policy-Only Saved-Tensors CPU Offload
 
 Hypothesis:
