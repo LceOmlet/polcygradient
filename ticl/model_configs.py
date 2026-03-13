@@ -517,7 +517,7 @@ def get_rlpfn_default_config():
     config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
     config['transformer']['single_eval_causal'] = True
-    config['optimizer']['rl_objective'] = 'reinforce'
+    config['optimizer']['rl_objective'] = 'alpha_grad'
     # Policy-gradient rollout chunking over batch columns.
     # None means full-batch rollout chunk (max parallel width).
     config['optimizer']['policy_rollout_chunk_size'] = None

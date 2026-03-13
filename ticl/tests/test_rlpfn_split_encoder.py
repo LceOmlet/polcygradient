@@ -17,7 +17,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
-    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],

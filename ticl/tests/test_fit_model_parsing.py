@@ -195,7 +195,7 @@ def test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options():
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
-    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],
