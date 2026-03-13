@@ -491,7 +491,7 @@ def get_rlpfn_default_config():
         "reinforce_action_rms_eps": 1e-6,
         "first_policy_gradient_state_grad_clip_norm": 4.0,
         "first_policy_gradient_action_grad_clip_value": 4.0,
-        "first_policy_gradient_action_grad_clip_norm": 0.0,
+        "first_policy_gradient_action_grad_clip_norm": 1.0,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,

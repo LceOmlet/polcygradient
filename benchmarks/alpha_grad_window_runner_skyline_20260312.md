@@ -51,12 +51,12 @@ Interpretation:
 - It remains an experimental skyline because the partition change also changes strict-SCM execution grouping and therefore is not strictly forward-equivalent to the older baseline.
 - Under the user’s current acceptance criterion, this acceleration is now the active skyline to optimize from.
 
-### Evaluated Robustness Candidate: `action` Adjoint Norm Clip = `1.0`
+### Enabled Robustness Default: `action` Adjoint Norm Clip = `1.0`
 
 Scope:
 
 - branch baseline: experimental skyline above (`2 GiB` strict-SCM partition, full policy offload forced on)
-- candidate:
+- default:
   - `first_policy_gradient_state_grad_clip_norm = 4.0` (unchanged)
   - `first_policy_gradient_action_grad_clip_value = 4.0` (unchanged)
   - `first_policy_gradient_action_grad_clip_norm = 1.0`
