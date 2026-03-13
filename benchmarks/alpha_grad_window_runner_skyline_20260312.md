@@ -58,7 +58,7 @@ Scope:
 - branch baseline: experimental skyline above (`2 GiB` strict-SCM partition, full policy offload forced on)
 - default:
   - `first_policy_gradient_state_grad_clip_norm = 4.0` (unchanged)
-  - `first_policy_gradient_action_grad_clip_value = 4.0` (unchanged)
+  - `first_policy_gradient_action_grad_clip_value = 0.0` (disabled by default)
   - `first_policy_gradient_action_grad_clip_norm = 1.0`
 
 Motivation:

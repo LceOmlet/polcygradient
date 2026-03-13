@@ -201,7 +201,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
-    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 4.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
