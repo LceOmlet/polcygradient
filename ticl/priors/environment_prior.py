@@ -1685,7 +1685,7 @@ class EnvironmentPrior:
             os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION", "0.25")
         )
         reference_scm_partition_max_bytes = str(
-            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(256 * 1024 * 1024))
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(2 * 1024 * 1024 * 1024))
         ).strip()
         try:
             self.reference_scm_partition_max_bytes = int(reference_scm_partition_max_bytes)

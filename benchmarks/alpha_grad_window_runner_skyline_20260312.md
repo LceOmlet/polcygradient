@@ -1,5 +1,56 @@
 ## Alpha Family TBPTT Window Runner
 
+### Accepted Experimental Skyline: 2GB Strict-SCM Partition
+
+Scope:
+
+- worktree: `/tmp/rlpfn_alpha_grad_bridge_20260312`
+- branch: `experiment/alpha-family-window-runner-20260312`
+- change: raise default strict reference SCM partition budget from `256 MiB` to `2 GiB`
+- intent: reduce tiny strict-SCM hidden backward launches under the same full-offload training setup
+- acceptance basis: user-directed relaxed criterion that allows this acceleration to become the new skyline despite deterministic execution drift
+
+Guarded risky-load benchmark setup:
+
+- backend: `torch_vectorized`
+- grouping: `family`
+- `batch_size=64`
+- `n_samples=1024`
+- `single_eval_pos=697`
+- `pg_tbptt_window=32`
+- `kv_cache_mode=paged`
+- saved-tensors offload:
+  - `pg_saved_tensors_cpu_offload=true`
+  - `pg_saved_tensors_cpu_offload_scope=policy`
+  - `pg_saved_tensors_pin_memory=false`
+  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe=false`
+- guard:
+  - fail if peak allocated or reserved GPU memory exceeds `10 GiB`
+  - fail if host RSS exceeds `20 GiB`
+- fixed overrides across runs: same `h_list`, `env_seeds`, `rollout_seeds`
+
+Results:
+
+| objective | status | batch wall (s) | sink backward (s) | non-sink (s) | peak alloc (MiB) | peak reserved (MiB) | RSS (GiB) | objective | reward mean | reward std |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | ok | 171.641 | 87.630 | 84.011 | 2702.345 | 2746.0 | 7.623 | 0.025617 | 0.025617 | 2.808138 |
+| `alpha_grad` | ok | 244.836 | 84.157 | 160.679 | 2707.985 | 2786.0 | 7.308 | 0.819741 | 0.025617 | 2.808138 |
+
+Focused regression checks after changing the default:
+
+- strict SCM/reference subset: `13 passed`
+- `alpha` TBPTT subset: `2 passed`
+- `test_mlp_prior.py`: `9 passed`
+- tiny CLI smoke:
+  - `first_policy_gradient`: passed
+  - `alpha_grad`: passed
+
+Interpretation:
+
+- This change materially improves risky-load throughput under forced full offload while staying inside the active GPU/host guards.
+- It remains an experimental skyline because the partition change also changes strict-SCM execution grouping and therefore is not strictly forward-equivalent to the older baseline.
+- Under the user’s current acceptance criterion, this acceleration is now the active skyline to optimize from.
+
 ### Scope
 
 - Worktree: `/tmp/rlpfn_alpha_grad_bridge_20260312`
