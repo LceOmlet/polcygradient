@@ -5846,16 +5846,26 @@ def test_environment_prior_terminal_reset_single_rollout_adds_bonus_and_resets_s
     assert torch.all(x[1:, terminal_col] == 1.0)
 
 
-def test_environment_prior_terminal_tail_event_from_signal_selects_two_sided_tails():
+def test_environment_prior_terminal_tail_event_from_signal_selects_two_sided_tails_from_history():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[-2.0], [-1.0], [1.0], [2.0]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[-1.0], [-0.25], [0.25], [1.0]], dtype=torch.float32)
     enabled = torch.tensor([True, True, True, True])
     reset_prob = torch.full((4,), 0.5, dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [-1.0, -1.0, -1.0, -1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
 
     terminal_next = prior._terminal_tail_event_from_signal(
         terminal_signal,
         enabled=enabled,
         reset_prob=reset_prob,
+        signal_history=signal_history,
+        history_length=3,
     )
 
     assert torch.equal(terminal_next, torch.tensor([True, False, False, True]))
@@ -5866,11 +5876,21 @@ def test_environment_prior_terminal_tail_event_from_signal_allows_zero_count():
     terminal_signal = torch.tensor([[-2.0], [-1.0], [1.0], [2.0]], dtype=torch.float32)
     enabled = torch.tensor([True, True, True, True])
     reset_prob = torch.zeros((4,), dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [-1.0, -1.0, -1.0, -1.0],
+            [0.0, 0.0, 0.0, 0.0],
+            [1.0, 1.0, 1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
 
     terminal_next = prior._terminal_tail_event_from_signal(
         terminal_signal,
         enabled=enabled,
         reset_prob=reset_prob,
+        signal_history=signal_history,
+        history_length=3,
     )
 
     assert torch.equal(terminal_next, torch.tensor([False, False, False, False]))
@@ -5878,18 +5898,166 @@ def test_environment_prior_terminal_tail_event_from_signal_allows_zero_count():
 
 def test_environment_prior_terminal_tail_event_from_signal_randomized_boundary_avoids_forced_two_hits():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[-1.0], [1.0]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[-0.5], [0.5]], dtype=torch.float32)
     enabled = torch.tensor([True, True])
     reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [-1.0, -1.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
 
     terminal_next = prior._terminal_tail_event_from_signal(
         terminal_signal,
         enabled=enabled,
         reset_prob=reset_prob,
         terminal_draw=torch.tensor([0.2, 0.8], dtype=torch.float32),
+        signal_history=signal_history,
+        history_length=2,
     )
 
     assert torch.equal(terminal_next, torch.tensor([True, False]))
+
+
+def test_environment_prior_terminal_tail_event_from_signal_uses_per_sample_history_not_batch():
+    prior = EnvironmentPrior({})
+    terminal_signal = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
+    enabled = torch.tensor([True, True])
+    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [-1.0, -10.0],
+            [0.0, 0.0],
+            [1.0, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        terminal_signal,
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=signal_history,
+        history_length=3,
+    )
+
+    assert torch.equal(terminal_next, torch.tensor([True, False]))
+
+
+def test_environment_prior_terminal_tail_event_from_signal_uses_batch_only_during_warmup():
+    prior = EnvironmentPrior({})
+    terminal_signal = torch.tensor([[-0.5], [0.5]], dtype=torch.float32)
+    enabled = torch.tensor([True, True])
+    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    signal_history = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        terminal_signal,
+        enabled=enabled,
+        reset_prob=reset_prob,
+        terminal_draw=torch.tensor([0.2, 0.8], dtype=torch.float32),
+        signal_history=signal_history,
+        history_length=1,
+        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+    )
+
+    assert torch.equal(terminal_next, torch.tensor([True, False]))
+
+
+def test_environment_prior_terminal_history_accumulates_during_batch_warmup_then_switches_to_sample_history():
+    prior = EnvironmentPrior({})
+    signal_history = torch.zeros((4, 2), dtype=torch.float32)
+    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    enabled = torch.tensor([True, True], dtype=torch.bool)
+    for t, signal_t in enumerate(
+        (
+            torch.tensor([[-1.0], [-10.0]], dtype=torch.float32),
+            torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+            torch.tensor([[1.0], [10.0]], dtype=torch.float32),
+        )
+    ):
+        prior._apply_terminal_reset_step(
+            state_next=torch.zeros((2, 1), dtype=torch.float32),
+            reward_next=torch.zeros((2,), dtype=torch.float32),
+            terminal_draw=torch.ones((2,), dtype=torch.float32),
+            reset_prob=reset_prob,
+            bonus_scale_draw=torch.zeros((2,), dtype=torch.float32),
+            bonus_scale_min=torch.ones((2,), dtype=torch.float32),
+            bonus_scale_max=torch.ones((2,), dtype=torch.float32),
+            bonus_tanh_c=torch.full((2,), 10.0, dtype=torch.float32),
+            reset_state=torch.zeros((2, 1), dtype=torch.float32),
+            enabled=enabled,
+            terminal_signal=signal_t,
+            terminal_signal_history=signal_history,
+            history_index=t,
+            history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+            history_relaxed_mask=torch.ones((2,), dtype=torch.bool),
+        )
+
+    assert torch.equal(
+        signal_history[:3],
+        torch.tensor(
+            [
+                [-1.0, -10.0],
+                [0.0, 0.0],
+                [1.0, 10.0],
+            ],
+            dtype=torch.float32,
+        ),
+    )
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        torch.tensor([[1.0], [1.0]], dtype=torch.float32),
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=signal_history,
+        history_length=3,
+        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+        history_relaxed_mask=torch.ones((2,), dtype=torch.bool),
+    )
+
+    assert torch.equal(terminal_next, torch.tensor([True, False]))
+
+
+def test_environment_prior_terminal_tail_event_from_signal_requires_non_extreme_history_hit_before_relaxing():
+    prior = EnvironmentPrior({})
+    enabled = torch.tensor([True], dtype=torch.bool)
+    reset_prob = torch.tensor([0.5], dtype=torch.float32)
+    history_relaxed = torch.tensor([False], dtype=torch.bool)
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        torch.tensor([[3.0]], dtype=torch.float32),
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32),
+        history_length=3,
+        history_relaxed_mask=history_relaxed,
+    )
+    assert torch.equal(terminal_next, torch.tensor([False]))
+    assert torch.equal(history_relaxed, torch.tensor([False]))
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        torch.tensor([[2.5]], dtype=torch.float32),
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=torch.tensor([[0.0], [1.0], [2.0], [3.0]], dtype=torch.float32),
+        history_length=4,
+        history_relaxed_mask=history_relaxed,
+    )
+    assert torch.equal(terminal_next, torch.tensor([True]))
+    assert torch.equal(history_relaxed, torch.tensor([True]))
+
+    terminal_next = prior._terminal_tail_event_from_signal(
+        torch.tensor([[-1.0]], dtype=torch.float32),
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=torch.tensor([[0.0], [1.0], [2.0], [3.0], [2.5]], dtype=torch.float32),
+        history_length=5,
+        history_relaxed_mask=history_relaxed,
+    )
+    assert torch.equal(terminal_next, torch.tensor([True]))
 
 
 def test_environment_prior_rollout_policy_gradient_loss_reports_terminal_count_stats(monkeypatch):

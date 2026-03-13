@@ -4807,12 +4807,38 @@ class EnvironmentPrior:
         return lo_v + (hi_v - lo_v) * w
 
     @staticmethod
+    def _empirical_quantile_2d(sorted_values, q):
+        if sorted_values.ndim != 2:
+            raise ValueError("sorted_values must be 2D")
+        n, m = sorted_values.shape
+        if n <= 0 or m <= 0:
+            raise ValueError("sorted_values must be non-empty")
+        q_t = torch.as_tensor(q, device=sorted_values.device, dtype=sorted_values.dtype).reshape(-1)
+        if q_t.numel() != m:
+            raise ValueError("q must have one entry per column")
+        if n == 1:
+            return sorted_values[0].clone()
+        q_t = torch.clamp(q_t, min=0.0, max=1.0)
+        pos = q_t * float(n - 1)
+        lo = torch.floor(pos).to(dtype=torch.long)
+        hi = torch.ceil(pos).to(dtype=torch.long)
+        w = pos - lo.to(dtype=sorted_values.dtype)
+        cols = torch.arange(m, device=sorted_values.device, dtype=torch.long)
+        lo_v = sorted_values[lo, cols]
+        hi_v = sorted_values[hi, cols]
+        return lo_v + (hi_v - lo_v) * w
+
+    @staticmethod
     def _terminal_tail_event_from_signal(
         terminal_signal,
         *,
         enabled,
         reset_prob,
         terminal_draw=None,
+        signal_history=None,
+        history_length=0,
+        history_warmup_count=None,
+        history_relaxed_mask=None,
         rms_eps=1e-6,
     ):
         if terminal_signal is None:
@@ -4839,50 +4865,155 @@ class EnvironmentPrior:
             return torch.zeros_like(signal_t, dtype=torch.bool)
         if bool((prob_t[enabled_t] >= 1).all().item()):
             return enabled_t.clone()
-        signal_enabled = signal_t[enabled_t]
-        rms = torch.sqrt(torch.clamp(signal_enabled.square().mean(), min=0.0))
-        rms = torch.clamp(rms, min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype))
-        signal_norm = signal_t / rms
+        history_len = int(max(0, int(history_length)))
+        history_t = signal_history
+        enabled_idx = torch.nonzero(enabled_t.reshape(-1), as_tuple=False).reshape(-1)
+        if enabled_idx.numel() <= 0:
+            return torch.zeros_like(signal_t, dtype=torch.bool)
         draw_t = terminal_draw
         if draw_t is None:
-            draw_t = torch.zeros_like(signal_norm)
+            draw_t = torch.zeros_like(signal_t.reshape(-1))
         elif not torch.is_tensor(draw_t):
             draw_t = torch.as_tensor(draw_t, device=signal_t.device, dtype=signal_t.dtype)
         else:
             draw_t = draw_t.to(device=signal_t.device, dtype=signal_t.dtype)
         if draw_t.ndim > 0 and draw_t.shape[-1] == 1:
             draw_t = draw_t.squeeze(-1)
+        draw_enabled = draw_t.reshape(-1).index_select(0, enabled_idx)
+        prob_enabled = prob_t.reshape(-1).index_select(0, enabled_idx)
+        signal_enabled = signal_t.reshape(-1).index_select(0, enabled_idx)
+        terminal_enabled = torch.zeros_like(signal_enabled, dtype=torch.bool)
 
-        enabled_idx = torch.nonzero(enabled_t, as_tuple=False).reshape(-1)
-        sorted_order = torch.argsort(signal_norm[enabled_t], dim=0)
-        sorted_global_idx = enabled_idx.index_select(0, sorted_order)
-        n_enabled = int(sorted_global_idx.numel())
-        if n_enabled <= 0:
-            return torch.zeros_like(signal_norm, dtype=torch.bool)
+        def _apply_batch_mode(mask):
+            idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
+            if idx.numel() <= 0:
+                return
+            signal_batch = signal_enabled.index_select(0, idx)
+            prob_batch = prob_enabled.index_select(0, idx)
+            draw_batch = draw_enabled.index_select(0, idx)
+            rms_batch = torch.sqrt(torch.clamp(signal_batch.square().mean(), min=0.0))
+            rms_batch = torch.clamp(
+                rms_batch,
+                min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype),
+            )
+            signal_norm_batch = signal_batch / rms_batch
+            sorted_order = torch.argsort(signal_norm_batch, dim=0)
+            sorted_local_idx = idx.index_select(0, sorted_order)
+            n_enabled_local = int(sorted_local_idx.numel())
+            if n_enabled_local <= 0:
+                return
+            two_sided_q = torch.clamp(
+                prob_enabled.index_select(0, sorted_local_idx) * 0.5,
+                min=0.0,
+                max=0.5,
+            )
+            scaled = two_sided_q * float(n_enabled_local)
+            whole = torch.floor(scaled).to(dtype=torch.long)
+            frac = torch.clamp(
+                scaled - whole.to(dtype=signal_t.dtype),
+                min=0.0,
+                max=1.0,
+            )
+            ranks_from_low = torch.arange(n_enabled_local, device=signal_t.device, dtype=torch.long)
+            ranks_from_high = torch.flip(ranks_from_low, dims=[0])
+            draw_sorted = draw_enabled.index_select(0, sorted_local_idx)
+            lower_hit = (ranks_from_low < whole) | (
+                (ranks_from_low == whole) & (frac > 0.0) & (draw_sorted < frac)
+            )
+            upper_hit = (ranks_from_high < whole) | (
+                (ranks_from_high == whole) & (frac > 0.0) & (draw_sorted < frac)
+            )
+            terminal_enabled.index_copy_(0, sorted_local_idx, lower_hit | upper_hit)
 
-        # Use rank-based two-sided tail selection with randomized boundary handling.
-        # This keeps the trigger tied to the RMS-normalized tail quantile while
-        # avoiding the "always pick both extremes" bias when p is smaller than
-        # two samples per step.
-        two_sided_q = torch.clamp(prob_t[sorted_global_idx] * 0.5, min=0.0, max=0.5)
-        scaled = two_sided_q * float(n_enabled)
-        whole = torch.floor(scaled).to(dtype=torch.long)
-        frac = torch.clamp(scaled - whole.to(dtype=signal_t.dtype), min=0.0, max=1.0)
+        use_history = torch.zeros_like(signal_enabled, dtype=torch.bool)
+        if (signal_history is not None) and (history_len > 0):
+            if not torch.is_tensor(history_t):
+                history_t = torch.as_tensor(history_t, device=signal_t.device, dtype=signal_t.dtype)
+            else:
+                history_t = history_t.to(device=signal_t.device, dtype=signal_t.dtype)
+            if history_t.ndim == 1:
+                history_t = history_t.unsqueeze(-1)
+            if history_t.ndim == 3 and history_t.shape[-1] == 1:
+                history_t = history_t.squeeze(-1)
+            if history_t.ndim != 2:
+                raise ValueError("signal_history must be rank-2 [time, batch]")
+            if history_t.shape[1] != signal_t.reshape(-1).shape[0]:
+                raise ValueError("signal_history batch dimension must match terminal_signal")
+            history_t = history_t[:history_len]
+            if history_t.shape[0] > 0:
+                if history_warmup_count is None:
+                    use_history = torch.ones_like(signal_enabled, dtype=torch.bool)
+                else:
+                    warmup_t = history_warmup_count
+                    if not torch.is_tensor(warmup_t):
+                        warmup_t = torch.as_tensor(warmup_t, device=signal_t.device, dtype=signal_t.dtype)
+                    else:
+                        warmup_t = warmup_t.to(device=signal_t.device, dtype=signal_t.dtype)
+                    if warmup_t.ndim > 0 and warmup_t.shape[-1] == 1:
+                        warmup_t = warmup_t.squeeze(-1)
+                    warmup_enabled = warmup_t.reshape(-1).index_select(0, enabled_idx)
+                    use_history = torch.as_tensor(
+                        history_len > warmup_enabled,
+                        device=signal_t.device,
+                        dtype=torch.bool,
+                    )
+                history_idx = torch.nonzero(use_history, as_tuple=False).reshape(-1)
+                if history_idx.numel() > 0:
+                    signal_hist = signal_enabled.index_select(0, history_idx)
+                    prob_hist = prob_enabled.index_select(0, history_idx)
+                    draw_hist = draw_enabled.index_select(0, history_idx)
+                    hist_enabled = history_t.index_select(1, enabled_idx.index_select(0, history_idx))
+                    rms = torch.sqrt(torch.clamp(hist_enabled.square().mean(dim=0), min=0.0))
+                    rms = torch.clamp(
+                        rms,
+                        min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype),
+                    )
+                    signal_norm = signal_hist / rms
+                    history_norm = hist_enabled / rms.unsqueeze(0)
+                    sorted_history, _ = torch.sort(history_norm, dim=0)
+                    q_lo = EnvironmentPrior._empirical_quantile_2d(sorted_history, prob_hist * 0.5)
+                    q_hi = EnvironmentPrior._empirical_quantile_2d(sorted_history, 1.0 - prob_hist * 0.5)
+                    lower_strict = signal_norm < q_lo
+                    upper_strict = signal_norm > q_hi
+                    lower_eq = signal_norm == q_lo
+                    upper_eq = signal_norm == q_hi
+                    lower_boundary = lower_eq & ~upper_eq & (draw_hist < (prob_hist * 0.5))
+                    upper_boundary = upper_eq & ~lower_eq & (draw_hist < (prob_hist * 0.5))
+                    both_boundary = lower_eq & upper_eq & (draw_hist < prob_hist)
+                    history_hit = lower_strict | upper_strict | lower_boundary | upper_boundary | both_boundary
+                    if history_relaxed_mask is not None:
+                        relaxed_t = history_relaxed_mask
+                        if not torch.is_tensor(relaxed_t):
+                            relaxed_t = torch.as_tensor(relaxed_t, device=signal_t.device, dtype=torch.bool)
+                        else:
+                            relaxed_t = relaxed_t.to(device=signal_t.device, dtype=torch.bool)
+                        relaxed_hist = relaxed_t.reshape(-1).index_select(
+                            0,
+                            enabled_idx.index_select(0, history_idx),
+                        )
+                        hist_min = history_norm.amin(dim=0)
+                        hist_max = history_norm.amax(dim=0)
+                        non_extreme_hit = history_hit & (signal_norm > hist_min) & (signal_norm < hist_max)
+                        allow_hist = history_hit & relaxed_hist
+                        unlock_hist = non_extreme_hit & ~relaxed_hist
+                        history_result = allow_hist | unlock_hist
+                        if bool(unlock_hist.any().item()):
+                            global_unlock_idx = enabled_idx.index_select(
+                                0,
+                                history_idx.index_select(0, torch.nonzero(unlock_hist, as_tuple=False).reshape(-1)),
+                            )
+                            relaxed_flat = relaxed_t.reshape(-1)
+                            relaxed_flat.index_fill_(0, global_unlock_idx, True)
+                    else:
+                        history_result = history_hit
+                    terminal_enabled.index_copy_(0, history_idx, history_result)
 
-        ranks_from_low = torch.arange(n_enabled, device=signal_t.device, dtype=torch.long)
-        ranks_from_high = torch.flip(ranks_from_low, dims=[0])
-        draw_sorted = draw_t.index_select(0, sorted_global_idx)
-
-        lower_hit = (ranks_from_low < whole) | (
-            (ranks_from_low == whole) & (frac > 0.0) & (draw_sorted < frac)
-        )
-        upper_hit = (ranks_from_high < whole) | (
-            (ranks_from_high == whole) & (frac > 0.0) & (draw_sorted < frac)
-        )
-        terminal_sorted = lower_hit | upper_hit
-        terminal_out = torch.zeros_like(signal_norm, dtype=torch.bool)
-        terminal_out.index_fill_(0, sorted_global_idx[terminal_sorted], True)
-        return terminal_out & enabled_t
+        batch_mask = ~use_history
+        if bool(batch_mask.any().item()):
+            _apply_batch_mode(batch_mask)
+        terminal_out = torch.zeros_like(signal_t.reshape(-1), dtype=torch.bool)
+        terminal_out.index_copy_(0, enabled_idx, terminal_enabled)
+        return terminal_out.reshape(signal_t.shape) & enabled_t
 
     @staticmethod
     def _terminal_bonus_from_signal(
@@ -4991,6 +5122,10 @@ class EnvironmentPrior:
         reset_state,
         enabled,
         terminal_signal=None,
+        terminal_signal_history=None,
+        history_index=None,
+        history_warmup_count=None,
+        history_relaxed_mask=None,
     ):
         enabled_t = enabled
         if not torch.is_tensor(enabled_t):
@@ -5024,7 +5159,17 @@ class EnvironmentPrior:
             enabled=enabled_t,
             reset_prob=prob_t,
             terminal_draw=terminal_draw,
+            signal_history=terminal_signal_history,
+            history_length=history_index,
+            history_warmup_count=history_warmup_count,
+            history_relaxed_mask=history_relaxed_mask,
         )
+        if terminal_signal_history is not None and history_index is not None:
+            hist_t = terminal_signal_history
+            if not torch.is_tensor(hist_t):
+                raise ValueError("terminal_signal_history must be a tensor")
+            signal_store = terminal_signal_t.reshape(-1).to(device=hist_t.device, dtype=hist_t.dtype)
+            hist_t[history_index].copy_(signal_store)
         terminal_bonus_t = terminal_bonus_t.to(device=state_next.device, dtype=reward_next.dtype)
         reward_next = reward_next + terminal_bonus_t * terminal_next.to(dtype=reward_next.dtype)
         terminal_mask = terminal_next
@@ -12382,6 +12527,16 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
+            if terminal_token_enabled
+            else None
+        )
+        terminal_history_relaxed = (
+            torch.zeros((batch_size,), device=device, dtype=torch.bool)
+            if terminal_token_enabled
+            else None
+        )
 
         env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
@@ -12493,6 +12648,10 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_signal_history=terminal_signal_history,
+                    history_index=t,
+                    history_warmup_count=env.get("terminal_reset_count_target", None),
+                    history_relaxed_mask=terminal_history_relaxed,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -12884,8 +13043,21 @@ class EnvironmentPrior:
             terminal_reset_enabled = torch.full((batch_size,), bool(terminal_reset_enabled), device=device, dtype=torch.bool)
         else:
             terminal_reset_enabled = terminal_reset_enabled.to(device=device, dtype=torch.bool)
+        terminal_reset_count_target = env.get(
+            "terminal_reset_count_target",
+            torch.ones((batch_size,), device=device, dtype=torch.float32),
+        )
+        if not torch.is_tensor(terminal_reset_count_target):
+            terminal_reset_count_target = torch.full(
+                (batch_size,),
+                float(terminal_reset_count_target),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            terminal_reset_count_target = terminal_reset_count_target.to(device=device, dtype=torch.float32)
         terminal_reset_prob = self._terminal_reset_prob_from_count(
-            env.get("terminal_reset_count_target", torch.ones((batch_size,), device=device, dtype=torch.float32)),
+            terminal_reset_count_target,
             n_samples,
         ).to(device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
@@ -13115,6 +13287,16 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
+            if terminal_token_enabled
+            else None
+        )
+        terminal_history_relaxed = (
+            torch.zeros((batch_size,), device=device, dtype=torch.bool)
+            if terminal_token_enabled
+            else None
+        )
 
         env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
@@ -13450,6 +13632,10 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_state_t,
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_signal_history=terminal_signal_history,
+                    history_index=t,
+                    history_warmup_count=terminal_reset_count_target,
+                    history_relaxed_mask=terminal_history_relaxed,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -14740,6 +14926,16 @@ class EnvironmentPrior:
                     token_action_src_cols = token_action_assign[:, 1]
                     token_action_dst_cols = token_action_cols[token_action_valid]
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
+            if terminal_token_enabled
+            else None
+        )
+        terminal_history_relaxed = (
+            torch.zeros((batch_size,), device=device, dtype=torch.bool)
+            if terminal_token_enabled
+            else None
+        )
 
         def _accumulate_gp_projection_profile(fn_obj):
             nonlocal transition_gp_first_projection_wall_s
@@ -15391,6 +15587,10 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_signal_history=terminal_signal_history,
+                    history_index=t,
+                    history_warmup_count=terminal_reset_count_target,
+                    history_relaxed_mask=terminal_history_relaxed,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -16213,6 +16413,16 @@ class EnvironmentPrior:
             terminal_bonus_scale_draws = _rand((n_samples,), dtype=state_t.dtype)
             terminal_reset_states = _randn((n_samples, state_dim), dtype=state_t.dtype) * env["init_state_std"]
         terminal_count_realized = torch.zeros((1,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, 1), device=device, dtype=torch.float32)
+            if terminal_reset_enabled
+            else None
+        )
+        terminal_history_relaxed = (
+            torch.zeros((1,), device=device, dtype=torch.bool)
+            if terminal_reset_enabled
+            else None
+        )
 
         for t in range(n_samples):
             obs_t = state_t[:obs_dim]  # observable subset of state
@@ -16578,6 +16788,10 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t].unsqueeze(0),
                     enabled=True,
                     terminal_signal=None if terminal_signal_next is None else terminal_signal_next.reshape(1, 1),
+                    terminal_signal_history=terminal_signal_history,
+                    history_index=t,
+                    history_warmup_count=env.get("terminal_reset_count_target", None),
+                    history_relaxed_mask=terminal_history_relaxed,
                 )
                 state_next = state_next.squeeze(0)
                 reward_next = reward_next.reshape(())
@@ -17165,6 +17379,11 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
+            if terminal_token_enabled
+            else None
+        )
 
         env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
@@ -17295,6 +17514,10 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_signal_history=terminal_signal_history,
+                    history_index=t,
+                    history_warmup_count=terminal_reset_count_target,
+                    history_relaxed_mask=terminal_history_relaxed,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -19893,6 +20116,16 @@ class EnvironmentPrior:
         reward_mask_t = torch.ones((batch_size,), device=device, dtype=torch.float32)
         terminal_t = torch.zeros((batch_size,), device=device, dtype=torch.float32)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        terminal_signal_history = (
+            torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
+            if terminal_token_enabled
+            else None
+        )
+        terminal_history_relaxed = (
+            torch.zeros((batch_size,), device=device, dtype=torch.bool)
+            if terminal_token_enabled
+            else None
+        )
         cache = None
 
         strict_seed_mode = rollout_generators is not None
@@ -20352,9 +20585,13 @@ class EnvironmentPrior:
                         bonus_scale_min=terminal_bonus_scale_min,
                         bonus_scale_max=terminal_bonus_scale_max,
                         bonus_tanh_c=terminal_bonus_tanh_c,
-                        reset_state=terminal_reset_states[t],
+                    reset_state=terminal_reset_states[t],
                         enabled=terminal_reset_enabled,
                         terminal_signal=terminal_signal_next,
+                        terminal_signal_history=terminal_signal_history,
+                        history_index=t,
+                        history_warmup_count=terminal_reset_count_target,
+                        history_relaxed_mask=terminal_history_relaxed,
                     )
                 else:
                     terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
