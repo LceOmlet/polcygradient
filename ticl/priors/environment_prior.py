@@ -7444,23 +7444,25 @@ class EnvironmentPrior:
             local_generator.manual_seed(int(rng_seed))
         lipschitz_enabled = bool(h.get("lipschitz_enforce", False))
         strict_joint_transition = self._resolve_strict_joint_transition_enabled(h)
+        terminal_reset_enabled = bool(self._resolve_terminal_reset_enabled(h))
         lipschitz_audit_acc = self._new_lipschitz_audit_accumulator(
             lipschitz_enabled,
             device=device,
             dtype=torch.float32,
         )
+        state_out_dim = state_dim + (1 if terminal_reset_enabled else 0)
 
         # X-style / Y-style generators.
         with self._lipschitz_audit_scope(lipschitz_audit_acc):
             transition_generator = (
-                transition_builder(in_dim, state_dim, h, device, generator=local_generator)
+                transition_builder(in_dim, state_out_dim, h, device, generator=local_generator)
                 if strict_joint_transition
                 else None
             )
             x_generator = (
                 None
                 if strict_joint_transition
-                else builder(in_dim, state_dim, h, device, generator=local_generator)
+                else builder(in_dim, state_out_dim, h, device, generator=local_generator)
             )  # for s_{t+1}
             y_generator = (
                 None
@@ -7486,17 +7488,27 @@ class EnvironmentPrior:
         reinforce_reward_tanh_bound = float(self._resolve_reinforce_reward_tanh_bound(h))
         reinforce_action_transform = self._resolve_reinforce_action_transform(h)
         reinforce_action_rms_eps = float(self._resolve_reinforce_action_rms_eps(h))
-        terminal_reset_enabled = bool(self._resolve_terminal_reset_enabled(h))
         terminal_reset_count_target = int(self._resolve_terminal_reset_count_target(h))
         terminal_bonus_tanh_c = float(self._resolve_terminal_bonus_tanh_c(h))
         terminal_bonus_scale_min = float(self._resolve_terminal_bonus_scale_min(h))
         terminal_bonus_scale_max = float(self._resolve_terminal_bonus_scale_max(h))
         if terminal_reset_enabled:
-            with self._lipschitz_audit_scope(lipschitz_audit_acc):
-                terminal_generator = (
-                    transition_builder(in_dim, 1, h, device, generator=local_generator)
-                    if strict_joint_transition
-                    else builder(in_dim, 1, h, device, generator=local_generator)
+            if strict_joint_transition:
+                transition_generator = self._wrap_transition_with_terminal_extra(
+                    transition_generator,
+                    state_dim,
+                )
+            else:
+                x_generator_full = x_generator
+                x_generator = self._wrap_state_generator_with_terminal_extra(
+                    x_generator_full,
+                    state_dim,
+                )
+                transition_generator = self._build_terminal_shared_transition_fn(
+                    x_generator_full,
+                    y_generator,
+                    batch_size=1,
+                    state_cap=state_dim,
                 )
         state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
         state_highway_lambda = float(self._resolve_state_highway_lambda(h))
@@ -9866,6 +9878,208 @@ class EnvironmentPrior:
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
         return transition_fn
 
+    @staticmethod
+    def _copy_transition_runtime_attrs(dst_fn, src_fn):
+        for attr in (
+            "_envgen_checkpoint_enabled",
+            "_prefers_packed_env_input",
+            "_packed_input_cap",
+            "_consume_gp_projection_profile",
+            "_profile_group_count",
+            "_gp_shared_transition",
+        ):
+            if hasattr(src_fn, attr):
+                setattr(dst_fn, attr, getattr(src_fn, attr))
+        return dst_fn
+
+    @staticmethod
+    def _trim_state_output(state_out_full, state_spec):
+        if not torch.is_tensor(state_out_full):
+            raise RuntimeError("state output must be a tensor")
+        if torch.is_tensor(state_spec):
+            state_dims = state_spec.to(device=state_out_full.device, dtype=torch.long)
+            if state_dims.dim() != 1 or state_dims.shape[0] != state_out_full.shape[0]:
+                raise RuntimeError("hetero state trim expects per-sample state dims")
+            state_cap = int(max(1, int(state_dims.max().item())))
+            state_out = state_out_full.new_zeros((state_out_full.shape[0], state_cap))
+            state_mask = (
+                torch.arange(state_cap, device=state_out_full.device, dtype=torch.long).unsqueeze(0)
+                < state_dims.unsqueeze(1)
+            )
+            state_out[state_mask] = state_out_full[:, :state_cap][state_mask]
+            return state_out
+        state_cap = int(max(1, int(state_spec)))
+        return state_out_full[..., :state_cap]
+
+    @staticmethod
+    def _split_state_with_terminal_extra(state_out_full, state_spec, terminal_enabled=None):
+        if not torch.is_tensor(state_out_full):
+            raise RuntimeError("state generator with terminal extra must return a tensor")
+        if torch.is_tensor(state_spec):
+            state_dims = state_spec.to(device=state_out_full.device, dtype=torch.long)
+            if state_dims.dim() != 1 or state_dims.shape[0] != state_out_full.shape[0]:
+                raise RuntimeError("hetero terminal split expects per-sample state dims")
+            state_cap = int(max(1, int(state_dims.max().item())))
+            state_out = state_out_full.new_zeros((state_out_full.shape[0], state_cap))
+            state_mask = (
+                torch.arange(state_cap, device=state_out_full.device, dtype=torch.long).unsqueeze(0)
+                < state_dims.unsqueeze(1)
+            )
+            state_out[state_mask] = state_out_full[:, :state_cap][state_mask]
+            terminal_signal = state_out_full.new_zeros((state_out_full.shape[0], 1))
+            if terminal_enabled is None:
+                terminal_mask = torch.ones_like(state_dims, dtype=torch.bool, device=state_out_full.device)
+            else:
+                terminal_mask = terminal_enabled.to(device=state_out_full.device, dtype=torch.bool)
+            if bool(torch.any(terminal_mask).item()):
+                terminal_pos = state_dims.clamp(max=max(0, state_out_full.shape[1] - 1))
+                active_idx = torch.nonzero(terminal_mask, as_tuple=False).squeeze(-1)
+                terminal_signal[active_idx, 0] = state_out_full[active_idx, terminal_pos[active_idx]]
+            return state_out, terminal_signal
+
+        state_cap = int(max(1, int(state_spec)))
+        state_out = state_out_full[..., :state_cap]
+        terminal_signal = state_out_full[..., state_cap: state_cap + 1]
+        if terminal_enabled is not None:
+            terminal_mask = terminal_enabled.to(device=state_out_full.device, dtype=torch.bool).view(-1, 1)
+            terminal_signal = torch.where(
+                terminal_mask,
+                terminal_signal,
+                torch.zeros_like(terminal_signal),
+            )
+        return state_out, terminal_signal
+
+    def _wrap_state_generator_with_terminal_extra(self, state_fn_full, state_cap, terminal_enabled=None):
+        if torch.is_tensor(state_cap):
+            state_cap_int = int(max(1, int(state_cap.max().item())))
+        else:
+            state_cap_int = int(max(1, int(state_cap)))
+
+        def state_fn(*args, **kwargs):
+            out = state_fn_full(*args, **kwargs)
+            return self._trim_state_output(out, state_cap)
+
+        if hasattr(state_fn_full, "_envgen_checkpoint_enabled"):
+            state_fn._envgen_checkpoint_enabled = bool(
+                getattr(state_fn_full, "_envgen_checkpoint_enabled", False)
+            )
+        if hasattr(state_fn_full, "_out_width"):
+            state_fn._out_width = state_cap_int
+        if hasattr(state_fn_full, "_noise_scale"):
+            noise_scale = getattr(state_fn_full, "_noise_scale", None)
+            if torch.is_tensor(noise_scale):
+                state_fn._noise_scale = noise_scale[..., :state_cap_int]
+        return state_fn
+
+    def _wrap_transition_with_terminal_extra(self, transition_fn_full, state_cap, terminal_enabled=None):
+        def transition_fn(*args, **kwargs):
+            out = transition_fn_full(*args, **kwargs)
+            if (not isinstance(out, tuple)) or len(out) < 2:
+                raise RuntimeError("transition generator with terminal extra must return (state, reward)")
+            if len(out) >= 3:
+                state_out, reward_out, terminal_signal = out[:3]
+                state_main = self._trim_state_output(state_out, state_cap)
+                return state_main, reward_out, terminal_signal
+            state_out, reward_out = out[:2]
+            state_main, terminal_signal = self._split_state_with_terminal_extra(
+                state_out,
+                state_cap,
+                terminal_enabled=terminal_enabled,
+            )
+            return state_main, reward_out, terminal_signal
+
+        return self._copy_transition_runtime_attrs(transition_fn, transition_fn_full)
+
+    def _build_terminal_shared_transition_fn(
+        self,
+        state_fn_full,
+        reward_fn,
+        batch_size,
+        state_cap,
+        terminal_enabled=None,
+    ):
+        batch_size = int(batch_size)
+        if torch.is_tensor(state_cap):
+            state_cap_int = int(max(1, int(state_cap.max().item())))
+        else:
+            state_cap_int = int(max(1, int(state_cap)))
+        state_out_width = int(max(1, int(getattr(state_fn_full, "_out_width", state_cap_int + 1))))
+        reward_out_width = int(max(1, int(getattr(reward_fn, "_out_width", 1))))
+        state_noise_scale = getattr(state_fn_full, "_noise_scale", None)
+        reward_noise_scale = getattr(reward_fn, "_noise_scale", None)
+        checkpoint_enabled = bool(
+            getattr(state_fn_full, "_envgen_checkpoint_enabled", False)
+            or getattr(reward_fn, "_envgen_checkpoint_enabled", False)
+        )
+
+        def transition_fn(x, generators_for_noise=None, x_is_dual_packed=False):
+            if bool(x_is_dual_packed):
+                x_state = x[:batch_size]
+                x_reward = x[batch_size: batch_size * 2]
+                state_input = x_state
+                reward_input = x_reward
+                state_stable_input = True
+                reward_stable_input = True
+            else:
+                x_state = x
+                x_reward = x
+                if checkpoint_enabled and self._envgen_checkpoint_active(x_state):
+                    shared_input = x_state.clone()
+                    state_input = shared_input
+                    reward_input = shared_input
+                    state_stable_input = True
+                    reward_stable_input = True
+                else:
+                    state_input = x_state
+                    reward_input = x_reward
+                    state_stable_input = False
+                    reward_stable_input = False
+            state_noise_eps = None
+            reward_noise_eps = None
+            state_generators = generators_for_noise
+            reward_generators = generators_for_noise
+            if generators_for_noise is not None:
+                generators_list = list(generators_for_noise)
+                if len(generators_list) != batch_size:
+                    raise ValueError("generators_for_noise must match batch size")
+                dual_scale = None
+                if torch.is_tensor(state_noise_scale) and torch.is_tensor(reward_noise_scale):
+                    dual_scale = torch.cat([state_noise_scale, reward_noise_scale], dim=0)
+                if dual_scale is not None and bool(torch.any(dual_scale > 0)):
+                    dual_noise = self._sample_scaled_noise_batch(
+                        generators_list + generators_list,
+                        scale=dual_scale,
+                        width=max(state_out_width, reward_out_width),
+                        device=x_state.device,
+                        dtype=x_state.dtype,
+                    )
+                    if dual_noise is not None:
+                        state_noise_eps = dual_noise[:batch_size, :state_out_width]
+                        reward_noise_eps = dual_noise[batch_size:, :reward_out_width]
+                        state_generators = None
+                        reward_generators = None
+            state_full = state_fn_full(
+                state_input,
+                generators_for_noise=state_generators,
+                noise_eps=state_noise_eps,
+                stable_input=state_stable_input,
+            )
+            reward_next = reward_fn(
+                reward_input,
+                generators_for_noise=reward_generators,
+                noise_eps=reward_noise_eps,
+                stable_input=reward_stable_input,
+            )
+            state_main, terminal_signal = self._split_state_with_terminal_extra(
+                state_full,
+                state_cap,
+                terminal_enabled=terminal_enabled,
+            )
+            return state_main, reward_next[:, :1], terminal_signal
+
+        transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
+        return transition_fn
+
     def _build_scm_hetero_joint_transition_batch_fn(
         self,
         in_dims,
@@ -10340,6 +10554,12 @@ class EnvironmentPrior:
         skipped_non_transition_generator_count = 0
         skipped_non_transition_rng_preserve_count = 0
         lipschitz_enabled = any(bool(h.get("lipschitz_enforce", False)) for h in h_list)
+        terminal_reset_enabled = torch.tensor(
+            [bool(self._resolve_terminal_reset_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_dims_for_generator = state_dims + terminal_reset_enabled.to(dtype=torch.long)
         lipschitz_audit_acc = self._new_lipschitz_audit_accumulator(
             lipschitz_enabled,
             device=device,
@@ -10383,7 +10603,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     transition_generator = self._build_scm_hetero_joint_transition_batch_fn(
                         in_dims=in_dims,
-                        state_dims=state_dims,
+                        state_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         depth_values=depth_values,
@@ -10396,7 +10616,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     transition_generator = self._build_scm_hetero_transition_batch_fn(
                         in_dims=in_dims,
-                        state_dims=state_dims,
+                        state_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         depth_values=depth_values,
@@ -10408,7 +10628,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     x_generator = self._build_scm_hetero_batch_fn(
                         in_dims=in_dims,
-                        out_dims=state_dims,
+                        out_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         depth_values=depth_values,
@@ -10457,7 +10677,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     transition_generator = self._build_gp_hetero_joint_transition_batch_fn(
                         in_dims=in_dims,
-                        state_dims=state_dims,
+                        state_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         generators=generators,
@@ -10469,7 +10689,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     transition_generator = self._build_gp_hetero_transition_batch_fn(
                         in_dims=in_dims,
-                        state_dims=state_dims,
+                        state_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         input_mask=input_mask,
@@ -10482,7 +10702,7 @@ class EnvironmentPrior:
                     build_t0 = time.perf_counter()
                     x_generator = self._build_gp_hetero_batch_fn(
                         in_dims=in_dims,
-                        out_dims=state_dims,
+                        out_dims=state_dims_for_generator,
                         h_list=h_list,
                         device=device,
                         generators=generators,
@@ -10565,11 +10785,6 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
-        terminal_reset_enabled = torch.tensor(
-            [bool(self._resolve_terminal_reset_enabled(h)) for h in h_list],
-            device=device,
-            dtype=torch.bool,
-        )
         terminal_reset_count_target = torch.tensor(
             [int(self._resolve_terminal_reset_count_target(h)) for h in h_list],
             device=device,
@@ -10591,53 +10806,27 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         if bool(torch.any(terminal_reset_enabled).item()):
-            with self._lipschitz_audit_scope(lipschitz_audit_acc):
-                if family == "scm":
-                    depth_values_terminal = [max(2, int(h["num_layers"])) for h in h_list]
-                    activation_values_terminal = [self._activation_name(h["prior_mlp_activations"]) for h in h_list]
-                    terminal_generator = (
-                        self._build_scm_hetero_joint_transition_batch_fn(
-                            in_dims=in_dims,
-                            state_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                            h_list=h_list,
-                            device=device,
-                            depth_values=depth_values_terminal,
-                            activation_names=activation_values_terminal,
-                            generators=generators,
-                            input_mask=input_mask,
-                        )
-                        if strict_joint_transition
-                        else self._build_scm_hetero_batch_fn(
-                            in_dims=in_dims,
-                            out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                            h_list=h_list,
-                            device=device,
-                            depth_values=depth_values_terminal,
-                            activation_names=activation_values_terminal,
-                            generators=generators,
-                            input_mask=input_mask,
-                        )
-                    )
-                else:
-                    terminal_generator = (
-                        self._build_gp_hetero_joint_transition_batch_fn(
-                            in_dims=in_dims,
-                            state_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                            h_list=h_list,
-                            device=device,
-                            generators=generators,
-                            input_mask=input_mask,
-                        )
-                        if strict_joint_transition
-                        else self._build_gp_hetero_batch_fn(
-                            in_dims=in_dims,
-                            out_dims=torch.ones((batch_size,), device=device, dtype=torch.long),
-                            h_list=h_list,
-                            device=device,
-                            generators=generators,
-                            input_mask=input_mask,
-                        )
-                    )
+            x_generator_full = x_generator
+            if x_generator_full is not None:
+                x_generator = self._wrap_state_generator_with_terminal_extra(
+                    x_generator_full,
+                    state_dims,
+                    terminal_enabled=terminal_reset_enabled,
+                )
+            if transition_generator is not None:
+                transition_generator = self._wrap_transition_with_terminal_extra(
+                    transition_generator,
+                    state_dims,
+                    terminal_enabled=terminal_reset_enabled,
+                )
+            elif x_generator_full is not None:
+                transition_generator = self._build_terminal_shared_transition_fn(
+                    x_generator_full,
+                    y_generator,
+                    batch_size=batch_size,
+                    state_cap=state_dims,
+                    terminal_enabled=terminal_reset_enabled,
+                )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -11142,15 +11331,21 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         with self._lipschitz_audit_scope(lipschitz_audit_acc):
+            terminal_reset_enabled = torch.tensor(
+                [bool(self._resolve_terminal_reset_enabled(h)) for h in h_list],
+                device=device,
+                dtype=torch.bool,
+            )
+            state_dim_for_generator = int(state_dim + (1 if bool(torch.any(terminal_reset_enabled).item()) else 0))
             transition_generator = (
-                transition_builder(in_dim, state_dim, h_list, device, generators=generators)
+                transition_builder(in_dim, state_dim_for_generator, h_list, device, generators=generators)
                 if strict_joint_transition
                 else None
             )
             x_generator = (
                 None
                 if strict_joint_transition
-                else builder(in_dim, state_dim, h_list, device, generators=generators)
+                else builder(in_dim, state_dim_for_generator, h_list, device, generators=generators)
             )
             y_generator = (
                 None
@@ -11204,11 +11399,6 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
-        terminal_reset_enabled = torch.tensor(
-            [bool(self._resolve_terminal_reset_enabled(h)) for h in h_list],
-            device=device,
-            dtype=torch.bool,
-        )
         terminal_reset_count_target = torch.tensor(
             [int(self._resolve_terminal_reset_count_target(h)) for h in h_list],
             device=device,
@@ -11230,11 +11420,26 @@ class EnvironmentPrior:
             dtype=torch.float32,
         )
         if bool(torch.any(terminal_reset_enabled).item()):
-            with self._lipschitz_audit_scope(lipschitz_audit_acc):
-                terminal_generator = (
-                    transition_builder(in_dim, 1, h_list, device, generators=generators)
-                    if strict_joint_transition
-                    else builder(in_dim, 1, h_list, device, generators=generators)
+            x_generator_full = x_generator
+            if x_generator_full is not None:
+                x_generator = self._wrap_state_generator_with_terminal_extra(
+                    x_generator_full,
+                    state_dim,
+                    terminal_enabled=terminal_reset_enabled,
+                )
+            if strict_joint_transition:
+                transition_generator = self._wrap_transition_with_terminal_extra(
+                    transition_generator,
+                    state_dim,
+                    terminal_enabled=terminal_reset_enabled,
+                )
+            elif x_generator_full is not None:
+                transition_generator = self._build_terminal_shared_transition_fn(
+                    x_generator_full,
+                    y_generator,
+                    batch_size=batch_size,
+                    state_cap=state_dim,
+                    terminal_enabled=terminal_reset_enabled,
                 )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],

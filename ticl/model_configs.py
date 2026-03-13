@@ -17,7 +17,7 @@ def get_optimizer_config():
         "pg_saved_tensors_cpu_offload": False,
         "pg_saved_tensors_cpu_offload_scope": "all",
         "pg_saved_tensors_pin_memory": True,
-        "pg_saved_tensors_cpu_offload_auto_disable_when_safe": False,
+        "pg_saved_tensors_cpu_offload_auto_disable_when_safe": True,
         "pg_saved_tensors_cpu_offload_auto_min_free_gb": 8.0,
         "pg_saved_tensors_cpu_offload_auto_max_batch_size": 64,
         "pg_saved_tensors_cpu_offload_auto_max_n_samples": 1024,
@@ -575,7 +575,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
