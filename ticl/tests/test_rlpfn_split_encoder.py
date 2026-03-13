@@ -1,5 +1,6 @@
 import torch
 
+import ticl.model_configs as model_configs
 from ticl.model_configs import get_model_default_config
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
@@ -116,6 +117,19 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 
 
+def test_rlpfn_terminal_reset_enabled_expands_split_obs_slots(monkeypatch):
+    orig_get_shared_defaults = model_configs.get_shared_defaults
+
+    def _patched_shared_defaults():
+        cfg = orig_get_shared_defaults()
+        cfg["prior"]["environment"]["terminal_reset_enabled"] = True
+        return cfg
+
+    monkeypatch.setattr(model_configs, "get_shared_defaults", _patched_shared_defaults)
+    cfg = model_configs.get_rlpfn_default_config()
+    assert cfg["transformer"]["x_obs_dim"] == 403
+
+
 def test_tabpfn_split_obs_action_encoder_forward():
     emsize = 32
     model = TabPFN(
@@ -204,6 +218,63 @@ def test_tabpfn_forward_policy_step_split_matches_materialized_token():
         action_t,
         reward_t,
         reward_mask_t,
+        kv_cache=None,
+        max_cache_len=32,
+        kv_cache_mode="immutable",
+    )
+
+    assert torch.allclose(out_ref, out_split, atol=1e-6, rtol=1e-5)
+    _assert_nested_tensor_close(cache_ref, cache_split, atol=1e-6, rtol=1e-5)
+
+
+def test_tabpfn_forward_policy_step_split_matches_materialized_token_with_terminal():
+    torch.manual_seed(20260313)
+    emsize = 16
+    model = TabPFN(
+        n_out=2,
+        n_features=13,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=9,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+
+    batch_size = 5
+    obs_t = torch.randn(batch_size, 6)
+    action_t = torch.randn(batch_size, 4)
+    reward_t = torch.randn(batch_size, 1)
+    reward_mask_t = torch.rand(batch_size, 1)
+    terminal_t = torch.rand(batch_size, 1)
+
+    x_token = torch.zeros(1, batch_size, 13, dtype=obs_t.dtype)
+    x_token[0, :, :6] = obs_t
+    x_token[0, :, 6] = reward_t.reshape(-1)
+    x_token[0, :, 7] = reward_mask_t.reshape(-1)
+    x_token[0, :, 8] = terminal_t.reshape(-1)
+    x_token[0, :, 9:13] = action_t
+    y_token = reward_t.reshape(1, batch_size)
+
+    out_ref, cache_ref = model.forward_policy_step(
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=32,
+        kv_cache_mode="immutable",
+    )
+    out_split, cache_split = model.forward_policy_step_split(
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        terminal_t=terminal_t,
         kv_cache=None,
         max_cache_len=32,
         kv_cache_mode="immutable",

@@ -514,7 +514,8 @@ def get_rlpfn_default_config():
     config['transformer']['classification_task'] = False
     config['transformer']['y_encoder'] = 'linear'
     config['transformer']['x_encoder_type'] = 'split_obs_action'
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
+    terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + terminal_obs_extra
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
     config['transformer']['single_eval_causal'] = True
     config['optimizer']['rl_objective'] = 'alpha_grad'
