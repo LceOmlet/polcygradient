@@ -1398,6 +1398,9 @@ class EnvironmentPrior:
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
         cfg.setdefault("first_policy_gradient_action_grad_clip_value", 0.0)
         cfg.setdefault("first_policy_gradient_action_grad_clip_norm", 0.0)
+        cfg.setdefault("alpha_grad_local_coordinate_enabled", True)
+        cfg.setdefault("alpha_grad_unit_grad_enabled", True)
+        cfg.setdefault("alpha_grad_unit_grad_delta", 1e-6)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -4974,6 +4977,21 @@ class EnvironmentPrior:
     def _resolve_alpha_grad_variance_eps(h):
         v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_variance_eps", 1e-6))
         return max(float(v), 0.0)
+
+    @staticmethod
+    def _resolve_alpha_grad_local_coordinate_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_local_coordinate_enabled", True))
+
+    @staticmethod
+    def _resolve_alpha_grad_unit_grad_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_unit_grad_enabled", True))
+
+    @staticmethod
+    def _resolve_alpha_grad_unit_grad_delta(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_unit_grad_delta", 1e-6))
+        if not math.isfinite(v) or v < 0.0:
+            return 1e-6
+        return float(v)
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -17906,6 +17924,21 @@ class EnvironmentPrior:
         var = torch.where(counts > 0, var, torch.zeros_like(var))
         return mean, var, counts
 
+    @staticmethod
+    def _alpha_grad_unit_normalize(values, valid_mask, delta):
+        if values.ndim != 3:
+            raise ValueError(f"values must have shape (T, B, C), got {tuple(values.shape)}")
+        if valid_mask.shape != values.shape:
+            raise ValueError(
+                "valid_mask must match values shape, "
+                f"got {tuple(valid_mask.shape)} and {tuple(values.shape)}"
+            )
+        delta = float(max(0.0, delta))
+        mask_f = valid_mask.to(device=values.device, dtype=values.dtype)
+        denom = ((values.square() * mask_f).sum(dim=-1, keepdim=True)).sqrt() + float(delta)
+        normalized = values / denom
+        return torch.where(valid_mask, normalized, torch.zeros_like(normalized))
+
     def alpha_grad_loss_from_rollout_tensors(
         self,
         *,
@@ -18017,6 +18050,9 @@ class EnvironmentPrior:
         if variance_eps is None:
             variance_eps = self._resolve_alpha_grad_variance_eps(self.config)
         variance_eps = float(max(variance_eps, 0.0))
+        local_coordinate_enabled = self._resolve_alpha_grad_local_coordinate_enabled(self.config)
+        unit_grad_enabled = self._resolve_alpha_grad_unit_grad_enabled(self.config)
+        unit_grad_delta = self._resolve_alpha_grad_unit_grad_delta(self.config)
         if discount is None:
             discount = self._resolve_scalar(self.config.get("discount", 1.0))
         discount = float(max(0.0, min(1.0, discount)))
@@ -18047,6 +18083,26 @@ class EnvironmentPrior:
                 for part, inp in zip(grad_parts, grad_inputs)
             )
 
+        def _prepare_alpha_sources(g0_values, g1_values, valid_mask_local):
+            if unit_grad_enabled:
+                g0_source = self._alpha_grad_unit_normalize(g0_values, valid_mask_local, unit_grad_delta)
+                g1_source = self._alpha_grad_unit_normalize(g1_values, valid_mask_local, unit_grad_delta)
+            else:
+                g0_source = torch.where(valid_mask_local, g0_values, torch.zeros_like(g0_values))
+                g1_source = torch.where(valid_mask_local, g1_values, torch.zeros_like(g1_values))
+            return g0_source, g1_source
+
+        def _compute_alpha_mix(g0_values, g1_values, valid_mask_local):
+            g0_source, g1_source = _prepare_alpha_sources(g0_values, g1_values, valid_mask_local)
+            _, v0_local, counts_local = self._masked_batch_mean_and_var(g0_source, valid_mask_local)
+            _, v1_local, _ = self._masked_batch_mean_and_var(g1_source, valid_mask_local)
+            denom_local = v0_local + v1_local + float(variance_eps)
+            alpha_local = torch.where(denom_local > 0, v0_local / denom_local, torch.zeros_like(v0_local))
+            alpha_local = torch.where(counts_local > 0, alpha_local, torch.zeros_like(alpha_local))
+            gmix_local = ((1.0 - alpha_local).unsqueeze(1) * g0_values) + (alpha_local.unsqueeze(1) * g1_values)
+            gmix_local = torch.where(valid_mask_local, gmix_local, torch.zeros_like(gmix_local))
+            return gmix_local, alpha_local, v0_local, v1_local, counts_local
+
         g0_analytic = None
         if log_prob_score is not None:
             returns = self._returns_to_go(rewards, discount=discount)
@@ -18057,6 +18113,9 @@ class EnvironmentPrior:
                 * log_prob_score.detach()
             ) / float(max(1, rewards.numel()))
 
+        alpha_summary = None
+        surrogate = None
+
         if action_group_entries is not None:
             root_records = []
             flat_roots = []
@@ -18065,11 +18124,17 @@ class EnvironmentPrior:
                     raise ValueError("grouped alpha_grad action traces must be dict entries")
                 group_indices = tuple(int(i) for i in group_entry.get("indices", ()))
                 group_roots = group_entry.get("action_mean_roots", None)
+                group_mask = group_entry.get("action_mask", None)
                 if (not group_indices) or (not isinstance(group_roots, tuple)):
                     continue
+                if not torch.is_tensor(group_mask):
+                    raise ValueError("grouped alpha_grad action traces must provide a local action_mask tensor")
                 if len(group_roots) != int(rewards.shape[0]):
                     raise ValueError("grouped alpha_grad roots must match rewards time dimension")
+                if int(group_mask.shape[0]) != int(rewards.shape[0]):
+                    raise ValueError("grouped alpha_grad local action_mask must match rewards time dimension")
                 for t_idx, root in enumerate(group_roots):
+                    mask_t = group_mask[t_idx].to(dtype=torch.bool)
                     root_orig = root
                     if root.ndim == 1:
                         if len(group_indices) != 1:
@@ -18079,111 +18144,205 @@ class EnvironmentPrior:
                         root_view = root
                     if root_view.ndim != 2 or root_view.shape[0] != len(group_indices):
                         raise ValueError("grouped alpha_grad roots must have shape (Bg, C)")
+                    if tuple(mask_t.shape) != tuple(root_view.shape):
+                        raise ValueError(
+                            "grouped alpha_grad local masks must match grouped root shape, "
+                            f"got {tuple(mask_t.shape)} and {tuple(root_view.shape)}"
+                        )
                     flat_roots.append(root_orig)
-                    root_records.append((t_idx, group_indices, root_orig, root_view))
+                    root_records.append((t_idx, group_indices, root_orig, root_view, mask_t))
             if not flat_roots:
                 raise RuntimeError("alpha_grad rollout did not preserve differentiable action roots")
             g1_parts = _grad_parts_or_zeros(first_loss, flat_roots)
-            g_shape = tuple(action_mask.shape)
             g_dtype = flat_roots[0].dtype
             g_device = flat_roots[0].device
-            g1 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
             if g0_analytic is not None:
-                g0 = g0_analytic.to(device=g_device, dtype=g_dtype)
                 g0_parts = (None,) * len(root_records)
             else:
-                g0 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
                 g0_parts = _grad_parts_or_zeros(reinforce_loss, flat_roots)
-            for (t_idx, group_indices, root_orig, root_view), g1_part, g0_part in zip(root_records, g1_parts, g0_parts):
-                width = int(root_view.shape[-1])
-                if width > int(g1.shape[-1]):
-                    raise RuntimeError("alpha_grad grouped root width exceeds action mask width")
-                idx_list = list(group_indices)
-                if g1_part is not None and g1_part.ndim == 1:
-                    g1_part = g1_part.unsqueeze(0)
-                if g0_part is not None and g0_part.ndim == 1:
-                    g0_part = g0_part.unsqueeze(0)
-                if g1_part is not None:
-                    g1[t_idx, idx_list, :width] = g1_part
-                if (g0_analytic is None) and (g0_part is not None):
-                    g0[t_idx, idx_list, :width] = g0_part
-        elif action_mean_inputs is None:
-            g1 = _grad_parts_or_zeros(first_loss, (action_mean,))[0]
-            if g0_analytic is not None:
-                g0 = g0_analytic.to(device=action_mean.device, dtype=action_mean.dtype)
-            else:
-                g0 = _grad_parts_or_zeros(reinforce_loss, (action_mean,))[0]
-        else:
-            g1_parts = _grad_parts_or_zeros(first_loss, action_mean_inputs)
-            g1 = torch.stack(
-                list(g1_parts),
-                dim=0,
-            )
-            if g1.ndim == 2:
-                g1 = g1.unsqueeze(1)
-            if g0_analytic is not None:
-                root0 = action_mean_inputs[0]
-                g0 = g0_analytic.to(device=root0.device, dtype=root0.dtype)
-            else:
-                g0_parts = _grad_parts_or_zeros(reinforce_loss, action_mean_inputs)
-                g0 = torch.stack(
-                    list(g0_parts),
-                    dim=0,
-                )
-                if g0.ndim == 2:
-                    g0 = g0.unsqueeze(1)
 
-        g1_det = g1.detach().to(dtype=torch.float32)
-        g0_det = g0.detach().to(dtype=torch.float32)
-        valid_mask = action_mask & torch.isfinite(g0_det) & torch.isfinite(g1_det)
-        _, v0, counts = self._masked_batch_mean_and_var(g0_det, valid_mask)
-        _, v1, _ = self._masked_batch_mean_and_var(g1_det, valid_mask)
-        denom = v0 + v1 + float(variance_eps)
-        alpha = torch.where(denom > 0, v0 / denom, torch.zeros_like(v0))
-        alpha = torch.where(counts > 0, alpha, torch.zeros_like(alpha))
-        gmix_det = ((1.0 - alpha).unsqueeze(1) * g0_det) + (alpha.unsqueeze(1) * g1_det)
-        gmix_det = torch.where(valid_mask, gmix_det, torch.zeros_like(gmix_det))
-        if action_group_entries is not None:
-            surrogate = torch.zeros((), device=g1.device, dtype=g1.dtype)
-            for t_idx, group_indices, root_orig, root_view in root_records:
-                width = int(root_view.shape[-1])
-                target_grad = gmix_det[t_idx, list(group_indices), :width].to(dtype=root_view.dtype)
-                if root_orig.ndim == 1:
-                    target_grad = target_grad.squeeze(0)
-                    root_term = root_orig
+            if local_coordinate_enabled:
+                surrogate = torch.zeros((), device=g_device, dtype=g_dtype)
+                alpha_values = []
+                v0_values = []
+                v1_values = []
+                count_values = []
+                valid_num = 0
+                valid_den = 0
+                g0_nonfinite = 0.0
+                g1_nonfinite = 0.0
+                g0_abs_max = 0.0
+                g1_abs_max = 0.0
+                mix_abs_max = 0.0
+                for (t_idx, group_indices, root_orig, root_view, mask_t), g1_part, g0_part in zip(root_records, g1_parts, g0_parts):
+                    idx_list = list(group_indices)
+                    if g1_part is not None and g1_part.ndim == 1:
+                        g1_part = g1_part.unsqueeze(0)
+                    if g0_part is not None and g0_part.ndim == 1:
+                        g0_part = g0_part.unsqueeze(0)
+                    local_g1 = g1_part.detach().to(dtype=torch.float32)
+                    if g0_analytic is not None:
+                        local_g0 = g0_analytic[t_idx, idx_list, : int(root_view.shape[-1])].detach().to(dtype=torch.float32)
+                    else:
+                        local_g0 = g0_part.detach().to(dtype=torch.float32)
+                    valid_local = mask_t & torch.isfinite(local_g0) & torch.isfinite(local_g1)
+                    gmix_local, alpha_local, v0_local, v1_local, counts_local = _compute_alpha_mix(
+                        local_g0.unsqueeze(0),
+                        local_g1.unsqueeze(0),
+                        valid_local.unsqueeze(0),
+                    )
+                    gmix_local = gmix_local.squeeze(0)
+                    alpha_vec = alpha_local.squeeze(0)
+                    counts_vec = counts_local.squeeze(0)
+                    if root_orig.ndim == 1:
+                        target_grad = gmix_local.squeeze(0).to(dtype=root_orig.dtype)
+                        root_term = root_orig
+                    else:
+                        target_grad = gmix_local.to(dtype=root_view.dtype)
+                        root_term = root_view
+                    surrogate = surrogate + ((root_term - root_term.detach()) * target_grad).sum()
+                    alpha_values.append(alpha_vec[counts_vec > 0])
+                    v0_values.append(v0_local.squeeze(0)[counts_vec > 0])
+                    v1_values.append(v1_local.squeeze(0)[counts_vec > 0])
+                    count_values.append(counts_vec[counts_vec > 0])
+                    valid_num += int(valid_local.sum().item())
+                    valid_den += int(valid_local.numel())
+                    g0_nonfinite += float((~torch.isfinite(local_g0)).to(dtype=torch.float32).sum().item())
+                    g1_nonfinite += float((~torch.isfinite(local_g1)).to(dtype=torch.float32).sum().item())
+                    g0_abs_max = max(g0_abs_max, float(local_g0.abs().max().item()))
+                    g1_abs_max = max(g1_abs_max, float(local_g1.abs().max().item()))
+                    mix_abs_max = max(mix_abs_max, float(gmix_local.abs().max().item()))
+
+                alpha_cat = torch.cat([x.reshape(-1) for x in alpha_values if x.numel() > 0], dim=0) if any(x.numel() > 0 for x in alpha_values) else torch.zeros((0,), device=rewards.device, dtype=torch.float32)
+                v0_cat = torch.cat([x.reshape(-1) for x in v0_values if x.numel() > 0], dim=0) if any(x.numel() > 0 for x in v0_values) else torch.zeros((0,), device=rewards.device, dtype=torch.float32)
+                v1_cat = torch.cat([x.reshape(-1) for x in v1_values if x.numel() > 0], dim=0) if any(x.numel() > 0 for x in v1_values) else torch.zeros((0,), device=rewards.device, dtype=torch.float32)
+                counts_cat = torch.cat([x.reshape(-1) for x in count_values if x.numel() > 0], dim=0) if any(x.numel() > 0 for x in count_values) else torch.zeros((0,), device=rewards.device, dtype=torch.float32)
+                alpha_summary = {
+                    "alpha_mean": alpha_cat.mean() if alpha_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "alpha_std": alpha_cat.std(unbiased=False) if alpha_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "alpha_min": alpha_cat.min() if alpha_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "alpha_max": alpha_cat.max() if alpha_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "v0_mean": v0_cat.mean() if v0_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "v1_mean": v1_cat.mean() if v1_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "count_min": counts_cat.min() if counts_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "count_max": counts_cat.max() if counts_cat.numel() > 0 else torch.zeros((), device=rewards.device, dtype=torch.float32),
+                    "valid_share": torch.as_tensor(float(valid_num) / float(max(1, valid_den)), device=rewards.device, dtype=torch.float32),
+                    "g0_abs_max": torch.as_tensor(g0_abs_max, device=rewards.device, dtype=torch.float32),
+                    "g1_abs_max": torch.as_tensor(g1_abs_max, device=rewards.device, dtype=torch.float32),
+                    "mix_abs_max": torch.as_tensor(mix_abs_max, device=rewards.device, dtype=torch.float32),
+                    "g0_nonfinite_share": torch.as_tensor(g0_nonfinite / float(max(1, valid_den)), device=rewards.device, dtype=torch.float32),
+                    "g1_nonfinite_share": torch.as_tensor(g1_nonfinite / float(max(1, valid_den)), device=rewards.device, dtype=torch.float32),
+                }
+            else:
+                g_shape = tuple(action_mask.shape)
+                g1 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+                if g0_analytic is not None:
+                    g0 = g0_analytic.to(device=g_device, dtype=g_dtype)
                 else:
-                    root_term = root_view
-                surrogate = surrogate + (
-                    (root_term - root_term.detach()) * target_grad
-                ).sum()
-        elif action_mean_inputs is None:
-            surrogate = ((action_mean - action_mean.detach()) * gmix_det.to(dtype=action_mean.dtype)).sum()
+                    g0 = torch.zeros(g_shape, device=g_device, dtype=g_dtype)
+                for (t_idx, group_indices, _root_orig, root_view, _mask_t), g1_part, g0_part in zip(root_records, g1_parts, g0_parts):
+                    width = int(root_view.shape[-1])
+                    idx_list = list(group_indices)
+                    if g1_part is not None and g1_part.ndim == 1:
+                        g1_part = g1_part.unsqueeze(0)
+                    if g0_part is not None and g0_part.ndim == 1:
+                        g0_part = g0_part.unsqueeze(0)
+                    if g1_part is not None:
+                        g1[t_idx, idx_list, :width] = g1_part
+                    if (g0_analytic is None) and (g0_part is not None):
+                        g0[t_idx, idx_list, :width] = g0_part
+                g1_det = g1.detach().to(dtype=torch.float32)
+                g0_det = g0.detach().to(dtype=torch.float32)
+                valid_mask = action_mask & torch.isfinite(g0_det) & torch.isfinite(g1_det)
+                gmix_det, alpha, v0, v1, counts = _compute_alpha_mix(g0_det, g1_det, valid_mask)
+                surrogate = torch.zeros((), device=g1.device, dtype=g1.dtype)
+                for t_idx, group_indices, root_orig, root_view, _mask_t in root_records:
+                    width = int(root_view.shape[-1])
+                    target_grad = gmix_det[t_idx, list(group_indices), :width].to(dtype=root_view.dtype)
+                    if root_orig.ndim == 1:
+                        target_grad = target_grad.squeeze(0)
+                        root_term = root_orig
+                    else:
+                        root_term = root_view
+                    surrogate = surrogate + ((root_term - root_term.detach()) * target_grad).sum()
+                alpha_summary = {
+                    "alpha_mean": alpha.mean().detach(),
+                    "alpha_std": alpha.std(unbiased=False).detach(),
+                    "alpha_min": alpha.min().detach(),
+                    "alpha_max": alpha.max().detach(),
+                    "v0_mean": v0.mean().detach(),
+                    "v1_mean": v1.mean().detach(),
+                    "count_min": counts.min().detach(),
+                    "count_max": counts.max().detach(),
+                    "valid_share": valid_mask.to(dtype=torch.float32).mean().detach(),
+                    "g0_abs_max": g0_det.abs().max().detach(),
+                    "g1_abs_max": g1_det.abs().max().detach(),
+                    "mix_abs_max": gmix_det.abs().max().detach(),
+                    "g0_nonfinite_share": (~torch.isfinite(g0)).to(dtype=torch.float32).mean().detach(),
+                    "g1_nonfinite_share": (~torch.isfinite(g1)).to(dtype=torch.float32).mean().detach(),
+                }
+            objective_device = g_device
+            objective_dtype = g_dtype
         else:
-            surrogate = torch.zeros(
-                (),
-                device=action_mean_inputs[0].device,
-                dtype=action_mean_inputs[0].dtype,
-            )
-            for t, root in enumerate(action_mean_inputs):
-                target_grad = gmix_det[t].to(dtype=root.dtype)
-                if root.ndim == 1:
-                    target_grad = target_grad.squeeze(0)
-                surrogate = surrogate + (
-                    (root - root.detach()) * target_grad
-                ).sum()
-        if action_group_entries is not None:
-            objective_device = g1.device
-            objective_dtype = g1.dtype
-        elif action_mean_inputs is None:
-            objective_device = action_mean.device
-            objective_dtype = action_mean.dtype
-        else:
-            objective_device = action_mean_inputs[0].device
-            objective_dtype = action_mean_inputs[0].dtype
+            if action_mean_inputs is None:
+                g1 = _grad_parts_or_zeros(first_loss, (action_mean,))[0]
+                if g0_analytic is not None:
+                    g0 = g0_analytic.to(device=action_mean.device, dtype=action_mean.dtype)
+                else:
+                    g0 = _grad_parts_or_zeros(reinforce_loss, (action_mean,))[0]
+                root_device = action_mean.device
+                root_dtype = action_mean.dtype
+            else:
+                g1_parts = _grad_parts_or_zeros(first_loss, action_mean_inputs)
+                g1 = torch.stack(list(g1_parts), dim=0)
+                if g1.ndim == 2:
+                    g1 = g1.unsqueeze(1)
+                if g0_analytic is not None:
+                    root0 = action_mean_inputs[0]
+                    g0 = g0_analytic.to(device=root0.device, dtype=root0.dtype)
+                else:
+                    g0_parts = _grad_parts_or_zeros(reinforce_loss, action_mean_inputs)
+                    g0 = torch.stack(list(g0_parts), dim=0)
+                    if g0.ndim == 2:
+                        g0 = g0.unsqueeze(1)
+                root_device = action_mean_inputs[0].device
+                root_dtype = action_mean_inputs[0].dtype
+
+            g1_det = g1.detach().to(dtype=torch.float32)
+            g0_det = g0.detach().to(dtype=torch.float32)
+            valid_mask = action_mask & torch.isfinite(g0_det) & torch.isfinite(g1_det)
+            gmix_det, alpha, v0, v1, counts = _compute_alpha_mix(g0_det, g1_det, valid_mask)
+            if action_mean_inputs is None:
+                surrogate = ((action_mean - action_mean.detach()) * gmix_det.to(dtype=action_mean.dtype)).sum()
+            else:
+                surrogate = torch.zeros((), device=root_device, dtype=root_dtype)
+                for t, root in enumerate(action_mean_inputs):
+                    target_grad = gmix_det[t].to(dtype=root.dtype)
+                    if root.ndim == 1:
+                        target_grad = target_grad.squeeze(0)
+                    surrogate = surrogate + ((root - root.detach()) * target_grad).sum()
+            alpha_summary = {
+                "alpha_mean": alpha.mean().detach(),
+                "alpha_std": alpha.std(unbiased=False).detach(),
+                "alpha_min": alpha.min().detach(),
+                "alpha_max": alpha.max().detach(),
+                "v0_mean": v0.mean().detach(),
+                "v1_mean": v1.mean().detach(),
+                "count_min": counts.min().detach(),
+                "count_max": counts.max().detach(),
+                "valid_share": valid_mask.to(dtype=torch.float32).mean().detach(),
+                "g0_abs_max": g0_det.abs().max().detach(),
+                "g1_abs_max": g1_det.abs().max().detach(),
+                "mix_abs_max": gmix_det.abs().max().detach(),
+                "g0_nonfinite_share": (~torch.isfinite(g0)).to(dtype=torch.float32).mean().detach(),
+                "g1_nonfinite_share": (~torch.isfinite(g1)).to(dtype=torch.float32).mean().detach(),
+            }
+            objective_device = root_device
+            objective_dtype = root_dtype
+
         objective = reinforce_stats["objective"].detach().to(device=objective_device, dtype=objective_dtype)
         loss = surrogate - objective
 
-        valid_share = valid_mask.to(dtype=torch.float32).mean().detach()
         stats = {
             "objective": reinforce_stats["objective"].detach(),
             "reward_mean": first_stats["reward_mean"].detach(),
@@ -18206,22 +18365,24 @@ class EnvironmentPrior:
                 torch.zeros((), device=rewards.device, dtype=torch.float32),
             ),
             "alpha_grad_enabled": 1,
+            "alpha_grad_local_coordinate_enabled": int(local_coordinate_enabled),
+            "alpha_grad_unit_grad_enabled": int(unit_grad_enabled),
             "alpha_grad_first_objective": first_stats["objective"].detach(),
             "alpha_grad_reinforce_objective": reinforce_stats["objective"].detach(),
-            "alpha_grad_alpha_mean": alpha.mean().detach(),
-            "alpha_grad_alpha_std": alpha.std(unbiased=False).detach(),
-            "alpha_grad_alpha_min": alpha.min().detach(),
-            "alpha_grad_alpha_max": alpha.max().detach(),
-            "alpha_grad_v0_mean": v0.mean().detach(),
-            "alpha_grad_v1_mean": v1.mean().detach(),
-            "alpha_grad_valid_share": valid_share,
-            "alpha_grad_count_min": counts.min().detach(),
-            "alpha_grad_count_max": counts.max().detach(),
-            "alpha_grad_g0_abs_max": g0_det.abs().max().detach(),
-            "alpha_grad_g1_abs_max": g1_det.abs().max().detach(),
-            "alpha_grad_mix_abs_max": gmix_det.abs().max().detach(),
-            "alpha_grad_g0_nonfinite_share": (~torch.isfinite(g0)).to(dtype=torch.float32).mean().detach(),
-            "alpha_grad_g1_nonfinite_share": (~torch.isfinite(g1)).to(dtype=torch.float32).mean().detach(),
+            "alpha_grad_alpha_mean": alpha_summary["alpha_mean"],
+            "alpha_grad_alpha_std": alpha_summary["alpha_std"],
+            "alpha_grad_alpha_min": alpha_summary["alpha_min"],
+            "alpha_grad_alpha_max": alpha_summary["alpha_max"],
+            "alpha_grad_v0_mean": alpha_summary["v0_mean"],
+            "alpha_grad_v1_mean": alpha_summary["v1_mean"],
+            "alpha_grad_valid_share": alpha_summary["valid_share"],
+            "alpha_grad_count_min": alpha_summary["count_min"],
+            "alpha_grad_count_max": alpha_summary["count_max"],
+            "alpha_grad_g0_abs_max": alpha_summary["g0_abs_max"],
+            "alpha_grad_g1_abs_max": alpha_summary["g1_abs_max"],
+            "alpha_grad_mix_abs_max": alpha_summary["mix_abs_max"],
+            "alpha_grad_g0_nonfinite_share": alpha_summary["g0_nonfinite_share"],
+            "alpha_grad_g1_nonfinite_share": alpha_summary["g1_nonfinite_share"],
             "reinforce_return_nonfinite_share": reinforce_stats.get(
                 "reinforce_return_nonfinite_share",
                 torch.zeros((), device=rewards.device, dtype=torch.float32),

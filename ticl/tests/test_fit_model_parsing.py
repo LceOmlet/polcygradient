@@ -1,3 +1,5 @@
+import pytest
+
 from ticl.fit_model import main
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
@@ -175,6 +177,21 @@ def test_rlpfn_parser_accepts_first_pg_action_grad_clip_options():
     assert args.prior.environment.first_policy_gradient_action_grad_clip_norm == 1.5
 
 
+def test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--alpha-grad-local-coordinate-enabled", "false",
+            "--alpha-grad-unit-grad-enabled", "false",
+            "--alpha-grad-unit-grad-delta", "1e-4",
+        ]
+    )
+    assert args.prior.environment.alpha_grad_local_coordinate_enabled is False
+    assert args.prior.environment.alpha_grad_unit_grad_enabled is False
+    assert args.prior.environment.alpha_grad_unit_grad_delta == pytest.approx(1e-4)
+
+
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
@@ -203,6 +220,9 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
+    assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False

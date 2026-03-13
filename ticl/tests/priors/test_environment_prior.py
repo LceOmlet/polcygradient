@@ -2464,6 +2464,41 @@ def test_environment_prior_first_policy_gradient_loss_uses_mean_reward_objective
     assert float(loss) == pytest.approx(-float(rewards.mean()))
 
 
+def _alpha_grad_unit_normalize_manual(values, valid_mask, delta):
+    mask_f = valid_mask.to(device=values.device, dtype=values.dtype)
+    denom = ((values.square() * mask_f).sum(dim=-1, keepdim=True)).sqrt() + float(delta)
+    normalized = values / denom
+    return torch.where(valid_mask, normalized, torch.zeros_like(normalized))
+
+
+def _alpha_grad_manual_mix(
+    g0,
+    g1,
+    valid_mask,
+    *,
+    variance_eps=1e-6,
+    unit_grad_enabled=True,
+    unit_grad_delta=1e-6,
+):
+    if unit_grad_enabled:
+        g0_source = _alpha_grad_unit_normalize_manual(g0, valid_mask, unit_grad_delta)
+        g1_source = _alpha_grad_unit_normalize_manual(g1, valid_mask, unit_grad_delta)
+    else:
+        g0_source = torch.where(valid_mask, g0, torch.zeros_like(g0))
+        g1_source = torch.where(valid_mask, g1, torch.zeros_like(g1))
+    mask_f = valid_mask.to(dtype=g0.dtype)
+    count = mask_f.sum(dim=1).clamp_min(1.0)
+    mu0 = (g0_source * mask_f).sum(dim=1) / count
+    mu1 = (g1_source * mask_f).sum(dim=1) / count
+    v0 = (((g0_source - mu0.unsqueeze(1)) ** 2) * mask_f).sum(dim=1) / count
+    v1 = (((g1_source - mu1.unsqueeze(1)) ** 2) * mask_f).sum(dim=1) / count
+    alpha = v0 / (v0 + v1 + float(variance_eps))
+    alpha = torch.where(count > 0, alpha, torch.zeros_like(alpha))
+    grad = ((1.0 - alpha).unsqueeze(1) * g0) + (alpha.unsqueeze(1) * g1)
+    grad = torch.where(valid_mask, grad, torch.zeros_like(grad))
+    return grad, alpha, v0, v1
+
+
 def test_environment_prior_alpha_grad_matches_manual_action_space_mixing():
     prior = EnvironmentPrior({"discount": 1.0})
     action_mean = torch.tensor(
@@ -2508,24 +2543,24 @@ def test_environment_prior_alpha_grad_matches_manual_action_space_mixing():
     g1 = torch.autograd.grad(first_loss, action_mean, retain_graph=True)[0].detach()
     g0 = torch.autograd.grad(reinforce_loss, action_mean, retain_graph=True)[0].detach()
     valid = action_mask & torch.isfinite(g0) & torch.isfinite(g1)
-    mask_f = valid.to(dtype=torch.float32)
-    count = mask_f.sum(dim=1).clamp_min(1.0)
-    mu0 = (g0 * mask_f).sum(dim=1) / count
-    mu1 = (g1 * mask_f).sum(dim=1) / count
-    v0 = (((g0 - mu0.unsqueeze(1)) ** 2) * mask_f).sum(dim=1) / count
-    v1 = (((g1 - mu1.unsqueeze(1)) ** 2) * mask_f).sum(dim=1) / count
-    alpha = v0 / (v0 + v1 + 1e-6)
-    grad_expected = ((1.0 - alpha).unsqueeze(1) * g0) + (alpha.unsqueeze(1) * g1)
-    grad_expected = torch.where(valid, grad_expected, torch.zeros_like(grad_expected))
+    grad_expected, _, _, _ = _alpha_grad_manual_mix(
+        g0,
+        g1,
+        valid,
+        variance_eps=1e-6,
+        unit_grad_enabled=True,
+        unit_grad_delta=1e-6,
+    )
 
     assert torch.allclose(grad_actual, grad_expected, atol=1e-6, rtol=1e-5)
     assert float(stats["objective"]) == pytest.approx(float(reinforce_stats["objective"]))
     assert int(stats["alpha_grad_enabled"]) == 1
+    assert int(stats["alpha_grad_unit_grad_enabled"]) == 1
     assert float(stats["alpha_grad_valid_share"]) > 0.0
 
 
 def test_environment_prior_alpha_grad_group_traces_match_dense_manual_gradient():
-    prior = EnvironmentPrior({"discount": 1.0})
+    prior = EnvironmentPrior({"discount": 1.0, "alpha_grad_local_coordinate_enabled": False})
     action_mean_dense = torch.tensor(
         [
             [[0.2, -0.3], [0.4, 0.1], [-0.2, 0.5]],
@@ -2593,10 +2628,109 @@ def test_environment_prior_alpha_grad_group_traces_match_dense_manual_gradient()
     grad_group1 = torch.autograd.grad(loss_grouped, group1_roots, retain_graph=True)
 
     assert int(stats_grouped["alpha_grad_enabled"]) == 1
+    assert int(stats_grouped["alpha_grad_local_coordinate_enabled"]) == 0
     assert torch.allclose(grad_group0[0], grad_dense[0, [0, 2]], atol=1e-6, rtol=1e-5)
     assert torch.allclose(grad_group0[1], grad_dense[1, [0, 2]], atol=1e-6, rtol=1e-5)
     assert torch.allclose(grad_group1[0], grad_dense[0, [1]], atol=1e-6, rtol=1e-5)
     assert torch.allclose(grad_group1[1], grad_dense[1, [1]], atol=1e-6, rtol=1e-5)
+
+
+def test_environment_prior_alpha_grad_group_traces_local_coordinate_matches_manual_group_local_gradient():
+    prior = EnvironmentPrior({"discount": 1.0})
+    action_mean_dense = torch.tensor(
+        [
+            [[0.2, -0.3], [0.4, 0.1], [-0.2, 0.5]],
+            [[0.6, -0.4], [0.1, 0.7], [0.3, -0.6]],
+        ],
+        dtype=torch.float32,
+    )
+    action_mask = torch.tensor(
+        [
+            [[True, True], [True, True], [True, False]],
+            [[True, True], [True, True], [True, False]],
+        ],
+        dtype=torch.bool,
+    )
+    group0_roots = (
+        action_mean_dense[0, [0, 2]].clone().requires_grad_(),
+        action_mean_dense[1, [0, 2]].clone().requires_grad_(),
+    )
+    group1_roots = (
+        action_mean_dense[0, [1]].clone().requires_grad_(),
+        action_mean_dense[1, [1]].clone().requires_grad_(),
+    )
+    action_mean_grouped = (
+        {
+            "indices": (0, 2),
+            "action_mean_roots": group0_roots,
+            "action_mask": action_mask[:, [0, 2]],
+        },
+        {
+            "indices": (1,),
+            "action_mean_roots": group1_roots,
+            "action_mask": action_mask[:, [1]],
+        },
+    )
+    action_mean_rebuilt = torch.zeros_like(action_mean_dense)
+    action_mean_rebuilt[0, [0, 2]] = group0_roots[0]
+    action_mean_rebuilt[1, [0, 2]] = group0_roots[1]
+    action_mean_rebuilt[0, [1]] = group1_roots[0]
+    action_mean_rebuilt[1, [1]] = group1_roots[1]
+    rewards_grouped = (1.5 * action_mean_rebuilt[..., 0]) - (0.25 * action_mean_rebuilt[..., 1])
+    log_probs_grouped = (0.7 * action_mean_rebuilt[..., 0]) + (0.2 * action_mean_rebuilt[..., 1])
+    loss_grouped, stats_grouped = prior.alpha_grad_loss_from_rollout_tensors(
+        rewards=rewards_grouped,
+        log_probs=log_probs_grouped,
+        action_mean=action_mean_grouped,
+        action_mask=action_mask,
+        discount=1.0,
+        variance_eps=1e-6,
+    )
+    grad_group0 = torch.autograd.grad(loss_grouped, group0_roots, retain_graph=True)
+    grad_group1 = torch.autograd.grad(loss_grouped, group1_roots, retain_graph=True)
+
+    first_loss, _ = prior.first_policy_gradient_loss_from_rewards(rewards_grouped)
+    reinforce_loss, _ = prior.reinforce_loss_from_rewards(
+        rewards=rewards_grouped,
+        log_probs=log_probs_grouped,
+        discount=1.0,
+    )
+    g1_group0 = tuple(x.detach() for x in torch.autograd.grad(first_loss, group0_roots, retain_graph=True))
+    g1_group1 = tuple(x.detach() for x in torch.autograd.grad(first_loss, group1_roots, retain_graph=True))
+    g0_group0 = tuple(x.detach() for x in torch.autograd.grad(reinforce_loss, group0_roots, retain_graph=True))
+    g0_group1 = tuple(x.detach() for x in torch.autograd.grad(reinforce_loss, group1_roots, retain_graph=True))
+
+    expected_group0 = []
+    expected_group1 = []
+    for t_idx in range(len(group0_roots)):
+        valid0 = action_mask[t_idx, [0, 2]] & torch.isfinite(g0_group0[t_idx]) & torch.isfinite(g1_group0[t_idx])
+        valid1 = action_mask[t_idx, [1]] & torch.isfinite(g0_group1[t_idx]) & torch.isfinite(g1_group1[t_idx])
+        grad0, _, _, _ = _alpha_grad_manual_mix(
+            g0_group0[t_idx].unsqueeze(0),
+            g1_group0[t_idx].unsqueeze(0),
+            valid0.unsqueeze(0),
+            variance_eps=1e-6,
+            unit_grad_enabled=True,
+            unit_grad_delta=1e-6,
+        )
+        grad1, _, _, _ = _alpha_grad_manual_mix(
+            g0_group1[t_idx].unsqueeze(0),
+            g1_group1[t_idx].unsqueeze(0),
+            valid1.unsqueeze(0),
+            variance_eps=1e-6,
+            unit_grad_enabled=True,
+            unit_grad_delta=1e-6,
+        )
+        expected_group0.append(grad0.squeeze(0))
+        expected_group1.append(grad1.squeeze(0))
+
+    assert int(stats_grouped["alpha_grad_enabled"]) == 1
+    assert int(stats_grouped["alpha_grad_local_coordinate_enabled"]) == 1
+    assert int(stats_grouped["alpha_grad_unit_grad_enabled"]) == 1
+    assert torch.allclose(grad_group0[0], expected_group0[0], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group0[1], expected_group0[1], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group1[0], expected_group1[0], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(grad_group1[1], expected_group1[1], atol=1e-6, rtol=1e-5)
 
 
 def test_environment_prior_alpha_grad_log_prob_score_matches_autograd_g0_path():

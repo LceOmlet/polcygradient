@@ -42,6 +42,9 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
+    assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,
