@@ -596,3 +596,66 @@ Interpretation:
 - This is a semantics-safe shared-forward win that lands almost entirely in the expected `rowwise_noise_plan` hotspot.
 - GPU memory remains flat within noise.
 - The remaining top heads are now `g1 autograd.grad` on the alpha side and the still-large strict-SCM shared forward remainder, not rowwise plan bookkeeping itself.
+
+## Accepted: auto-bypass policy saved-tensors offload when the risky load is already memory-safe
+
+Hypothesis:
+
+- After the accepted shared-forward optimizations, the strongest pushed baseline still paid a large runtime tax for `policy` saved-tensors CPU offload.
+- Focused `g1 autograd.grad` profiling showed that, on the risky load we actually care about, the biggest remaining practical head was no longer strict SCM math:
+  - with `policy` offload enabled, `cudaMemcpyAsync / cudaEventRecord / cudaStreamSynchronize` dominated self CPU time inside `g1`
+  - the same risky load was already safe without policy offload, with peak GPU allocation only around `3.2 GiB`
+- So the next highest-confidence change was not another math/kernel patch. It was to keep the existing `policy` offload mechanism, but automatically bypass it when the current CUDA free memory and load size are inside a conservative validated safe envelope.
+
+Implementation:
+
+- Add `_resolve_effective_policy_saved_tensors_offload(...)` in `train.py`
+- Thread four new knobs through parser/config/train plumbing:
+  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe`
+  - `pg_saved_tensors_cpu_offload_auto_min_free_gb`
+  - `pg_saved_tensors_cpu_offload_auto_max_batch_size`
+  - `pg_saved_tensors_cpu_offload_auto_max_n_samples`
+- Keep the rollout math unchanged:
+  - when the guard says "safe", policy-scope offload is bypassed for that batch
+  - otherwise behavior falls back to the original offload path
+- Set `rlpfn` defaults to:
+  - `pg_saved_tensors_cpu_offload = true`
+  - `pg_saved_tensors_cpu_offload_scope = policy`
+  - `pg_saved_tensors_pin_memory = false`
+  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe = true`
+  - `pg_saved_tensors_cpu_offload_auto_min_free_gb = 8.0`
+  - `pg_saved_tensors_cpu_offload_auto_max_batch_size = 64`
+  - `pg_saved_tensors_cpu_offload_auto_max_n_samples = 1024`
+
+Focused checks:
+
+- parser/default config subsets
+- `_resolve_effective_policy_saved_tensors_offload(...)` helper tests
+- strict SCM focused subset
+- `alpha_grad` TBPTT subset
+- `test_mlp_prior.py`
+
+Risky-load evidence, same fixed overrides `B=64, ns=1024, sep=697, tbptt=32, paged, family`:
+
+| objective | previous pushed baseline wall (s) | auto-bypass wall (s) | delta | previous pushed baseline peak alloc (MiB) | auto-bypass peak alloc (MiB) | delta |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | 219.663 | 118.865 | -100.798 | 1109.218 | 3259.454 | +2150.236 |
+| `alpha_grad` | 324.985 | 154.503 | -170.482 | 1115.174 | 3263.593 | +2148.419 |
+
+Additional safety evidence on the same runs:
+
+- `first_policy_gradient`
+  - `status = ok`
+  - `peak_reserved = 3326 MiB`
+  - `rss = 1.704 GiB`
+- `alpha_grad`
+  - `status = ok`
+  - `peak_reserved = 3364 MiB`
+  - `rss = 1.712 GiB`
+
+Interpretation:
+
+- This is the first change in this sequence that directly attacks the currently dominant runtime/offload scheduling tax instead of another strict-SCM micro-hotspot.
+- The speedup is very large and lands on both `first_policy_gradient` and `alpha_grad`.
+- GPU memory does rise relative to the pushed policy-offload baseline, but it remains far below the risky-load guard and far below card capacity, so the change stays within the validated safe envelope.
+- Because the resolver only bypasses policy offload when the current load is inside that envelope, this remains a runtime policy change, not a training-semantics change.

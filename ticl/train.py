@@ -355,6 +355,49 @@ def _wrap_policy_step_fn_saved_tensors_offload(policy_step_fn, *, enabled: bool,
     return _wrapped
 
 
+def _resolve_effective_policy_saved_tensors_offload(
+    *,
+    enabled,
+    scope,
+    device,
+    batch_size,
+    n_samples,
+    auto_disable_when_safe=False,
+    auto_min_free_gb=8.0,
+    auto_max_batch_size=64,
+    auto_max_n_samples=1024,
+):
+    enabled = bool(enabled)
+    scope = str(scope or "all").strip().lower()
+    if (not enabled) or scope != "policy":
+        return enabled
+    if not bool(auto_disable_when_safe):
+        return enabled
+    try:
+        batch_size = int(batch_size)
+        n_samples = int(n_samples)
+        auto_max_batch_size = int(auto_max_batch_size)
+        auto_max_n_samples = int(auto_max_n_samples)
+    except Exception:
+        return enabled
+    if batch_size > max(0, auto_max_batch_size) or n_samples > max(0, auto_max_n_samples):
+        return enabled
+    device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+    if device_obj.type != "cuda" or (not torch.cuda.is_available()):
+        return enabled
+    try:
+        free_bytes, _total_bytes = torch.cuda.mem_get_info(device_obj)
+    except Exception:
+        return enabled
+    try:
+        min_free_bytes = int(max(0.0, float(auto_min_free_gb)) * (1024 ** 3))
+    except Exception:
+        min_free_bytes = 0
+    if int(free_bytes) >= int(min_free_bytes):
+        return False
+    return enabled
+
+
 def _is_oom_exception(exc: BaseException) -> bool:
     if isinstance(exc, torch.OutOfMemoryError):
         return True
@@ -1016,6 +1059,10 @@ def _compute_policy_rollout_chunk_loss(
     pg_saved_tensors_cpu_offload=False,
     pg_saved_tensors_cpu_offload_scope="all",
     pg_saved_tensors_pin_memory=True,
+    pg_saved_tensors_cpu_offload_auto_disable_when_safe=False,
+    pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
+    pg_saved_tensors_cpu_offload_auto_max_batch_size=64,
+    pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
     h_list_override=None,
@@ -1026,10 +1073,21 @@ def _compute_policy_rollout_chunk_loss(
     offload_scope = str(pg_saved_tensors_cpu_offload_scope or "all").strip().lower()
     if offload_scope not in {"all", "policy"}:
         offload_scope = "all"
-    full_offload_enabled = bool(pg_saved_tensors_cpu_offload) and (offload_scope == "all")
+    effective_policy_saved_tensors_cpu_offload = _resolve_effective_policy_saved_tensors_offload(
+        enabled=pg_saved_tensors_cpu_offload,
+        scope=offload_scope,
+        device=device,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        auto_disable_when_safe=pg_saved_tensors_cpu_offload_auto_disable_when_safe,
+        auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
+        auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
+        auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
+    )
+    full_offload_enabled = bool(effective_policy_saved_tensors_cpu_offload) and (offload_scope == "all")
     policy_step_fn = _wrap_policy_step_fn_saved_tensors_offload(
         policy_step_fn,
-        enabled=bool(pg_saved_tensors_cpu_offload) and (offload_scope == "policy"),
+        enabled=bool(effective_policy_saved_tensors_cpu_offload) and (offload_scope == "policy"),
         pin_memory=pg_saved_tensors_pin_memory,
     )
     rollout_kwargs = {}
@@ -1954,6 +2012,10 @@ def train_epoch_policy_gradient(
     pg_saved_tensors_cpu_offload=False,
     pg_saved_tensors_cpu_offload_scope="all",
     pg_saved_tensors_pin_memory=True,
+    pg_saved_tensors_cpu_offload_auto_disable_when_safe=False,
+    pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
+    pg_saved_tensors_cpu_offload_auto_max_batch_size=64,
+    pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
     pg_oom_debug_raise=False,
     pg_oom_fail_fast=False,
     pg_kv_cache_mode="auto",
@@ -2722,6 +2784,10 @@ def train_epoch_policy_gradient(
                                             pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
                                             pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                                             pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                                            pg_saved_tensors_cpu_offload_auto_disable_when_safe=pg_saved_tensors_cpu_offload_auto_disable_when_safe,
+                                            pg_saved_tensors_cpu_offload_auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
+                                            pg_saved_tensors_cpu_offload_auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
+                                            pg_saved_tensors_cpu_offload_auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
                                             pg_tbptt_window=current_tbptt_window,
                                             tbptt_loss_sink=None,
                                             h_list_override=warmup_h_list_override,
@@ -3016,6 +3082,10 @@ def train_epoch_policy_gradient(
                                         pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
                                         pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                                         pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                                        pg_saved_tensors_cpu_offload_auto_disable_when_safe=pg_saved_tensors_cpu_offload_auto_disable_when_safe,
+                                        pg_saved_tensors_cpu_offload_auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
+                                        pg_saved_tensors_cpu_offload_auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
+                                        pg_saved_tensors_cpu_offload_auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
                                         pg_tbptt_window=current_tbptt_window,
                                         tbptt_loss_sink=_tbptt_chunk_loss_sink,
                                         rl_objective=rl_objective,
@@ -6371,6 +6441,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_saved_tensors_cpu_offload=False,
           pg_saved_tensors_cpu_offload_scope="all",
           pg_saved_tensors_pin_memory=True,
+          pg_saved_tensors_cpu_offload_auto_disable_when_safe=False,
+          pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
+          pg_saved_tensors_cpu_offload_auto_max_batch_size=64,
+          pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
           pg_oom_debug_raise=False,
           pg_oom_fail_fast=False,
           pg_kv_cache_mode="auto",
@@ -6671,6 +6745,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 )
             print("Policy saved-tensors CPU offload:", bool(pg_saved_tensors_cpu_offload))
             print("Policy saved-tensors CPU offload scope:", str(pg_saved_tensors_cpu_offload_scope))
+            print(
+                "Policy saved-tensors CPU offload auto-disable when safe:",
+                bool(pg_saved_tensors_cpu_offload_auto_disable_when_safe),
+            )
+            if bool(pg_saved_tensors_cpu_offload_auto_disable_when_safe):
+                print(
+                    "Policy saved-tensors CPU offload auto guard:",
+                    f"min_free_gb={float(pg_saved_tensors_cpu_offload_auto_min_free_gb):.2f} "
+                    f"max_batch={int(pg_saved_tensors_cpu_offload_auto_max_batch_size)} "
+                    f"max_n_samples={int(pg_saved_tensors_cpu_offload_auto_max_n_samples)}",
+                )
             print("Policy OOM debug re-raise:", bool(pg_oom_debug_raise))
             if pg_tbptt_window is None:
                 print("Policy TBPTT window: disabled(full-horizon)")
@@ -7095,6 +7180,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     pg_saved_tensors_cpu_offload=pg_saved_tensors_cpu_offload,
                     pg_saved_tensors_cpu_offload_scope=pg_saved_tensors_cpu_offload_scope,
                     pg_saved_tensors_pin_memory=pg_saved_tensors_pin_memory,
+                    pg_saved_tensors_cpu_offload_auto_disable_when_safe=pg_saved_tensors_cpu_offload_auto_disable_when_safe,
+                    pg_saved_tensors_cpu_offload_auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
+                    pg_saved_tensors_cpu_offload_auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
+                    pg_saved_tensors_cpu_offload_auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
                     pg_oom_debug_raise=pg_oom_debug_raise,
                     pg_oom_fail_fast=pg_oom_fail_fast,
                     pg_kv_cache_mode=pg_kv_cache_mode,

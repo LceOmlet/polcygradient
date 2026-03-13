@@ -17,6 +17,10 @@ def get_optimizer_config():
         "pg_saved_tensors_cpu_offload": False,
         "pg_saved_tensors_cpu_offload_scope": "all",
         "pg_saved_tensors_pin_memory": True,
+        "pg_saved_tensors_cpu_offload_auto_disable_when_safe": False,
+        "pg_saved_tensors_cpu_offload_auto_min_free_gb": 8.0,
+        "pg_saved_tensors_cpu_offload_auto_max_batch_size": 64,
+        "pg_saved_tensors_cpu_offload_auto_max_n_samples": 1024,
         "pg_oom_debug_raise": False,
         "pg_oom_fail_fast": False,
         "pg_kv_cache_mode": "auto",
@@ -563,6 +567,10 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32
     # Keep one rollout->update cycle per batch by default for throughput-first

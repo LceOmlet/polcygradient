@@ -81,6 +81,10 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 64
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
 
@@ -110,11 +114,19 @@ def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
             "--pg-saved-tensors-cpu-offload", "true",
             "--pg-saved-tensors-cpu-offload-scope", "policy",
             "--pg-saved-tensors-pin-memory", "false",
+            "--pg-saved-tensors-cpu-offload-auto-disable-when-safe", "true",
+            "--pg-saved-tensors-cpu-offload-auto-min-free-gb", "10",
+            "--pg-saved-tensors-cpu-offload-auto-max-batch-size", "32",
+            "--pg-saved-tensors-cpu-offload-auto-max-n-samples", "512",
         ]
     )
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 10.0
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 32
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 512
 
 
 def test_rlpfn_parser_accepts_reinforce_objective():
@@ -191,6 +203,13 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 0.0
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
+    assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 64
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,

@@ -338,6 +338,84 @@ def test_policy_rollout_checkpoint_and_offload_match_baseline_semantics():
         assert torch.allclose(g_base, g_combo, atol=1e-6, rtol=1e-5)
 
 
+def test_policy_saved_tensors_offload_auto_bypass_disables_policy_scope_when_safe(monkeypatch):
+    monkeypatch.setattr(train_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        train_mod.torch.cuda,
+        "mem_get_info",
+        lambda device=None: (12 * (1024 ** 3), 24 * (1024 ** 3)),
+    )
+
+    enabled = train_mod._resolve_effective_policy_saved_tensors_offload(
+        enabled=True,
+        scope="policy",
+        device="cuda:0",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=True,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+    )
+
+    assert enabled is False
+
+
+def test_policy_saved_tensors_offload_auto_bypass_keeps_offload_when_outside_safe_envelope(monkeypatch):
+    monkeypatch.setattr(train_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        train_mod.torch.cuda,
+        "mem_get_info",
+        lambda device=None: (6 * (1024 ** 3), 24 * (1024 ** 3)),
+    )
+
+    enabled = train_mod._resolve_effective_policy_saved_tensors_offload(
+        enabled=True,
+        scope="policy",
+        device="cuda:0",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=True,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+    )
+
+    assert enabled is True
+
+
+def test_policy_saved_tensors_offload_auto_bypass_only_applies_to_policy_scope(monkeypatch):
+    monkeypatch.setattr(train_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        train_mod.torch.cuda,
+        "mem_get_info",
+        lambda device=None: (12 * (1024 ** 3), 24 * (1024 ** 3)),
+    )
+
+    assert train_mod._resolve_effective_policy_saved_tensors_offload(
+        enabled=True,
+        scope="all",
+        device="cuda:0",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=True,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+    ) is True
+    assert train_mod._resolve_effective_policy_saved_tensors_offload(
+        enabled=False,
+        scope="policy",
+        device="cuda:0",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=True,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+    ) is False
+
+
 def test_policy_rollout_checkpoint_preserves_aev5_next_stats_and_semantics():
     env_cfg = _fixed_env_cfg()
     env_cfg["anti_explosion_vanishing_v5_enabled"] = False
@@ -872,10 +950,11 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, kwargs
         calls.append(int(batch_size))
         # Keep a valid autograd path for train_epoch_policy_gradient.
         anchor = next(model.parameters()).sum() * 0.0
@@ -965,11 +1044,12 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch(rl_object
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
                       pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None,
-                      h_list_override=None, env_seeds_override=None, rollout_seeds_override=None, rl_objective="policy_gradient"):
+                      h_list_override=None, env_seeds_override=None, rollout_seeds_override=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
         del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory
-        del pg_tbptt_window, tbptt_loss_sink, rollout_seeds_override
+        del pg_tbptt_window, tbptt_loss_sink, rollout_seeds_override, kwargs
         calls.append(
             {
                 "batch_size": int(batch_size),
@@ -1075,10 +1155,11 @@ def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, kwargs
         calls.append(int(batch_size))
         if int(batch_size) in oom_sizes_once:
             oom_sizes_once.remove(int(batch_size))
@@ -1139,10 +1220,11 @@ def test_policy_rollout_oom_can_reduce_tbptt_before_chunk_size():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, kwargs
         calls.append((int(batch_size), None if pg_tbptt_window is None else int(pg_tbptt_window)))
         if (not first_oom["raised"]) and pg_tbptt_window is None:
             first_oom["raised"] = True
@@ -1211,10 +1293,11 @@ def test_policy_rollout_runtime_oom_during_backward_is_caught_and_skipped():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, batch_size, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, kwargs
         anchor = next(model.parameters()).sum() * 0.0
         stats = {
             "objective": torch.zeros((), device=device),
@@ -1270,10 +1353,11 @@ def test_policy_rollout_runtime_oom_debug_raise_propagates_exception():
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, batch_size, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, kwargs
         anchor = next(model.parameters()).sum() * 0.0
         stats = {
             "objective": torch.zeros((), device=device),
@@ -1337,10 +1421,11 @@ def test_policy_rollout_checkpoint_temporarily_disables_inner_recompute_attn_and
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, kwargs
         del batch_size
         seen.append(_layer_recompute_flags(model))
         anchor = next(model.parameters()).sum() * 0.0
@@ -1756,10 +1841,11 @@ def test_pg_phase_start_is_written_before_rollout_finishes(tmp_path):
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, batch_size, n_samples, num_features, device
         del single_eval_pos, collect_x, policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective, kwargs
         raise KeyboardInterrupt()
 
     def _fake_print_exc(*args, **kwargs):
@@ -1818,10 +1904,11 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
     def _fake_compute(*, env_prior, policy_step_fn, batch_size, n_samples, num_features, device,
                       single_eval_pos, collect_x, policy_rollout_checkpoint,
                       policy_rollout_checkpoint_reentrant, pg_saved_tensors_cpu_offload,
-                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient"):
+                      pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink=None, rl_objective="policy_gradient",
+                      **kwargs):
         del env_prior, policy_step_fn, n_samples, num_features, single_eval_pos, collect_x
         del policy_rollout_checkpoint, policy_rollout_checkpoint_reentrant
-        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective
+        del pg_saved_tensors_cpu_offload, pg_saved_tensors_pin_memory, pg_tbptt_window, tbptt_loss_sink, rl_objective, kwargs
         anchor = next(model.parameters()).sum() * 0.0
         stats = {
             "objective": torch.zeros((), device=device),
