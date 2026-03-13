@@ -51,6 +51,50 @@ Interpretation:
 - It remains an experimental skyline because the partition change also changes strict-SCM execution grouping and therefore is not strictly forward-equivalent to the older baseline.
 - Under the user’s current acceptance criterion, this acceleration is now the active skyline to optimize from.
 
+### Accepted Robustness Default: `action` Adjoint Norm Clip = `1.0`
+
+Scope:
+
+- branch baseline: experimental skyline above (`2 GiB` strict-SCM partition, full policy offload forced on)
+- change: set
+  - `first_policy_gradient_state_grad_clip_norm = 4.0` (unchanged)
+  - `first_policy_gradient_action_grad_clip_value = 4.0` (unchanged)
+  - `first_policy_gradient_action_grad_clip_norm = 1.0` (new default)
+
+Motivation:
+
+- `g1` is highly sensitive to small forward execution perturbations.
+- Under the accepted `2 GiB` partition skyline, the goal is to improve gradient robustness without materially changing risky-load throughput or memory.
+
+Small deterministic robustness evidence, fixed `B=64, ns=128, sep=103`, full offload forced on:
+
+#### `first_policy_gradient`
+
+| setting | cosine(`256MB`,`2GB`) | grad norm default | grad norm `2GB` |
+| --- | ---: | ---: | ---: |
+| previous default (`state=4, action_value=4, action_norm=0`) | `-0.3416` | `16994.23` | `17919.81` |
+| accepted (`state=4, action_value=4, action_norm=1`) | `0.4573` | `4111.90` | `3938.35` |
+
+#### `alpha_grad`
+
+| setting | cosine(`256MB`,`2GB`) | grad norm default | grad norm `2GB` |
+| --- | ---: | ---: | ---: |
+| previous default (`state=4, action_value=4, action_norm=0`) | `0.8974` | `39211.61` | `73233.91` |
+| accepted (`state=4, action_value=4, action_norm=1`) | `0.8928` | `7326.14` | `11739.42` |
+
+Risky-load impact, fixed `B=64, ns=1024, sep=697`, full offload forced on:
+
+| objective | previous wall (s) | accepted wall (s) | previous peak alloc (MiB) | accepted peak alloc (MiB) |
+| --- | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | `171.641` | `173.836` | `2702.345` | `2702.361` |
+| `alpha_grad` | `244.836` | `242.501` | `2707.985` | `2708.000` |
+
+Interpretation:
+
+- The new default materially improves `first_pg` robustness to the accepted partition perturbation.
+- `alpha` remains high-cosine and its risky-load wall/peak memory are effectively unchanged.
+- This is therefore accepted as a robustness-oriented default on the experimental skyline.
+
 ### Scope
 
 - Worktree: `/tmp/rlpfn_alpha_grad_bridge_20260312`
