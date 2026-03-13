@@ -83,7 +83,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 64
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
@@ -223,10 +223,12 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
+    assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
+    assert cfg["prior"]["environment"]["reference_scm_partition_max_bytes"] == 2 * 1024 * 1024 * 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 64
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024

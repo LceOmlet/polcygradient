@@ -467,7 +467,6 @@ def get_rlpfn_default_config():
     # - action head: 30 dims
     config = get_shared_defaults()
     config['prior']['prior_type'] = 'environment_only'
-    config['prior']['num_features'] = 432
     # RLPFN default rollout horizon.
     config['prior']['n_samples'] = 1024
 
@@ -505,6 +504,8 @@ def get_rlpfn_default_config():
         "batch_parallel_backend": "torch_vectorized",
         "batch_shared_environment": False,
         "batch_vectorized_grouping": "family",
+        "reference_scm_partition_max_bytes": 2 * 1024 * 1024 * 1024,
+        "terminal_reset_enabled": True,
     })
 
     # Keep a strict fixed feature width for split heads.
@@ -514,8 +515,12 @@ def get_rlpfn_default_config():
     config['transformer']['classification_task'] = False
     config['transformer']['y_encoder'] = 'linear'
     config['transformer']['x_encoder_type'] = 'split_obs_action'
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
+    terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + terminal_obs_extra
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
+    config['prior']['num_features'] = (
+        int(config['transformer']['x_obs_dim']) + int(config['transformer']['x_action_dim'])
+    )
     config['transformer']['single_eval_causal'] = True
     config['optimizer']['rl_objective'] = 'alpha_grad'
     # Policy-gradient rollout chunking over batch columns.
@@ -570,7 +575,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
@@ -588,9 +593,8 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_oom_fail_fast'] = True
     # Longer TBPTT mainline needs a more conservative default step size.
     config['optimizer']['learning_rate'] = 4e-4
-    # Current maintained memory-efficiency mainline should benchmark from
-    # physical batch 1024.
-    config['dataloader']['batch_size'] = 1024
+    # Keep the default command inside the validated skyline envelope.
+    config['dataloader']['batch_size'] = 64
     config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
     config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
     config['prior']['environment']['lipschitz_enforce'] = False

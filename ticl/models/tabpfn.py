@@ -458,6 +458,7 @@ class TabPFN(nn.Module):
         action_t,
         reward_t,
         reward_mask_t,
+        terminal_t=None,
         kv_cache=None,
         max_cache_len=None,
         kv_cache_mode: str = "auto",
@@ -487,6 +488,9 @@ class TabPFN(nn.Module):
 
         reward_scalar = reward_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
         reward_mask_scalar = reward_mask_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        terminal_scalar = None
+        if terminal_t is not None:
+            terminal_scalar = terminal_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
 
         obs_encoder = self.encoder.obs_encoder
         action_encoder = self.encoder.action_encoder
@@ -503,9 +507,10 @@ class TabPFN(nn.Module):
             y_bias_vec = None
         obs_dim = int(self.encoder.obs_dim)
         action_dim = int(self.encoder.action_dim)
-        obs_slot_dim = int(max(0, obs_dim - 2))
+        obs_slot_dim = int(max(0, obs_dim - (3 if terminal_scalar is not None else 2)))
         reward_idx = obs_slot_dim
         mask_idx = obs_slot_dim + 1
+        terminal_idx = obs_slot_dim + 2 if terminal_scalar is not None else None
 
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
@@ -541,6 +546,9 @@ class TabPFN(nn.Module):
             if mask_idx < obs_dim:
                 fused_inputs.append(reward_mask_scalar)
                 fused_weights.append(obs_weight[:, mask_idx].unsqueeze(1))
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                fused_inputs.append(terminal_scalar)
+                fused_weights.append(obs_weight[:, terminal_idx].unsqueeze(1))
 
             fused_bias = obs_bias + action_bias
             if y_bias_vec is not None:
@@ -571,6 +579,8 @@ class TabPFN(nn.Module):
                 obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
             if mask_idx < obs_dim:
                 obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                obs_enc = obs_enc + terminal_scalar * obs_weight[:, terminal_idx].unsqueeze(0)
             if y_bias_vec is not None:
                 obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
 

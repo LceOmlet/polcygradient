@@ -809,7 +809,7 @@ def _build_policy_step_fn(
 
     split_policy_forward_step = None
     split_compile_active = False
-    split_obs_slot_dim = None
+    split_obs_total_dim = None
     split_action_slot_dim = None
     if split_fastpath_available:
         split_policy_forward_step = model_ref.forward_policy_step_split
@@ -827,7 +827,7 @@ def _build_policy_step_fn(
                 f"(backend={pg_torch_compile_backend}, mode={pg_torch_compile_mode}, "
                 f"fullgraph={bool(pg_torch_compile_fullgraph)}, dynamic={bool(pg_torch_compile_dynamic)})"
             )
-        split_obs_slot_dim = int(max(0, int(model_encoder.obs_dim) - 2))
+        split_obs_total_dim = int(model_encoder.obs_dim)
         split_action_slot_dim = int(model_encoder.action_dim)
 
     # Reuse token buffers across rollout steps to avoid per-step cat/pad
@@ -855,6 +855,16 @@ def _build_policy_step_fn(
         # from being retained through PFN inputs.
         reward_scalar = reward_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
         reward_mask = reward_mask_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
+        terminal_scalar = None
+        terminal_token_enabled = False
+        if isinstance(env_info, dict) and ("terminal_t" in env_info):
+            terminal_scalar = env_info["terminal_t"].reshape(batch_size).detach().to(dtype=obs_t.dtype)
+            terminal_token_enabled = True
+        split_obs_slot_dim = (
+            int(max(0, int(split_obs_total_dim) - (3 if terminal_token_enabled else 2)))
+            if split_obs_total_dim is not None
+            else None
+        )
 
         use_split_fastpath = (
             bool(split_fastpath_available)
@@ -871,6 +881,7 @@ def _build_policy_step_fn(
                 action_t,
                 reward_scalar.reshape(batch_size, 1),
                 reward_mask.reshape(batch_size, 1),
+                terminal_t=(terminal_scalar.reshape(batch_size, 1) if terminal_token_enabled else None),
                 kv_cache=cache,
                 max_cache_len=max_cache_len,
                 kv_cache_mode=kv_cache_mode,
@@ -950,7 +961,9 @@ def _build_policy_step_fn(
             x_row[:, obs_slot_dim] = reward_scalar
         if (obs_slot_dim + 1) < num_features:
             x_row[:, obs_slot_dim + 1] = reward_mask
-        action_write_start = obs_slot_dim + 2
+        if terminal_token_enabled and (obs_slot_dim + 2) < num_features:
+            x_row[:, obs_slot_dim + 2] = terminal_scalar
+        action_write_start = obs_slot_dim + (3 if terminal_token_enabled else 2)
         if action_write_start < num_features:
             action_copy = int(min(action_t.shape[-1], action_slot_dim, num_features - action_write_start))
             if action_copy > 0:
@@ -2444,6 +2457,73 @@ def train_epoch_policy_gradient(
                 fixed_batch_h_list_override = None
                 fixed_batch_env_seeds_override = None
 
+            def _format_pg_phase_start_alpha_suffix(h_list_preview):
+                if h_list_preview is None:
+                    return ""
+                alpha_values = []
+                for h in h_list_preview:
+                    if not isinstance(h, dict) or ("alpha" not in h):
+                        continue
+                    try:
+                        alpha_values.append(float(max(1e-4, min(1.0, float(h["alpha"])))))
+                    except Exception:
+                        continue
+                if len(alpha_values) <= 0:
+                    return ""
+                alpha_tensor = torch.as_tensor(alpha_values, dtype=torch.float32)
+                return (
+                    f" env_alpha_mean={float(alpha_tensor.mean().item()):.3e}"
+                    f" env_alpha_min={float(alpha_tensor.min().item()):.3e}"
+                    f" env_alpha_max={float(alpha_tensor.max().item()):.3e}"
+                )
+
+            def _format_pg_phase_start_terminal_suffix(h_list_preview):
+                if h_list_preview is None:
+                    return ""
+                target_values = []
+                for h in h_list_preview:
+                    if not isinstance(h, dict):
+                        continue
+                    try:
+                        if not bool(env_prior._resolve_terminal_reset_enabled(h)):
+                            continue
+                        target_values.append(float(env_prior._resolve_terminal_reset_count_target(h)))
+                    except Exception:
+                        continue
+                if len(target_values) <= 0:
+                    return ""
+                target_tensor = torch.as_tensor(target_values, dtype=torch.float32)
+                return (
+                    f" env_X_mean={float(target_tensor.mean().item()):.3f}"
+                    f" env_X_min={float(target_tensor.min().item()):.0f}"
+                    f" env_X_max={float(target_tensor.max().item()):.0f}"
+                )
+
+            def _format_pg_phase_terminal_suffix(
+                target_mean,
+                target_min,
+                target_max,
+                realized_mean,
+                realized_min,
+                realized_max,
+            ):
+                if target_mean is None and realized_mean is None:
+                    return ""
+                parts = []
+                if target_mean is not None:
+                    parts.append(
+                        f" X_mean={float(target_mean):.3f}"
+                        f" X_min={float(target_min):.0f}"
+                        f" X_max={float(target_max):.0f}"
+                    )
+                if realized_mean is not None:
+                    parts.append(
+                        f" hatX_mean={float(realized_mean):.3f}"
+                        f" hatX_min={float(realized_min):.0f}"
+                        f" hatX_max={float(realized_max):.0f}"
+                    )
+                return "".join(parts)
+
             for replay_step_idx in range(pg_env_replay_steps):
                 replay_phase_suffix = ""
                 if pg_env_replay_steps > 1:
@@ -2459,6 +2539,20 @@ def train_epoch_policy_gradient(
                     single_eval_pos = env_prior._sample_single_eval_pos(n_samples, None)
                     batch_h_list_override = None
                     batch_env_seeds_override = None
+                pg_phase_start_alpha_suffix = ""
+                pg_phase_start_terminal_suffix = ""
+                if should_log_pg_phase:
+                    if batch_h_list_override is not None:
+                        pg_phase_start_alpha_suffix = _format_pg_phase_start_alpha_suffix(batch_h_list_override)
+                        pg_phase_start_terminal_suffix = _format_pg_phase_start_terminal_suffix(batch_h_list_override)
+                    else:
+                        preview_rng_state = _capture_rng_state(device)
+                        try:
+                            preview_h_list = env_prior._sample_batch_hypers(batch_size)
+                        finally:
+                            _restore_rng_state(preview_rng_state)
+                        pg_phase_start_alpha_suffix = _format_pg_phase_start_alpha_suffix(preview_h_list)
+                        pg_phase_start_terminal_suffix = _format_pg_phase_start_terminal_suffix(preview_h_list)
                 if should_log_pg_phase:
                     _emit_pg_phase_log_line(
                         f"[pg-phase-start] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
@@ -2466,6 +2560,8 @@ def train_epoch_policy_gradient(
                         f"status=start rl_objective={rl_objective} "
                         f"batch_size={int(batch_size)} n_samples={int(n_samples)} "
                         f"single_eval_pos={int(single_eval_pos)}"
+                        f"{pg_phase_start_alpha_suffix}"
+                        f"{pg_phase_start_terminal_suffix}"
                     )
                 batch_rng_state = _capture_rng_state(device)
                 max_batch_oom_retries = 8
@@ -2505,6 +2601,12 @@ def train_epoch_policy_gradient(
                     batch_reward_inf_share = 0.0
                     batch_reward_clip_hit_share = 0.0
                     batch_reward_norm_clip_hit_share = 0.0
+                    batch_terminal_count_mean_value = None
+                    batch_terminal_count_min_value = None
+                    batch_terminal_count_max_value = None
+                    batch_terminal_target_mean_value = None
+                    batch_terminal_target_min_value = None
+                    batch_terminal_target_max_value = None
                     batch_reinforce_return_nonfinite_share = 0.0
                     batch_reinforce_log_prob_nonfinite_share = 0.0
                     batch_reinforce_adv_nonfinite_share = 0.0
@@ -3091,6 +3193,7 @@ def train_epoch_policy_gradient(
                                         rl_objective=rl_objective,
                                         **rollout_override_kwargs,
                                     )
+                                    chunk_terminal_stats = getattr(env_prior, "last_rollout_terminal_stats", None)
                                     weighted_pg_loss = pg_loss_chunk * chunk_weight
                                     loss = weighted_pg_loss / aggregate_k_gradients
                                     if tbptt_stream_backward_active and tbptt_window_backward_called:
@@ -3321,6 +3424,56 @@ def train_epoch_policy_gradient(
                                 batch_reward_norm_clip_hit_share += (
                                     float(chunk_reward_norm_clip_hit.detach().cpu()) * chunk_weight
                                 )
+                            except Exception:
+                                pass
+                        if chunk_terminal_stats is not None:
+                            try:
+                                chunk_terminal_mean = chunk_terminal_stats.get("terminal_count_mean", None)
+                                if chunk_terminal_mean is not None:
+                                    contrib = float(torch.as_tensor(chunk_terminal_mean).detach().cpu()) * chunk_weight
+                                    if batch_terminal_count_mean_value is None:
+                                        batch_terminal_count_mean_value = contrib
+                                    else:
+                                        batch_terminal_count_mean_value += contrib
+                                chunk_terminal_min = chunk_terminal_stats.get("terminal_count_min", None)
+                                if chunk_terminal_min is not None:
+                                    value = float(torch.as_tensor(chunk_terminal_min).detach().cpu())
+                                    batch_terminal_count_min_value = (
+                                        value
+                                        if batch_terminal_count_min_value is None
+                                        else min(batch_terminal_count_min_value, value)
+                                    )
+                                chunk_terminal_max = chunk_terminal_stats.get("terminal_count_max", None)
+                                if chunk_terminal_max is not None:
+                                    value = float(torch.as_tensor(chunk_terminal_max).detach().cpu())
+                                    batch_terminal_count_max_value = (
+                                        value
+                                        if batch_terminal_count_max_value is None
+                                        else max(batch_terminal_count_max_value, value)
+                                    )
+                                chunk_terminal_target_mean = chunk_terminal_stats.get("terminal_count_target_mean", None)
+                                if chunk_terminal_target_mean is not None:
+                                    contrib = float(torch.as_tensor(chunk_terminal_target_mean).detach().cpu()) * chunk_weight
+                                    if batch_terminal_target_mean_value is None:
+                                        batch_terminal_target_mean_value = contrib
+                                    else:
+                                        batch_terminal_target_mean_value += contrib
+                                chunk_terminal_target_min = chunk_terminal_stats.get("terminal_count_target_min", None)
+                                if chunk_terminal_target_min is not None:
+                                    value = float(torch.as_tensor(chunk_terminal_target_min).detach().cpu())
+                                    batch_terminal_target_min_value = (
+                                        value
+                                        if batch_terminal_target_min_value is None
+                                        else min(batch_terminal_target_min_value, value)
+                                    )
+                                chunk_terminal_target_max = chunk_terminal_stats.get("terminal_count_target_max", None)
+                                if chunk_terminal_target_max is not None:
+                                    value = float(torch.as_tensor(chunk_terminal_target_max).detach().cpu())
+                                    batch_terminal_target_max_value = (
+                                        value
+                                        if batch_terminal_target_max_value is None
+                                        else max(batch_terminal_target_max_value, value)
+                                    )
                             except Exception:
                                 pass
                         chunk_reinforce_return_nonfinite = pg_stats_chunk.get("reinforce_return_nonfinite_share", None)
@@ -5571,6 +5724,15 @@ def train_epoch_policy_gradient(
                                 wandb_payload["pg_gpu/pg_loss_sig"] = str(batch_pg_loss_signature)
                             wandb.log(wandb_payload)
     
+                terminal_phase_suffix = _format_pg_phase_terminal_suffix(
+                    batch_terminal_target_mean_value,
+                    batch_terminal_target_min_value,
+                    batch_terminal_target_max_value,
+                    batch_terminal_count_mean_value,
+                    batch_terminal_count_min_value,
+                    batch_terminal_count_max_value,
+                )
+
                 if batch_oom:
                     skipped_steps += 1
                     stable_batches_for_chunk_growth = 0
@@ -5582,6 +5744,7 @@ def train_epoch_policy_gradient(
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=oom"
+                            f"{terminal_phase_suffix}"
                             f"{rollout_breakdown_suffix}"
                         )
                     if epoch_profiler is not None:
@@ -5629,6 +5792,7 @@ def train_epoch_policy_gradient(
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=loss_nonfinite"
+                            f"{terminal_phase_suffix}"
                             f"{rollout_breakdown_suffix}"
                         )
                     print(f"[train-skip] epoch={batch_epoch_for_profile} batch={batch} reason=loss_nonfinite loss={loss_val}")
@@ -5680,6 +5844,7 @@ def train_epoch_policy_gradient(
                             f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                             f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                             f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_nonfinite"
+                            f"{terminal_phase_suffix}"
                             f"{rollout_breakdown_suffix}"
                         )
                     _emit_nonfinite_gradient_diagnostics(model, epoch=batch_epoch_for_profile, batch=batch)
@@ -5870,6 +6035,7 @@ def train_epoch_policy_gradient(
                                 f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                                 f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                                 f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=grad_norm_nonfinite"
+                                f"{terminal_phase_suffix}"
                                 f" grad_abs_mean={grad_abs_mean_info}"
                                 f" grad_abs_max={grad_abs_max_info}"
                                 f" grad_rms={grad_rms_info}"
@@ -6242,6 +6408,7 @@ def train_epoch_policy_gradient(
                         f"grad_numel={grad_numel_info} "
                         f"stepped={int(bool(batch_optimizer_stepped))} "
                         f"opt_step={opt_step_info}"
+                        f"{terminal_phase_suffix}"
                         f"{aev2_suffix}"
                         f"{aev3_suffix}"
                         f"{aev4_suffix}"
