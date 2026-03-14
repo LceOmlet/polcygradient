@@ -21114,6 +21114,8 @@ class EnvironmentPrior:
                 else zero_t
             ),
             "alpha_grad_enabled": 1,
+            "alpha_grad_local_coordinate_enabled": int(self._resolve_alpha_grad_local_coordinate_enabled(self.config)),
+            "alpha_grad_unit_grad_enabled": int(self._resolve_alpha_grad_unit_grad_enabled(self.config)),
         }
         self.last_rollout_terminal_stats = self._terminal_count_summary(
             terminal_count_realized,

@@ -813,3 +813,68 @@ Interpretation:
 - The earlier apparent memory regression was not a new runtime cost that needed further compression; it was the partition-override bug.
 - Once the line is forced back to true `256 MiB`, the extra memory disappears, so there is no additional semantics-safe memory reduction to apply on this old-skyline compatibility path.
 - The current default `2 GiB` skyline remains a separate accepted speed-oriented line with intentionally different execution grouping and a different memory/time tradeoff.
+
+## Alpha Grad Semantic Coverage Matrix
+
+Scope:
+
+- current branch head: `2ce7b15`
+- default path under audit:
+  - `rl_objective=alpha_grad`
+  - `terminal_reset_enabled=true`
+  - `alpha_grad_local_coordinate_enabled=true`
+  - `alpha_grad_unit_grad_enabled=true`
+  - `reference_scm_partition_max_bytes=2 GiB`
+- compatibility line under audit:
+  - terminal disabled
+  - `local_coordinate=false`
+  - `unit_grad=false`
+  - `reference_scm_partition_max_bytes=256 MiB`
+
+Feature inventory and certificates:
+
+| feature | semantic contract | certificates / regression tests | latest scan |
+| --- | --- | --- | --- |
+| SCM / reference transition semantics | strict shared-vectorized rollout preserves SCM/reference builder semantics for the default environment contract | `test_environment_prior_strict_reference_semantics_shared_vectorized_rollout` | pass |
+| Partition-budget control | config-level `reference_scm_partition_max_bytes` is respected, and env var override still wins when explicitly set | `test_environment_prior_partition_budget_respects_config_when_env_unset`, `test_environment_prior_partition_budget_env_override_wins` | pass |
+| `g0` score path | reinforce log-prob score matches autograd gradient, and analytic `g0` matches the pre-change autograd path used by `alpha_grad` | `test_environment_prior_reinforce_log_prob_score_matches_autograd_gradient`, `test_environment_prior_alpha_grad_log_prob_score_matches_autograd_g0_path` | pass |
+| Core `alpha_grad` mix math | `alpha_grad_loss_from_rollout_tensors(...)` matches the manual dense formula and returns stable finite gradients | `test_environment_prior_alpha_grad_matches_manual_action_space_mixing`, `test_environment_prior_alpha_grad_rollout_gradients_are_finite` | pass |
+| Local-coordinate alpha | grouped traces mix in per-group local coordinates when enabled, and preserve legacy coarse semantics when disabled | `test_environment_prior_alpha_grad_group_traces_match_dense_manual_gradient`, `test_environment_prior_alpha_grad_group_traces_local_coordinate_matches_manual_group_local_gradient` | pass |
+| Unit-grad alpha | alpha is computed from unit-normalized `g0/g1` blocks while raw gradients are still mixed back into the surrogate | `test_environment_prior_alpha_grad_matches_manual_action_space_mixing`, `test_environment_prior_alpha_grad_group_traces_local_coordinate_matches_manual_group_local_gradient` | pass |
+| TBPTT semantic equivalence | alpha TBPTT full-window semantics match full horizon, and non-final family windows stay finite | `test_alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics`, `test_environment_prior_alpha_grad_tbptt_nonfinal_family_window_gradients_are_finite`, `test_alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case` | pass |
+| Split encoder / policy split tokenization | default alpha config, action/state clip defaults, and terminal token expansion match the split encoder contract | `test_rlpfn_default_config_uses_split_encoder`, `test_rlpfn_default_terminal_reset_expands_split_obs_slots`, `test_tabpfn_forward_policy_step_split_matches_materialized_token_with_terminal` | pass |
+| Parser / config plumbing | CLI and model defaults expose alpha/local/unit/terminal/partition options consistently | `test_rlpfn_parser_accepts_alpha_grad_objective`, `test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options`, `test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims` | pass |
+| Terminal tail rule | `D_t` uses two-sided tail selection, allows `X=0`, uses per-sample history after warmup, and requires a non-extreme first history hit before relaxing | `test_environment_prior_terminal_tail_event_from_signal_selects_two_sided_tails_from_history`, `test_environment_prior_terminal_tail_event_from_signal_allows_zero_count`, `test_environment_prior_terminal_tail_event_from_signal_uses_per_sample_history_not_batch`, `test_environment_prior_terminal_tail_event_from_signal_uses_batch_only_during_warmup`, `test_environment_prior_terminal_tail_event_from_signal_requires_non_extreme_history_hit_before_relaxing` | pass |
+| Terminal rollout integration | terminal bonus/reset/token/stats propagate through single, structure, family, and alpha family-TBPTT paths | `test_environment_prior_rollout_policy_gradient_loss_reports_terminal_count_stats`, `test_environment_prior_rollout_with_policy_structure_grouping_matches_serial_with_terminal_reset`, `test_environment_prior_rollout_with_policy_family_grouping_matches_serial_with_terminal_reset`, `test_environment_prior_alpha_grad_family_tbptt_reports_terminal_count_stats` | pass |
+| Terminal-disabled compatibility | when terminal is disabled, family rollout must not inject a zero terminal token into policy inputs | `test_environment_prior_family_rollout_omits_terminal_token_when_terminal_disabled` | pass |
+| Old auto-bypass skyline compatibility | current terminal branch matches the old `d974845` auto-bypass skyline under true `256 MiB`, terminal-off, non-local, non-unit overrides | guarded same-payload benchmark table above | pass |
+
+Consolidated semantic scan run on `2ce7b15`:
+
+- `py_compile`:
+  - `environment_prior.py`
+  - `test_environment_prior.py`
+  - `test_fit_model_parsing.py`
+  - `test_rlpfn_split_encoder.py`
+  - `test_train_policy_rollout_checkpoint.py`
+- parser subset:
+  - `pytest -q ticl/tests/test_fit_model_parsing.py -k 'alpha_grad or terminal or partition'`
+  - result: `2 passed`
+- split/default subset:
+  - `pytest -q ticl/tests/test_rlpfn_split_encoder.py -k 'default or terminal or split'`
+  - result: `5 passed`
+- environment/terminal/alpha subset:
+  - `pytest -q ticl/tests/priors/test_environment_prior.py -k 'alpha_grad or terminal or partition_budget or strict_reference_semantics_shared_vectorized_rollout or reinforce_log_prob_score_matches_autograd_gradient'`
+  - result: `28 passed`
+- alpha TBPTT checkpoint subset:
+  - `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics or alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case'`
+  - result: `2 passed`
+- MLP semantic baseline:
+  - `pytest -q ticl/tests/priors/test_mlp_prior.py`
+  - result: `9 passed`
+
+Current residual gap found by the scan:
+
+- The legacy certificate `test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg` still fails under the current branch.
+- This gap is not in the default `alpha_grad` path itself; it is an older `first_policy_gradient` structure-vs-family certificate that still needs to be re-baselined against the accepted `2 GiB` skyline or rewritten as an explicit `256 MiB`, terminal-off compatibility certificate.
+- The scan therefore clears the current default `alpha_grad` path and old-skyline compatibility line, while leaving one non-default legacy `first_pg` checkpoint certificate open.

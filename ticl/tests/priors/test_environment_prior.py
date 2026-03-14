@@ -6499,6 +6499,9 @@ def test_environment_prior_alpha_grad_family_tbptt_reports_terminal_count_stats(
     assert float(rollout["terminal_stats"]["terminal_count_target_mean"]) == 4.0
     assert float(stats["terminal_count_mean"]) == 4.0
     assert float(stats["terminal_count_target_mean"]) == 4.0
+    assert int(stats["alpha_grad_enabled"]) == 1
+    assert int(stats["alpha_grad_local_coordinate_enabled"]) == 1
+    assert int(stats["alpha_grad_unit_grad_enabled"]) == 1
 
 
 def test_environment_prior_strict_reference_semantics_shared_vectorized_rollout(monkeypatch):
