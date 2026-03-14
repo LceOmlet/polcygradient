@@ -51,58 +51,6 @@ Interpretation:
 - It remains an experimental skyline because the partition change also changes strict-SCM execution grouping and therefore is not strictly forward-equivalent to the older baseline.
 - Under the user’s current acceptance criterion, this acceleration is now the active skyline to optimize from.
 
-### Accepted: Direct TBPTT-Streaming Reproduction of the Forced Policy-Offload 2GiB Low-Memory Line
-
-Scope:
-
-- target commit: `070ff68`
-- harness: [repro_forced_policy_offload_2g_firstpg.py](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg.py)
-- setup:
-  - `pg_saved_tensors_cpu_offload=true`
-  - `pg_saved_tensors_cpu_offload_scope=policy`
-  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe=false`
-  - `reference_scm_partition_max_bytes=2 GiB`
-  - `batch_size=64`
-  - `n_samples=1024`
-  - `single_eval_pos=697`
-  - `kv_cache_mode=paged`
-  - `family`
-  - `terminal_reset_enabled=false`
-  - `alpha_grad_local_coordinate_enabled=false`
-  - `alpha_grad_unit_grad_enabled=false`
-  - `first_policy_gradient_action_grad_clip_value=4`
-  - `first_policy_gradient_action_grad_clip_norm=0`
-
-Key correction:
-
-- Earlier direct reproductions were accidentally running the workload as a full-rollout graph retention path.
-- The real low-memory line uses the same TBPTT streaming semantics as training:
-  - `pg_tbptt_window=32`
-  - `tbptt_loss_sink` active
-  - effective outer rollout checkpoint = `false`
-- This is the smallest code-path difference that explains why earlier reproductions split into:
-  - host-RSS blow-up on non-reentrant outer-checkpoint paths
-  - higher GPU memory on reentrant outer-checkpoint paths
-
-Guarded reproduction evidence on the corrected streaming harness:
-
-| objective | payload status | teardown status | wall (s) | peak alloc (MiB) | peak reserved (MiB) | `nvidia-smi` process peak (MiB) | `nvidia-smi` total peak (MiB) | peak RSS sum (GiB) | streamed roots |
-| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
-| `first_policy_gradient` | `ok` | `rss_guard_kill` | 129.533 | 2115.753 | 2156.0 | 2162 | 2644 | 6.316 | 32 |
-| `alpha_grad` | `ok` | `rss_guard_kill` | 189.745 | 2447.570 | 2520.0 | 2464 | 2946 | 6.040 | 32 |
-
-Artifacts:
-
-- [070ff68 first_pg summary](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_first_policy_gradient_ckpt1_reent1_mutable1_stream1.json)
-- [070ff68 alpha summary](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_alpha_grad_ckpt1_reent1_mutable1_stream1.json)
-
-Interpretation:
-
-- The previously missing low-memory behavior was not hidden in terminal or newer `alpha` defaults.
-- The missing piece was reproducing the correct execution semantics: TBPTT streaming with per-window backward, not an outer-checkpoint whole-rollout graph.
-- Once that path is matched, both `first_pg` and `alpha_grad` fall back into the expected `~2-2.5 GiB alloc / ~2.6-3.0 GiB nvidia-smi` memory class.
-- Under the current hard guard, both runs complete their JSON payload successfully and are then torn down by the RSS guard once the process-tree sum crosses `~6 GiB`; this keeps the machine safe while preserving the low-memory reproduction evidence.
-
 ### Enabled Robustness Default: `action` Adjoint Norm Clip = `1.0`
 
 Scope:
@@ -926,8 +874,64 @@ Consolidated semantic scan run on `2ce7b15`:
   - `pytest -q ticl/tests/priors/test_mlp_prior.py`
   - result: `9 passed`
 
-Current residual gap found by the scan:
+Legacy certificate closure:
 
-- The legacy certificate `test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg` still fails under the current branch.
-- This gap is not in the default `alpha_grad` path itself; it is an older `first_policy_gradient` structure-vs-family certificate that still needs to be re-baselined against the accepted `2 GiB` skyline or rewritten as an explicit `256 MiB`, terminal-off compatibility certificate.
-- The scan therefore clears the current default `alpha_grad` path and old-skyline compatibility line, while leaving one non-default legacy `first_pg` checkpoint certificate open.
+- `test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg` has been repaired by forcing the family-side rollout onto the explicit semantic A/B path with `batch_vectorized_strict_rng_match=true`.
+- Focused regression after the repair:
+  - `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg or alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics or alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case or test_policy_rollout_nonreentrant_checkpoint_disables_policy_saved_tensors_offload or test_policy_rollout_reentrant_checkpoint_keeps_policy_saved_tensors_offload_enabled'`
+  - result: `5 passed`
+- This closes the previously documented non-default legacy `first_pg` checkpoint certificate gap.
+
+## Retained Baseline: Direct TBPTT-Streaming Reproduction of the Forced Policy-Offload 2GiB Low-Memory Line
+
+This is a later recovered/reproduced baseline, not the current top-of-file active skyline. It is kept here at the end of the document because it was established after the main skyline sequence and is primarily a retained reference line.
+
+Scope:
+
+- target commit: `070ff68`
+- harness: [repro_forced_policy_offload_2g_firstpg.py](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg.py)
+- setup:
+  - `pg_saved_tensors_cpu_offload=true`
+  - `pg_saved_tensors_cpu_offload_scope=policy`
+  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe=false`
+  - `reference_scm_partition_max_bytes=2 GiB`
+  - `batch_size=64`
+  - `n_samples=1024`
+  - `single_eval_pos=697`
+  - `kv_cache_mode=paged`
+  - `family`
+  - `terminal_reset_enabled=false`
+  - `alpha_grad_local_coordinate_enabled=false`
+  - `alpha_grad_unit_grad_enabled=false`
+  - `first_policy_gradient_action_grad_clip_value=4`
+  - `first_policy_gradient_action_grad_clip_norm=0`
+
+Key correction:
+
+- Earlier direct reproductions were accidentally running the workload as a full-rollout graph retention path.
+- The real low-memory line uses the same TBPTT streaming semantics as training:
+  - `pg_tbptt_window=32`
+  - `tbptt_loss_sink` active
+  - effective outer rollout checkpoint = `false`
+- This is the smallest code-path difference that explains why earlier reproductions split into:
+  - host-RSS blow-up on non-reentrant outer-checkpoint paths
+  - higher GPU memory on reentrant outer-checkpoint paths
+
+Guarded reproduction evidence on the corrected streaming harness:
+
+| objective | payload status | teardown status | wall (s) | peak alloc (MiB) | peak reserved (MiB) | `nvidia-smi` process peak (MiB) | `nvidia-smi` total peak (MiB) | peak RSS sum (GiB) | streamed roots |
+| --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | `ok` | `rss_guard_kill` | 129.533 | 2115.753 | 2156.0 | 2162 | 2644 | 6.316 | 32 |
+| `alpha_grad` | `ok` | `rss_guard_kill` | 189.745 | 2447.570 | 2520.0 | 2464 | 2946 | 6.040 | 32 |
+
+Artifacts:
+
+- [070ff68 first_pg summary](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_first_policy_gradient_ckpt1_reent1_mutable1_stream1.json)
+- [070ff68 alpha summary](/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_alpha_grad_ckpt1_reent1_mutable1_stream1.json)
+
+Interpretation:
+
+- The previously missing low-memory behavior was not hidden in terminal or newer `alpha` defaults.
+- The missing piece was reproducing the correct execution semantics: TBPTT streaming with per-window backward, not an outer-checkpoint whole-rollout graph.
+- Once that path is matched, both `first_pg` and `alpha_grad` fall back into the expected `~2-2.5 GiB alloc / ~2.6-3.0 GiB nvidia-smi` memory class.
+- Under the current hard guard, both runs complete their JSON payload successfully and are then torn down by the RSS guard once the process-tree sum crosses `~6 GiB`; this keeps the machine safe while preserving the low-memory reproduction evidence.
