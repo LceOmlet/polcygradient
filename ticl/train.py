@@ -398,6 +398,43 @@ def _resolve_effective_policy_saved_tensors_offload(
     return enabled
 
 
+def _resolve_effective_policy_saved_tensors_offload_for_rollout(
+    *,
+    enabled,
+    scope,
+    device,
+    batch_size,
+    n_samples,
+    auto_disable_when_safe=False,
+    auto_min_free_gb=8.0,
+    auto_max_batch_size=64,
+    auto_max_n_samples=1024,
+    policy_rollout_checkpoint=False,
+    policy_rollout_checkpoint_reentrant=True,
+):
+    """Resolve runtime offload, then apply rollout-level safety constraints.
+
+    Non-reentrant rollout checkpoint records the forward autograd graph. When
+    policy saved tensors are simultaneously redirected to CPU, large policy
+    activations can accumulate on host memory for the full checkpointed region.
+    We disable offload in that combination to keep host memory bounded.
+    """
+    enabled = _resolve_effective_policy_saved_tensors_offload(
+        enabled=enabled,
+        scope=scope,
+        device=device,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        auto_disable_when_safe=auto_disable_when_safe,
+        auto_min_free_gb=auto_min_free_gb,
+        auto_max_batch_size=auto_max_batch_size,
+        auto_max_n_samples=auto_max_n_samples,
+    )
+    if bool(enabled) and bool(policy_rollout_checkpoint) and (not bool(policy_rollout_checkpoint_reentrant)):
+        return False
+    return bool(enabled)
+
+
 def _is_oom_exception(exc: BaseException) -> bool:
     if isinstance(exc, torch.OutOfMemoryError):
         return True
@@ -1086,7 +1123,7 @@ def _compute_policy_rollout_chunk_loss(
     offload_scope = str(pg_saved_tensors_cpu_offload_scope or "all").strip().lower()
     if offload_scope not in {"all", "policy"}:
         offload_scope = "all"
-    effective_policy_saved_tensors_cpu_offload = _resolve_effective_policy_saved_tensors_offload(
+    effective_policy_saved_tensors_cpu_offload = _resolve_effective_policy_saved_tensors_offload_for_rollout(
         enabled=pg_saved_tensors_cpu_offload,
         scope=offload_scope,
         device=device,
@@ -1096,6 +1133,8 @@ def _compute_policy_rollout_chunk_loss(
         auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
         auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
         auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
+        policy_rollout_checkpoint=policy_rollout_checkpoint,
+        policy_rollout_checkpoint_reentrant=policy_rollout_checkpoint_reentrant,
     )
     full_offload_enabled = bool(effective_policy_saved_tensors_cpu_offload) and (offload_scope == "all")
     policy_step_fn = _wrap_policy_step_fn_saved_tensors_offload(

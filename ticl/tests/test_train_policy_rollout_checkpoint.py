@@ -361,6 +361,42 @@ def test_policy_saved_tensors_offload_auto_bypass_disables_policy_scope_when_saf
     assert enabled is False
 
 
+def test_policy_rollout_nonreentrant_checkpoint_disables_policy_saved_tensors_offload():
+    enabled = train_mod._resolve_effective_policy_saved_tensors_offload_for_rollout(
+        enabled=True,
+        scope="policy",
+        device="cpu",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=False,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=False,
+    )
+
+    assert enabled is False
+
+
+def test_policy_rollout_reentrant_checkpoint_keeps_policy_saved_tensors_offload_enabled():
+    enabled = train_mod._resolve_effective_policy_saved_tensors_offload_for_rollout(
+        enabled=True,
+        scope="policy",
+        device="cpu",
+        batch_size=64,
+        n_samples=1024,
+        auto_disable_when_safe=False,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=64,
+        auto_max_n_samples=1024,
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=True,
+    )
+
+    assert enabled is True
+
+
 def test_policy_saved_tensors_offload_auto_bypass_keeps_offload_when_outside_safe_envelope(monkeypatch):
     monkeypatch.setattr(train_mod.torch.cuda, "is_available", lambda: True)
     monkeypatch.setattr(
