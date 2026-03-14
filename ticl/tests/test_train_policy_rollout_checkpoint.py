@@ -175,12 +175,17 @@ def _run_streaming_tbptt_chunk(
     h_list_override=None,
     env_seeds_override=None,
     rollout_seeds_override=None,
+    return_prior=False,
+    seed=20260311,
+    model_state_dict=None,
 ):
-    _seed_everything(20260311)
+    _seed_everything(int(seed))
     model = _build_policy_model_for_num_features(
         num_features=num_features,
         recompute_attn=recompute_attn,
     )
+    if model_state_dict is not None:
+        model.load_state_dict(model_state_dict)
     prior = EnvironmentPrior(dict(env_cfg))
     step_fn = _build_policy_step_fn(
         model,
@@ -226,6 +231,8 @@ def _run_streaming_tbptt_chunk(
         )
         for k, v in stats.items()
     }
+    if return_prior:
+        return stats_detached, grads, streamed_roots, prior
     return stats_detached, grads, streamed_roots
 
 
@@ -2250,6 +2257,227 @@ def test_alpha_grad_tbptt_family_vectorized_unbiased_rr_q1_replays_full_prefix_c
     assert torch.isfinite(stats_family["objective"])
     assert len(grads_family) > 0
     assert all(torch.isfinite(g).all() for g in grads_family)
+
+
+def test_alpha_grad_tbptt_unbiased_rr_exact_replay_certificate():
+    _seed_everything(31)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+    family_env_cfg["alpha_grad_tbptt_unbiased_rr_enabled"] = True
+    family_env_cfg["alpha_grad_tbptt_unbiased_rr_survival_prob"] = 1.0
+
+    _, _, _, prior = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        batch_size=2,
+        n_samples=24,
+        single_eval_pos=20,
+        kv_cache_mode="immutable",
+        rl_objective="alpha_grad",
+        return_prior=True,
+    )
+
+    debug = getattr(prior, "last_alpha_tbptt_unbiased_rr_debug", None)
+    assert isinstance(debug, dict)
+    windows = debug.get("windows", None)
+    assert isinstance(windows, list)
+    assert len(windows) == 3
+
+    def _assert_boundary_debug_equal(lhs, rhs):
+        for key in ("state_t", "action_t", "reward_t", "reward_mask_t", "terminal_t"):
+            assert torch.allclose(lhs[key], rhs[key], atol=0.0, rtol=0.0)
+        assert len(lhs["cache_leaves"]) == len(rhs["cache_leaves"])
+        for left_leaf, right_leaf in zip(lhs["cache_leaves"], rhs["cache_leaves"]):
+            assert torch.allclose(left_leaf, right_leaf, atol=0.0, rtol=0.0)
+
+    replayed_eval_windows = 0
+    for window in windows:
+        forward = window["forward"]
+        replay = window["replay"]
+        _assert_boundary_debug_equal(forward["boundary_out"], replay["boundary_out"])
+        if bool(window["has_eval"]):
+            replayed_eval_windows += 1
+            assert forward["weighted_local_loss"] is not None
+            assert replay["weighted_local_loss"] is not None
+            assert torch.allclose(forward["weighted_local_loss"], replay["weighted_local_loss"], atol=0.0, rtol=0.0)
+            assert forward["rewards_window"] is not None
+            assert replay["rewards_window"] is not None
+            assert torch.allclose(forward["rewards_window"], replay["rewards_window"], atol=0.0, rtol=0.0)
+            assert forward["log_probs_window"] is not None
+            assert replay["log_probs_window"] is not None
+            assert torch.allclose(forward["log_probs_window"], replay["log_probs_window"], atol=0.0, rtol=0.0)
+            assert forward["action_mean_window"] is not None
+            assert replay["action_mean_window"] is not None
+            assert torch.allclose(forward["action_mean_window"], replay["action_mean_window"], atol=0.0, rtol=0.0)
+
+    assert replayed_eval_windows == 1
+
+
+def test_alpha_grad_tbptt_unbiased_rr_rollout_mc_mean_matches_q1_exact_gradient(monkeypatch):
+    _seed_everything(43)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    base_env_cfg = dict(full_cfg["prior"]["environment"])
+    base_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    base_env_cfg["batch_vectorized_grouping"] = "family"
+
+    sampler_prior = EnvironmentPrior(dict(base_env_cfg))
+    h_list = sampler_prior._sample_batch_hypers(1)
+    env_seeds = sampler_prior._sample_seed_list(1)
+    rollout_seeds = sampler_prior._sample_seed_list(1)
+
+    _seed_everything(44)
+    base_model = _build_policy_model_for_num_features(num_features=num_features, recompute_attn=False)
+    base_state = {
+        key: value.detach().clone()
+        for key, value in base_model.state_dict().items()
+    }
+
+    def _flat_grad_for_survival_prob(q, *, continuation_seed):
+        env_cfg = dict(base_env_cfg)
+        env_cfg["alpha_grad_tbptt_unbiased_rr_enabled"] = True
+        env_cfg["alpha_grad_tbptt_unbiased_rr_survival_prob"] = float(q)
+        survival_gen = torch.Generator(device="cpu")
+        survival_gen.manual_seed(int(continuation_seed))
+
+        def _sample_survival(prob, device):
+            p = float(prob)
+            if p <= 0.0:
+                return False
+            if p >= 1.0:
+                return True
+            del device
+            return bool(torch.rand((), generator=survival_gen).item() < p)
+
+        with monkeypatch.context() as m:
+            m.setattr(EnvironmentPrior, "_alpha_tbptt_sample_survival", staticmethod(_sample_survival))
+            _, grads, _ = _run_streaming_tbptt_chunk(
+                env_cfg=env_cfg,
+                num_features=num_features,
+                batch_size=1,
+                n_samples=24,
+                single_eval_pos=20,
+                kv_cache_mode="immutable",
+                allow_grad_mutable_cache=False,
+                rl_objective="alpha_grad",
+                h_list_override=h_list,
+                env_seeds_override=env_seeds,
+                rollout_seeds_override=rollout_seeds,
+                seed=1001,
+                model_state_dict=base_state,
+            )
+        return torch.cat([g.reshape(-1).to(dtype=torch.float64) for g in grads], dim=0)
+
+    exact_grad = _flat_grad_for_survival_prob(1.0, continuation_seed=1001)
+
+    survival_prob = 0.75
+    sample_count = 64
+    mc_grads = torch.stack(
+        [
+            _flat_grad_for_survival_prob(survival_prob, continuation_seed=2000 + idx)
+            for idx in range(sample_count)
+        ],
+        dim=0,
+    )
+    mc_mean = mc_grads.mean(dim=0)
+
+    mean_abs_exact = float(exact_grad.abs().mean().item())
+    mean_abs_err = float((mc_mean - exact_grad).abs().mean().item())
+    rel_mean_err = mean_abs_err / max(mean_abs_exact, 1e-8)
+    cosine = torch.nn.functional.cosine_similarity(
+        mc_mean.reshape(1, -1).to(dtype=torch.float32),
+        exact_grad.reshape(1, -1).to(dtype=torch.float32),
+        dim=1,
+    )
+
+    # This is a rollout-level Monte Carlo certificate, not an exact algebraic
+    # identity. Keep the threshold tight enough to catch directional drift,
+    # but tolerant to finite-sample noise on a small CPU fixture.
+    assert float(cosine.item()) > 0.995
+    assert rel_mean_err < 0.08
+
+
+def test_policy_step_cache_snapshot_restore_matches_grad_and_nograd():
+    _seed_everything(41)
+    model = _build_policy_model_for_num_features(num_features=16, recompute_attn=False)
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=16,
+        max_cache_len=24,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+
+    batch_size = 2
+    env_info = {
+        "obs_slot_dim": 12,
+        "action_slot_dim": 2,
+        "action_dim": 3,
+        "phase_t": torch.zeros((batch_size, 1), dtype=torch.float32),
+        "terminal_t": torch.zeros((batch_size, 1), dtype=torch.float32),
+    }
+    obs_t = torch.randn(batch_size, 12)
+    action_t = torch.randn(batch_size, 3)
+    reward_t = torch.randn(batch_size, 1)
+    reward_mask_t = torch.ones(batch_size, 1)
+    cache = None
+    for step_idx in range(3):
+        with torch.no_grad():
+            action_t, cache = step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info)
+        obs_t = obs_t + 0.01
+        reward_t = reward_t + 0.02
+
+    cache_nograd = EnvironmentPrior._detach_policy_cache(cache, clone_tensors=True)
+    cache_grad, _ = EnvironmentPrior._clone_policy_cache_with_grad(cache)
+    obs_test = torch.randn(batch_size, 12)
+    action_test = torch.randn(batch_size, 3)
+    reward_test = torch.randn(batch_size, 1)
+    reward_mask_test = torch.ones(batch_size, 1)
+    env_info_eval = {
+        "obs_slot_dim": 12,
+        "action_slot_dim": 2,
+        "action_dim": 3,
+        "phase_t": torch.ones((batch_size, 1), dtype=torch.float32),
+        "terminal_t": torch.zeros((batch_size, 1), dtype=torch.float32),
+    }
+
+    with torch.no_grad():
+        action_nograd, cache_out_nograd = step_fn(
+            obs_test,
+            action_test,
+            reward_test,
+            reward_mask_test,
+            cache_nograd,
+            3,
+            env_info_eval,
+        )
+    action_grad, cache_out_grad = step_fn(
+        obs_test,
+        action_test,
+        reward_test,
+        reward_mask_test,
+        cache_grad,
+        3,
+        env_info_eval,
+    )
+
+    assert torch.allclose(action_nograd, action_grad, atol=0.0, rtol=0.0)
+    leaves_nograd = EnvironmentPrior._flatten_policy_cache_tensors(cache_out_nograd)
+    leaves_grad = EnvironmentPrior._flatten_policy_cache_tensors(cache_out_grad)
+    assert len(leaves_nograd) == len(leaves_grad)
+    for left_leaf, right_leaf in zip(leaves_nograd, leaves_grad):
+        assert torch.allclose(left_leaf, right_leaf, atol=0.0, rtol=0.0)
 
 
 def test_tbptt_window_reduces_saved_tensor_bytes_trend():

@@ -13173,6 +13173,15 @@ class EnvironmentPrior:
             "cache_leaves": tuple(cache_leaf * scale_t for cache_leaf in boundary_eta.get("cache_leaves", tuple())),
         }
 
+    @staticmethod
+    def _alpha_tbptt_sample_survival(prob, device):
+        p = float(prob)
+        if p <= 0.0:
+            return False
+        if p >= 1.0:
+            return True
+        return bool(torch.rand((), device=device).item() < p)
+
     def _rollout_distinct_envs_vectorized_with_policy(
         self,
         env,
@@ -20135,6 +20144,7 @@ class EnvironmentPrior:
             raise ValueError("alpha family TBPTT window runner requires 0 < tbptt_window < n_samples")
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
         self.clear_rollout_artifacts()
+        self.last_alpha_tbptt_unbiased_rr_debug = None
 
         if h_list_override is not None:
             if len(h_list_override) != batch_size:
@@ -20846,6 +20856,38 @@ class EnvironmentPrior:
                 _clone_tensor_or_none(snapshot[6]),
             )
 
+        def _snapshot_torch_rng_state():
+            snapshot = {
+                "cpu": torch.random.get_rng_state().clone(),
+            }
+            if device_obj.type == "cuda":
+                snapshot["cuda"] = torch.cuda.get_rng_state(device=device_obj).clone()
+            else:
+                snapshot["cuda"] = None
+            return snapshot
+
+        def _restore_torch_rng_state(snapshot):
+            if snapshot is None:
+                return
+            cpu_state = snapshot.get("cpu", None)
+            if cpu_state is not None:
+                torch.random.set_rng_state(cpu_state)
+            if device_obj.type == "cuda":
+                cuda_state = snapshot.get("cuda", None)
+                if cuda_state is not None:
+                    torch.cuda.set_rng_state(cuda_state, device=device_obj)
+
+        def _snapshot_terminal_replay_state():
+            return {
+                "terminal_signal_history": (
+                    None if terminal_signal_history is None else terminal_signal_history.clone()
+                ),
+                "terminal_history_relaxed": (
+                    None if terminal_history_relaxed is None else terminal_history_relaxed.clone()
+                ),
+                "terminal_count_realized": terminal_count_realized.clone(),
+            }
+
         def _snapshot_boundary(state_in, action_in, reward_in, reward_mask_in, terminal_in, cache_in):
             return {
                 "state_t": state_in.detach().clone(),
@@ -20892,7 +20934,10 @@ class EnvironmentPrior:
             bridge_eta=None,
             group_rollout_generators_override=None,
             noise_state_override=None,
+            terminal_replay_state_override=None,
+            torch_rng_state_override=None,
             build_grad_graph=True,
+            force_grad_boundary=False,
         ):
             nonlocal noise_block_start, noise_block_end
             nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
@@ -20903,15 +20948,19 @@ class EnvironmentPrior:
                 or (noise_state_override is not None)
             )
             restore_noise_snapshot = None
+            restore_torch_rng_snapshot = None
             if noise_streaming_mode and (replay_mode or (noise_state_override is not None)):
                 restore_noise_snapshot = _snapshot_noise_block_state()
             if noise_state_override is not None:
                 _restore_noise_block_state(noise_state_override)
+            if torch_rng_state_override is not None:
+                restore_torch_rng_snapshot = _snapshot_torch_rng_state()
+                _restore_torch_rng_state(torch_rng_state_override)
             try:
                 with torch.set_grad_enabled(bool(build_grad_graph)):
                     boundary = _prepare_boundary(
                         boundary_start,
-                        requires_grad_boundary=bool(build_grad_graph and compute_boundary_eta),
+                        requires_grad_boundary=bool(build_grad_graph and (compute_boundary_eta or force_grad_boundary)),
                     )
                     state_local = boundary["state_t"]
                     action_local = boundary["action_t"]
@@ -20919,22 +20968,36 @@ class EnvironmentPrior:
                     reward_mask_local = boundary["reward_mask_t"]
                     terminal_local = boundary["terminal_t"]
                     cache_local = boundary["cache"]
-                    terminal_signal_history_local = (
-                        terminal_signal_history
-                        if (terminal_signal_history is None or not replay_mode)
-                        else terminal_signal_history.clone()
-                    )
-                    terminal_history_relaxed_local = (
-                        terminal_history_relaxed
-                        if (terminal_history_relaxed is None or not replay_mode)
-                        else terminal_history_relaxed.clone()
-                    )
-                    terminal_count_local = terminal_count_realized if not replay_mode else terminal_count_realized.clone()
+                    if terminal_replay_state_override is not None:
+                        terminal_signal_history_local = (
+                            None
+                            if terminal_replay_state_override.get("terminal_signal_history", None) is None
+                            else terminal_replay_state_override["terminal_signal_history"].clone()
+                        )
+                        terminal_history_relaxed_local = (
+                            None
+                            if terminal_replay_state_override.get("terminal_history_relaxed", None) is None
+                            else terminal_replay_state_override["terminal_history_relaxed"].clone()
+                        )
+                        terminal_count_local = terminal_replay_state_override["terminal_count_realized"].clone()
+                    else:
+                        terminal_signal_history_local = (
+                            terminal_signal_history
+                            if (terminal_signal_history is None or not replay_mode)
+                            else terminal_signal_history.clone()
+                        )
+                        terminal_history_relaxed_local = (
+                            terminal_history_relaxed
+                            if (terminal_history_relaxed is None or not replay_mode)
+                            else terminal_history_relaxed.clone()
+                        )
+                        terminal_count_local = terminal_count_realized if not replay_mode else terminal_count_realized.clone()
                     reward_buffer = []
                     log_prob_buffer = []
                     log_prob_score_buffer = []
                     action_mean_buffer = []
                     action_mask_buffer = []
+                    step_debug_buffer = [] if bool(unbiased_rr_enabled) else None
 
                     for t in range(window_start, window_end):
                         if terminal_token_enabled:
@@ -21103,6 +21166,8 @@ class EnvironmentPrior:
                                     ]
                             else:
                                 env_in = torch.zeros_like(group["env_in"]) if transition_input_grad_active else group["env_in"]
+                                if not transition_input_grad_active:
+                                    env_in.zero_()
                                 env_in[:, :state_dim_g] = state_in
                                 if env_obs_start is not None:
                                     env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
@@ -21233,6 +21298,8 @@ class EnvironmentPrior:
                             )
                         else:
                             terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
+                        state_next_pre_mask = state_next
+                        reward_next_pre_clip = reward_next
                         state_next = state_next * state_mask
                         if first_pg_state_grad_clip_norm > 0.0:
                             state_next = self._clip_tensor_grad_by_global_norm(
@@ -21248,6 +21315,32 @@ class EnvironmentPrior:
                             log_prob_score_buffer.append(reinforce_log_prob_score_t)
                             action_mean_buffer.append(action_mean)
                             action_mask_buffer.append(action_mask_bool)
+                        if step_debug_buffer is not None:
+                            step_debug_buffer.append(
+                                {
+                                    "t": int(t),
+                                    "obs_t": obs_t.detach().clone(),
+                                    "action_mean": action_mean.detach().clone(),
+                                    "action_next": action_next.detach().clone(),
+                                    "reward_next": reward_next.detach().clone(),
+                                    "reward_next_raw": reward_next_raw.detach().clone(),
+                                    "reward_next_pre_clip": reward_next_pre_clip.detach().clone(),
+                                    "state_next": state_next.detach().clone(),
+                                    "state_next_pre_mask": state_next_pre_mask.detach().clone(),
+                                    "terminal_next": terminal_next.detach().clone(),
+                                    "noise_t": noise_t.detach().clone(),
+                                    "state_noise_t": None if state_noise_t is None else state_noise_t.detach().clone(),
+                                    "dropout_draw_t": None if dropout_draw_t is None else dropout_draw_t.detach().clone(),
+                                    "terminal_signal_next": (
+                                        None if terminal_signal_next is None else terminal_signal_next.detach().clone()
+                                    ),
+                                    "terminal_bonus_base_next": (
+                                        None
+                                        if terminal_bonus_base_next is None
+                                        else terminal_bonus_base_next.detach().clone()
+                                    ),
+                                }
+                            )
                         state_local = state_next
                         action_local = action_env
                         reward_local = reward_next
@@ -21265,6 +21358,8 @@ class EnvironmentPrior:
                     weighted_local_loss = None
                     stats_window = None
                     rewards_window_det = None
+                    log_probs_window_det = None
+                    action_mean_window_det = None
                     window_weight = 0.0
                     eval_step_count = len(reward_buffer)
                     if compute_local_alpha and eval_step_count > 0:
@@ -21291,6 +21386,8 @@ class EnvironmentPrior:
                         window_weight = float(eval_step_count) / float(max(1, total_eval_steps))
                         weighted_local_loss = loss_window * window_weight
                         rewards_window_det = rewards_window.detach()
+                        log_probs_window_det = log_probs_window.detach()
+                        action_mean_window_det = torch.stack(action_mean_roots, dim=0).detach()
                     bridge_loss = self._alpha_tbptt_bridge_loss_from_eta(boundary_out, bridge_eta)
                     boundary_eta = None
                     if compute_boundary_eta:
@@ -21313,12 +21410,17 @@ class EnvironmentPrior:
                         "boundary_eta": boundary_eta,
                         "boundary_out": boundary_out,
                         "rewards_window_det": rewards_window_det,
+                        "log_probs_window_det": log_probs_window_det,
+                        "action_mean_window_det": action_mean_window_det,
                         "bridge_loss": bridge_loss,
                         "terminal_count_realized": terminal_count_local,
+                        "step_debug_det": step_debug_buffer,
                     }
             finally:
                 if restore_noise_snapshot is not None:
                     _restore_noise_block_state(restore_noise_snapshot)
+                if restore_torch_rng_snapshot is not None:
+                    _restore_torch_rng_state(restore_torch_rng_snapshot)
 
         def _accumulate_window_stats(current_result):
             nonlocal objective_accum, total_weight
@@ -21426,8 +21528,49 @@ class EnvironmentPrior:
             terminal_count_realized = current_result["terminal_count_realized"]
             cache = self._detach_policy_cache(boundary_out["cache"], clone_tensors=(tbptt_loss_sink is None))
 
+        def _boundary_out_debug_snapshot(boundary_out):
+            cache_leaves = tuple(
+                leaf.detach().clone()
+                for leaf in self._flatten_policy_cache_tensors(boundary_out["cache"])
+            )
+            return {
+                "state_t": boundary_out["state_t"].detach().clone(),
+                "action_t": boundary_out["action_t"].detach().clone(),
+                "reward_t": boundary_out["reward_t"].detach().clone(),
+                "reward_mask_t": boundary_out["reward_mask_t"].detach().clone(),
+                "terminal_t": boundary_out["terminal_t"].detach().clone(),
+                "cache_leaves": cache_leaves,
+            }
+
+        def _window_result_debug_snapshot(result):
+            return {
+                "boundary_out": _boundary_out_debug_snapshot(result["boundary_out"]),
+                "weighted_local_loss": (
+                    None
+                    if result["weighted_local_loss"] is None
+                    else result["weighted_local_loss"].detach().clone()
+                ),
+                "rewards_window": (
+                    None
+                    if result["rewards_window_det"] is None
+                    else result["rewards_window_det"].detach().clone()
+                ),
+                "log_probs_window": (
+                    None
+                    if result.get("log_probs_window_det", None) is None
+                    else result["log_probs_window_det"].detach().clone()
+                ),
+                "action_mean_window": (
+                    None
+                    if result.get("action_mean_window_det", None) is None
+                    else result["action_mean_window_det"].detach().clone()
+                ),
+                "step_debug": list(result.get("step_debug_det", []) or []),
+            }
+
         if unbiased_rr_enabled:
             window_bundles = []
+            unbiased_rr_debug_windows = []
             for window_start in range(0, n_samples, tbptt_window_size):
                 window_end = min(n_samples, window_start + tbptt_window_size)
                 current_window_boundary = _snapshot_boundary(
@@ -21438,8 +21581,10 @@ class EnvironmentPrior:
                     terminal_t,
                     cache,
                 )
+                current_window_terminal_replay_state = _snapshot_terminal_replay_state()
                 current_window_generator_states = _snapshot_group_rollout_generator_states()
                 current_window_noise_state = _snapshot_noise_block_state()
+                current_window_torch_rng_state = _snapshot_torch_rng_state()
                 compute_local_alpha = bool(window_end > single_eval_pos)
                 current_result = _run_window_from_boundary(
                     current_window_boundary,
@@ -21448,7 +21593,8 @@ class EnvironmentPrior:
                     compute_local_alpha=compute_local_alpha,
                     compute_boundary_eta=False,
                     bridge_eta=None,
-                    build_grad_graph=False,
+                    build_grad_graph=True,
+                    force_grad_boundary=True,
                 )
                 _accumulate_window_stats(current_result)
                 _advance_main_state_from_result(current_result)
@@ -21460,6 +21606,9 @@ class EnvironmentPrior:
                         "has_eval": bool(compute_local_alpha),
                         "generator_states": current_window_generator_states,
                         "noise_state": current_window_noise_state,
+                        "torch_rng_state": current_window_torch_rng_state,
+                        "terminal_replay_state": current_window_terminal_replay_state,
+                        "forward_debug": _window_result_debug_snapshot(current_result),
                     }
                 )
 
@@ -21468,12 +21617,7 @@ class EnvironmentPrior:
                 bridge_eta = None
                 continuation_hit = False
                 if incoming_eta is not None:
-                    if unbiased_rr_survival_prob >= 1.0:
-                        continuation_hit = True
-                    elif unbiased_rr_survival_prob > 0.0:
-                        continuation_hit = bool(
-                            torch.rand((), device=device).item() < float(unbiased_rr_survival_prob)
-                        )
+                    continuation_hit = self._alpha_tbptt_sample_survival(unbiased_rr_survival_prob, device)
                     if continuation_hit:
                         bridge_eta = self._alpha_tbptt_scale_boundary_eta(
                             incoming_eta,
@@ -21495,6 +21639,8 @@ class EnvironmentPrior:
                     bridge_eta=bridge_eta,
                     group_rollout_generators_override=_restore_group_rollout_generators_from_states(bundle["generator_states"]),
                     noise_state_override=bundle["noise_state"],
+                    terminal_replay_state_override=bundle["terminal_replay_state"],
+                    torch_rng_state_override=bundle["torch_rng_state"],
                     build_grad_graph=True,
                 )
                 if replay_result["bridge_loss"] is not None:
@@ -21508,8 +21654,24 @@ class EnvironmentPrior:
                         weighted_losses.append(replay_result["weighted_local_loss"])
                     else:
                         tbptt_loss_sink(replay_result["weighted_local_loss"])
+                unbiased_rr_debug_windows.append(
+                    {
+                        "window_start": int(bundle["window_start"]),
+                        "window_end": int(bundle["window_end"]),
+                        "has_eval": bool(bundle["has_eval"]),
+                        "continuation_hit": bool(continuation_hit),
+                        "forward": bundle["forward_debug"],
+                        "replay": _window_result_debug_snapshot(replay_result),
+                    }
+                )
                 incoming_eta = replay_result["boundary_eta"]
                 unbiased_rr_replay_window_count += 1
+            self.last_alpha_tbptt_unbiased_rr_debug = {
+                "single_eval_pos": int(single_eval_pos),
+                "tbptt_window": int(tbptt_window_size),
+                "survival_prob": float(unbiased_rr_survival_prob),
+                "windows": list(reversed(unbiased_rr_debug_windows)),
+            }
         else:
             prev_window_boundary = None
             prev_window_range = None
@@ -21543,12 +21705,7 @@ class EnvironmentPrior:
                         and prev_prev_window_boundary is not None
                         and two_hop_ipw_survival_prob > 0.0
                     ):
-                        if two_hop_ipw_survival_prob >= 1.0:
-                            second_hop_survived = True
-                        else:
-                            second_hop_survived = bool(
-                                torch.rand((), device=device).item() < float(two_hop_ipw_survival_prob)
-                            )
+                        second_hop_survived = self._alpha_tbptt_sample_survival(two_hop_ipw_survival_prob, device)
                     prev_window_has_eval = bool(int(prev_window_range[1]) > int(single_eval_pos))
                     bridge_result = _run_window_from_boundary(
                         prev_window_boundary,
