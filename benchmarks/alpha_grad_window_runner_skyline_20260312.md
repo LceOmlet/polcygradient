@@ -988,6 +988,38 @@ Implementation:
   - boundary snapshot
   - group rollout-generator states
   - streaming noise-block state
+  - terminal replay state
+  - `torch` RNG state
+
+Mathematical model:
+
+- Let `ell_k(theta)` be the local `alpha_grad` window loss for TBPTT window `k`.
+  - `ell_k = 0` for windows that contain only `E = 0`
+- Let `h_k` be the full replay boundary at window entry:
+  - `state_t`
+  - `action_t`
+  - `reward_t`
+  - `reward_mask_t`
+  - `terminal_t`
+  - policy `cache`
+- Let `h_{k+1}^{out}(theta, xi_k; h_k)` be the replayed boundary output of window `k`
+  under the saved stochastic bundle `xi_k`.
+- With continuation probability `q`, sample `z_k ~ Bernoulli(q)` during the reverse replay sweep.
+- The implemented augmented window loss is:
+  - `L_k(theta) = ell_k(theta) + (z_k / q) * < stopgrad(lambda_{k+1}), h_{k+1}^{out}(theta, xi_k; h_k) >`
+- The boundary cotangent recursion is:
+  - `lambda_K = 0`
+  - `lambda_k = d L_k / d h_k`
+- The implemented estimator is the parameter-gradient sum:
+  - `g_hat(theta) = sum_k d L_k / d theta`
+
+Interpretation:
+
+- This is no longer the earlier fixed one-hop or fixed two-hop truncation.
+- It is a recursive randomized replay estimator for the full-chain surrogate
+  `sum_k ell_k` along the realized trajectory.
+- Under exact replay, `E[z_k / q] = 1` gives unbiased continuation through the
+  whole prefix chain for this implemented surrogate objective.
 
 Semantic certificates:
 
@@ -995,13 +1027,23 @@ Semantic certificates:
   - `test_alpha_tbptt_unbiased_rr_helper_matches_exact_three_window_expectation`
 - rollout-level `q=1` replay traverses the whole prefix chain:
   - `test_alpha_grad_tbptt_family_vectorized_unbiased_rr_q1_replays_full_prefix_chain`
+- exact replay certificate:
+  - `test_alpha_grad_tbptt_unbiased_rr_exact_replay_certificate`
+- policy cache snapshot/restore consistency across `no-grad` and `grad-enabled` execution:
+  - `test_policy_step_cache_snapshot_restore_matches_grad_and_nograd`
+- rollout-level Monte Carlo mean matches the `q=1` full-prefix gradient on a fixed realized trajectory:
+  - `test_alpha_grad_tbptt_unbiased_rr_rollout_mc_mean_matches_q1_exact_gradient`
 
 Focused regression results:
 
-- `conda run -n rlpfn python -m pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or two_hop_ipw_helper or only_scores_eval_suffix or two_hop_ipw_replays_second_boundary or unbiased_rr_helper or unbiased_rr_q1'`
-  - result: `7 passed`
+- `conda run -n rlpfn python -m pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or unbiased_rr_helper or unbiased_rr_q1 or exact_replay_certificate or rollout_mc_mean_matches_q1_exact_gradient or policy_step_cache_snapshot_restore or only_scores_eval_suffix'`
+  - result: `8 passed`
 - `conda run -n rlpfn python -m pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'phase_token or collect_x_marks_phase or handles_nonfinal_window_case'`
   - result: `3 passed`
+- `conda run -n rlpfn python -m pytest -q ticl/tests/test_fit_model_parsing.py`
+  - result: `31 passed`
+- `conda run -n rlpfn python -m pytest -q ticl/tests/test_rlpfn_split_encoder.py`
+  - result: `6 passed`
 
 Design boundary:
 
@@ -1010,6 +1052,9 @@ Design boundary:
   - family alpha TBPTT path only
   - default off
   - no changes to terminal, offload, or non-alpha legacy paths
+- Unbiasedness claim scope:
+  - supported for the implemented full-chain surrogate gradient `sum_k ell_k`
+  - not automatically a claim about every broader external RL objective someone may map onto this surrogate
 
 ## Retained Baseline: Direct TBPTT-Streaming Reproduction of the Forced Policy-Offload 2GiB Low-Memory Line
 
