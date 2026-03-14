@@ -5142,7 +5142,7 @@ class EnvironmentPrior:
         )
         if terminal_signal is None:
             terminal_signal_t = state_next.mean(dim=-1)
-            terminal_bonus_t = bonus_scale_t * torch.tanh(terminal_signal_t / torch.as_tensor(
+            terminal_bonus_t = bonus_scale_t * torch.tanh(terminal_signal_t.detach() / torch.as_tensor(
                 bonus_tanh_c,
                 device=state_next.device,
                 dtype=state_next.dtype,
@@ -5150,12 +5150,16 @@ class EnvironmentPrior:
         else:
             terminal_signal_t = terminal_signal.to(device=state_next.device, dtype=state_next.dtype)
             terminal_bonus_t = self._terminal_bonus_from_signal(
-                terminal_signal_t,
+                terminal_signal_t.detach(),
                 bonus_scale=bonus_scale_t,
                 tanh_c=bonus_tanh_c,
             )
+        # Terminal events are discrete control flow. History/quantile bookkeeping
+        # must not retain the pathwise graph across time; only the bonus term keeps
+        # the continuous dependence on the raw terminal signal.
+        terminal_signal_event = terminal_signal_t.detach()
         terminal_next = self._terminal_tail_event_from_signal(
-            terminal_signal_t,
+            terminal_signal_event,
             enabled=enabled_t,
             reset_prob=prob_t,
             terminal_draw=terminal_draw,
@@ -5168,7 +5172,7 @@ class EnvironmentPrior:
             hist_t = terminal_signal_history
             if not torch.is_tensor(hist_t):
                 raise ValueError("terminal_signal_history must be a tensor")
-            signal_store = terminal_signal_t.reshape(-1).to(device=hist_t.device, dtype=hist_t.dtype)
+            signal_store = terminal_signal_event.reshape(-1).to(device=hist_t.device, dtype=hist_t.dtype)
             hist_t[history_index].copy_(signal_store)
         terminal_bonus_t = terminal_bonus_t.to(device=state_next.device, dtype=reward_next.dtype)
         reward_next = reward_next + terminal_bonus_t * terminal_next.to(dtype=reward_next.dtype)

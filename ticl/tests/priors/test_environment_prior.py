@@ -6060,6 +6060,41 @@ def test_environment_prior_terminal_tail_event_from_signal_requires_non_extreme_
     assert torch.equal(terminal_next, torch.tensor([True]))
 
 
+def test_environment_prior_terminal_history_and_bonus_are_detached_from_terminal_signal():
+    prior = EnvironmentPrior({})
+    terminal_signal = torch.tensor([[2.0]], dtype=torch.float32, requires_grad=True)
+    signal_history = torch.zeros((2, 1), dtype=torch.float32)
+    reward_base = torch.zeros((1,), dtype=torch.float32, requires_grad=True)
+
+    state_next, reward_next, terminal_next = prior._apply_terminal_reset_step(
+        state_next=torch.zeros((1, 1), dtype=torch.float32),
+        reward_next=reward_base,
+        terminal_draw=torch.zeros((1,), dtype=torch.float32),
+        reset_prob=torch.tensor([1.0], dtype=torch.float32),
+        bonus_scale_draw=torch.zeros((1,), dtype=torch.float32),
+        bonus_scale_min=torch.tensor([3.0], dtype=torch.float32),
+        bonus_scale_max=torch.tensor([3.0], dtype=torch.float32),
+        bonus_tanh_c=torch.tensor([10.0], dtype=torch.float32),
+        reset_state=torch.ones((1, 1), dtype=torch.float32),
+        enabled=torch.tensor([True], dtype=torch.bool),
+        terminal_signal=terminal_signal,
+        terminal_signal_history=signal_history,
+        history_index=0,
+        history_warmup_count=torch.tensor([1.0], dtype=torch.float32),
+        history_relaxed_mask=torch.tensor([False], dtype=torch.bool),
+    )
+
+    del state_next, terminal_next
+    assert signal_history.requires_grad is False
+    assert signal_history.grad_fn is None
+    assert signal_history[0].grad_fn is None
+
+    reward_next.sum().backward()
+    assert terminal_signal.grad is None
+    assert reward_base.grad is not None
+    assert torch.allclose(reward_base.grad, torch.ones_like(reward_base))
+
+
 def test_environment_prior_rollout_policy_gradient_loss_reports_terminal_count_stats(monkeypatch):
     _seed_everything(20260313)
     sampled = _make_terminal_sampled_h_list()[:1]
