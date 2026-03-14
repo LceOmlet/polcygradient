@@ -1949,6 +1949,8 @@ def test_alpha_grad_tbptt_family_vectorized_only_scores_eval_suffix_and_replays_
     assert float(stats_family["alpha_grad_eval_step_count"]) == pytest.approx(4.0)
     assert float(stats_family["alpha_grad_eval_window_count"]) == pytest.approx(1.0)
     assert float(stats_family["alpha_grad_boundary_bridge_count"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_two_hop_ipw_enabled"]) == pytest.approx(0.0)
+    assert float(stats_family["alpha_grad_two_hop_bridge_count"]) == pytest.approx(0.0)
     assert torch.isfinite(stats_family["objective"])
     assert len(grads_family) > 0
     assert all(torch.isfinite(g).all() for g in grads_family)
@@ -2029,6 +2031,225 @@ def test_alpha_tbptt_bridge_loss_helper_backprops_exact_eta():
     assert torch.allclose(reward_mask.grad, eta["reward_mask_t"])
     assert torch.allclose(terminal.grad, eta["terminal_t"])
     assert torch.allclose(cache_leaf.grad, eta["cache_leaves"][0])
+
+
+def test_alpha_tbptt_two_hop_ipw_helper_matches_exact_two_hop_expectation():
+    q = 0.25
+    h0 = torch.tensor([[1.0, -2.0]], dtype=torch.float32, requires_grad=True)
+    h1 = torch.tensor([[0.5, 3.0]], dtype=torch.float32, requires_grad=True)
+    w0 = torch.tensor([[2.0, -1.0], [0.25, 1.5]], dtype=torch.float32)
+    w1 = torch.tensor([[1.0, 0.5], [-0.75, 2.0]], dtype=torch.float32)
+
+    boundary1_in = {
+        "state_t": h1,
+        "action_t": torch.zeros((1, 0), dtype=torch.float32, requires_grad=True),
+        "reward_t": torch.zeros((1,), dtype=torch.float32, requires_grad=True),
+        "reward_mask_t": torch.ones((1,), dtype=torch.float32, requires_grad=True),
+        "terminal_t": torch.zeros((1,), dtype=torch.float32, requires_grad=True),
+        "cache": tuple(),
+    }
+    h2_out = h1 @ w1
+    boundary1_out = {
+        "state_t": h2_out,
+        "action_t": boundary1_in["action_t"],
+        "reward_t": boundary1_in["reward_t"],
+        "reward_mask_t": boundary1_in["reward_mask_t"],
+        "terminal_t": boundary1_in["terminal_t"],
+        "cache": tuple(),
+    }
+    eta2 = {
+        "state_t": torch.tensor([[0.2, -0.4]], dtype=torch.float32),
+        "action_t": torch.zeros((1, 0), dtype=torch.float32),
+        "reward_t": torch.zeros((1,), dtype=torch.float32),
+        "reward_mask_t": torch.zeros((1,), dtype=torch.float32),
+        "terminal_t": torch.zeros((1,), dtype=torch.float32),
+        "cache_leaves": tuple(),
+    }
+    bridge1 = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary1_out, eta2)
+    eta1 = EnvironmentPrior._alpha_tbptt_boundary_eta_from_loss(bridge1, boundary1_in, tuple())
+
+    boundary0_out_exact = {
+        "state_t": h0 @ w0,
+        "action_t": boundary1_in["action_t"],
+        "reward_t": boundary1_in["reward_t"],
+        "reward_mask_t": boundary1_in["reward_mask_t"],
+        "terminal_t": boundary1_in["terminal_t"],
+        "cache": tuple(),
+    }
+    exact_two_hop = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary0_out_exact, eta1)
+    exact_grad = torch.autograd.grad(exact_two_hop, h0, retain_graph=True)[0]
+
+    miss_grad = torch.zeros_like(h0)
+    hit_eta = EnvironmentPrior._alpha_tbptt_scale_boundary_eta(eta1, 1.0 / q)
+    boundary0_out_hit = {
+        "state_t": h0 @ w0,
+        "action_t": boundary1_in["action_t"],
+        "reward_t": boundary1_in["reward_t"],
+        "reward_mask_t": boundary1_in["reward_mask_t"],
+        "terminal_t": boundary1_in["terminal_t"],
+        "cache": tuple(),
+    }
+    hit_loss = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary0_out_hit, hit_eta)
+    hit_grad = torch.autograd.grad(hit_loss, h0)[0]
+    expected_grad = (1.0 - q) * miss_grad + q * hit_grad
+
+    assert torch.allclose(expected_grad, exact_grad, atol=1e-6, rtol=1e-6)
+
+
+def test_alpha_grad_tbptt_family_vectorized_two_hop_ipw_replays_second_boundary():
+    _seed_everything(23)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+    family_env_cfg["alpha_grad_tbptt_two_hop_ipw_enabled"] = True
+    family_env_cfg["alpha_grad_tbptt_two_hop_ipw_survival_prob"] = 1.0
+
+    stats_family, grads_family, roots_family = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        batch_size=2,
+        n_samples=24,
+        single_eval_pos=20,
+        kv_cache_mode="immutable",
+        rl_objective="alpha_grad",
+    )
+
+    assert len(roots_family) == 3
+    assert float(stats_family["alpha_grad_eval_step_count"]) == pytest.approx(4.0)
+    assert float(stats_family["alpha_grad_eval_window_count"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_boundary_bridge_count"]) == pytest.approx(2.0)
+    assert float(stats_family["alpha_grad_two_hop_ipw_enabled"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_two_hop_ipw_survival_prob"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_two_hop_bridge_count"]) == pytest.approx(1.0)
+    assert torch.isfinite(stats_family["objective"])
+    assert len(grads_family) > 0
+    assert all(torch.isfinite(g).all() for g in grads_family)
+
+
+def test_alpha_tbptt_unbiased_rr_helper_matches_exact_three_window_expectation():
+    q = 0.2
+    w0 = torch.tensor([[1.25, -0.5], [0.75, 1.5]], dtype=torch.float32)
+    w1 = torch.tensor([[0.5, -1.0], [1.25, 0.25]], dtype=torch.float32)
+    eta2_base = torch.tensor([[0.3, -0.6]], dtype=torch.float32)
+
+    def _boundary_from_state(state_leaf):
+        return {
+            "state_t": state_leaf,
+            "action_t": torch.zeros((1, 0), dtype=torch.float32, requires_grad=True),
+            "reward_t": torch.zeros((1,), dtype=torch.float32, requires_grad=True),
+            "reward_mask_t": torch.ones((1,), dtype=torch.float32, requires_grad=True),
+            "terminal_t": torch.zeros((1,), dtype=torch.float32, requires_grad=True),
+            "cache": tuple(),
+        }
+
+    h1_exact = torch.tensor([[0.5, 2.0]], dtype=torch.float32, requires_grad=True)
+    h0_exact = torch.tensor([[1.0, -1.5]], dtype=torch.float32, requires_grad=True)
+    boundary1_in_exact = _boundary_from_state(h1_exact)
+    boundary1_out_exact = {
+        "state_t": h1_exact @ w1,
+        "action_t": boundary1_in_exact["action_t"],
+        "reward_t": boundary1_in_exact["reward_t"],
+        "reward_mask_t": boundary1_in_exact["reward_mask_t"],
+        "terminal_t": boundary1_in_exact["terminal_t"],
+        "cache": tuple(),
+    }
+    eta2 = {
+        "state_t": eta2_base,
+        "action_t": torch.zeros((1, 0), dtype=torch.float32),
+        "reward_t": torch.zeros((1,), dtype=torch.float32),
+        "reward_mask_t": torch.zeros((1,), dtype=torch.float32),
+        "terminal_t": torch.zeros((1,), dtype=torch.float32),
+        "cache_leaves": tuple(),
+    }
+    bridge1_exact = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary1_out_exact, eta2)
+    eta1_exact = EnvironmentPrior._alpha_tbptt_boundary_eta_from_loss(bridge1_exact, boundary1_in_exact, tuple())
+    boundary0_out_exact = {
+        "state_t": h0_exact @ w0,
+        "action_t": boundary1_in_exact["action_t"],
+        "reward_t": boundary1_in_exact["reward_t"],
+        "reward_mask_t": boundary1_in_exact["reward_mask_t"],
+        "terminal_t": boundary1_in_exact["terminal_t"],
+        "cache": tuple(),
+    }
+    exact_loss = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary0_out_exact, eta1_exact)
+    exact_grad = torch.autograd.grad(exact_loss, h0_exact)[0]
+
+    expected_grad = torch.zeros_like(exact_grad)
+    for z1 in (0, 1):
+        for z0 in (0, 1):
+            h1 = torch.tensor([[0.5, 2.0]], dtype=torch.float32, requires_grad=True)
+            h0 = torch.tensor([[1.0, -1.5]], dtype=torch.float32, requires_grad=True)
+            boundary1_in = _boundary_from_state(h1)
+            eta1 = None
+            if z1 == 1:
+                boundary1_out = {
+                    "state_t": h1 @ w1,
+                    "action_t": boundary1_in["action_t"],
+                    "reward_t": boundary1_in["reward_t"],
+                    "reward_mask_t": boundary1_in["reward_mask_t"],
+                    "terminal_t": boundary1_in["terminal_t"],
+                    "cache": tuple(),
+                }
+                scaled_eta2 = EnvironmentPrior._alpha_tbptt_scale_boundary_eta(eta2, 1.0 / q)
+                bridge1 = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary1_out, scaled_eta2)
+                eta1 = EnvironmentPrior._alpha_tbptt_boundary_eta_from_loss(bridge1, boundary1_in, tuple())
+
+            case_grad = torch.zeros_like(exact_grad)
+            if (z0 == 1) and (eta1 is not None):
+                boundary0_out = {
+                    "state_t": h0 @ w0,
+                    "action_t": boundary1_in["action_t"],
+                    "reward_t": boundary1_in["reward_t"],
+                    "reward_mask_t": boundary1_in["reward_mask_t"],
+                    "terminal_t": boundary1_in["terminal_t"],
+                    "cache": tuple(),
+                }
+                scaled_eta1 = EnvironmentPrior._alpha_tbptt_scale_boundary_eta(eta1, 1.0 / q)
+                bridge0 = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary0_out, scaled_eta1)
+                case_grad = torch.autograd.grad(bridge0, h0)[0]
+
+            prob = ((q if z1 == 1 else (1.0 - q)) * (q if z0 == 1 else (1.0 - q)))
+            expected_grad = expected_grad + (prob * case_grad)
+
+    assert torch.allclose(expected_grad, exact_grad, atol=1e-6, rtol=1e-6)
+
+
+def test_alpha_grad_tbptt_family_vectorized_unbiased_rr_q1_replays_full_prefix_chain():
+    _seed_everything(29)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+    family_env_cfg["alpha_grad_tbptt_unbiased_rr_enabled"] = True
+    family_env_cfg["alpha_grad_tbptt_unbiased_rr_survival_prob"] = 1.0
+
+    stats_family, grads_family, roots_family = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        batch_size=2,
+        n_samples=24,
+        single_eval_pos=20,
+        kv_cache_mode="immutable",
+        rl_objective="alpha_grad",
+    )
+
+    assert len(roots_family) == 3
+    assert float(stats_family["alpha_grad_eval_step_count"]) == pytest.approx(4.0)
+    assert float(stats_family["alpha_grad_eval_window_count"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_boundary_bridge_count"]) == pytest.approx(2.0)
+    assert float(stats_family["alpha_grad_unbiased_rr_enabled"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_unbiased_rr_survival_prob"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_unbiased_rr_replay_window_count"]) == pytest.approx(3.0)
+    assert float(stats_family["alpha_grad_unbiased_rr_continuation_hit_count"]) == pytest.approx(2.0)
+    assert float(stats_family["alpha_grad_two_hop_ipw_enabled"]) == pytest.approx(0.0)
+    assert torch.isfinite(stats_family["objective"])
+    assert len(grads_family) > 0
+    assert all(torch.isfinite(g).all() for g in grads_family)
 
 
 def test_tbptt_window_reduces_saved_tensor_bytes_trend():

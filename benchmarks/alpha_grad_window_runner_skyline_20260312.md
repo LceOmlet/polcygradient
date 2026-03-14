@@ -906,13 +906,22 @@ Implementation:
   - scores only the eval suffix inside each window
   - skips local alpha loss on pure `E = 0` windows
   - replays exactly one earlier window using the next window's boundary cotangent
+- Added an optional second-hop inverse-probability correction:
+  - it keeps the first replay hop deterministic
+  - it samples whether the correction survives one more boundary with probability `q`
+  - when it survives, the second-hop bridge uses the exact `1 / q` multiplier
+  - it stores only the last two window boundaries, so memory stays near the current one-hop profile
 
 Design boundary:
 
 - This is the deterministic one-hop practical baseline from the note, not recursive chunk-adjoint and not randomized unbiased replay.
+- The new optional second-hop mode is only a minimal two-boundary inverse-probability correction.
+- It should be interpreted carefully:
+  - it is unbiased for the added second-hop term / two-hop-truncated surrogate
+  - it is not a certificate of full-chain unbiasedness when earlier windows still exist beyond those two stored boundaries
 - The implementation is intentionally limited to the smallest change that preserves the current memory / speed envelope:
   - no multi-window graph retention
-  - no stochastic continuation chain
+  - no unbounded stochastic continuation chain
   - no wider change to non-default legacy paths
 
 Semantic certificates:
@@ -927,6 +936,10 @@ Semantic certificates:
   - `test_alpha_tbptt_boundary_eta_helper_matches_manual_grad_parts`
 - bridge loss backpropagates the supplied cotangent exactly to boundary leaves:
   - `test_alpha_tbptt_bridge_loss_helper_backprops_exact_eta`
+- two-hop inverse-probability weighting matches the exact second-hop expectation on a toy chain:
+  - `test_alpha_tbptt_two_hop_ipw_helper_matches_exact_two_hop_expectation`
+- family alpha TBPTT can replay the second boundary when the survival probability is `1`:
+  - `test_alpha_grad_tbptt_family_vectorized_two_hop_ipw_replays_second_boundary`
 
 Focused regression results:
 
@@ -936,6 +949,10 @@ Focused regression results:
   - result: `4 passed`
 - `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or only_scores_eval_suffix'`
   - result: `3 passed`
+- `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or two_hop_ipw_helper or only_scores_eval_suffix or two_hop_ipw_replays_second_boundary'`
+  - result: `5 passed`
+- `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'phase_token or collect_x_marks_phase or handles_nonfinal_window_case'`
+  - result: `3 passed`
 
 Interpretation:
 
@@ -944,7 +961,55 @@ Interpretation:
   - correct `eta` extraction
   - correct bridge VJP
   - correct `E = 1` window gating
+- The optional two-hop mode now has a minimal certificate:
+  - exact inverse-probability correction for the second hop
+  - rollout-level proof that a second boundary replay is actually executed when enabled
 - This is not a certificate of exact full-chain gradient equivalence; it is a certificate that the implemented one-hop surrogate matches its declared mathematics.
+- It is also not a certificate of full-chain unbiasedness:
+  - only the second-hop correction is unbiased under the current implementation
+  - deeper-than-two-window truncation remains biased by design to protect memory and compute
+
+## Experimental: Unbiased Credit Assignment for Alpha TBPTT
+
+Scope:
+
+- This is a new, separate credit-assignment path for `alpha_grad` family TBPTT.
+- It is intentionally isolated from the existing one-hop and two-hop implementations:
+  - `alpha_grad_tbptt_unbiased_rr_enabled=false` by default
+  - existing skyline behavior is unchanged unless the new flag is explicitly enabled
+
+Implementation:
+
+- The unbiased path uses:
+  - forward window collection without local backward
+  - reverse replay sweep over saved window bundles
+  - Bernoulli continuation with inverse-survival weighting
+- Exact replay state is bundled per window:
+  - boundary snapshot
+  - group rollout-generator states
+  - streaming noise-block state
+
+Semantic certificates:
+
+- helper-level three-window expectation matches exact recursive replay math:
+  - `test_alpha_tbptt_unbiased_rr_helper_matches_exact_three_window_expectation`
+- rollout-level `q=1` replay traverses the whole prefix chain:
+  - `test_alpha_grad_tbptt_family_vectorized_unbiased_rr_q1_replays_full_prefix_chain`
+
+Focused regression results:
+
+- `conda run -n rlpfn python -m pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or two_hop_ipw_helper or only_scores_eval_suffix or two_hop_ipw_replays_second_boundary or unbiased_rr_helper or unbiased_rr_q1'`
+  - result: `7 passed`
+- `conda run -n rlpfn python -m pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'phase_token or collect_x_marks_phase or handles_nonfinal_window_case'`
+  - result: `3 passed`
+
+Design boundary:
+
+- This new path is the first implementation in the repo that targets randomized unbiased credit assignment, not just local one-hop replay.
+- It is still intentionally narrow:
+  - family alpha TBPTT path only
+  - default off
+  - no changes to terminal, offload, or non-alpha legacy paths
 
 ## Retained Baseline: Direct TBPTT-Streaming Reproduction of the Forced Policy-Offload 2GiB Low-Memory Line
 

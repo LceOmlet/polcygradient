@@ -1409,6 +1409,10 @@ class EnvironmentPrior:
         cfg.setdefault("alpha_grad_local_coordinate_enabled", True)
         cfg.setdefault("alpha_grad_unit_grad_enabled", True)
         cfg.setdefault("alpha_grad_unit_grad_delta", 1e-6)
+        cfg.setdefault("alpha_grad_tbptt_two_hop_ipw_enabled", False)
+        cfg.setdefault("alpha_grad_tbptt_two_hop_ipw_survival_prob", 0.25)
+        cfg.setdefault("alpha_grad_tbptt_unbiased_rr_enabled", False)
+        cfg.setdefault("alpha_grad_tbptt_unbiased_rr_survival_prob", 0.1)
         # Optional residual highway on state update:
         # s_{t+1} <- lambda * s_t + (1-lambda) * tanh(clamp(s_{t+1})).
         cfg.setdefault("state_highway_enabled", False)
@@ -5500,6 +5504,28 @@ class EnvironmentPrior:
         if not math.isfinite(v) or v < 0.0:
             return 1e-6
         return float(v)
+
+    @staticmethod
+    def _resolve_alpha_grad_tbptt_two_hop_ipw_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_tbptt_two_hop_ipw_enabled", False))
+
+    @staticmethod
+    def _resolve_alpha_grad_tbptt_two_hop_ipw_survival_prob(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_tbptt_two_hop_ipw_survival_prob", 0.25))
+        if not math.isfinite(v):
+            return 0.25
+        return float(min(1.0, max(0.0, v)))
+
+    @staticmethod
+    def _resolve_alpha_grad_tbptt_unbiased_rr_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_tbptt_unbiased_rr_enabled", False))
+
+    @staticmethod
+    def _resolve_alpha_grad_tbptt_unbiased_rr_survival_prob(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_tbptt_unbiased_rr_survival_prob", 0.1))
+        if not math.isfinite(v):
+            return 0.1
+        return float(min(1.0, max(0.0, v)))
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -13133,6 +13159,20 @@ class EnvironmentPrior:
             ).sum()
         return bridge_loss
 
+    @staticmethod
+    def _alpha_tbptt_scale_boundary_eta(boundary_eta, scale):
+        if boundary_eta is None:
+            return None
+        scale_t = float(scale)
+        return {
+            "state_t": boundary_eta["state_t"] * scale_t,
+            "action_t": boundary_eta["action_t"] * scale_t,
+            "reward_t": boundary_eta["reward_t"] * scale_t,
+            "reward_mask_t": boundary_eta["reward_mask_t"] * scale_t,
+            "terminal_t": boundary_eta["terminal_t"] * scale_t,
+            "cache_leaves": tuple(cache_leaf * scale_t for cache_leaf in boundary_eta.get("cache_leaves", tuple())),
+        }
+
     def _rollout_distinct_envs_vectorized_with_policy(
         self,
         env,
@@ -20724,8 +20764,87 @@ class EnvironmentPrior:
         phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
         phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
         bridge_replay_count = 0
+        two_hop_bridge_count = 0
+        unbiased_rr_replay_window_count = 0
+        unbiased_rr_continuation_hit_count = 0
         eval_window_count = 0
         eval_step_count_total = 0
+        two_hop_ipw_enabled = self._resolve_alpha_grad_tbptt_two_hop_ipw_enabled(self.config)
+        two_hop_ipw_survival_prob = self._resolve_alpha_grad_tbptt_two_hop_ipw_survival_prob(self.config)
+        unbiased_rr_enabled = self._resolve_alpha_grad_tbptt_unbiased_rr_enabled(self.config)
+        unbiased_rr_survival_prob = self._resolve_alpha_grad_tbptt_unbiased_rr_survival_prob(self.config)
+
+        def _clone_tensor_or_none(t):
+            if t is None:
+                return None
+            return t.clone()
+
+        def _snapshot_group_rollout_generator_states():
+            snapshots = []
+            for group in transition_groups:
+                group_gens = group.get("rollout_generators", None)
+                if group_gens is None:
+                    snapshots.append(None)
+                    continue
+                state_list = []
+                for gen in group_gens:
+                    state_list.append(None if gen is None else gen.get_state().clone())
+                snapshots.append(tuple(state_list))
+            return tuple(snapshots)
+
+        def _restore_group_rollout_generators_from_states(group_state_snapshot):
+            restored = []
+            for group_states in group_state_snapshot:
+                if group_states is None:
+                    restored.append(None)
+                    continue
+                group_gens = []
+                for gen_state in group_states:
+                    if gen_state is None:
+                        group_gens.append(None)
+                        continue
+                    gen = torch.Generator(device=device_obj)
+                    gen.set_state(gen_state)
+                    group_gens.append(gen)
+                restored.append(group_gens)
+            return tuple(restored)
+
+        def _snapshot_noise_block_state():
+            if not noise_streaming_mode:
+                return None
+            return (
+                int(noise_block_start),
+                int(noise_block_end),
+                _clone_tensor_or_none(transition_noise_block),
+                _clone_tensor_or_none(action_noise_train_block),
+                _clone_tensor_or_none(action_noise_eval_block),
+                _clone_tensor_or_none(state_noise_block),
+                _clone_tensor_or_none(dropout_draws_block),
+            )
+
+        def _restore_noise_block_state(snapshot):
+            nonlocal noise_block_start, noise_block_end
+            nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
+            nonlocal state_noise_block, dropout_draws_block
+            if snapshot is None:
+                return
+            (
+                noise_block_start,
+                noise_block_end,
+                transition_noise_block,
+                action_noise_train_block,
+                action_noise_eval_block,
+                state_noise_block,
+                dropout_draws_block,
+            ) = (
+                int(snapshot[0]),
+                int(snapshot[1]),
+                _clone_tensor_or_none(snapshot[2]),
+                _clone_tensor_or_none(snapshot[3]),
+                _clone_tensor_or_none(snapshot[4]),
+                _clone_tensor_or_none(snapshot[5]),
+                _clone_tensor_or_none(snapshot[6]),
+            )
 
         def _snapshot_boundary(state_in, action_in, reward_in, reward_mask_in, terminal_in, cache_in):
             return {
@@ -20771,575 +20890,533 @@ class EnvironmentPrior:
             compute_local_alpha,
             compute_boundary_eta,
             bridge_eta=None,
+            group_rollout_generators_override=None,
+            noise_state_override=None,
+            build_grad_graph=True,
         ):
             nonlocal noise_block_start, noise_block_end
             nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
             nonlocal state_noise_block, dropout_draws_block
-            boundary = _prepare_boundary(boundary_start, requires_grad_boundary=bool(compute_boundary_eta))
-            state_local = boundary["state_t"]
-            action_local = boundary["action_t"]
-            reward_local = boundary["reward_t"]
-            reward_mask_local = boundary["reward_mask_t"]
-            terminal_local = boundary["terminal_t"]
-            cache_local = boundary["cache"]
-            replay_mode = bridge_eta is not None
-            terminal_signal_history_local = (
-                terminal_signal_history
-                if (terminal_signal_history is None or not replay_mode)
-                else terminal_signal_history.clone()
+            replay_mode = bool(
+                (bridge_eta is not None)
+                or (group_rollout_generators_override is not None)
+                or (noise_state_override is not None)
             )
-            terminal_history_relaxed_local = (
-                terminal_history_relaxed
-                if (terminal_history_relaxed is None or not replay_mode)
-                else terminal_history_relaxed.clone()
-            )
-            terminal_count_local = terminal_count_realized if not replay_mode else terminal_count_realized.clone()
-            noise_snapshot = None
-            if replay_mode and noise_streaming_mode:
-                noise_snapshot = (
-                    int(noise_block_start),
-                    int(noise_block_end),
-                    transition_noise_block,
-                    action_noise_train_block,
-                    action_noise_eval_block,
-                    state_noise_block,
-                    dropout_draws_block,
-                )
-            reward_buffer = []
-            log_prob_buffer = []
-            log_prob_score_buffer = []
-            action_mean_buffer = []
-            action_mask_buffer = []
-
-            for t in range(window_start, window_end):
-                if terminal_token_enabled:
-                    env_info["terminal_t"] = terminal_local.reshape(batch_size, 1)
-                else:
-                    env_info.pop("terminal_t", None)
-                env_info["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
-                obs_t = state_local[:, :max_obs_dim] * obs_mask
-                if policy_accepts_reward_mask:
-                    policy_out = policy_step_fn(
-                        obs_t,
-                        action_local,
-                        reward_local.reshape(batch_size, 1),
-                        reward_mask_local.reshape(batch_size, 1),
-                        cache_local,
-                        t,
-                        env_info,
+            restore_noise_snapshot = None
+            if noise_streaming_mode and (replay_mode or (noise_state_override is not None)):
+                restore_noise_snapshot = _snapshot_noise_block_state()
+            if noise_state_override is not None:
+                _restore_noise_block_state(noise_state_override)
+            try:
+                with torch.set_grad_enabled(bool(build_grad_graph)):
+                    boundary = _prepare_boundary(
+                        boundary_start,
+                        requires_grad_boundary=bool(build_grad_graph and compute_boundary_eta),
                     )
-                else:
-                    policy_out = policy_step_fn(
-                        obs_t,
-                        action_local,
-                        reward_local.reshape(batch_size, 1),
-                        cache_local,
-                        t,
-                        env_info,
+                    state_local = boundary["state_t"]
+                    action_local = boundary["action_t"]
+                    reward_local = boundary["reward_t"]
+                    reward_mask_local = boundary["reward_mask_t"]
+                    terminal_local = boundary["terminal_t"]
+                    cache_local = boundary["cache"]
+                    terminal_signal_history_local = (
+                        terminal_signal_history
+                        if (terminal_signal_history is None or not replay_mode)
+                        else terminal_signal_history.clone()
                     )
-                if isinstance(policy_out, tuple):
-                    action_next, cache_local = policy_out
-                else:
-                    action_next = policy_out
-                if action_next.ndim == 1:
-                    action_next = action_next.reshape(batch_size, 1)
-                if action_next.ndim != 2 or action_next.shape[0] != batch_size:
-                    raise ValueError(
-                        f"policy action batch mismatch: expected ({batch_size}, {max_action_dim}), got {tuple(action_next.shape)}"
+                    terminal_history_relaxed_local = (
+                        terminal_history_relaxed
+                        if (terminal_history_relaxed is None or not replay_mode)
+                        else terminal_history_relaxed.clone()
                     )
-                if action_next.shape[-1] != max_action_dim:
-                    raise ValueError(
-                        f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
-                    )
-                action_mean = action_next
+                    terminal_count_local = terminal_count_realized if not replay_mode else terminal_count_realized.clone()
+                    reward_buffer = []
+                    log_prob_buffer = []
+                    log_prob_score_buffer = []
+                    action_mean_buffer = []
+                    action_mask_buffer = []
 
-                noise_block_idx = None
-                if noise_streaming_mode:
-                    if t >= noise_block_end:
-                        _refresh_noise_block(t)
-                    noise_block_idx = int(t - noise_block_start)
-                if t < single_eval_pos:
-                    if torch.any(action_noise_train_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
-                        )
-                    if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
-                        action_eps_t = action_noise_train_block[noise_block_idx]
-                    elif action_noise_train is not None:
-                        action_eps_t = action_noise_train[t]
-                    else:
-                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
-                    action_std_t = action_noise_train_std
-                else:
-                    if torch.any(action_noise_eval_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
-                        )
-                    if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
-                        action_eps_t = action_noise_eval_block[noise_block_idx]
-                    elif action_noise_eval is not None:
-                        action_eps_t = action_noise_eval[t]
-                    else:
-                        raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
-                    action_std_t = action_noise_eval_std
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = self._transform_reinforce_action(
-                    action_pre_tanh,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
-                    mask=action_mask,
-                )
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
-                    action_mean,
-                    action_std_t,
-                    action=action_next.detach(),
-                    mask=action_mask,
-                ).detach()
-                reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                    action_pre_tanh.detach(),
-                    action_mean.detach(),
-                    action_std_t,
-                    mask=action_mask,
-                ).detach().to(dtype=torch.float32)
-
-                if noise_streaming_mode and noise_block_idx is not None:
-                    noise_t = transition_noise_block[noise_block_idx]
-                    state_noise_t = None if state_noise_block is None else state_noise_block[noise_block_idx]
-                    dropout_draw_t = None if dropout_draws_block is None else dropout_draws_block[noise_block_idx]
-                else:
-                    noise_t = transition_noise[t]
-                    state_noise_t = None if state_noise is None else state_noise[t]
-                    dropout_draw_t = None if dropout_draws is None else dropout_draws[t]
-
-                reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
-                reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
-                state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
-                terminal_signal_next = None
-                terminal_bonus_base_next = None
-                action_env = action_next
-                if first_pg_action_grad_clip_value > 0.0:
-                    action_env = self._clip_tensor_grad_by_value(action_env, max_abs=first_pg_action_grad_clip_value)
-                if first_pg_action_grad_clip_norm > 0.0:
-                    action_env = self._clip_tensor_grad_by_global_norm(action_env, max_norm=first_pg_action_grad_clip_norm)
-
-                for group in transition_groups:
-                    group_slice = group["slice"]
-                    group_indices = group["indices"]
-                    env_g = group["env"]
-                    state_dim_g = int(group["state_dim"])
-                    obs_dim_g = int(group["obs_dim"])
-                    action_dim_g = int(group["action_dim"])
-                    noise_dim_g = int(group["noise_dim"])
-                    if group_slice is None:
-                        state_in = state_local.index_select(0, group_indices)[:, :state_dim_g]
-                        obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
-                        action_in = action_env.index_select(0, group_indices)[:, :action_dim_g]
-                        noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
-                    else:
-                        state_in = state_local[group_slice, :state_dim_g]
-                        obs_in = obs_t[group_slice, :obs_dim_g]
-                        action_in = action_env[group_slice, :action_dim_g]
-                        noise_in = noise_t[group_slice, :noise_dim_g]
-                    state_in = self._scale_state_env_input(state_in, group.get("state_input_scale_view", 1.0))
-                    env_obs_start = group["env_obs_start"]
-                    env_action_start = int(group["env_action_start"])
-                    env_noise_start = int(group["env_noise_start"])
-                    transition_input_grad_active = bool(
-                        torch.is_grad_enabled()
-                        and (
-                            state_in.requires_grad
-                            or obs_in.requires_grad
-                            or action_in.requires_grad
-                            or noise_in.requires_grad
-                        )
-                    )
-                    if bool(group.get("packed_input_enabled", False)):
-                        if transition_input_grad_active:
-                            transition_input = torch.zeros_like(group["packed_input"])
+                    for t in range(window_start, window_end):
+                        if terminal_token_enabled:
+                            env_info["terminal_t"] = terminal_local.reshape(batch_size, 1)
                         else:
-                            transition_input = group["packed_input"]
-                            transition_input.zero_()
-                        transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
-                        packed_obs_rows = group.get("packed_obs_rows", None)
-                        if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
-                            transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
-                                packed_obs_rows, group["packed_obs_src_cols"]
-                            ]
-                        packed_action_rows = group.get("packed_action_rows", None)
-                        if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
-                            transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
-                                packed_action_rows, group["packed_action_src_cols"]
-                            ]
-                        packed_noise_rows = group.get("packed_noise_rows", None)
-                        if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
-                            transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
-                                packed_noise_rows, group["packed_noise_src_cols"]
-                            ]
-                    else:
-                        env_in = torch.zeros_like(group["env_in"]) if transition_input_grad_active else group["env_in"]
-                        env_in[:, :state_dim_g] = state_in
-                        if env_obs_start is not None:
-                            env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
-                        env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
-                        env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
-                        transition_input = env_in
-
-                    transition_generator_g = group.get("transition_generator", None)
-                    terminal_generator_g = group.get("terminal_generator", None)
-                    if bool(group.get("use_fused_transition", False)) and callable(transition_generator_g):
-                        if bool(group.get("packed_input_enabled", False)):
-                            transition_out_g = transition_generator_g(
-                                transition_input,
-                                generators_for_noise=group["rollout_generators"],
-                                x_is_dual_packed=False,
-                                x_input_is_packed=True,
+                            env_info.pop("terminal_t", None)
+                        env_info["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
+                        obs_t = state_local[:, :max_obs_dim] * obs_mask
+                        if policy_accepts_reward_mask:
+                            policy_out = policy_step_fn(
+                                obs_t,
+                                action_local,
+                                reward_local.reshape(batch_size, 1),
+                                reward_mask_local.reshape(batch_size, 1),
+                                cache_local,
+                                t,
+                                env_info,
                             )
                         else:
-                            transition_out_g = transition_generator_g(
-                                transition_input,
-                                generators_for_noise=group["rollout_generators"],
-                                x_is_dual_packed=False,
+                            policy_out = policy_step_fn(
+                                obs_t,
+                                action_local,
+                                reward_local.reshape(batch_size, 1),
+                                cache_local,
+                                t,
+                                env_info,
                             )
-                        x_next_g, reward_next_raw_g, terminal_signal_next_g, terminal_bonus_base_next_g = self._unpack_transition_output(transition_out_g)
-                        reward_next_raw_g = group["reward_scale_view"] * reward_next_raw_g.reshape(-1)
-                        if terminal_bonus_base_next_g is not None:
-                            if terminal_bonus_base_next is None:
-                                terminal_bonus_base_next = torch.zeros((batch_size,), device=device, dtype=terminal_bonus_base_next_g.dtype)
-                            if group_slice is None:
-                                terminal_bonus_base_next.index_copy_(0, group_indices, terminal_bonus_base_next_g.reshape(-1))
+                        if isinstance(policy_out, tuple):
+                            action_next, cache_local = policy_out
+                        else:
+                            action_next = policy_out
+                        if action_next.ndim == 1:
+                            action_next = action_next.reshape(batch_size, 1)
+                        if action_next.ndim != 2 or action_next.shape[0] != batch_size:
+                            raise ValueError(
+                                f"policy action batch mismatch: expected ({batch_size}, {max_action_dim}), got {tuple(action_next.shape)}"
+                            )
+                        if action_next.shape[-1] != max_action_dim:
+                            raise ValueError(
+                                f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
+                            )
+                        action_mean = action_next
+
+                        noise_block_idx = None
+                        if noise_streaming_mode:
+                            if t >= noise_block_end:
+                                _refresh_noise_block(t)
+                            noise_block_idx = int(t - noise_block_start)
+                        if t < single_eval_pos:
+                            if torch.any(action_noise_train_std <= 0):
+                                raise ValueError(
+                                    "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
+                                )
+                            if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
+                                action_eps_t = action_noise_train_block[noise_block_idx]
+                            elif action_noise_train is not None:
+                                action_eps_t = action_noise_train[t]
                             else:
-                                terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
-                    else:
-                        reward_next_raw_g = group["reward_scale_view"] * env_g["y_generator"](
-                            transition_input,
-                            generators_for_noise=group["rollout_generators"],
-                        ).reshape(-1)
-                        x_next_g = env_g["x_generator"](
-                            transition_input,
-                            generators_for_noise=group["rollout_generators"],
-                        )
-                        terminal_signal_next_g = None
-                    state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
-                    if terminal_token_enabled and (terminal_signal_next_g is None) and callable(terminal_generator_g):
-                        if bool(group.get("packed_input_enabled", False)):
-                            terminal_signal_next_g = self._terminal_signal_from_generator_output(
-                                terminal_generator_g(
-                                    transition_input,
-                                    generators_for_noise=group["rollout_generators"],
-                                    x_is_dual_packed=False,
-                                    x_input_is_packed=True,
+                                raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
+                            action_std_t = action_noise_train_std
+                        else:
+                            if torch.any(action_noise_eval_std <= 0):
+                                raise ValueError(
+                                    "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
                                 )
+                            if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
+                                action_eps_t = action_noise_eval_block[noise_block_idx]
+                            elif action_noise_eval is not None:
+                                action_eps_t = action_noise_eval[t]
+                            else:
+                                raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
+                            action_std_t = action_noise_eval_std
+                        action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
+                        action_next = self._transform_reinforce_action(
+                            action_pre_tanh,
+                            mode=action_transform_mode,
+                            rms_eps=action_rms_eps,
+                            mask=action_mask,
+                        )
+                        reinforce_log_prob_t = self._squashed_gaussian_log_prob(
+                            action_pre_tanh.detach(),
+                            action_mean,
+                            action_std_t,
+                            action=action_next.detach(),
+                            mask=action_mask,
+                        ).detach()
+                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                            action_pre_tanh.detach(),
+                            action_mean.detach(),
+                            action_std_t,
+                            mask=action_mask,
+                        ).detach().to(dtype=torch.float32)
+
+                        if noise_streaming_mode and noise_block_idx is not None:
+                            noise_t = transition_noise_block[noise_block_idx]
+                            state_noise_t = None if state_noise_block is None else state_noise_block[noise_block_idx]
+                            dropout_draw_t = None if dropout_draws_block is None else dropout_draws_block[noise_block_idx]
+                        else:
+                            noise_t = transition_noise[t]
+                            state_noise_t = None if state_noise is None else state_noise[t]
+                            dropout_draw_t = None if dropout_draws is None else dropout_draws[t]
+
+                        reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
+                        reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
+                        state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
+                        terminal_signal_next = None
+                        terminal_bonus_base_next = None
+                        action_env = action_next
+                        if first_pg_action_grad_clip_value > 0.0:
+                            action_env = self._clip_tensor_grad_by_value(action_env, max_abs=first_pg_action_grad_clip_value)
+                        if first_pg_action_grad_clip_norm > 0.0:
+                            action_env = self._clip_tensor_grad_by_global_norm(action_env, max_norm=first_pg_action_grad_clip_norm)
+
+                        for group_idx, group in enumerate(transition_groups):
+                            group_slice = group["slice"]
+                            group_indices = group["indices"]
+                            env_g = group["env"]
+                            state_dim_g = int(group["state_dim"])
+                            obs_dim_g = int(group["obs_dim"])
+                            action_dim_g = int(group["action_dim"])
+                            noise_dim_g = int(group["noise_dim"])
+                            if group_slice is None:
+                                state_in = state_local.index_select(0, group_indices)[:, :state_dim_g]
+                                obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
+                                action_in = action_env.index_select(0, group_indices)[:, :action_dim_g]
+                                noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
+                            else:
+                                state_in = state_local[group_slice, :state_dim_g]
+                                obs_in = obs_t[group_slice, :obs_dim_g]
+                                action_in = action_env[group_slice, :action_dim_g]
+                                noise_in = noise_t[group_slice, :noise_dim_g]
+                            state_in = self._scale_state_env_input(state_in, group.get("state_input_scale_view", 1.0))
+                            env_obs_start = group["env_obs_start"]
+                            env_action_start = int(group["env_action_start"])
+                            env_noise_start = int(group["env_noise_start"])
+                            transition_input_grad_active = bool(
+                                torch.is_grad_enabled()
+                                and (
+                                    state_in.requires_grad
+                                    or obs_in.requires_grad
+                                    or action_in.requires_grad
+                                    or noise_in.requires_grad
+                                )
+                            )
+                            if bool(group.get("packed_input_enabled", False)):
+                                if transition_input_grad_active:
+                                    transition_input = torch.zeros_like(group["packed_input"])
+                                else:
+                                    transition_input = group["packed_input"]
+                                    transition_input.zero_()
+                                transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
+                                packed_obs_rows = group.get("packed_obs_rows", None)
+                                if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
+                                    transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
+                                        packed_obs_rows, group["packed_obs_src_cols"]
+                                    ]
+                                packed_action_rows = group.get("packed_action_rows", None)
+                                if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
+                                    transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
+                                        packed_action_rows, group["packed_action_src_cols"]
+                                    ]
+                                packed_noise_rows = group.get("packed_noise_rows", None)
+                                if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
+                                    transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
+                                        packed_noise_rows, group["packed_noise_src_cols"]
+                                    ]
+                            else:
+                                env_in = torch.zeros_like(group["env_in"]) if transition_input_grad_active else group["env_in"]
+                                env_in[:, :state_dim_g] = state_in
+                                if env_obs_start is not None:
+                                    env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                                env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                                env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                                transition_input = env_in
+
+                            transition_generator_g = group.get("transition_generator", None)
+                            terminal_generator_g = group.get("terminal_generator", None)
+                            group_rollout_generators = group.get("rollout_generators", None)
+                            if group_rollout_generators_override is not None:
+                                group_rollout_generators = group_rollout_generators_override[group_idx]
+                            if bool(group.get("use_fused_transition", False)) and callable(transition_generator_g):
+                                if bool(group.get("packed_input_enabled", False)):
+                                    transition_out_g = transition_generator_g(
+                                        transition_input,
+                                        generators_for_noise=group_rollout_generators,
+                                        x_is_dual_packed=False,
+                                        x_input_is_packed=True,
+                                    )
+                                else:
+                                    transition_out_g = transition_generator_g(
+                                        transition_input,
+                                        generators_for_noise=group_rollout_generators,
+                                        x_is_dual_packed=False,
+                                    )
+                                x_next_g, reward_next_raw_g, terminal_signal_next_g, terminal_bonus_base_next_g = self._unpack_transition_output(transition_out_g)
+                                reward_next_raw_g = group["reward_scale_view"] * reward_next_raw_g.reshape(-1)
+                                if terminal_bonus_base_next_g is not None:
+                                    if terminal_bonus_base_next is None:
+                                        terminal_bonus_base_next = torch.zeros((batch_size,), device=device, dtype=terminal_bonus_base_next_g.dtype)
+                                    if group_slice is None:
+                                        terminal_bonus_base_next.index_copy_(0, group_indices, terminal_bonus_base_next_g.reshape(-1))
+                                    else:
+                                        terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
+                            else:
+                                reward_next_raw_g = group["reward_scale_view"] * env_g["y_generator"](
+                                    transition_input,
+                                    generators_for_noise=group_rollout_generators,
+                                ).reshape(-1)
+                                x_next_g = env_g["x_generator"](
+                                    transition_input,
+                                    generators_for_noise=group_rollout_generators,
+                                )
+                                terminal_signal_next_g = None
+                            state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
+                            if terminal_token_enabled and (terminal_signal_next_g is None) and callable(terminal_generator_g):
+                                if bool(group.get("packed_input_enabled", False)):
+                                    terminal_signal_next_g = self._terminal_signal_from_generator_output(
+                                        terminal_generator_g(
+                                            transition_input,
+                                            generators_for_noise=group_rollout_generators,
+                                            x_is_dual_packed=False,
+                                            x_input_is_packed=True,
+                                        )
+                                    )
+                                else:
+                                    terminal_signal_next_g = self._terminal_signal_from_generator_output(
+                                        terminal_generator_g(
+                                            transition_input,
+                                            generators_for_noise=group_rollout_generators,
+                                            x_is_dual_packed=False,
+                                        )
+                                    )
+                            if group_slice is None:
+                                reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
+                                state_next[group_indices, :state_dim_g] = state_next_g
+                                if terminal_signal_next_g is not None:
+                                    if terminal_signal_next is None:
+                                        terminal_signal_next = torch.zeros((batch_size, 1), device=device, dtype=terminal_signal_next_g.dtype)
+                                    terminal_signal_next.index_copy_(0, group_indices, terminal_signal_next_g)
+                            else:
+                                reward_next_raw[group_slice] = reward_next_raw_g
+                                state_next[group_slice, :state_dim_g] = state_next_g
+                                if terminal_signal_next_g is not None:
+                                    if terminal_signal_next is None:
+                                        terminal_signal_next = torch.zeros((batch_size, 1), device=device, dtype=terminal_signal_next_g.dtype)
+                                    terminal_signal_next[group_slice] = terminal_signal_next_g
+
+                        reward_next = torch.maximum(torch.minimum(reward_next_raw, reward_clip), -reward_clip)
+                        if dropout_draw_t is not None:
+                            drop_mask = dropout_active & (dropout_draw_t < reward_dropout_ratio)
+                            reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
+                            impute_mask = drop_mask & reward_dropout_impute_zero
+                            reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                        reward_next = self._transform_rollout_reward(
+                            reward_next,
+                            mode=self._resolve_reinforce_reward_transform(self.config),
+                            rms_eps=reinforce_reward_rms_eps,
+                            tanh_c=reinforce_reward_tanh_c,
+                            tanh_bound=reinforce_reward_tanh_bound,
+                        )
+                        if state_noise_t is not None:
+                            state_next = state_next + state_noise_t * state_noise_std[:, None]
+                        if not bool(reference_semantics.all().item()):
+                            state_next_post = self._apply_state_postprocess(
+                                state_next_raw=state_next,
+                                state_prev=state_local,
+                                state_clip=state_clip,
+                                state_highway_enabled=state_highway_enabled,
+                                state_highway_lambda=state_highway_lambda,
+                            )
+                            state_next = torch.where(reference_semantics[:, None], state_next, state_next_post)
+                        state_next = self._apply_state_full_rms(
+                            state_next,
+                            enabled=state_full_rms_enabled,
+                            target=state_full_rms_target,
+                            state_mask=state_mask,
+                        )
+                        if terminal_token_enabled:
+                            state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
+                                state_next=state_next,
+                                reward_next=reward_next,
+                                terminal_draw=terminal_reset_draws[t],
+                                reset_prob=terminal_reset_prob,
+                                bonus_scale_draw=terminal_bonus_scale_draws[t],
+                                bonus_scale_min=terminal_bonus_scale_min,
+                                bonus_scale_max=terminal_bonus_scale_max,
+                                bonus_tanh_c=terminal_bonus_tanh_c,
+                                reset_state=terminal_reset_states[t],
+                                enabled=terminal_reset_enabled,
+                                terminal_signal=terminal_signal_next,
+                                terminal_bonus_base=terminal_bonus_base_next,
+                                terminal_signal_history=terminal_signal_history_local,
+                                history_index=t,
+                                history_warmup_count=terminal_reset_count_target,
+                                history_relaxed_mask=terminal_history_relaxed_local,
                             )
                         else:
-                            terminal_signal_next_g = self._terminal_signal_from_generator_output(
-                                terminal_generator_g(
-                                    transition_input,
-                                    generators_for_noise=group["rollout_generators"],
-                                    x_is_dual_packed=False,
-                                )
+                            terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
+                        state_next = state_next * state_mask
+                        if first_pg_state_grad_clip_norm > 0.0:
+                            state_next = self._clip_tensor_grad_by_global_norm(
+                                state_next,
+                                max_norm=first_pg_state_grad_clip_norm,
                             )
-                    if group_slice is None:
-                        reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
-                        state_next[group_indices, :state_dim_g] = state_next_g
-                        if terminal_signal_next_g is not None:
-                            if terminal_signal_next is None:
-                                terminal_signal_next = torch.zeros((batch_size, 1), device=device, dtype=terminal_signal_next_g.dtype)
-                            terminal_signal_next.index_copy_(0, group_indices, terminal_signal_next_g)
-                    else:
-                        reward_next_raw[group_slice] = reward_next_raw_g
-                        state_next[group_slice, :state_dim_g] = state_next_g
-                        if terminal_signal_next_g is not None:
-                            if terminal_signal_next is None:
-                                terminal_signal_next = torch.zeros((batch_size, 1), device=device, dtype=terminal_signal_next_g.dtype)
-                            terminal_signal_next[group_slice] = terminal_signal_next_g
+                        if terminal_token_enabled:
+                            terminal_count_local = terminal_count_local + terminal_next.to(dtype=torch.float32)
+                        action_next = action_next * action_mask
+                        if t >= single_eval_pos:
+                            reward_buffer.append(reward_next)
+                            log_prob_buffer.append(reinforce_log_prob_t)
+                            log_prob_score_buffer.append(reinforce_log_prob_score_t)
+                            action_mean_buffer.append(action_mean)
+                            action_mask_buffer.append(action_mask_bool)
+                        state_local = state_next
+                        action_local = action_env
+                        reward_local = reward_next
+                        reward_mask_local = reward_mask_next
+                        terminal_local = terminal_next
 
-                reward_next = torch.maximum(torch.minimum(reward_next_raw, reward_clip), -reward_clip)
-                if dropout_draw_t is not None:
-                    drop_mask = dropout_active & (dropout_draw_t < reward_dropout_ratio)
-                    reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
-                    impute_mask = drop_mask & reward_dropout_impute_zero
-                    reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
-                reward_next = self._transform_rollout_reward(
-                    reward_next,
-                    mode=self._resolve_reinforce_reward_transform(self.config),
-                    rms_eps=reinforce_reward_rms_eps,
-                    tanh_c=reinforce_reward_tanh_c,
-                    tanh_bound=reinforce_reward_tanh_bound,
-                )
-                if state_noise_t is not None:
-                    state_next = state_next + state_noise_t * state_noise_std[:, None]
-                if not bool(reference_semantics.all().item()):
-                    state_next_post = self._apply_state_postprocess(
-                        state_next_raw=state_next,
-                        state_prev=state_local,
-                        state_clip=state_clip,
-                        state_highway_enabled=state_highway_enabled,
-                        state_highway_lambda=state_highway_lambda,
-                    )
-                    state_next = torch.where(reference_semantics[:, None], state_next, state_next_post)
-                state_next = self._apply_state_full_rms(
-                    state_next,
-                    enabled=state_full_rms_enabled,
-                    target=state_full_rms_target,
-                    state_mask=state_mask,
-                )
-                if terminal_token_enabled:
-                    state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
-                        state_next=state_next,
-                        reward_next=reward_next,
-                        terminal_draw=terminal_reset_draws[t],
-                        reset_prob=terminal_reset_prob,
-                        bonus_scale_draw=terminal_bonus_scale_draws[t],
-                        bonus_scale_min=terminal_bonus_scale_min,
-                        bonus_scale_max=terminal_bonus_scale_max,
-                        bonus_tanh_c=terminal_bonus_tanh_c,
-                        reset_state=terminal_reset_states[t],
-                        enabled=terminal_reset_enabled,
-                        terminal_signal=terminal_signal_next,
-                        terminal_bonus_base=terminal_bonus_base_next,
-                        terminal_signal_history=terminal_signal_history_local,
-                        history_index=t,
-                        history_warmup_count=terminal_reset_count_target,
-                        history_relaxed_mask=terminal_history_relaxed_local,
-                    )
-                else:
-                    terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
-                state_next = state_next * state_mask
-                if first_pg_state_grad_clip_norm > 0.0:
-                    state_next = self._clip_tensor_grad_by_global_norm(
-                        state_next,
-                        max_norm=first_pg_state_grad_clip_norm,
-                    )
-                if terminal_token_enabled:
-                    terminal_count_local = terminal_count_local + terminal_next.to(dtype=torch.float32)
-                action_next = action_next * action_mask
-                if t >= single_eval_pos:
-                    reward_buffer.append(reward_next)
-                    log_prob_buffer.append(reinforce_log_prob_t)
-                    log_prob_score_buffer.append(reinforce_log_prob_score_t)
-                    action_mean_buffer.append(action_mean)
-                    action_mask_buffer.append(action_mask_bool)
-                state_local = state_next
-                action_local = action_env
-                reward_local = reward_next
-                reward_mask_local = reward_mask_next
-                terminal_local = terminal_next
+                    boundary_out = {
+                        "state_t": state_local,
+                        "action_t": action_local,
+                        "reward_t": reward_local,
+                        "reward_mask_t": reward_mask_local,
+                        "terminal_t": terminal_local,
+                        "cache": cache_local,
+                    }
+                    weighted_local_loss = None
+                    stats_window = None
+                    rewards_window_det = None
+                    window_weight = 0.0
+                    eval_step_count = len(reward_buffer)
+                    if compute_local_alpha and eval_step_count > 0:
+                        rewards_window = torch.stack(reward_buffer, dim=0)
+                        log_probs_window = torch.stack(log_prob_buffer, dim=0)
+                        log_prob_score_window = torch.stack(log_prob_score_buffer, dim=0)
+                        action_mean_roots = tuple(action_mean_buffer)
+                        action_mask_window = torch.stack(action_mask_buffer, dim=0)
+                        if needs_unpermute:
+                            rewards_window = rewards_window.index_select(1, inv_perm)
+                            log_probs_window = log_probs_window.index_select(1, inv_perm)
+                            log_prob_score_window = log_prob_score_window.index_select(1, inv_perm)
+                            action_mask_window = action_mask_window.index_select(1, inv_perm)
+                            action_mean_roots = tuple(root.index_select(0, inv_perm) for root in action_mean_roots)
 
-            boundary_out = {
-                "state_t": state_local,
-                "action_t": action_local,
-                "reward_t": reward_local,
-                "reward_mask_t": reward_mask_local,
-                "terminal_t": terminal_local,
-                "cache": cache_local,
-            }
-            weighted_local_loss = None
-            stats_window = None
-            boundary_eta = None
-            rewards_window_det = None
-            window_weight = 0.0
-            eval_step_count = len(reward_buffer)
-            if compute_local_alpha and eval_step_count > 0:
-                rewards_window = torch.stack(reward_buffer, dim=0)
-                log_probs_window = torch.stack(log_prob_buffer, dim=0)
-                log_prob_score_window = torch.stack(log_prob_score_buffer, dim=0)
-                action_mean_roots = tuple(action_mean_buffer)
-                action_mask_window = torch.stack(action_mask_buffer, dim=0)
-                if needs_unpermute:
-                    rewards_window = rewards_window.index_select(1, inv_perm)
-                    log_probs_window = log_probs_window.index_select(1, inv_perm)
-                    log_prob_score_window = log_prob_score_window.index_select(1, inv_perm)
-                    action_mask_window = action_mask_window.index_select(1, inv_perm)
-                    action_mean_roots = tuple(root.index_select(0, inv_perm) for root in action_mean_roots)
+                        loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
+                            rewards=rewards_window,
+                            log_probs=log_probs_window,
+                            action_mean=action_mean_roots,
+                            action_mask=action_mask_window,
+                            log_prob_score=log_prob_score_window,
+                            discount=discount,
+                        )
+                        window_weight = float(eval_step_count) / float(max(1, total_eval_steps))
+                        weighted_local_loss = loss_window * window_weight
+                        rewards_window_det = rewards_window.detach()
+                    bridge_loss = self._alpha_tbptt_bridge_loss_from_eta(boundary_out, bridge_eta)
+                    boundary_eta = None
+                    if compute_boundary_eta:
+                        eta_source_loss = None
+                        if weighted_local_loss is not None:
+                            eta_source_loss = weighted_local_loss
+                        if bridge_loss is not None:
+                            eta_source_loss = bridge_loss if eta_source_loss is None else (eta_source_loss + bridge_loss)
+                        if eta_source_loss is not None:
+                            boundary_eta = self._alpha_tbptt_boundary_eta_from_loss(
+                                eta_source_loss,
+                                boundary,
+                                boundary["cache_grad_targets"],
+                            )
+                    return {
+                        "weighted_local_loss": weighted_local_loss,
+                        "stats_window": stats_window,
+                        "window_weight": window_weight,
+                        "eval_step_count": eval_step_count,
+                        "boundary_eta": boundary_eta,
+                        "boundary_out": boundary_out,
+                        "rewards_window_det": rewards_window_det,
+                        "bridge_loss": bridge_loss,
+                        "terminal_count_realized": terminal_count_local,
+                    }
+            finally:
+                if restore_noise_snapshot is not None:
+                    _restore_noise_block_state(restore_noise_snapshot)
 
-                loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
-                    rewards=rewards_window,
-                    log_probs=log_probs_window,
-                    action_mean=action_mean_roots,
-                    action_mask=action_mask_window,
-                    log_prob_score=log_prob_score_window,
-                    discount=discount,
-                )
-                window_weight = float(eval_step_count) / float(max(1, total_eval_steps))
-                weighted_local_loss = loss_window * window_weight
-                rewards_window_det = rewards_window.detach()
-                if compute_boundary_eta:
-                    boundary_eta = self._alpha_tbptt_boundary_eta_from_loss(
-                        weighted_local_loss,
-                        boundary,
-                        boundary["cache_grad_targets"],
-                    )
-
-            bridge_loss = self._alpha_tbptt_bridge_loss_from_eta(boundary_out, bridge_eta)
-            if noise_snapshot is not None:
-                (
-                    noise_block_start,
-                    noise_block_end,
-                    transition_noise_block,
-                    action_noise_train_block,
-                    action_noise_eval_block,
-                    state_noise_block,
-                    dropout_draws_block,
-                ) = noise_snapshot
-            return {
-                "weighted_local_loss": weighted_local_loss,
-                "stats_window": stats_window,
-                "window_weight": window_weight,
-                "eval_step_count": eval_step_count,
-                "boundary_eta": boundary_eta,
-                "boundary_out": boundary_out,
-                "rewards_window_det": rewards_window_det,
-                "bridge_loss": bridge_loss,
-                "terminal_count_realized": terminal_count_local,
-            }
-
-        prev_window_boundary = None
-        prev_window_range = None
-
-        for window_start in range(0, n_samples, tbptt_window_size):
-            window_end = min(n_samples, window_start + tbptt_window_size)
-            current_window_boundary = _snapshot_boundary(
-                state_t,
-                action_t,
-                reward_t,
-                reward_mask_t,
-                terminal_t,
-                cache,
-            )
-            compute_local_alpha = bool(window_end > single_eval_pos)
-            current_result = _run_window_from_boundary(
-                current_window_boundary,
-                window_start=window_start,
-                window_end=window_end,
-                compute_local_alpha=compute_local_alpha,
-                compute_boundary_eta=compute_local_alpha,
-                bridge_eta=None,
-            )
-
-            if prev_window_boundary is not None and current_result["boundary_eta"] is not None:
-                bridge_result = _run_window_from_boundary(
-                    prev_window_boundary,
-                    window_start=int(prev_window_range[0]),
-                    window_end=int(prev_window_range[1]),
-                    compute_local_alpha=False,
-                    compute_boundary_eta=False,
-                    bridge_eta=current_result["boundary_eta"],
-                )
-                if bridge_result["bridge_loss"] is not None:
-                    if tbptt_loss_sink is None:
-                        weighted_losses.append(bridge_result["bridge_loss"])
-                    else:
-                        tbptt_loss_sink(bridge_result["bridge_loss"])
-                    bridge_replay_count += 1
-
+        def _accumulate_window_stats(current_result):
+            nonlocal objective_accum, total_weight
+            nonlocal reward_sum, reward_sumsq, reward_count
+            nonlocal reward_min_accum, reward_max_accum, reward_absmax_accum
+            nonlocal reward_clip_hit_accum, reward_norm_clip_hit_accum
+            nonlocal reward_nonfinite_share_accum, reward_nan_share_accum, reward_inf_share_accum
+            nonlocal reinforce_return_nonfinite_share_accum
+            nonlocal reinforce_log_prob_nonfinite_share_accum, reinforce_adv_nonfinite_share_accum
+            nonlocal eval_window_count, eval_step_count_total
             weighted_local_loss = current_result["weighted_local_loss"]
             stats_window = current_result["stats_window"]
             window_weight = float(current_result["window_weight"])
-            if weighted_local_loss is not None:
-                if tbptt_loss_sink is None:
-                    weighted_losses.append(weighted_local_loss)
-                else:
-                    tbptt_loss_sink(weighted_local_loss)
+            if weighted_local_loss is None:
+                return
+            objective_term = stats_window["objective"].detach() * window_weight
+            objective_accum = objective_term if objective_accum is None else (objective_accum + objective_term)
+            total_weight += window_weight
+            eval_window_count += 1
+            eval_step_count_total += int(current_result["eval_step_count"])
 
-                objective_term = stats_window["objective"].detach() * window_weight
-                objective_accum = objective_term if objective_accum is None else (objective_accum + objective_term)
-                total_weight += window_weight
-                eval_window_count += 1
-                eval_step_count_total += int(current_result["eval_step_count"])
-
-                rewards_det = current_result["rewards_window_det"].to(dtype=torch.float64)
-                reward_sum = rewards_det.sum() if reward_sum is None else (reward_sum + rewards_det.sum())
-                reward_sumsq = (
-                    (rewards_det * rewards_det).sum()
-                    if reward_sumsq is None
-                    else (reward_sumsq + (rewards_det * rewards_det).sum())
+            rewards_det = current_result["rewards_window_det"].to(dtype=torch.float64)
+            reward_sum = rewards_det.sum() if reward_sum is None else (reward_sum + rewards_det.sum())
+            reward_sumsq = (
+                (rewards_det * rewards_det).sum()
+                if reward_sumsq is None
+                else (reward_sumsq + (rewards_det * rewards_det).sum())
+            )
+            reward_count += int(rewards_det.numel())
+            reward_min_w = stats_window.get("reward_min", None)
+            if reward_min_w is not None:
+                reward_min_w = reward_min_w.detach()
+                reward_min_accum = reward_min_w if reward_min_accum is None else torch.minimum(reward_min_accum, reward_min_w)
+            reward_max_w = stats_window.get("reward_max", None)
+            if reward_max_w is not None:
+                reward_max_w = reward_max_w.detach()
+                reward_max_accum = reward_max_w if reward_max_accum is None else torch.maximum(reward_max_accum, reward_max_w)
+            reward_absmax_w = stats_window.get("reward_abs_max", None)
+            if reward_absmax_w is not None:
+                reward_absmax_w = reward_absmax_w.detach()
+                reward_absmax_accum = reward_absmax_w if reward_absmax_accum is None else torch.maximum(reward_absmax_accum, reward_absmax_w)
+            reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
+            if reward_clip_hit_w is not None:
+                reward_clip_hit_w = reward_clip_hit_w.detach() * window_weight
+                reward_clip_hit_accum = reward_clip_hit_w if reward_clip_hit_accum is None else (reward_clip_hit_accum + reward_clip_hit_w)
+            reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
+            if reward_norm_clip_hit_w is not None:
+                reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * window_weight
+                reward_norm_clip_hit_accum = (
+                    reward_norm_clip_hit_w
+                    if reward_norm_clip_hit_accum is None
+                    else (reward_norm_clip_hit_accum + reward_norm_clip_hit_w)
                 )
-                reward_count += int(rewards_det.numel())
-                reward_min_w = stats_window.get("reward_min", None)
-                if reward_min_w is not None:
-                    reward_min_w = reward_min_w.detach()
-                    reward_min_accum = reward_min_w if reward_min_accum is None else torch.minimum(reward_min_accum, reward_min_w)
-                reward_max_w = stats_window.get("reward_max", None)
-                if reward_max_w is not None:
-                    reward_max_w = reward_max_w.detach()
-                    reward_max_accum = reward_max_w if reward_max_accum is None else torch.maximum(reward_max_accum, reward_max_w)
-                reward_absmax_w = stats_window.get("reward_abs_max", None)
-                if reward_absmax_w is not None:
-                    reward_absmax_w = reward_absmax_w.detach()
-                    reward_absmax_accum = reward_absmax_w if reward_absmax_accum is None else torch.maximum(reward_absmax_accum, reward_absmax_w)
-                reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
-                if reward_clip_hit_w is not None:
-                    reward_clip_hit_w = reward_clip_hit_w.detach() * window_weight
-                    reward_clip_hit_accum = (
-                        reward_clip_hit_w
-                        if reward_clip_hit_accum is None
-                        else (reward_clip_hit_accum + reward_clip_hit_w)
-                    )
-                reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
-                if reward_norm_clip_hit_w is not None:
-                    reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * window_weight
-                    reward_norm_clip_hit_accum = (
-                        reward_norm_clip_hit_w
-                        if reward_norm_clip_hit_accum is None
-                        else (reward_norm_clip_hit_accum + reward_norm_clip_hit_w)
-                    )
-                reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
-                if reward_nonfinite_share_w is not None:
-                    reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * window_weight
-                    reward_nonfinite_share_accum = (
-                        reward_nonfinite_share_w
-                        if reward_nonfinite_share_accum is None
-                        else (reward_nonfinite_share_accum + reward_nonfinite_share_w)
-                    )
-                reward_nan_share_w = stats_window.get("reward_nan_share", None)
-                if reward_nan_share_w is not None:
-                    reward_nan_share_w = reward_nan_share_w.detach() * window_weight
-                    reward_nan_share_accum = (
-                        reward_nan_share_w
-                        if reward_nan_share_accum is None
-                        else (reward_nan_share_accum + reward_nan_share_w)
-                    )
-                reward_inf_share_w = stats_window.get("reward_inf_share", None)
-                if reward_inf_share_w is not None:
-                    reward_inf_share_w = reward_inf_share_w.detach() * window_weight
-                    reward_inf_share_accum = (
-                        reward_inf_share_w
-                        if reward_inf_share_accum is None
-                        else (reward_inf_share_accum + reward_inf_share_w)
-                    )
-                reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
-                if reinforce_return_nonfinite_share_w is not None:
-                    reinforce_return_nonfinite_share_w = (
-                        reinforce_return_nonfinite_share_w.detach() * window_weight
-                    )
-                    reinforce_return_nonfinite_share_accum = (
-                        reinforce_return_nonfinite_share_w
-                        if reinforce_return_nonfinite_share_accum is None
-                        else (reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w)
-                    )
-                reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
-                if reinforce_log_prob_nonfinite_share_w is not None:
-                    reinforce_log_prob_nonfinite_share_w = (
-                        reinforce_log_prob_nonfinite_share_w.detach() * window_weight
-                    )
-                    reinforce_log_prob_nonfinite_share_accum = (
-                        reinforce_log_prob_nonfinite_share_w
-                        if reinforce_log_prob_nonfinite_share_accum is None
-                        else (reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w)
-                    )
-                reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
-                if reinforce_adv_nonfinite_share_w is not None:
-                    reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * window_weight
-                    reinforce_adv_nonfinite_share_accum = (
-                        reinforce_adv_nonfinite_share_w
-                        if reinforce_adv_nonfinite_share_accum is None
-                        else (reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w)
-                    )
+            reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
+            if reward_nonfinite_share_w is not None:
+                reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * window_weight
+                reward_nonfinite_share_accum = (
+                    reward_nonfinite_share_w
+                    if reward_nonfinite_share_accum is None
+                    else (reward_nonfinite_share_accum + reward_nonfinite_share_w)
+                )
+            reward_nan_share_w = stats_window.get("reward_nan_share", None)
+            if reward_nan_share_w is not None:
+                reward_nan_share_w = reward_nan_share_w.detach() * window_weight
+                reward_nan_share_accum = reward_nan_share_w if reward_nan_share_accum is None else (reward_nan_share_accum + reward_nan_share_w)
+            reward_inf_share_w = stats_window.get("reward_inf_share", None)
+            if reward_inf_share_w is not None:
+                reward_inf_share_w = reward_inf_share_w.detach() * window_weight
+                reward_inf_share_accum = reward_inf_share_w if reward_inf_share_accum is None else (reward_inf_share_accum + reward_inf_share_w)
+            reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
+            if reinforce_return_nonfinite_share_w is not None:
+                reinforce_return_nonfinite_share_w = reinforce_return_nonfinite_share_w.detach() * window_weight
+                reinforce_return_nonfinite_share_accum = (
+                    reinforce_return_nonfinite_share_w
+                    if reinforce_return_nonfinite_share_accum is None
+                    else (reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w)
+                )
+            reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
+            if reinforce_log_prob_nonfinite_share_w is not None:
+                reinforce_log_prob_nonfinite_share_w = reinforce_log_prob_nonfinite_share_w.detach() * window_weight
+                reinforce_log_prob_nonfinite_share_accum = (
+                    reinforce_log_prob_nonfinite_share_w
+                    if reinforce_log_prob_nonfinite_share_accum is None
+                    else (reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w)
+                )
+            reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
+            if reinforce_adv_nonfinite_share_w is not None:
+                reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * window_weight
+                reinforce_adv_nonfinite_share_accum = (
+                    reinforce_adv_nonfinite_share_w
+                    if reinforce_adv_nonfinite_share_accum is None
+                    else (reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w)
+                )
+            if stored_reward_windows is not None and current_result["rewards_window_det"] is not None:
+                stored_reward_windows.append(current_result["rewards_window_det"])
 
-                if stored_reward_windows is not None and current_result["rewards_window_det"] is not None:
-                    stored_reward_windows.append(current_result["rewards_window_det"])
-
+        def _advance_main_state_from_result(current_result):
+            nonlocal state_t, action_t, reward_t, reward_mask_t, terminal_t, terminal_count_realized, cache
             boundary_out = current_result["boundary_out"]
             state_t = boundary_out["state_t"].detach()
             action_t = boundary_out["action_t"].detach()
@@ -21348,8 +21425,183 @@ class EnvironmentPrior:
             terminal_t = boundary_out["terminal_t"].detach()
             terminal_count_realized = current_result["terminal_count_realized"]
             cache = self._detach_policy_cache(boundary_out["cache"], clone_tensors=(tbptt_loss_sink is None))
-            prev_window_boundary = current_window_boundary
-            prev_window_range = (window_start, window_end)
+
+        if unbiased_rr_enabled:
+            window_bundles = []
+            for window_start in range(0, n_samples, tbptt_window_size):
+                window_end = min(n_samples, window_start + tbptt_window_size)
+                current_window_boundary = _snapshot_boundary(
+                    state_t,
+                    action_t,
+                    reward_t,
+                    reward_mask_t,
+                    terminal_t,
+                    cache,
+                )
+                current_window_generator_states = _snapshot_group_rollout_generator_states()
+                current_window_noise_state = _snapshot_noise_block_state()
+                compute_local_alpha = bool(window_end > single_eval_pos)
+                current_result = _run_window_from_boundary(
+                    current_window_boundary,
+                    window_start=window_start,
+                    window_end=window_end,
+                    compute_local_alpha=compute_local_alpha,
+                    compute_boundary_eta=False,
+                    bridge_eta=None,
+                    build_grad_graph=False,
+                )
+                _accumulate_window_stats(current_result)
+                _advance_main_state_from_result(current_result)
+                window_bundles.append(
+                    {
+                        "boundary": current_window_boundary,
+                        "window_start": int(window_start),
+                        "window_end": int(window_end),
+                        "has_eval": bool(compute_local_alpha),
+                        "generator_states": current_window_generator_states,
+                        "noise_state": current_window_noise_state,
+                    }
+                )
+
+            incoming_eta = None
+            for bundle in reversed(window_bundles):
+                bridge_eta = None
+                continuation_hit = False
+                if incoming_eta is not None:
+                    if unbiased_rr_survival_prob >= 1.0:
+                        continuation_hit = True
+                    elif unbiased_rr_survival_prob > 0.0:
+                        continuation_hit = bool(
+                            torch.rand((), device=device).item() < float(unbiased_rr_survival_prob)
+                        )
+                    if continuation_hit:
+                        bridge_eta = self._alpha_tbptt_scale_boundary_eta(
+                            incoming_eta,
+                            1.0 / float(unbiased_rr_survival_prob),
+                        )
+                        unbiased_rr_continuation_hit_count += 1
+
+                compute_local_alpha = bool(bundle["has_eval"])
+                compute_boundary_eta = bool(compute_local_alpha or (bridge_eta is not None))
+                if not compute_boundary_eta:
+                    incoming_eta = None
+                    continue
+                replay_result = _run_window_from_boundary(
+                    bundle["boundary"],
+                    window_start=int(bundle["window_start"]),
+                    window_end=int(bundle["window_end"]),
+                    compute_local_alpha=compute_local_alpha,
+                    compute_boundary_eta=compute_boundary_eta,
+                    bridge_eta=bridge_eta,
+                    group_rollout_generators_override=_restore_group_rollout_generators_from_states(bundle["generator_states"]),
+                    noise_state_override=bundle["noise_state"],
+                    build_grad_graph=True,
+                )
+                if replay_result["bridge_loss"] is not None:
+                    if tbptt_loss_sink is None:
+                        weighted_losses.append(replay_result["bridge_loss"])
+                    else:
+                        tbptt_loss_sink(replay_result["bridge_loss"])
+                    bridge_replay_count += 1
+                if replay_result["weighted_local_loss"] is not None:
+                    if tbptt_loss_sink is None:
+                        weighted_losses.append(replay_result["weighted_local_loss"])
+                    else:
+                        tbptt_loss_sink(replay_result["weighted_local_loss"])
+                incoming_eta = replay_result["boundary_eta"]
+                unbiased_rr_replay_window_count += 1
+        else:
+            prev_window_boundary = None
+            prev_window_range = None
+            prev_prev_window_boundary = None
+            prev_prev_window_range = None
+
+            for window_start in range(0, n_samples, tbptt_window_size):
+                window_end = min(n_samples, window_start + tbptt_window_size)
+                current_window_boundary = _snapshot_boundary(
+                    state_t,
+                    action_t,
+                    reward_t,
+                    reward_mask_t,
+                    terminal_t,
+                    cache,
+                )
+                compute_local_alpha = bool(window_end > single_eval_pos)
+                current_result = _run_window_from_boundary(
+                    current_window_boundary,
+                    window_start=window_start,
+                    window_end=window_end,
+                    compute_local_alpha=compute_local_alpha,
+                    compute_boundary_eta=compute_local_alpha,
+                    bridge_eta=None,
+                )
+
+                if prev_window_boundary is not None and current_result["boundary_eta"] is not None:
+                    second_hop_survived = False
+                    if (
+                        two_hop_ipw_enabled
+                        and prev_prev_window_boundary is not None
+                        and two_hop_ipw_survival_prob > 0.0
+                    ):
+                        if two_hop_ipw_survival_prob >= 1.0:
+                            second_hop_survived = True
+                        else:
+                            second_hop_survived = bool(
+                                torch.rand((), device=device).item() < float(two_hop_ipw_survival_prob)
+                            )
+                    prev_window_has_eval = bool(int(prev_window_range[1]) > int(single_eval_pos))
+                    bridge_result = _run_window_from_boundary(
+                        prev_window_boundary,
+                        window_start=int(prev_window_range[0]),
+                        window_end=int(prev_window_range[1]),
+                        compute_local_alpha=bool(second_hop_survived and prev_window_has_eval),
+                        compute_boundary_eta=bool(second_hop_survived),
+                        bridge_eta=current_result["boundary_eta"],
+                    )
+                    if bridge_result["bridge_loss"] is not None:
+                        if tbptt_loss_sink is None:
+                            weighted_losses.append(bridge_result["bridge_loss"])
+                        else:
+                            tbptt_loss_sink(bridge_result["bridge_loss"])
+                        bridge_replay_count += 1
+                    if (
+                        second_hop_survived
+                        and prev_prev_window_boundary is not None
+                        and bridge_result["boundary_eta"] is not None
+                    ):
+                        scaled_two_hop_eta = self._alpha_tbptt_scale_boundary_eta(
+                            bridge_result["boundary_eta"],
+                            1.0 / float(two_hop_ipw_survival_prob),
+                        )
+                        second_bridge_result = _run_window_from_boundary(
+                            prev_prev_window_boundary,
+                            window_start=int(prev_prev_window_range[0]),
+                            window_end=int(prev_prev_window_range[1]),
+                            compute_local_alpha=False,
+                            compute_boundary_eta=False,
+                            bridge_eta=scaled_two_hop_eta,
+                        )
+                        if second_bridge_result["bridge_loss"] is not None:
+                            if tbptt_loss_sink is None:
+                                weighted_losses.append(second_bridge_result["bridge_loss"])
+                            else:
+                                tbptt_loss_sink(second_bridge_result["bridge_loss"])
+                            bridge_replay_count += 1
+                            two_hop_bridge_count += 1
+
+                weighted_local_loss = current_result["weighted_local_loss"]
+                if weighted_local_loss is not None:
+                    if tbptt_loss_sink is None:
+                        weighted_losses.append(weighted_local_loss)
+                    else:
+                        tbptt_loss_sink(weighted_local_loss)
+
+                _accumulate_window_stats(current_result)
+                _advance_main_state_from_result(current_result)
+                prev_prev_window_boundary = prev_window_boundary
+                prev_prev_window_range = prev_window_range
+                prev_window_boundary = current_window_boundary
+                prev_window_range = (window_start, window_end)
 
         rewards_device = device if isinstance(device, torch.device) else torch.device(str(device))
         if tbptt_loss_sink is None:
@@ -21419,6 +21671,13 @@ class EnvironmentPrior:
             "alpha_grad_eval_step_count": torch.as_tensor(float(eval_step_count_total), device=rewards_device, dtype=torch.float32),
             "alpha_grad_eval_window_count": torch.as_tensor(float(eval_window_count), device=rewards_device, dtype=torch.float32),
             "alpha_grad_boundary_bridge_count": torch.as_tensor(float(bridge_replay_count), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_two_hop_ipw_enabled": torch.as_tensor(float(int(two_hop_ipw_enabled)), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_two_hop_ipw_survival_prob": torch.as_tensor(float(two_hop_ipw_survival_prob), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_two_hop_bridge_count": torch.as_tensor(float(two_hop_bridge_count), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_unbiased_rr_enabled": torch.as_tensor(float(int(unbiased_rr_enabled)), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_unbiased_rr_survival_prob": torch.as_tensor(float(unbiased_rr_survival_prob), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_unbiased_rr_replay_window_count": torch.as_tensor(float(unbiased_rr_replay_window_count), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_unbiased_rr_continuation_hit_count": torch.as_tensor(float(unbiased_rr_continuation_hit_count), device=rewards_device, dtype=torch.float32),
             "alpha_grad_local_coordinate_enabled": int(self._resolve_alpha_grad_local_coordinate_enabled(self.config)),
             "alpha_grad_unit_grad_enabled": int(self._resolve_alpha_grad_unit_grad_enabled(self.config)),
         }
