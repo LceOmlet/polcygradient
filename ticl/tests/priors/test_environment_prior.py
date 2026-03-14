@@ -5037,6 +5037,18 @@ def test_environment_prior_strict_reference_scm_partitioned_builder_matches_unpa
     assert torch.allclose(reward_off, reward_on, atol=1e-6, rtol=1e-6)
 
 
+def test_environment_prior_partition_budget_respects_config_when_env_unset(monkeypatch):
+    monkeypatch.delenv("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", raising=False)
+    prior = EnvironmentPrior({"reference_scm_partition_max_bytes": 123456789})
+    assert prior.reference_scm_partition_max_bytes == 123456789
+
+
+def test_environment_prior_partition_budget_env_override_wins(monkeypatch):
+    monkeypatch.setenv("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", "987654321")
+    prior = EnvironmentPrior({"reference_scm_partition_max_bytes": 123456789})
+    assert prior.reference_scm_partition_max_bytes == 987654321
+
+
 def test_environment_prior_strict_reference_scm_family_coarse_batch_matches_reference_builder():
     _seed_everything(20260309)
     prior = EnvironmentPrior({})
@@ -6277,6 +6289,54 @@ def test_environment_prior_rollout_with_policy_structure_grouping_matches_serial
     terminal_col = int(sampled[0]["obs_slot_dim"]) + 2
     assert torch.all(rollout_vec["x"][0, :, terminal_col] == 0.0)
     assert torch.all(rollout_vec["x"][1:, :, terminal_col] == 1.0)
+
+
+def test_environment_prior_family_rollout_omits_terminal_token_when_terminal_disabled(monkeypatch):
+    _seed_everything(20260314)
+    base_h = _make_terminal_sampled_h_list()[0]
+    sampled = [dict(base_h) for _ in range(4)]
+    for h in sampled:
+        h["terminal_reset_enabled"] = False
+
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+
+    prior = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
+    _install_constant_terminal_builders(prior, monkeypatch)
+    prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior._sample_environment_family_coarse_batch = (
+        lambda h_list, device, rng_seeds=None, **_: prior._sample_environment_batch(
+            h_list=h_list,
+            device=device,
+            rng_seeds=rng_seeds,
+        )
+    )
+
+    seen = []
+
+    def _record_policy_step(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+        del obs_t, reward_t, reward_mask_t, cache, step_idx
+        seen.append("terminal_t" in env_info)
+        return torch.zeros_like(action_t)
+
+    prior.rollout_with_policy(
+        policy_step_fn=_record_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=[11, 23, 37, 41],
+        rollout_seeds_override=[101, 211, 307, 401],
+    )
+
+    assert len(seen) > 0
+    assert not any(seen)
 
 
 def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_with_terminal_reset(monkeypatch):

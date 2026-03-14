@@ -754,3 +754,62 @@ Interpretation:
 - The speedup is very large and lands on both `first_policy_gradient` and `alpha_grad`.
 - GPU memory does rise relative to the pushed policy-offload baseline, but it remains far below the risky-load guard and far below card capacity, so the change stays within the validated safe envelope.
 - Because the resolver only bypasses policy offload when the current load is inside that envelope, this remains a runtime policy change, not a training-semantics change.
+
+## Accepted: terminal-on-latest-skyline preserves old auto-bypass semantics under true `256 MiB` partition
+
+Scope:
+
+- current branch head: `af774ab`
+- old comparison point: `d974845`
+- fixed risky-load harness:
+  - same saved payload (`h_list`, `env_seeds`, `rollout_seeds`)
+  - `B=64`
+  - `ns=1024`
+  - `sep=697`
+  - `tbptt=32`
+  - `paged`
+  - `family`
+  - `pg_saved_tensors_cpu_offload=true`
+  - `pg_saved_tensors_cpu_offload_scope=policy`
+  - `pg_saved_tensors_cpu_offload_auto_disable_when_safe=true`
+- semantic alignment overrides:
+  - `reference_scm_partition_max_bytes=256 MiB`
+  - `terminal_reset_enabled=false`
+  - `alpha_grad_local_coordinate_enabled=false`
+  - `alpha_grad_unit_grad_enabled=false`
+  - `first_policy_gradient_action_grad_clip_value=4`
+  - `first_policy_gradient_action_grad_clip_norm=0`
+
+Root cause and fix:
+
+- The terminal branch initially looked much weaker than the old auto-bypass skyline, but the comparison was corrupted by a real override bug:
+  - `EnvironmentPrior.__init__` ignored `cfg["reference_scm_partition_max_bytes"]` and only read the environment variable fallback
+  - so "forced `256 MiB`" comparisons were silently still running at the `2 GiB` latest-skyline partition
+- A second semantics bug was present in generic family rollout:
+  - when terminal reset was disabled, `env_info["terminal_t"]` was still passed into `policy_step_fn`
+  - this injected an all-zero terminal token into `first_policy_gradient` even though terminal was off
+- After fixing both bugs, the old auto-bypass skyline and the current terminal branch align again on the same true `256 MiB` line.
+
+Focused checks:
+
+- `partition_budget_respects_config_when_env_unset`
+- `partition_budget_env_override_wins`
+- `family_rollout_omits_terminal_token_when_terminal_disabled`
+- terminal-focused subset
+- `py_compile`
+
+Same-harness semantic comparison after the fix:
+
+| objective | commit | wall (s) | peak alloc (MiB) | peak reserved (MiB) | objective | reward mean | reward std |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| `first_policy_gradient` | `d974845` | 96.331 | 3207.932 | 3272.0 | 0.09917917 | 0.09917917 | 2.39829898 |
+| `first_policy_gradient` | `af774ab` | 98.823 | 3207.939 | 3272.0 | 0.09917917 | 0.09917917 | 2.39829898 |
+| `alpha_grad` | `d974845` | 129.577 | 3209.354 | 3308.0 | 3.17373276 | 0.09917917 | 2.39829898 |
+| `alpha_grad` | `af774ab` | 129.554 | 3209.361 | 3308.0 | 3.17373276 | 0.09917917 | 2.39829898 |
+
+Interpretation:
+
+- Under the true old auto-bypass skyline settings, current terminal-on-latest-skyline is now semantically aligned with the old skyline for both `first_policy_gradient` and `alpha_grad`.
+- The earlier apparent memory regression was not a new runtime cost that needed further compression; it was the partition-override bug.
+- Once the line is forced back to true `256 MiB`, the extra memory disappears, so there is no additional semantics-safe memory reduction to apply on this old-skyline compatibility path.
+- The current default `2 GiB` skyline remains a separate accepted speed-oriented line with intentionally different execution grouping and a different memory/time tradeoff.

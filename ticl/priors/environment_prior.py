@@ -1696,8 +1696,9 @@ class EnvironmentPrior:
         self.reference_scm_memory_guard_fraction = float(
             os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION", "0.25")
         )
+        reference_scm_partition_default = cfg.get("reference_scm_partition_max_bytes", 2 * 1024 * 1024 * 1024)
         reference_scm_partition_max_bytes = str(
-            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(2 * 1024 * 1024 * 1024))
+            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(reference_scm_partition_default))
         ).strip()
         try:
             self.reference_scm_partition_max_bytes = int(reference_scm_partition_max_bytes)
@@ -15297,8 +15298,11 @@ class EnvironmentPrior:
                                     action_src = action_t[:, :action_write_cap].detach()
                                     token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
 
-            if policy_accepts_reward_mask:
+            if terminal_token_enabled:
                 env_info["terminal_t"] = terminal_t.reshape(batch_size, 1)
+            else:
+                env_info.pop("terminal_t", None)
+            if policy_accepts_reward_mask:
                 policy_cuda_start = None
                 policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
@@ -15314,7 +15318,6 @@ class EnvironmentPrior:
                     env_info,
                 )
             else:
-                env_info["terminal_t"] = terminal_t.reshape(batch_size, 1)
                 policy_cuda_start = None
                 policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
