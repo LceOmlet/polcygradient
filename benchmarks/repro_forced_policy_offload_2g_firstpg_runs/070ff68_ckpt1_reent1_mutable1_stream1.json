@@ -1,0 +1,22 @@
+{
+  "label": "070ff68_ckpt1_reent1_mutable1_stream1",
+  "git_rev": "070ff68",
+  "target_repo": "/home/chen/RLPFN/worktrees/070ff68",
+  "status": "ok",
+  "returncode": -9,
+  "peak_gpu_process_mib": 2144,
+  "peak_gpu_total_mib": 2616,
+  "peak_rss_sum_gib": 6.835155487060547,
+  "log_path": "/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_ckpt1_reent1_mutable1_stream1.log",
+  "tbptt_stream": true,
+  "tbptt_window": 32,
+  "rollout_plus_loss_s": 129.64827013015747,
+  "backward_s": 0.0012652873992919922,
+  "wall_s": 129.64953541755676,
+  "streamed_root_count": 32,
+  "peak_alloc_mib": 2116.40869140625,
+  "peak_reserved_mib": 2164.0,
+  "objective": -0.05584552884101868,
+  "reward_mean": -0.05584552884101868,
+  "reward_std": 2.66933274269104
+}

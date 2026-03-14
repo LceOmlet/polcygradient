@@ -5860,7 +5860,7 @@ def test_environment_prior_terminal_reset_single_rollout_adds_bonus_and_resets_s
 
 def test_environment_prior_terminal_tail_event_from_signal_selects_two_sided_tails_from_history():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[-1.0], [-0.25], [0.25], [1.0]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[-2.0], [-0.25], [0.25], [2.0]], dtype=torch.float32)
     enabled = torch.tensor([True, True, True, True])
     reset_prob = torch.full((4,), 0.5, dtype=torch.float32)
     signal_history = torch.tensor(
@@ -5908,15 +5908,16 @@ def test_environment_prior_terminal_tail_event_from_signal_allows_zero_count():
     assert torch.equal(terminal_next, torch.tensor([False, False, False, False]))
 
 
-def test_environment_prior_terminal_tail_event_from_signal_randomized_boundary_avoids_forced_two_hits():
+def test_environment_prior_terminal_tail_event_from_signal_randomized_boundary_recovers_fractional_tail_count():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[-0.5], [0.5]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[0.5], [0.5]], dtype=torch.float32)
     enabled = torch.tensor([True, True])
-    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    reset_prob = torch.full((2,), 0.75, dtype=torch.float32)
     signal_history = torch.tensor(
         [
-            [-1.0, -1.0],
+            [0.0, 0.0],
             [1.0, 1.0],
+            [2.0, 2.0],
         ],
         dtype=torch.float32,
     )
@@ -5927,7 +5928,7 @@ def test_environment_prior_terminal_tail_event_from_signal_randomized_boundary_a
         reset_prob=reset_prob,
         terminal_draw=torch.tensor([0.2, 0.8], dtype=torch.float32),
         signal_history=signal_history,
-        history_length=2,
+        history_length=3,
     )
 
     assert torch.equal(terminal_next, torch.tensor([True, False]))
@@ -5935,7 +5936,7 @@ def test_environment_prior_terminal_tail_event_from_signal_randomized_boundary_a
 
 def test_environment_prior_terminal_tail_event_from_signal_uses_per_sample_history_not_batch():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[2.0], [2.0]], dtype=torch.float32)
     enabled = torch.tensor([True, True])
     reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
     signal_history = torch.tensor(
@@ -5958,27 +5959,31 @@ def test_environment_prior_terminal_tail_event_from_signal_uses_per_sample_histo
     assert torch.equal(terminal_next, torch.tensor([True, False]))
 
 
-def test_environment_prior_terminal_tail_event_from_signal_uses_batch_only_during_warmup():
+def test_environment_prior_terminal_tail_event_from_signal_does_not_trigger_before_history_resolution_is_sufficient():
     prior = EnvironmentPrior({})
-    terminal_signal = torch.tensor([[-0.5], [0.5]], dtype=torch.float32)
-    enabled = torch.tensor([True, True])
-    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
-    signal_history = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
+    terminal_signal = torch.tensor([[-10.0], [10.0]], dtype=torch.float32)
+    enabled = torch.tensor([True, True], dtype=torch.bool)
+    reset_prob = torch.full((2,), 0.2, dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [-1.0, -1.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
 
     terminal_next = prior._terminal_tail_event_from_signal(
         terminal_signal,
         enabled=enabled,
         reset_prob=reset_prob,
-        terminal_draw=torch.tensor([0.2, 0.8], dtype=torch.float32),
         signal_history=signal_history,
-        history_length=1,
-        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+        history_length=2,
     )
 
-    assert torch.equal(terminal_next, torch.tensor([True, False]))
+    assert torch.equal(terminal_next, torch.tensor([False, False]))
 
 
-def test_environment_prior_terminal_history_accumulates_during_batch_warmup_then_switches_to_sample_history():
+def test_environment_prior_terminal_history_accumulates_and_history_resolution_controls_activation():
     prior = EnvironmentPrior({})
     signal_history = torch.zeros((4, 2), dtype=torch.float32)
     reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
@@ -6004,8 +6009,6 @@ def test_environment_prior_terminal_history_accumulates_during_batch_warmup_then
             terminal_signal=signal_t,
             terminal_signal_history=signal_history,
             history_index=t,
-            history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
-            history_relaxed_mask=torch.ones((2,), dtype=torch.bool),
         )
 
     assert torch.equal(
@@ -6021,55 +6024,48 @@ def test_environment_prior_terminal_history_accumulates_during_batch_warmup_then
     )
 
     terminal_next = prior._terminal_tail_event_from_signal(
-        torch.tensor([[1.0], [1.0]], dtype=torch.float32),
+        torch.tensor([[2.0], [2.0]], dtype=torch.float32),
         enabled=enabled,
         reset_prob=reset_prob,
         signal_history=signal_history,
         history_length=3,
-        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
-        history_relaxed_mask=torch.ones((2,), dtype=torch.bool),
     )
 
     assert torch.equal(terminal_next, torch.tensor([True, False]))
 
 
-def test_environment_prior_terminal_tail_event_from_signal_requires_non_extreme_history_hit_before_relaxing():
+def test_environment_prior_terminal_tail_event_from_signal_uses_fractional_resolution_without_non_extreme_unlock():
     prior = EnvironmentPrior({})
-    enabled = torch.tensor([True], dtype=torch.bool)
-    reset_prob = torch.tensor([0.5], dtype=torch.float32)
-    history_relaxed = torch.tensor([False], dtype=torch.bool)
+    enabled = torch.tensor([True, True], dtype=torch.bool)
+    reset_prob = torch.full((2,), 0.75, dtype=torch.float32)
+    signal_history = torch.tensor(
+        [
+            [0.0, 0.0],
+            [1.0, 1.0],
+            [2.0, 2.0],
+        ],
+        dtype=torch.float32,
+    )
 
     terminal_next = prior._terminal_tail_event_from_signal(
-        torch.tensor([[3.0]], dtype=torch.float32),
+        torch.tensor([[0.5], [2.5]], dtype=torch.float32),
         enabled=enabled,
         reset_prob=reset_prob,
-        signal_history=torch.tensor([[0.0], [1.0], [2.0]], dtype=torch.float32),
+        terminal_draw=torch.tensor([0.4, 0.8], dtype=torch.float32),
+        signal_history=signal_history,
         history_length=3,
-        history_relaxed_mask=history_relaxed,
     )
-    assert torch.equal(terminal_next, torch.tensor([False]))
-    assert torch.equal(history_relaxed, torch.tensor([False]))
+    assert torch.equal(terminal_next, torch.tensor([True, True]))
 
     terminal_next = prior._terminal_tail_event_from_signal(
-        torch.tensor([[2.5]], dtype=torch.float32),
+        torch.tensor([[0.5], [2.5]], dtype=torch.float32),
         enabled=enabled,
         reset_prob=reset_prob,
-        signal_history=torch.tensor([[0.0], [1.0], [2.0], [3.0]], dtype=torch.float32),
-        history_length=4,
-        history_relaxed_mask=history_relaxed,
+        terminal_draw=torch.tensor([0.6, 0.8], dtype=torch.float32),
+        signal_history=signal_history,
+        history_length=3,
     )
-    assert torch.equal(terminal_next, torch.tensor([True]))
-    assert torch.equal(history_relaxed, torch.tensor([True]))
-
-    terminal_next = prior._terminal_tail_event_from_signal(
-        torch.tensor([[-1.0]], dtype=torch.float32),
-        enabled=enabled,
-        reset_prob=reset_prob,
-        signal_history=torch.tensor([[0.0], [1.0], [2.0], [3.0], [2.5]], dtype=torch.float32),
-        history_length=5,
-        history_relaxed_mask=history_relaxed,
-    )
-    assert torch.equal(terminal_next, torch.tensor([True]))
+    assert torch.equal(terminal_next, torch.tensor([False, True]))
 
 
 def test_environment_prior_terminal_history_is_detached_but_bonus_keeps_terminal_gradient():
@@ -6115,6 +6111,7 @@ def test_environment_prior_rollout_policy_gradient_loss_reports_terminal_count_s
     sampled[0]["action_noise_eval_std"] = 0.1
     prior = EnvironmentPrior(dict(get_prior_config()["prior"]["environment"], batch_parallel_backend="python_thread"))
     _install_constant_terminal_builders(prior, monkeypatch)
+    monkeypatch.setattr(prior, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
 
     loss, rollout, stats = prior.rollout_policy_gradient_loss(
         policy_step_fn=_zero_policy_step,
@@ -6205,6 +6202,30 @@ def _zero_policy_step(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx,
     return torch.zeros_like(action_t)
 
 
+def _zero_policy_step_with_grad(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+    del obs_t, reward_t, reward_mask_t, cache, step_idx, env_info
+    return action_t * 0.0
+
+
+def _always_terminal_tail_event_from_signal(
+    terminal_signal,
+    *,
+    enabled,
+    reset_prob,
+    terminal_draw=None,
+    signal_history=None,
+    history_length=0,
+    history_warmup_count=None,
+    history_relaxed_mask=None,
+    rms_eps=1e-6,
+):
+    del terminal_signal, reset_prob, terminal_draw, signal_history, history_length
+    del history_warmup_count, history_relaxed_mask, rms_eps
+    if torch.is_tensor(enabled):
+        return enabled.to(dtype=torch.bool)
+    return torch.as_tensor(enabled, dtype=torch.bool)
+
+
 def _make_terminal_sampled_h_list():
     specs = [
         dict(state_dim=3, obs_dim=2, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=2),
@@ -6253,6 +6274,8 @@ def test_environment_prior_rollout_with_policy_structure_grouping_matches_serial
     prior_vec = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="structure"))
     _install_constant_terminal_builders(prior_serial, monkeypatch)
     _install_constant_terminal_builders(prior_vec, monkeypatch)
+    monkeypatch.setattr(prior_serial, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
+    monkeypatch.setattr(prior_vec, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
     prior_serial._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
     prior_vec._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
 
@@ -6287,8 +6310,8 @@ def test_environment_prior_rollout_with_policy_structure_grouping_matches_serial
     assert torch.allclose(rollout_vec["rewards"], torch.full_like(rollout_vec["rewards"], expected_bonus), atol=1e-6, rtol=1e-6)
     assert torch.allclose(rollout_vec["x"][:, :, :2], torch.zeros_like(rollout_vec["x"][:, :, :2]), atol=1e-6, rtol=1e-6)
     terminal_col = int(sampled[0]["obs_slot_dim"]) + 2
-    assert torch.all(rollout_vec["x"][0, :, terminal_col] == 0.0)
-    assert torch.all(rollout_vec["x"][1:, :, terminal_col] == 1.0)
+    assert torch.all(rollout_vec["x"][:2, :, terminal_col] == 0.0)
+    assert torch.all(rollout_vec["x"][2:, :, terminal_col] == 1.0)
 
 
 def test_environment_prior_family_rollout_omits_terminal_token_when_terminal_disabled(monkeypatch):
@@ -6356,6 +6379,8 @@ def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_wi
     prior_vec = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
     _install_constant_terminal_builders(prior_serial, monkeypatch)
     _install_constant_terminal_builders(prior_vec, monkeypatch)
+    monkeypatch.setattr(prior_serial, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
+    monkeypatch.setattr(prior_vec, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
     prior_serial._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
     prior_vec._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
     prior_vec._sample_environment_family_coarse_batch = (
@@ -6397,8 +6422,8 @@ def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_wi
     assert torch.allclose(rollout_vec["rewards"], torch.full_like(rollout_vec["rewards"], expected_bonus), atol=1e-6, rtol=1e-6)
     assert torch.allclose(rollout_vec["x"][:, :, :2], torch.zeros_like(rollout_vec["x"][:, :, :2]), atol=1e-6, rtol=1e-6)
     terminal_col = int(sampled[0]["obs_slot_dim"]) + 2
-    assert torch.all(rollout_vec["x"][0, :, terminal_col] == 0.0)
-    assert torch.all(rollout_vec["x"][1:, :, terminal_col] == 1.0)
+    assert torch.all(rollout_vec["x"][:2, :, terminal_col] == 0.0)
+    assert torch.all(rollout_vec["x"][2:, :, terminal_col] == 1.0)
     assert isinstance(rollout_vec.get("terminal_stats", None), dict)
     assert float(rollout_vec["terminal_stats"]["terminal_count_mean"]) == 4.0
     assert float(rollout_vec["terminal_stats"]["terminal_count_min"]) == 4.0
@@ -6422,6 +6447,7 @@ def test_environment_prior_rollout_policy_gradient_loss_family_reports_terminal_
 
     prior = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
     _install_constant_terminal_builders(prior, monkeypatch)
+    monkeypatch.setattr(prior, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
     prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
     prior._sample_environment_family_coarse_batch = (
         lambda h_list, device, rng_seeds=None, **_: prior._sample_environment_batch(
@@ -6432,7 +6458,7 @@ def test_environment_prior_rollout_policy_gradient_loss_family_reports_terminal_
     )
 
     loss, rollout, stats = prior.rollout_policy_gradient_loss(
-        policy_step_fn=_zero_policy_step,
+        policy_step_fn=_zero_policy_step_with_grad,
         batch_size=4,
         n_samples=4,
         num_features=9,
@@ -6469,6 +6495,7 @@ def test_environment_prior_alpha_grad_family_tbptt_reports_terminal_count_stats(
 
     prior = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
     _install_constant_terminal_builders(prior, monkeypatch)
+    monkeypatch.setattr(prior, "_terminal_tail_event_from_signal", _always_terminal_tail_event_from_signal)
     prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
     prior._sample_environment_family_coarse_batch = (
         lambda h_list, device, rng_seeds=None, **_: prior._sample_environment_batch(
@@ -6479,7 +6506,7 @@ def test_environment_prior_alpha_grad_family_tbptt_reports_terminal_count_stats(
     )
 
     loss, rollout, stats = prior.rollout_policy_gradient_loss(
-        policy_step_fn=_zero_policy_step,
+        policy_step_fn=_zero_policy_step_with_grad,
         batch_size=4,
         n_samples=4,
         num_features=9,

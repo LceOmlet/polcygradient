@@ -1,0 +1,9 @@
+{
+  "label": "ckpt1_reent0_mutable0",
+  "status": "rss_guard_kill",
+  "returncode": -9,
+  "peak_gpu_process_mib": 2412,
+  "peak_gpu_total_mib": 2888,
+  "peak_rss_sum_gib": 6.9451141357421875,
+  "log_path": "/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/ckpt1_reent0_mutable0.log"
+}

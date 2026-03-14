@@ -1,0 +1,14 @@
+{
+  "label": "ckpt1_reent1_mutable1",
+  "status": "blocked_known_risky_combo",
+  "checkpoint": true,
+  "reentrant": true,
+  "mutable_kv": true,
+  "reasons": [
+    "known_direct_harness_gpu_blowup"
+  ],
+  "gpu_guard_mib": 5000,
+  "gpu_total_guard_mib": 6000,
+  "rss_guard_gb": 6.0,
+  "timeout_sec": 180
+}

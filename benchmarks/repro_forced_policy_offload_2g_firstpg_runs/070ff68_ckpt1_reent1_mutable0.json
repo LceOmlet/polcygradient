@@ -1,0 +1,11 @@
+{
+  "label": "070ff68_ckpt1_reent1_mutable0",
+  "git_rev": "070ff68",
+  "target_repo": "/home/chen/RLPFN/worktrees/070ff68",
+  "status": "gpu_guard_kill",
+  "returncode": -9,
+  "peak_gpu_process_mib": 5218,
+  "peak_gpu_total_mib": 5698,
+  "peak_rss_sum_gib": 1.6229705810546875,
+  "log_path": "/home/chen/RLPFN/ticl/benchmarks/repro_forced_policy_offload_2g_firstpg_runs/070ff68_ckpt1_reent1_mutable0.log"
+}
