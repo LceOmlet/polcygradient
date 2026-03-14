@@ -4884,49 +4884,6 @@ class EnvironmentPrior:
         prob_enabled = prob_t.reshape(-1).index_select(0, enabled_idx)
         signal_enabled = signal_t.reshape(-1).index_select(0, enabled_idx)
         terminal_enabled = torch.zeros_like(signal_enabled, dtype=torch.bool)
-
-        def _apply_batch_mode(mask):
-            idx = torch.nonzero(mask, as_tuple=False).reshape(-1)
-            if idx.numel() <= 0:
-                return
-            signal_batch = signal_enabled.index_select(0, idx)
-            prob_batch = prob_enabled.index_select(0, idx)
-            draw_batch = draw_enabled.index_select(0, idx)
-            rms_batch = torch.sqrt(torch.clamp(signal_batch.square().mean(), min=0.0))
-            rms_batch = torch.clamp(
-                rms_batch,
-                min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype),
-            )
-            signal_norm_batch = signal_batch / rms_batch
-            sorted_order = torch.argsort(signal_norm_batch, dim=0)
-            sorted_local_idx = idx.index_select(0, sorted_order)
-            n_enabled_local = int(sorted_local_idx.numel())
-            if n_enabled_local <= 0:
-                return
-            two_sided_q = torch.clamp(
-                prob_enabled.index_select(0, sorted_local_idx) * 0.5,
-                min=0.0,
-                max=0.5,
-            )
-            scaled = two_sided_q * float(n_enabled_local)
-            whole = torch.floor(scaled).to(dtype=torch.long)
-            frac = torch.clamp(
-                scaled - whole.to(dtype=signal_t.dtype),
-                min=0.0,
-                max=1.0,
-            )
-            ranks_from_low = torch.arange(n_enabled_local, device=signal_t.device, dtype=torch.long)
-            ranks_from_high = torch.flip(ranks_from_low, dims=[0])
-            draw_sorted = draw_enabled.index_select(0, sorted_local_idx)
-            lower_hit = (ranks_from_low < whole) | (
-                (ranks_from_low == whole) & (frac > 0.0) & (draw_sorted < frac)
-            )
-            upper_hit = (ranks_from_high < whole) | (
-                (ranks_from_high == whole) & (frac > 0.0) & (draw_sorted < frac)
-            )
-            terminal_enabled.index_copy_(0, sorted_local_idx, lower_hit | upper_hit)
-
-        use_history = torch.zeros_like(signal_enabled, dtype=torch.bool)
         if (signal_history is not None) and (history_len > 0):
             if not torch.is_tensor(history_t):
                 history_t = torch.as_tensor(history_t, device=signal_t.device, dtype=signal_t.dtype)
@@ -4942,76 +4899,75 @@ class EnvironmentPrior:
                 raise ValueError("signal_history batch dimension must match terminal_signal")
             history_t = history_t[:history_len]
             if history_t.shape[0] > 0:
-                if history_warmup_count is None:
-                    use_history = torch.ones_like(signal_enabled, dtype=torch.bool)
-                else:
-                    warmup_t = history_warmup_count
-                    if not torch.is_tensor(warmup_t):
-                        warmup_t = torch.as_tensor(warmup_t, device=signal_t.device, dtype=signal_t.dtype)
-                    else:
-                        warmup_t = warmup_t.to(device=signal_t.device, dtype=signal_t.dtype)
-                    if warmup_t.ndim > 0 and warmup_t.shape[-1] == 1:
-                        warmup_t = warmup_t.squeeze(-1)
-                    warmup_enabled = warmup_t.reshape(-1).index_select(0, enabled_idx)
-                    use_history = torch.as_tensor(
-                        history_len > warmup_enabled,
-                        device=signal_t.device,
-                        dtype=torch.bool,
-                    )
-                history_idx = torch.nonzero(use_history, as_tuple=False).reshape(-1)
-                if history_idx.numel() > 0:
-                    signal_hist = signal_enabled.index_select(0, history_idx)
-                    prob_hist = prob_enabled.index_select(0, history_idx)
+                hist_enabled = history_t.index_select(1, enabled_idx)
+                n_hist = int(hist_enabled.shape[0])
+                rms = torch.sqrt(torch.clamp(hist_enabled.square().mean(dim=0), min=0.0))
+                rms = torch.clamp(
+                    rms,
+                    min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype),
+                )
+                signal_norm = signal_enabled / rms
+                history_norm = hist_enabled / rms.unsqueeze(0)
+                sorted_history, _ = torch.sort(history_norm, dim=0)
+                tail_prob = torch.clamp(prob_enabled * 0.5, min=0.0, max=0.5)
+                tail_count_real = tail_prob * float(n_hist + 1)
+                tail_count_floor = torch.floor(tail_count_real).to(dtype=torch.long)
+                tail_count_frac = torch.clamp(
+                    tail_count_real - tail_count_floor.to(dtype=signal_t.dtype),
+                    min=0.0,
+                    max=1.0,
+                )
+                resolvable = tail_count_floor > 0
+                if bool(resolvable.any().item()):
+                    history_idx = torch.nonzero(resolvable, as_tuple=False).reshape(-1)
+                    signal_hist = signal_norm.index_select(0, history_idx)
                     draw_hist = draw_enabled.index_select(0, history_idx)
-                    hist_enabled = history_t.index_select(1, enabled_idx.index_select(0, history_idx))
-                    rms = torch.sqrt(torch.clamp(hist_enabled.square().mean(dim=0), min=0.0))
-                    rms = torch.clamp(
-                        rms,
-                        min=torch.as_tensor(rms_eps, device=signal_t.device, dtype=signal_t.dtype),
-                    )
-                    signal_norm = signal_hist / rms
-                    history_norm = hist_enabled / rms.unsqueeze(0)
-                    sorted_history, _ = torch.sort(history_norm, dim=0)
-                    q_lo = EnvironmentPrior._empirical_quantile_2d(sorted_history, prob_hist * 0.5)
-                    q_hi = EnvironmentPrior._empirical_quantile_2d(sorted_history, 1.0 - prob_hist * 0.5)
-                    lower_strict = signal_norm < q_lo
-                    upper_strict = signal_norm > q_hi
-                    lower_eq = signal_norm == q_lo
-                    upper_eq = signal_norm == q_hi
-                    lower_boundary = lower_eq & ~upper_eq & (draw_hist < (prob_hist * 0.5))
-                    upper_boundary = upper_eq & ~lower_eq & (draw_hist < (prob_hist * 0.5))
-                    both_boundary = lower_eq & upper_eq & (draw_hist < prob_hist)
-                    history_hit = lower_strict | upper_strict | lower_boundary | upper_boundary | both_boundary
-                    if history_relaxed_mask is not None:
-                        relaxed_t = history_relaxed_mask
-                        if not torch.is_tensor(relaxed_t):
-                            relaxed_t = torch.as_tensor(relaxed_t, device=signal_t.device, dtype=torch.bool)
-                        else:
-                            relaxed_t = relaxed_t.to(device=signal_t.device, dtype=torch.bool)
-                        relaxed_hist = relaxed_t.reshape(-1).index_select(
-                            0,
-                            enabled_idx.index_select(0, history_idx),
-                        )
-                        hist_min = history_norm.amin(dim=0)
-                        hist_max = history_norm.amax(dim=0)
-                        non_extreme_hit = history_hit & (signal_norm > hist_min) & (signal_norm < hist_max)
-                        allow_hist = history_hit & relaxed_hist
-                        unlock_hist = non_extreme_hit & ~relaxed_hist
-                        history_result = allow_hist | unlock_hist
-                        if bool(unlock_hist.any().item()):
-                            global_unlock_idx = enabled_idx.index_select(
-                                0,
-                                history_idx.index_select(0, torch.nonzero(unlock_hist, as_tuple=False).reshape(-1)),
-                            )
-                            relaxed_flat = relaxed_t.reshape(-1)
-                            relaxed_flat.index_fill_(0, global_unlock_idx, True)
-                    else:
-                        history_result = history_hit
-                    terminal_enabled.index_copy_(0, history_idx, history_result)
+                    tail_floor_hist = tail_count_floor.index_select(0, history_idx)
+                    tail_frac_hist = tail_count_frac.index_select(0, history_idx)
+                    sorted_hist = sorted_history.index_select(1, history_idx)
+                    cols = torch.arange(history_idx.numel(), device=signal_t.device, dtype=torch.long)
 
-        batch_mask = ~use_history
-        if bool(batch_mask.any().item()):
-            _apply_batch_mode(batch_mask)
+                    lower_cut = sorted_hist[tail_floor_hist - 1, cols]
+                    lower_strict = signal_hist < lower_cut
+                    lower_boundary = torch.zeros_like(lower_strict)
+                    has_lower_boundary = tail_floor_hist < n_hist
+                    if bool(has_lower_boundary.any().item()):
+                        hb_idx = torch.nonzero(has_lower_boundary, as_tuple=False).reshape(-1)
+                        next_lower_cut = sorted_hist[
+                            tail_floor_hist.index_select(0, hb_idx),
+                            cols.index_select(0, hb_idx),
+                        ]
+                        lower_boundary.index_copy_(
+                            0,
+                            hb_idx,
+                            (
+                                (signal_hist.index_select(0, hb_idx) >= lower_cut.index_select(0, hb_idx))
+                                & (signal_hist.index_select(0, hb_idx) < next_lower_cut)
+                                & (draw_hist.index_select(0, hb_idx) < tail_frac_hist.index_select(0, hb_idx))
+                            ),
+                        )
+
+                    upper_cut = sorted_hist[n_hist - tail_floor_hist, cols]
+                    upper_strict = signal_hist > upper_cut
+                    upper_boundary = torch.zeros_like(upper_strict)
+                    has_upper_boundary = tail_floor_hist < n_hist
+                    if bool(has_upper_boundary.any().item()):
+                        hb_idx = torch.nonzero(has_upper_boundary, as_tuple=False).reshape(-1)
+                        prev_upper_cut = sorted_hist[
+                            (n_hist - tail_floor_hist.index_select(0, hb_idx) - 1),
+                            cols.index_select(0, hb_idx),
+                        ]
+                        upper_boundary.index_copy_(
+                            0,
+                            hb_idx,
+                            (
+                                (signal_hist.index_select(0, hb_idx) <= upper_cut.index_select(0, hb_idx))
+                                & (signal_hist.index_select(0, hb_idx) > prev_upper_cut)
+                                & (draw_hist.index_select(0, hb_idx) < tail_frac_hist.index_select(0, hb_idx))
+                            ),
+                        )
+                    history_result = lower_strict | lower_boundary | upper_strict | upper_boundary
+                    terminal_enabled.index_copy_(0, history_idx, history_result)
         terminal_out = torch.zeros_like(signal_t.reshape(-1), dtype=torch.bool)
         terminal_out.index_copy_(0, enabled_idx, terminal_enabled)
         return terminal_out.reshape(signal_t.shape) & enabled_t
@@ -12782,9 +12738,10 @@ class EnvironmentPrior:
 
         token_reward_idx = obs_slot_dim
         token_mask_idx = obs_slot_dim + 1
-        token_terminal_idx = obs_slot_dim + 2
+        token_phase_idx = obs_slot_dim + 2
+        token_terminal_idx = obs_slot_dim + 3
         terminal_token_enabled = bool(torch.any(terminal_reset_enabled).item())
-        token_action_start = obs_slot_dim + (3 if terminal_token_enabled else 2)
+        token_action_start = obs_slot_dim + (4 if terminal_token_enabled else 3)
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
@@ -12805,6 +12762,8 @@ class EnvironmentPrior:
         env_action_start = env_layout["action_start"]
         env_noise_start = env_layout["noise_start"]
         state_input_scale = env.get("state_input_scale", 1.0)
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -12816,6 +12775,8 @@ class EnvironmentPrior:
                 token_row[:, token_reward_idx] = reward_t
             if token_mask_idx < num_features:
                 token_row[:, token_mask_idx] = reward_mask_t
+            if token_phase_idx < num_features:
+                token_row[:, token_phase_idx] = phase_eval_t.reshape(-1) if t >= single_eval_pos else phase_train_t.reshape(-1)
             if terminal_token_enabled and token_terminal_idx < num_features:
                 token_row[:, token_terminal_idx] = terminal_t
             if token_action_start < num_features and token_action_cap > 0:
@@ -13059,6 +13020,118 @@ class EnvironmentPrior:
                     detached["tail_frozen"] = True
             return detached
         return cache
+
+    @staticmethod
+    def _clone_policy_cache_with_grad(cache):
+        leaves = []
+
+        def _clone(node):
+            if node is None:
+                return None
+            if torch.is_tensor(node):
+                out = node.detach().clone()
+                if torch.is_floating_point(out):
+                    out.requires_grad_(True)
+                    leaves.append(out)
+                return out
+            if isinstance(node, list):
+                return [_clone(v) for v in node]
+            if isinstance(node, tuple):
+                return tuple(_clone(v) for v in node)
+            if isinstance(node, dict):
+                return {k: _clone(v) for k, v in node.items()}
+            return node
+
+        return _clone(cache), tuple(leaves)
+
+    @staticmethod
+    def _flatten_policy_cache_tensors(cache):
+        leaves = []
+
+        def _visit(node):
+            if node is None:
+                return
+            if torch.is_tensor(node):
+                if torch.is_floating_point(node):
+                    leaves.append(node)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    _visit(item)
+                return
+            if isinstance(node, tuple):
+                for item in node:
+                    _visit(item)
+                return
+            if isinstance(node, dict):
+                for item in node.values():
+                    _visit(item)
+                return
+
+        _visit(cache)
+        return tuple(leaves)
+
+    @staticmethod
+    def _alpha_tbptt_boundary_eta_from_loss(loss, boundary, cache_grad_targets):
+        grad_targets = (
+            boundary["state_t"],
+            boundary["action_t"],
+            boundary["reward_t"],
+            boundary["reward_mask_t"],
+            boundary["terminal_t"],
+        ) + tuple(cache_grad_targets)
+        grad_parts = torch.autograd.grad(
+            loss,
+            grad_targets,
+            retain_graph=True,
+            allow_unused=True,
+        )
+        state_grad = grad_parts[0] if grad_parts[0] is not None else torch.zeros_like(boundary["state_t"])
+        action_grad = grad_parts[1] if grad_parts[1] is not None else torch.zeros_like(boundary["action_t"])
+        reward_grad = grad_parts[2] if grad_parts[2] is not None else torch.zeros_like(boundary["reward_t"])
+        reward_mask_grad = (
+            grad_parts[3] if grad_parts[3] is not None else torch.zeros_like(boundary["reward_mask_t"])
+        )
+        terminal_grad = (
+            grad_parts[4] if grad_parts[4] is not None else torch.zeros_like(boundary["terminal_t"])
+        )
+        cache_grads = []
+        for grad_part, cache_target in zip(grad_parts[5:], cache_grad_targets):
+            cache_grads.append(
+                grad_part.detach() if grad_part is not None else torch.zeros_like(cache_target)
+            )
+        return {
+            "state_t": state_grad.detach(),
+            "action_t": action_grad.detach(),
+            "reward_t": reward_grad.detach(),
+            "reward_mask_t": reward_mask_grad.detach(),
+            "terminal_t": terminal_grad.detach(),
+            "cache_leaves": tuple(cache_grads),
+        }
+
+    @staticmethod
+    def _alpha_tbptt_bridge_loss_from_eta(boundary_out, boundary_eta):
+        if boundary_eta is None:
+            return None
+        bridge_loss = (
+            (boundary_out["state_t"] * boundary_eta["state_t"]).sum()
+            + (boundary_out["action_t"] * boundary_eta["action_t"]).sum()
+            + (boundary_out["reward_t"] * boundary_eta["reward_t"]).sum()
+            + (boundary_out["reward_mask_t"] * boundary_eta["reward_mask_t"]).sum()
+            + (boundary_out["terminal_t"] * boundary_eta["terminal_t"]).sum()
+        )
+        cache_out_leaves = EnvironmentPrior._flatten_policy_cache_tensors(boundary_out["cache"])
+        eta_cache_leaves = boundary_eta.get("cache_leaves", tuple())
+        if len(cache_out_leaves) != len(eta_cache_leaves):
+            raise RuntimeError(
+                "alpha TBPTT boundary replay cache leaf mismatch: "
+                f"{len(cache_out_leaves)} vs {len(eta_cache_leaves)}"
+            )
+        for cache_leaf, eta_leaf in zip(cache_out_leaves, eta_cache_leaves):
+            bridge_loss = bridge_loss + (
+                cache_leaf * eta_leaf.to(device=cache_leaf.device, dtype=cache_leaf.dtype)
+            ).sum()
+        return bridge_loss
 
     def _rollout_distinct_envs_vectorized_with_policy(
         self,
@@ -13544,9 +13617,10 @@ class EnvironmentPrior:
 
         token_reward_idx = obs_slot_dim
         token_mask_idx = obs_slot_dim + 1
-        token_terminal_idx = obs_slot_dim + 2
+        token_phase_idx = obs_slot_dim + 2
+        token_terminal_idx = obs_slot_dim + 3
         terminal_token_enabled = bool(torch.any(terminal_reset_enabled).item())
-        token_action_start = obs_slot_dim + (3 if terminal_token_enabled else 2)
+        token_action_start = obs_slot_dim + (4 if terminal_token_enabled else 3)
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
@@ -13567,6 +13641,8 @@ class EnvironmentPrior:
         env_action_start = env_layout["action_start"]
         env_noise_start = env_layout["noise_start"]
         state_input_scale = env.get("state_input_scale", 1.0)
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             if collect_x:
@@ -13580,6 +13656,10 @@ class EnvironmentPrior:
                         token_row[:, token_reward_idx] = reward_t.detach()
                     if token_mask_idx < num_features:
                         token_row[:, token_mask_idx] = reward_mask_t.detach()
+                    if token_phase_idx < num_features:
+                        token_row[:, token_phase_idx] = (
+                            phase_eval_t.reshape(-1) if t >= single_eval_pos else phase_train_t.reshape(-1)
+                        )
                     if terminal_token_enabled and token_terminal_idx < num_features:
                         token_row[:, token_terminal_idx] = terminal_t.detach()
                     if token_action_start < num_features and token_action_cap > 0:
@@ -13592,6 +13672,7 @@ class EnvironmentPrior:
                 policy_cuda_start = torch.cuda.Event(enable_timing=True)
                 policy_cuda_start.record()
             env["terminal_t"] = terminal_t.reshape(batch_size, 1)
+            env["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
             if policy_accepts_reward_mask:
                 policy_out = policy_step_fn(
                     obs_t,
@@ -15161,6 +15242,8 @@ class EnvironmentPrior:
         token_reward_cols = None
         token_mask_rows = None
         token_mask_cols = None
+        token_phase_rows = None
+        token_phase_cols = None
         token_action_write_cap = 0
         token_action_dst_rows = None
         token_action_dst_cols = None
@@ -15178,10 +15261,15 @@ class EnvironmentPrior:
             token_mask_cols = obs_slot_dims + 1
             token_mask_rows = torch.nonzero(token_mask_cols < num_features, as_tuple=False).squeeze(1)
 
+            token_phase_cols = obs_slot_dims + 2
+            token_phase_rows = torch.nonzero(token_phase_cols < num_features, as_tuple=False).squeeze(1)
+
             token_action_write_cap = int(min(max_action_dim, num_features))
             if token_action_write_cap > 0:
                 action_positions = torch.arange(token_action_write_cap, device=device, dtype=torch.long).unsqueeze(0)
-                action_start = (obs_slot_dims + 2).unsqueeze(1)
+                action_start = (
+                    obs_slot_dims + 2 + int(terminal_token_enabled) + 1
+                ).unsqueeze(1)
                 action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
                 token_action_cols = action_start + action_positions
                 token_action_valid = (action_positions < action_cap) & (token_action_cols < num_features)
@@ -15201,6 +15289,8 @@ class EnvironmentPrior:
             if terminal_token_enabled
             else None
         )
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
 
         def _accumulate_gp_projection_profile(fn_obj):
             nonlocal transition_gp_first_projection_wall_s
@@ -15257,6 +15347,16 @@ class EnvironmentPrior:
                                     reward_mask_t[token_mask_rows].detach()
                                 )
 
+                            if token_phase_rows is not None and token_phase_rows.numel() > 0:
+                                phase_src = (
+                                    phase_eval_t.reshape(-1)
+                                    if t >= single_eval_pos
+                                    else phase_train_t.reshape(-1)
+                                )
+                                token_row[token_phase_rows, token_phase_cols[token_phase_rows]] = (
+                                    phase_src[token_phase_rows]
+                                )
+
                             if token_action_dst_rows is not None:
                                 action_src = action_t[:, :token_action_write_cap].detach()
                                 token_row[token_action_dst_rows, token_action_dst_cols] = action_src[
@@ -15281,15 +15381,25 @@ class EnvironmentPrior:
                             if mask_rows.numel() > 0:
                                 token_row[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
 
+                            phase_cols = obs_slot_dims + 2
+                            phase_rows = torch.nonzero(phase_cols < num_features, as_tuple=False).squeeze(1)
+                            if phase_rows.numel() > 0:
+                                phase_src = (
+                                    phase_eval_t.reshape(-1)
+                                    if t >= single_eval_pos
+                                    else phase_train_t.reshape(-1)
+                                )
+                                token_row[phase_rows, phase_cols[phase_rows]] = phase_src[phase_rows]
+
                             action_write_cap = min(max_action_dim, num_features)
                             if action_write_cap > 0:
                                 action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
                                 if terminal_token_enabled:
-                                    terminal_cols = obs_slot_dims + 2
+                                    terminal_cols = obs_slot_dims + 3
                                     terminal_rows = torch.nonzero(terminal_cols < num_features, as_tuple=False).squeeze(1)
                                     if terminal_rows.numel() > 0:
                                         token_row[terminal_rows, terminal_cols[terminal_rows]] = terminal_t[terminal_rows].detach()
-                                action_start = (obs_slot_dims + (3 if terminal_token_enabled else 2)).unsqueeze(1)
+                                action_start = (obs_slot_dims + (4 if terminal_token_enabled else 3)).unsqueeze(1)
                                 action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
                                 action_cols = action_start + action_positions
                                 action_valid = (action_positions < action_cap) & (action_cols < num_features)
@@ -15302,6 +15412,7 @@ class EnvironmentPrior:
                 env_info["terminal_t"] = terminal_t.reshape(batch_size, 1)
             else:
                 env_info.pop("terminal_t", None)
+            env_info["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
             if policy_accepts_reward_mask:
                 policy_cuda_start = None
                 policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
@@ -16630,8 +16741,9 @@ class EnvironmentPrior:
         use_fast_env_in = policy_step_fn is None
         token_reward_idx = obs_slot_dim
         token_mask_idx = obs_slot_dim + 1
-        token_terminal_idx = obs_slot_dim + 2
-        token_action_start = obs_slot_dim + (3 if bool(env.get("terminal_reset_enabled", False)) else 2)
+        token_phase_idx = obs_slot_dim + 2
+        token_terminal_idx = obs_slot_dim + 3
+        token_action_start = obs_slot_dim + (4 if bool(env.get("terminal_reset_enabled", False)) else 3)
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
 
@@ -16714,6 +16826,8 @@ class EnvironmentPrior:
             if terminal_reset_enabled
             else None
         )
+        phase_train_t = torch.zeros((1, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((1, 1), device=device, dtype=torch.float32)
 
         for t in range(n_samples):
             obs_t = state_t[:obs_dim]  # observable subset of state
@@ -16728,6 +16842,10 @@ class EnvironmentPrior:
                         token_row[token_reward_idx] = reward_t.detach()
                     if token_mask_idx < num_features:
                         token_row[token_mask_idx] = reward_mask_t.detach()
+                    if token_phase_idx < num_features:
+                        token_row[token_phase_idx] = (
+                            phase_eval_t.reshape(-1)[0] if t >= single_eval_pos else phase_train_t.reshape(-1)[0]
+                        )
                     if terminal_reset_enabled and token_terminal_idx < num_features:
                         token_row[token_terminal_idx] = terminal_t.detach()
                     if token_action_start < num_features and token_action_cap > 0:
@@ -16761,6 +16879,7 @@ class EnvironmentPrior:
             else:
                 if policy_accepts_reward_mask:
                     env["terminal_t"] = terminal_t.reshape(1, 1)
+                    env["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
                     policy_out = policy_step_fn(
                         obs_t.unsqueeze(0),
                         action_t.unsqueeze(0),
@@ -16772,6 +16891,7 @@ class EnvironmentPrior:
                     )
                 else:
                     env["terminal_t"] = terminal_t.reshape(1, 1)
+                    env["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
                     policy_out = policy_step_fn(
                         obs_t.unsqueeze(0),
                         action_t.unsqueeze(0),
@@ -17666,9 +17786,10 @@ class EnvironmentPrior:
 
         token_reward_idx = obs_slot_dim
         token_mask_idx = obs_slot_dim + 1
-        token_terminal_idx = obs_slot_dim + 2
+        token_phase_idx = obs_slot_dim + 2
+        token_terminal_idx = obs_slot_dim + 3
         terminal_token_enabled = bool(torch.any(terminal_reset_enabled).item())
-        token_action_start = obs_slot_dim + (3 if terminal_token_enabled else 2)
+        token_action_start = obs_slot_dim + (4 if terminal_token_enabled else 3)
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
@@ -17693,6 +17814,8 @@ class EnvironmentPrior:
             reward_clip = reward_clip.to(device=device, dtype=torch.float32)
         state_clip = env["state_clip"].to(device=device, dtype=torch.float32) if torch.is_tensor(env["state_clip"]) else torch.full((batch_size,), float(env["state_clip"]), device=device, dtype=torch.float32)
         state_input_scale = env.get("state_input_scale", 1.0)
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
@@ -17704,6 +17827,10 @@ class EnvironmentPrior:
                 token_row[:, token_reward_idx] = reward_t
             if token_mask_idx < num_features:
                 token_row[:, token_mask_idx] = reward_mask_t
+            if token_phase_idx < num_features:
+                token_row[:, token_phase_idx] = (
+                    phase_eval_t.reshape(-1) if t >= single_eval_pos else phase_train_t.reshape(-1)
+                )
             if terminal_token_enabled and token_terminal_idx < num_features:
                 token_row[:, token_terminal_idx] = terminal_t
             if token_action_start < num_features and token_action_cap > 0:
@@ -20593,44 +20720,125 @@ class EnvironmentPrior:
         first_pg_action_grad_clip_norm = self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
         action_transform_mode = env_info.get("reinforce_action_transform", "rms")
         action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
-        sample_action = True
-        collect_log_probs = True
-        collect_log_prob_score = True
+        total_eval_steps = int(max(0, n_samples - int(single_eval_pos)))
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
+        bridge_replay_count = 0
+        eval_window_count = 0
+        eval_step_count_total = 0
 
-        for window_start in range(0, n_samples, tbptt_window_size):
-            window_end = min(n_samples, window_start + tbptt_window_size)
+        def _snapshot_boundary(state_in, action_in, reward_in, reward_mask_in, terminal_in, cache_in):
+            return {
+                "state_t": state_in.detach().clone(),
+                "action_t": action_in.detach().clone(),
+                "reward_t": reward_in.detach().clone(),
+                "reward_mask_t": reward_mask_in.detach().clone(),
+                "terminal_t": terminal_in.detach().clone(),
+                "cache": self._detach_policy_cache(cache_in, clone_tensors=True),
+            }
+
+        def _prepare_boundary(boundary, *, requires_grad_boundary):
+            state_in = boundary["state_t"].detach().clone()
+            action_in = boundary["action_t"].detach().clone()
+            reward_in = boundary["reward_t"].detach().clone()
+            reward_mask_in = boundary["reward_mask_t"].detach().clone()
+            terminal_in = boundary["terminal_t"].detach().clone()
+            if requires_grad_boundary:
+                state_in.requires_grad_(True)
+                action_in.requires_grad_(True)
+                reward_in.requires_grad_(True)
+                reward_mask_in.requires_grad_(True)
+                terminal_in.requires_grad_(True)
+                cache_in, cache_grad_targets = self._clone_policy_cache_with_grad(boundary["cache"])
+            else:
+                cache_in = self._detach_policy_cache(boundary["cache"], clone_tensors=True)
+                cache_grad_targets = tuple()
+            return {
+                "state_t": state_in,
+                "action_t": action_in,
+                "reward_t": reward_in,
+                "reward_mask_t": reward_mask_in,
+                "terminal_t": terminal_in,
+                "cache": cache_in,
+                "cache_grad_targets": cache_grad_targets,
+            }
+
+        def _run_window_from_boundary(
+            boundary_start,
+            *,
+            window_start,
+            window_end,
+            compute_local_alpha,
+            compute_boundary_eta,
+            bridge_eta=None,
+        ):
+            nonlocal noise_block_start, noise_block_end
+            nonlocal transition_noise_block, action_noise_train_block, action_noise_eval_block
+            nonlocal state_noise_block, dropout_draws_block
+            boundary = _prepare_boundary(boundary_start, requires_grad_boundary=bool(compute_boundary_eta))
+            state_local = boundary["state_t"]
+            action_local = boundary["action_t"]
+            reward_local = boundary["reward_t"]
+            reward_mask_local = boundary["reward_mask_t"]
+            terminal_local = boundary["terminal_t"]
+            cache_local = boundary["cache"]
+            replay_mode = bridge_eta is not None
+            terminal_signal_history_local = (
+                terminal_signal_history
+                if (terminal_signal_history is None or not replay_mode)
+                else terminal_signal_history.clone()
+            )
+            terminal_history_relaxed_local = (
+                terminal_history_relaxed
+                if (terminal_history_relaxed is None or not replay_mode)
+                else terminal_history_relaxed.clone()
+            )
+            terminal_count_local = terminal_count_realized if not replay_mode else terminal_count_realized.clone()
+            noise_snapshot = None
+            if replay_mode and noise_streaming_mode:
+                noise_snapshot = (
+                    int(noise_block_start),
+                    int(noise_block_end),
+                    transition_noise_block,
+                    action_noise_train_block,
+                    action_noise_eval_block,
+                    state_noise_block,
+                    dropout_draws_block,
+                )
             reward_buffer = []
             log_prob_buffer = []
             log_prob_score_buffer = []
             action_mean_buffer = []
             action_mask_buffer = []
+
             for t in range(window_start, window_end):
                 if terminal_token_enabled:
-                    env_info["terminal_t"] = terminal_t.reshape(batch_size, 1)
+                    env_info["terminal_t"] = terminal_local.reshape(batch_size, 1)
                 else:
                     env_info.pop("terminal_t", None)
-                obs_t = state_t[:, :max_obs_dim] * obs_mask
+                env_info["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
+                obs_t = state_local[:, :max_obs_dim] * obs_mask
                 if policy_accepts_reward_mask:
                     policy_out = policy_step_fn(
                         obs_t,
-                        action_t,
-                        reward_t.reshape(batch_size, 1),
-                        reward_mask_t.reshape(batch_size, 1),
-                        cache,
+                        action_local,
+                        reward_local.reshape(batch_size, 1),
+                        reward_mask_local.reshape(batch_size, 1),
+                        cache_local,
                         t,
                         env_info,
                     )
                 else:
                     policy_out = policy_step_fn(
                         obs_t,
-                        action_t,
-                        reward_t.reshape(batch_size, 1),
-                        cache,
+                        action_local,
+                        reward_local.reshape(batch_size, 1),
+                        cache_local,
                         t,
                         env_info,
                     )
                 if isinstance(policy_out, tuple):
-                    action_next, cache = policy_out
+                    action_next, cache_local = policy_out
                 else:
                     action_next = policy_out
                 if action_next.ndim == 1:
@@ -20644,8 +20852,6 @@ class EnvironmentPrior:
                         f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
                     )
                 action_mean = action_next
-                action_mean_buffer.append(action_mean)
-                action_mask_buffer.append(action_mask_bool)
 
                 noise_block_idx = None
                 if noise_streaming_mode:
@@ -20726,12 +20932,12 @@ class EnvironmentPrior:
                     action_dim_g = int(group["action_dim"])
                     noise_dim_g = int(group["noise_dim"])
                     if group_slice is None:
-                        state_in = state_t.index_select(0, group_indices)[:, :state_dim_g]
+                        state_in = state_local.index_select(0, group_indices)[:, :state_dim_g]
                         obs_in = obs_t.index_select(0, group_indices)[:, :obs_dim_g]
                         action_in = action_env.index_select(0, group_indices)[:, :action_dim_g]
                         noise_in = noise_t.index_select(0, group_indices)[:, :noise_dim_g]
                     else:
-                        state_in = state_t[group_slice, :state_dim_g]
+                        state_in = state_local[group_slice, :state_dim_g]
                         obs_in = obs_t[group_slice, :obs_dim_g]
                         action_in = action_env[group_slice, :action_dim_g]
                         noise_in = noise_t[group_slice, :noise_dim_g]
@@ -20866,7 +21072,7 @@ class EnvironmentPrior:
                 if not bool(reference_semantics.all().item()):
                     state_next_post = self._apply_state_postprocess(
                         state_next_raw=state_next,
-                        state_prev=state_t,
+                        state_prev=state_local,
                         state_clip=state_clip,
                         state_highway_enabled=state_highway_enabled,
                         state_highway_lambda=state_highway_lambda,
@@ -20892,10 +21098,10 @@ class EnvironmentPrior:
                         enabled=terminal_reset_enabled,
                         terminal_signal=terminal_signal_next,
                         terminal_bonus_base=terminal_bonus_base_next,
-                        terminal_signal_history=terminal_signal_history,
+                        terminal_signal_history=terminal_signal_history_local,
                         history_index=t,
                         history_warmup_count=terminal_reset_count_target,
-                        history_relaxed_mask=terminal_history_relaxed,
+                        history_relaxed_mask=terminal_history_relaxed_local,
                     )
                 else:
                     terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -20906,148 +21112,244 @@ class EnvironmentPrior:
                         max_norm=first_pg_state_grad_clip_norm,
                     )
                 if terminal_token_enabled:
-                    terminal_count_realized = terminal_count_realized + terminal_next.to(dtype=torch.float32)
+                    terminal_count_local = terminal_count_local + terminal_next.to(dtype=torch.float32)
                 action_next = action_next * action_mask
-                reward_buffer.append(reward_next)
-                log_prob_buffer.append(reinforce_log_prob_t)
-                log_prob_score_buffer.append(reinforce_log_prob_score_t)
-                state_t = state_next
-                action_t = action_env
-                reward_t = reward_next
-                reward_mask_t = reward_mask_next
-                terminal_t = terminal_next
+                if t >= single_eval_pos:
+                    reward_buffer.append(reward_next)
+                    log_prob_buffer.append(reinforce_log_prob_t)
+                    log_prob_score_buffer.append(reinforce_log_prob_score_t)
+                    action_mean_buffer.append(action_mean)
+                    action_mask_buffer.append(action_mask_bool)
+                state_local = state_next
+                action_local = action_env
+                reward_local = reward_next
+                reward_mask_local = reward_mask_next
+                terminal_local = terminal_next
 
-            rewards_window = torch.stack(reward_buffer, dim=0)
-            log_probs_window = torch.stack(log_prob_buffer, dim=0)
-            log_prob_score_window = torch.stack(log_prob_score_buffer, dim=0)
-            action_mean_roots = tuple(action_mean_buffer)
-            action_mask_window = torch.stack(action_mask_buffer, dim=0)
-            if needs_unpermute:
-                rewards_window = rewards_window.index_select(1, inv_perm)
-                log_probs_window = log_probs_window.index_select(1, inv_perm)
-                log_prob_score_window = log_prob_score_window.index_select(1, inv_perm)
-                action_mask_window = action_mask_window.index_select(1, inv_perm)
-                action_mean_roots = tuple(root.index_select(0, inv_perm) for root in action_mean_roots)
+            boundary_out = {
+                "state_t": state_local,
+                "action_t": action_local,
+                "reward_t": reward_local,
+                "reward_mask_t": reward_mask_local,
+                "terminal_t": terminal_local,
+                "cache": cache_local,
+            }
+            weighted_local_loss = None
+            stats_window = None
+            boundary_eta = None
+            rewards_window_det = None
+            window_weight = 0.0
+            eval_step_count = len(reward_buffer)
+            if compute_local_alpha and eval_step_count > 0:
+                rewards_window = torch.stack(reward_buffer, dim=0)
+                log_probs_window = torch.stack(log_prob_buffer, dim=0)
+                log_prob_score_window = torch.stack(log_prob_score_buffer, dim=0)
+                action_mean_roots = tuple(action_mean_buffer)
+                action_mask_window = torch.stack(action_mask_buffer, dim=0)
+                if needs_unpermute:
+                    rewards_window = rewards_window.index_select(1, inv_perm)
+                    log_probs_window = log_probs_window.index_select(1, inv_perm)
+                    log_prob_score_window = log_prob_score_window.index_select(1, inv_perm)
+                    action_mask_window = action_mask_window.index_select(1, inv_perm)
+                    action_mean_roots = tuple(root.index_select(0, inv_perm) for root in action_mean_roots)
 
-            loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
-                rewards=rewards_window,
-                log_probs=log_probs_window,
-                action_mean=action_mean_roots,
-                action_mask=action_mask_window,
-                log_prob_score=log_prob_score_window,
-                discount=discount,
+                loss_window, stats_window = self.alpha_grad_loss_from_rollout_tensors(
+                    rewards=rewards_window,
+                    log_probs=log_probs_window,
+                    action_mean=action_mean_roots,
+                    action_mask=action_mask_window,
+                    log_prob_score=log_prob_score_window,
+                    discount=discount,
+                )
+                window_weight = float(eval_step_count) / float(max(1, total_eval_steps))
+                weighted_local_loss = loss_window * window_weight
+                rewards_window_det = rewards_window.detach()
+                if compute_boundary_eta:
+                    boundary_eta = self._alpha_tbptt_boundary_eta_from_loss(
+                        weighted_local_loss,
+                        boundary,
+                        boundary["cache_grad_targets"],
+                    )
+
+            bridge_loss = self._alpha_tbptt_bridge_loss_from_eta(boundary_out, bridge_eta)
+            if noise_snapshot is not None:
+                (
+                    noise_block_start,
+                    noise_block_end,
+                    transition_noise_block,
+                    action_noise_train_block,
+                    action_noise_eval_block,
+                    state_noise_block,
+                    dropout_draws_block,
+                ) = noise_snapshot
+            return {
+                "weighted_local_loss": weighted_local_loss,
+                "stats_window": stats_window,
+                "window_weight": window_weight,
+                "eval_step_count": eval_step_count,
+                "boundary_eta": boundary_eta,
+                "boundary_out": boundary_out,
+                "rewards_window_det": rewards_window_det,
+                "bridge_loss": bridge_loss,
+                "terminal_count_realized": terminal_count_local,
+            }
+
+        prev_window_boundary = None
+        prev_window_range = None
+
+        for window_start in range(0, n_samples, tbptt_window_size):
+            window_end = min(n_samples, window_start + tbptt_window_size)
+            current_window_boundary = _snapshot_boundary(
+                state_t,
+                action_t,
+                reward_t,
+                reward_mask_t,
+                terminal_t,
+                cache,
             )
-            window_weight = float(window_end - window_start) / float(max(1, n_samples))
-            weighted_loss = loss_window * window_weight
-            if tbptt_loss_sink is None:
-                weighted_losses.append(weighted_loss)
-            else:
-                tbptt_loss_sink(weighted_loss)
-
-            objective_term = stats_window["objective"].detach() * float(window_weight)
-            objective_accum = objective_term if objective_accum is None else (objective_accum + objective_term)
-            total_weight += float(window_weight)
-
-            rewards_det = rewards_window.detach().to(dtype=torch.float64)
-            reward_sum = rewards_det.sum() if reward_sum is None else (reward_sum + rewards_det.sum())
-            reward_sumsq = (
-                (rewards_det * rewards_det).sum()
-                if reward_sumsq is None
-                else (reward_sumsq + (rewards_det * rewards_det).sum())
+            compute_local_alpha = bool(window_end > single_eval_pos)
+            current_result = _run_window_from_boundary(
+                current_window_boundary,
+                window_start=window_start,
+                window_end=window_end,
+                compute_local_alpha=compute_local_alpha,
+                compute_boundary_eta=compute_local_alpha,
+                bridge_eta=None,
             )
-            reward_count += int(rewards_det.numel())
-            reward_min_w = stats_window.get("reward_min", None)
-            if reward_min_w is not None:
-                reward_min_w = reward_min_w.detach()
-                reward_min_accum = reward_min_w if reward_min_accum is None else torch.minimum(reward_min_accum, reward_min_w)
-            reward_max_w = stats_window.get("reward_max", None)
-            if reward_max_w is not None:
-                reward_max_w = reward_max_w.detach()
-                reward_max_accum = reward_max_w if reward_max_accum is None else torch.maximum(reward_max_accum, reward_max_w)
-            reward_absmax_w = stats_window.get("reward_abs_max", None)
-            if reward_absmax_w is not None:
-                reward_absmax_w = reward_absmax_w.detach()
-                reward_absmax_accum = reward_absmax_w if reward_absmax_accum is None else torch.maximum(reward_absmax_accum, reward_absmax_w)
-            reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
-            if reward_clip_hit_w is not None:
-                reward_clip_hit_w = reward_clip_hit_w.detach() * float(window_weight)
-                reward_clip_hit_accum = (
-                    reward_clip_hit_w
-                    if reward_clip_hit_accum is None
-                    else (reward_clip_hit_accum + reward_clip_hit_w)
-                )
-            reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
-            if reward_norm_clip_hit_w is not None:
-                reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * float(window_weight)
-                reward_norm_clip_hit_accum = (
-                    reward_norm_clip_hit_w
-                    if reward_norm_clip_hit_accum is None
-                    else (reward_norm_clip_hit_accum + reward_norm_clip_hit_w)
-                )
-            reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
-            if reward_nonfinite_share_w is not None:
-                reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * float(window_weight)
-                reward_nonfinite_share_accum = (
-                    reward_nonfinite_share_w
-                    if reward_nonfinite_share_accum is None
-                    else (reward_nonfinite_share_accum + reward_nonfinite_share_w)
-                )
-            reward_nan_share_w = stats_window.get("reward_nan_share", None)
-            if reward_nan_share_w is not None:
-                reward_nan_share_w = reward_nan_share_w.detach() * float(window_weight)
-                reward_nan_share_accum = (
-                    reward_nan_share_w
-                    if reward_nan_share_accum is None
-                    else (reward_nan_share_accum + reward_nan_share_w)
-                )
-            reward_inf_share_w = stats_window.get("reward_inf_share", None)
-            if reward_inf_share_w is not None:
-                reward_inf_share_w = reward_inf_share_w.detach() * float(window_weight)
-                reward_inf_share_accum = (
-                    reward_inf_share_w
-                    if reward_inf_share_accum is None
-                    else (reward_inf_share_accum + reward_inf_share_w)
-                )
-            reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
-            if reinforce_return_nonfinite_share_w is not None:
-                reinforce_return_nonfinite_share_w = (
-                    reinforce_return_nonfinite_share_w.detach() * float(window_weight)
-                )
-                reinforce_return_nonfinite_share_accum = (
-                    reinforce_return_nonfinite_share_w
-                    if reinforce_return_nonfinite_share_accum is None
-                    else (reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w)
-                )
-            reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
-            if reinforce_log_prob_nonfinite_share_w is not None:
-                reinforce_log_prob_nonfinite_share_w = (
-                    reinforce_log_prob_nonfinite_share_w.detach() * float(window_weight)
-                )
-                reinforce_log_prob_nonfinite_share_accum = (
-                    reinforce_log_prob_nonfinite_share_w
-                    if reinforce_log_prob_nonfinite_share_accum is None
-                    else (reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w)
-                )
-            reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
-            if reinforce_adv_nonfinite_share_w is not None:
-                reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * float(window_weight)
-                reinforce_adv_nonfinite_share_accum = (
-                    reinforce_adv_nonfinite_share_w
-                    if reinforce_adv_nonfinite_share_accum is None
-                    else (reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w)
-                )
 
-            if stored_reward_windows is not None:
-                stored_reward_windows.append(rewards_window.detach())
+            if prev_window_boundary is not None and current_result["boundary_eta"] is not None:
+                bridge_result = _run_window_from_boundary(
+                    prev_window_boundary,
+                    window_start=int(prev_window_range[0]),
+                    window_end=int(prev_window_range[1]),
+                    compute_local_alpha=False,
+                    compute_boundary_eta=False,
+                    bridge_eta=current_result["boundary_eta"],
+                )
+                if bridge_result["bridge_loss"] is not None:
+                    if tbptt_loss_sink is None:
+                        weighted_losses.append(bridge_result["bridge_loss"])
+                    else:
+                        tbptt_loss_sink(bridge_result["bridge_loss"])
+                    bridge_replay_count += 1
 
-            if window_end < n_samples:
-                state_t = state_t.detach()
-                action_t = action_t.detach()
-                reward_t = reward_t.detach()
-                reward_mask_t = reward_mask_t.detach()
-                for group in transition_groups:
-                    group["env_in"] = group["env_in"].detach()
-                cache = self._detach_policy_cache(cache, clone_tensors=(tbptt_loss_sink is None))
+            weighted_local_loss = current_result["weighted_local_loss"]
+            stats_window = current_result["stats_window"]
+            window_weight = float(current_result["window_weight"])
+            if weighted_local_loss is not None:
+                if tbptt_loss_sink is None:
+                    weighted_losses.append(weighted_local_loss)
+                else:
+                    tbptt_loss_sink(weighted_local_loss)
+
+                objective_term = stats_window["objective"].detach() * window_weight
+                objective_accum = objective_term if objective_accum is None else (objective_accum + objective_term)
+                total_weight += window_weight
+                eval_window_count += 1
+                eval_step_count_total += int(current_result["eval_step_count"])
+
+                rewards_det = current_result["rewards_window_det"].to(dtype=torch.float64)
+                reward_sum = rewards_det.sum() if reward_sum is None else (reward_sum + rewards_det.sum())
+                reward_sumsq = (
+                    (rewards_det * rewards_det).sum()
+                    if reward_sumsq is None
+                    else (reward_sumsq + (rewards_det * rewards_det).sum())
+                )
+                reward_count += int(rewards_det.numel())
+                reward_min_w = stats_window.get("reward_min", None)
+                if reward_min_w is not None:
+                    reward_min_w = reward_min_w.detach()
+                    reward_min_accum = reward_min_w if reward_min_accum is None else torch.minimum(reward_min_accum, reward_min_w)
+                reward_max_w = stats_window.get("reward_max", None)
+                if reward_max_w is not None:
+                    reward_max_w = reward_max_w.detach()
+                    reward_max_accum = reward_max_w if reward_max_accum is None else torch.maximum(reward_max_accum, reward_max_w)
+                reward_absmax_w = stats_window.get("reward_abs_max", None)
+                if reward_absmax_w is not None:
+                    reward_absmax_w = reward_absmax_w.detach()
+                    reward_absmax_accum = reward_absmax_w if reward_absmax_accum is None else torch.maximum(reward_absmax_accum, reward_absmax_w)
+                reward_clip_hit_w = stats_window.get("reward_clip_hit_share", None)
+                if reward_clip_hit_w is not None:
+                    reward_clip_hit_w = reward_clip_hit_w.detach() * window_weight
+                    reward_clip_hit_accum = (
+                        reward_clip_hit_w
+                        if reward_clip_hit_accum is None
+                        else (reward_clip_hit_accum + reward_clip_hit_w)
+                    )
+                reward_norm_clip_hit_w = stats_window.get("reward_norm_clip_hit_share", None)
+                if reward_norm_clip_hit_w is not None:
+                    reward_norm_clip_hit_w = reward_norm_clip_hit_w.detach() * window_weight
+                    reward_norm_clip_hit_accum = (
+                        reward_norm_clip_hit_w
+                        if reward_norm_clip_hit_accum is None
+                        else (reward_norm_clip_hit_accum + reward_norm_clip_hit_w)
+                    )
+                reward_nonfinite_share_w = stats_window.get("reward_nonfinite_share", None)
+                if reward_nonfinite_share_w is not None:
+                    reward_nonfinite_share_w = reward_nonfinite_share_w.detach() * window_weight
+                    reward_nonfinite_share_accum = (
+                        reward_nonfinite_share_w
+                        if reward_nonfinite_share_accum is None
+                        else (reward_nonfinite_share_accum + reward_nonfinite_share_w)
+                    )
+                reward_nan_share_w = stats_window.get("reward_nan_share", None)
+                if reward_nan_share_w is not None:
+                    reward_nan_share_w = reward_nan_share_w.detach() * window_weight
+                    reward_nan_share_accum = (
+                        reward_nan_share_w
+                        if reward_nan_share_accum is None
+                        else (reward_nan_share_accum + reward_nan_share_w)
+                    )
+                reward_inf_share_w = stats_window.get("reward_inf_share", None)
+                if reward_inf_share_w is not None:
+                    reward_inf_share_w = reward_inf_share_w.detach() * window_weight
+                    reward_inf_share_accum = (
+                        reward_inf_share_w
+                        if reward_inf_share_accum is None
+                        else (reward_inf_share_accum + reward_inf_share_w)
+                    )
+                reinforce_return_nonfinite_share_w = stats_window.get("reinforce_return_nonfinite_share", None)
+                if reinforce_return_nonfinite_share_w is not None:
+                    reinforce_return_nonfinite_share_w = (
+                        reinforce_return_nonfinite_share_w.detach() * window_weight
+                    )
+                    reinforce_return_nonfinite_share_accum = (
+                        reinforce_return_nonfinite_share_w
+                        if reinforce_return_nonfinite_share_accum is None
+                        else (reinforce_return_nonfinite_share_accum + reinforce_return_nonfinite_share_w)
+                    )
+                reinforce_log_prob_nonfinite_share_w = stats_window.get("reinforce_log_prob_nonfinite_share", None)
+                if reinforce_log_prob_nonfinite_share_w is not None:
+                    reinforce_log_prob_nonfinite_share_w = (
+                        reinforce_log_prob_nonfinite_share_w.detach() * window_weight
+                    )
+                    reinforce_log_prob_nonfinite_share_accum = (
+                        reinforce_log_prob_nonfinite_share_w
+                        if reinforce_log_prob_nonfinite_share_accum is None
+                        else (reinforce_log_prob_nonfinite_share_accum + reinforce_log_prob_nonfinite_share_w)
+                    )
+                reinforce_adv_nonfinite_share_w = stats_window.get("reinforce_adv_nonfinite_share", None)
+                if reinforce_adv_nonfinite_share_w is not None:
+                    reinforce_adv_nonfinite_share_w = reinforce_adv_nonfinite_share_w.detach() * window_weight
+                    reinforce_adv_nonfinite_share_accum = (
+                        reinforce_adv_nonfinite_share_w
+                        if reinforce_adv_nonfinite_share_accum is None
+                        else (reinforce_adv_nonfinite_share_accum + reinforce_adv_nonfinite_share_w)
+                    )
+
+                if stored_reward_windows is not None and current_result["rewards_window_det"] is not None:
+                    stored_reward_windows.append(current_result["rewards_window_det"])
+
+            boundary_out = current_result["boundary_out"]
+            state_t = boundary_out["state_t"].detach()
+            action_t = boundary_out["action_t"].detach()
+            reward_t = boundary_out["reward_t"].detach()
+            reward_mask_t = boundary_out["reward_mask_t"].detach()
+            terminal_t = boundary_out["terminal_t"].detach()
+            terminal_count_realized = current_result["terminal_count_realized"]
+            cache = self._detach_policy_cache(boundary_out["cache"], clone_tensors=(tbptt_loss_sink is None))
+            prev_window_boundary = current_window_boundary
+            prev_window_range = (window_start, window_end)
 
         rewards_device = device if isinstance(device, torch.device) else torch.device(str(device))
         if tbptt_loss_sink is None:
@@ -21114,6 +21416,9 @@ class EnvironmentPrior:
                 else zero_t
             ),
             "alpha_grad_enabled": 1,
+            "alpha_grad_eval_step_count": torch.as_tensor(float(eval_step_count_total), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_eval_window_count": torch.as_tensor(float(eval_window_count), device=rewards_device, dtype=torch.float32),
+            "alpha_grad_boundary_bridge_count": torch.as_tensor(float(bridge_replay_count), device=rewards_device, dtype=torch.float32),
             "alpha_grad_local_coordinate_enabled": int(self._resolve_alpha_grad_local_coordinate_enabled(self.config)),
             "alpha_grad_unit_grad_enabled": int(self._resolve_alpha_grad_unit_grad_enabled(self.config)),
         }

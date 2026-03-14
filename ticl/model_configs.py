@@ -516,7 +516,8 @@ def get_rlpfn_default_config():
     config['transformer']['y_encoder'] = 'linear'
     config['transformer']['x_encoder_type'] = 'split_obs_action'
     terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + terminal_obs_extra
+    phase_obs_extra = 1
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + phase_obs_extra + terminal_obs_extra
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
     config['prior']['num_features'] = (
         int(config['transformer']['x_obs_dim']) + int(config['transformer']['x_action_dim'])

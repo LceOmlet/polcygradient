@@ -882,6 +882,70 @@ Legacy certificate closure:
   - result: `5 passed`
 - This closes the previously documented non-default legacy `first_pg` checkpoint certificate gap.
 
+## Implemented: Exploration / Exploitation Phase Separation for Alpha TBPTT
+
+Scope:
+
+- reference note: [/home/chen/RLPFN/tbptt_context_exploration_survey_chen.txt](/home/chen/RLPFN/tbptt_context_exploration_survey_chen.txt)
+- goal:
+  - use `single_eval_pos` as the project-level `E_t` definition
+  - `E_t = 0` for `t < single_eval_pos`
+  - `E_t = 1` for `t >= single_eval_pos`
+  - pass the exploration / exploitation marker into the policy model
+  - optimize local `alpha_grad` loss only on TBPTT windows that contain `E = 1`
+  - give earlier `E = 0` windows first-order credit assignment through deterministic one-hop window-boundary replay
+
+Implementation:
+
+- Added `phase_t` to split policy-step plumbing and token materialization.
+- Expanded the default split observation layout by one scalar slot so the policy can observe the exploration / exploitation phase marker.
+- Rollout code now writes a phase token derived from `single_eval_pos`:
+  - `0` before the evaluation boundary
+  - `1` from the evaluation boundary onward
+- `alpha_grad` family TBPTT special runner now:
+  - scores only the eval suffix inside each window
+  - skips local alpha loss on pure `E = 0` windows
+  - replays exactly one earlier window using the next window's boundary cotangent
+
+Design boundary:
+
+- This is the deterministic one-hop practical baseline from the note, not recursive chunk-adjoint and not randomized unbiased replay.
+- The implementation is intentionally limited to the smallest change that preserves the current memory / speed envelope:
+  - no multi-window graph retention
+  - no stochastic continuation chain
+  - no wider change to non-default legacy paths
+
+Semantic certificates:
+
+- phase token reaches the split policy fastpath:
+  - `test_policy_step_fn_passes_phase_token_to_split_policy`
+- collected rollout tokens encode `E_t` exactly from `single_eval_pos`:
+  - `test_environment_prior_collect_x_marks_phase_from_single_eval_pos`
+- family alpha TBPTT scores only the eval suffix and performs one replay hop:
+  - `test_alpha_grad_tbptt_family_vectorized_only_scores_eval_suffix_and_replays_one_boundary`
+- boundary cotangent extraction matches direct autograd:
+  - `test_alpha_tbptt_boundary_eta_helper_matches_manual_grad_parts`
+- bridge loss backpropagates the supplied cotangent exactly to boundary leaves:
+  - `test_alpha_tbptt_bridge_loss_helper_backprops_exact_eta`
+
+Focused regression results:
+
+- `pytest -q ticl/tests/test_rlpfn_split_encoder.py -k 'split_encoder or forward_policy_step_split'`
+  - result: `6 passed`
+- `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'phase_token or collect_x_marks_phase or only_scores_eval_suffix or handles_nonfinal_window_case'`
+  - result: `4 passed`
+- `pytest -q ticl/tests/test_train_policy_rollout_checkpoint.py -k 'boundary_eta_helper or bridge_loss_helper or only_scores_eval_suffix'`
+  - result: `3 passed`
+
+Interpretation:
+
+- The current implementation now has explicit semantic coverage for the exploration / exploitation split itself, not just for downstream rollout statistics.
+- The boundary replay path is certified as the intended one-hop surrogate:
+  - correct `eta` extraction
+  - correct bridge VJP
+  - correct `E = 1` window gating
+- This is not a certificate of exact full-chain gradient equivalence; it is a certificate that the implemented one-hop surrogate matches its declared mathematics.
+
 ## Retained Baseline: Direct TBPTT-Streaming Reproduction of the Forced Policy-Offload 2GiB Low-Memory Line
 
 This is a later recovered/reproduced baseline, not the current top-of-file active skyline. It is kept here at the end of the document because it was established after the main skyline sequence and is primarily a retained reference line.

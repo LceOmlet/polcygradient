@@ -892,13 +892,28 @@ def _build_policy_step_fn(
         # from being retained through PFN inputs.
         reward_scalar = reward_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
         reward_mask = reward_mask_t.reshape(batch_size).detach().to(dtype=obs_t.dtype)
+        phase_scalar = None
+        phase_token_enabled = False
+        if bool(split_fastpath_available) and isinstance(env_info, dict) and ("phase_t" in env_info):
+            phase_scalar = env_info["phase_t"].reshape(batch_size).detach().to(dtype=obs_t.dtype)
+            phase_token_enabled = True
         terminal_scalar = None
         terminal_token_enabled = False
         if isinstance(env_info, dict) and ("terminal_t" in env_info):
             terminal_scalar = env_info["terminal_t"].reshape(batch_size).detach().to(dtype=obs_t.dtype)
             terminal_token_enabled = True
         split_obs_slot_dim = (
-            int(max(0, int(split_obs_total_dim) - (3 if terminal_token_enabled else 2)))
+            int(
+                max(
+                    0,
+                    int(split_obs_total_dim)
+                    - (
+                        2
+                        + int(phase_token_enabled)
+                        + int(terminal_token_enabled)
+                    ),
+                )
+            )
             if split_obs_total_dim is not None
             else None
         )
@@ -918,6 +933,7 @@ def _build_policy_step_fn(
                 action_t,
                 reward_scalar.reshape(batch_size, 1),
                 reward_mask.reshape(batch_size, 1),
+                phase_t=(phase_scalar.reshape(batch_size, 1) if phase_token_enabled else None),
                 terminal_t=(terminal_scalar.reshape(batch_size, 1) if terminal_token_enabled else None),
                 kv_cache=cache,
                 max_cache_len=max_cache_len,
@@ -998,9 +1014,13 @@ def _build_policy_step_fn(
             x_row[:, obs_slot_dim] = reward_scalar
         if (obs_slot_dim + 1) < num_features:
             x_row[:, obs_slot_dim + 1] = reward_mask
-        if terminal_token_enabled and (obs_slot_dim + 2) < num_features:
-            x_row[:, obs_slot_dim + 2] = terminal_scalar
-        action_write_start = obs_slot_dim + (3 if terminal_token_enabled else 2)
+        phase_idx = obs_slot_dim + 2
+        if phase_token_enabled and phase_idx < num_features:
+            x_row[:, phase_idx] = phase_scalar
+        terminal_idx = obs_slot_dim + 2 + int(phase_token_enabled)
+        if terminal_token_enabled and terminal_idx < num_features:
+            x_row[:, terminal_idx] = terminal_scalar
+        action_write_start = obs_slot_dim + 2 + int(phase_token_enabled) + int(terminal_token_enabled)
         if action_write_start < num_features:
             action_copy = int(min(action_t.shape[-1], action_slot_dim, num_features - action_write_start))
             if action_copy > 0:

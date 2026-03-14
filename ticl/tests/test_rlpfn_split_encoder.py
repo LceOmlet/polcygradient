@@ -9,12 +9,12 @@ from ticl.models.tabpfn import TabPFN
 def test_rlpfn_default_config_uses_split_encoder():
     cfg = get_model_default_config("rlpfn")
     assert cfg["prior"]["prior_type"] == "environment_only"
-    assert cfg["prior"]["num_features"] == 433
+    assert cfg["prior"]["num_features"] == 434
     assert cfg["prior"]["environment"]["batch_parallel_backend"] == "torch_vectorized"
     assert cfg["prior"]["environment"]["batch_shared_environment"] is False
     assert cfg["prior"]["environment"]["batch_vectorized_grouping"] == "family"
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
-    assert cfg["transformer"]["x_obs_dim"] == 403
+    assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
@@ -122,8 +122,8 @@ def test_rlpfn_default_config_uses_split_encoder():
 def test_rlpfn_default_terminal_reset_expands_split_obs_slots():
     cfg = model_configs.get_rlpfn_default_config()
     assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
-    assert cfg["transformer"]["x_obs_dim"] == 403
-    assert cfg["prior"]["num_features"] == 433
+    assert cfg["transformer"]["x_obs_dim"] == 404
+    assert cfg["prior"]["num_features"] == 434
 
 
 def test_tabpfn_split_obs_action_encoder_forward():
@@ -270,6 +270,66 @@ def test_tabpfn_forward_policy_step_split_matches_materialized_token_with_termin
         action_t,
         reward_t,
         reward_mask_t,
+        terminal_t=terminal_t,
+        kv_cache=None,
+        max_cache_len=32,
+        kv_cache_mode="immutable",
+    )
+
+    assert torch.allclose(out_ref, out_split, atol=1e-6, rtol=1e-5)
+    _assert_nested_tensor_close(cache_ref, cache_split, atol=1e-6, rtol=1e-5)
+
+
+def test_tabpfn_forward_policy_step_split_matches_materialized_token_with_phase_and_terminal():
+    torch.manual_seed(20260314)
+    emsize = 16
+    model = TabPFN(
+        n_out=2,
+        n_features=14,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=10,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+
+    batch_size = 5
+    obs_t = torch.randn(batch_size, 6)
+    action_t = torch.randn(batch_size, 4)
+    reward_t = torch.randn(batch_size, 1)
+    reward_mask_t = torch.rand(batch_size, 1)
+    phase_t = torch.randint(0, 2, (batch_size, 1), dtype=torch.int64).to(dtype=obs_t.dtype)
+    terminal_t = torch.rand(batch_size, 1)
+
+    x_token = torch.zeros(1, batch_size, 14, dtype=obs_t.dtype)
+    x_token[0, :, :6] = obs_t
+    x_token[0, :, 6] = reward_t.reshape(-1)
+    x_token[0, :, 7] = reward_mask_t.reshape(-1)
+    x_token[0, :, 8] = phase_t.reshape(-1)
+    x_token[0, :, 9] = terminal_t.reshape(-1)
+    x_token[0, :, 10:14] = action_t
+    y_token = reward_t.reshape(1, batch_size)
+
+    out_ref, cache_ref = model.forward_policy_step(
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=32,
+        kv_cache_mode="immutable",
+    )
+    out_split, cache_split = model.forward_policy_step_split(
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=phase_t,
         terminal_t=terminal_t,
         kv_cache=None,
         max_cache_len=32,

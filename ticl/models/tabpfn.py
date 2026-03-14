@@ -458,6 +458,7 @@ class TabPFN(nn.Module):
         action_t,
         reward_t,
         reward_mask_t,
+        phase_t=None,
         terminal_t=None,
         kv_cache=None,
         max_cache_len=None,
@@ -488,6 +489,9 @@ class TabPFN(nn.Module):
 
         reward_scalar = reward_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
         reward_mask_scalar = reward_mask_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        phase_scalar = None
+        if phase_t is not None:
+            phase_scalar = phase_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
         terminal_scalar = None
         if terminal_t is not None:
             terminal_scalar = terminal_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
@@ -507,10 +511,16 @@ class TabPFN(nn.Module):
             y_bias_vec = None
         obs_dim = int(self.encoder.obs_dim)
         action_dim = int(self.encoder.action_dim)
-        obs_slot_dim = int(max(0, obs_dim - (3 if terminal_scalar is not None else 2)))
+        scalar_slots = 2 + int(phase_scalar is not None) + int(terminal_scalar is not None)
+        obs_slot_dim = int(max(0, obs_dim - scalar_slots))
         reward_idx = obs_slot_dim
         mask_idx = obs_slot_dim + 1
-        terminal_idx = obs_slot_dim + 2 if terminal_scalar is not None else None
+        phase_idx = obs_slot_dim + 2 if phase_scalar is not None else None
+        terminal_idx = (
+            obs_slot_dim + 2 + int(phase_scalar is not None)
+            if terminal_scalar is not None
+            else None
+        )
 
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
@@ -546,6 +556,9 @@ class TabPFN(nn.Module):
             if mask_idx < obs_dim:
                 fused_inputs.append(reward_mask_scalar)
                 fused_weights.append(obs_weight[:, mask_idx].unsqueeze(1))
+            if phase_idx is not None and phase_idx < obs_dim:
+                fused_inputs.append(phase_scalar)
+                fused_weights.append(obs_weight[:, phase_idx].unsqueeze(1))
             if terminal_idx is not None and terminal_idx < obs_dim:
                 fused_inputs.append(terminal_scalar)
                 fused_weights.append(obs_weight[:, terminal_idx].unsqueeze(1))

@@ -863,6 +863,91 @@ def test_policy_step_fn_prefers_split_fastpath_and_falls_back_on_slot_mismatch()
     assert model.calls["legacy"] == 1
 
 
+def test_policy_step_fn_passes_phase_token_to_split_policy():
+    class _DummyEncoder:
+        obs_dim = 10
+        action_dim = 4
+
+    class _DummyModel:
+        def __init__(self):
+            self.x_encoder_type = "split_obs_action"
+            self.encoder = _DummyEncoder()
+            self.phase_seen = None
+            self.terminal_seen = None
+
+        def forward_policy_step_split(
+            self,
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=None,
+            terminal_t=None,
+            kv_cache=None,
+            **kwargs,
+        ):
+            del obs_t, action_t, reward_t, reward_mask_t, kwargs
+            self.phase_seen = None if phase_t is None else phase_t.detach().clone()
+            self.terminal_seen = None if terminal_t is None else terminal_t.detach().clone()
+            out = torch.zeros((1, 2, 4), dtype=torch.float32)
+            return out, kv_cache
+
+        def forward_policy_step(self, *args, **kwargs):
+            raise AssertionError("split fastpath should be used")
+
+    model = _DummyModel()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=16,
+        max_cache_len=12,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    obs_t = torch.randn(2, 6, dtype=torch.float32)
+    action_t = torch.randn(2, 4, dtype=torch.float32)
+    reward_t = torch.randn(2, 1, dtype=torch.float32)
+    reward_mask_t = torch.ones(2, 1, dtype=torch.float32)
+    phase_t = torch.tensor([[0.0], [1.0]], dtype=torch.float32)
+    terminal_t = torch.tensor([[1.0], [0.0]], dtype=torch.float32)
+    env_info = {
+        "obs_slot_dim": 6,
+        "action_slot_dim": 4,
+        "action_dim": 4,
+        "phase_t": phase_t,
+        "terminal_t": terminal_t,
+    }
+
+    step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 0, env_info)
+    assert torch.allclose(model.phase_seen, phase_t)
+    assert torch.allclose(model.terminal_seen, terminal_t)
+
+
+def test_environment_prior_collect_x_marks_phase_from_single_eval_pos():
+    _seed_everything(20260314)
+    env_cfg = _fixed_env_cfg()
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["terminal_reset_enabled"] = False
+
+    prior = EnvironmentPrior(env_cfg)
+    single_eval_pos = 5
+    num_features = 17  # 12 obs slots + reward + mask + phase + 2 action slots
+    x, _, _ = prior.get_batch(
+        batch_size=2,
+        n_samples=8,
+        num_features=num_features,
+        device="cpu",
+        single_eval_pos=single_eval_pos,
+    )
+
+    phase_col = 12 + 2
+    assert torch.all(x[:single_eval_pos, :, phase_col] == 0)
+    assert torch.all(x[single_eval_pos:, :, phase_col] == 1)
+
+
 def test_policy_rollout_chunk_torch_vectorized_matches_serial_semantics():
     env_cfg_serial = _fixed_env_cfg()
     env_cfg_serial["batch_parallel_backend"] = "python_thread"
@@ -1820,6 +1905,130 @@ def test_alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case():
     assert torch.isfinite(stats_family["reward_std"])
     assert len(grads_family) > 0
     assert all(torch.isfinite(g).all() for g in grads_family)
+
+
+def test_alpha_grad_tbptt_family_vectorized_only_scores_eval_suffix_and_replays_one_boundary(monkeypatch):
+    _seed_everything(17)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+
+    original_alpha_loss = EnvironmentPrior.alpha_grad_loss_from_rollout_tensors
+    reward_lengths = []
+
+    def _wrapped_alpha_loss(self, *, rewards, log_probs, action_mean, action_mask=None, log_prob_score=None, discount=None, variance_eps=None):
+        reward_lengths.append(int(rewards.shape[0]))
+        return original_alpha_loss(
+            self,
+            rewards=rewards,
+            log_probs=log_probs,
+            action_mean=action_mean,
+            action_mask=action_mask,
+            log_prob_score=log_prob_score,
+            discount=discount,
+            variance_eps=variance_eps,
+        )
+
+    monkeypatch.setattr(EnvironmentPrior, "alpha_grad_loss_from_rollout_tensors", _wrapped_alpha_loss)
+
+    stats_family, grads_family, roots_family = _run_streaming_tbptt_chunk(
+        env_cfg=family_env_cfg,
+        num_features=num_features,
+        batch_size=2,
+        n_samples=16,
+        single_eval_pos=12,
+        rl_objective="alpha_grad",
+    )
+
+    assert reward_lengths == [4]
+    assert len(roots_family) == 2
+    assert int(stats_family["alpha_grad_enabled"]) == 1
+    assert float(stats_family["alpha_grad_eval_step_count"]) == pytest.approx(4.0)
+    assert float(stats_family["alpha_grad_eval_window_count"]) == pytest.approx(1.0)
+    assert float(stats_family["alpha_grad_boundary_bridge_count"]) == pytest.approx(1.0)
+    assert torch.isfinite(stats_family["objective"])
+    assert len(grads_family) > 0
+    assert all(torch.isfinite(g).all() for g in grads_family)
+
+
+def test_alpha_tbptt_boundary_eta_helper_matches_manual_grad_parts():
+    state = torch.tensor([[1.0, -2.0]], dtype=torch.float32, requires_grad=True)
+    action = torch.tensor([[0.5, 3.0]], dtype=torch.float32, requires_grad=True)
+    reward = torch.tensor([0.25], dtype=torch.float32, requires_grad=True)
+    reward_mask = torch.tensor([1.5], dtype=torch.float32, requires_grad=True)
+    terminal = torch.tensor([0.75], dtype=torch.float32, requires_grad=True)
+    cache_leaf = torch.tensor([[2.0, -1.0]], dtype=torch.float32, requires_grad=True)
+    boundary = {
+        "state_t": state,
+        "action_t": action,
+        "reward_t": reward,
+        "reward_mask_t": reward_mask,
+        "terminal_t": terminal,
+        "cache": (cache_leaf,),
+    }
+
+    loss = (
+        (state.square().sum() * 0.5)
+        + (action * torch.tensor([[2.0, -3.0]], dtype=torch.float32)).sum()
+        + (reward * 4.0).sum()
+        + (reward_mask * -5.0).sum()
+        + (terminal * 6.0).sum()
+        + (cache_leaf.square().sum() * 0.25)
+    )
+
+    eta = EnvironmentPrior._alpha_tbptt_boundary_eta_from_loss(loss, boundary, (cache_leaf,))
+    manual = torch.autograd.grad(
+        loss,
+        (state, action, reward, reward_mask, terminal, cache_leaf),
+        retain_graph=True,
+        allow_unused=True,
+    )
+
+    assert torch.allclose(eta["state_t"], manual[0])
+    assert torch.allclose(eta["action_t"], manual[1])
+    assert torch.allclose(eta["reward_t"], manual[2])
+    assert torch.allclose(eta["reward_mask_t"], manual[3])
+    assert torch.allclose(eta["terminal_t"], manual[4])
+    assert len(eta["cache_leaves"]) == 1
+    assert torch.allclose(eta["cache_leaves"][0], manual[5])
+
+
+def test_alpha_tbptt_bridge_loss_helper_backprops_exact_eta():
+    state = torch.tensor([[1.0, 2.0]], dtype=torch.float32, requires_grad=True)
+    action = torch.tensor([[3.0, -4.0]], dtype=torch.float32, requires_grad=True)
+    reward = torch.tensor([0.5], dtype=torch.float32, requires_grad=True)
+    reward_mask = torch.tensor([1.0], dtype=torch.float32, requires_grad=True)
+    terminal = torch.tensor([0.0], dtype=torch.float32, requires_grad=True)
+    cache_leaf = torch.tensor([[2.0, 3.0]], dtype=torch.float32, requires_grad=True)
+    boundary_out = {
+        "state_t": state,
+        "action_t": action,
+        "reward_t": reward,
+        "reward_mask_t": reward_mask,
+        "terminal_t": terminal,
+        "cache": {"leaf": cache_leaf},
+    }
+    eta = {
+        "state_t": torch.tensor([[0.1, -0.2]], dtype=torch.float32),
+        "action_t": torch.tensor([[0.3, 0.4]], dtype=torch.float32),
+        "reward_t": torch.tensor([0.5], dtype=torch.float32),
+        "reward_mask_t": torch.tensor([-0.6], dtype=torch.float32),
+        "terminal_t": torch.tensor([0.7], dtype=torch.float32),
+        "cache_leaves": (torch.tensor([[0.8, -0.9]], dtype=torch.float32),),
+    }
+
+    bridge_loss = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary_out, eta)
+    bridge_loss.backward()
+
+    assert torch.allclose(state.grad, eta["state_t"])
+    assert torch.allclose(action.grad, eta["action_t"])
+    assert torch.allclose(reward.grad, eta["reward_t"])
+    assert torch.allclose(reward_mask.grad, eta["reward_mask_t"])
+    assert torch.allclose(terminal.grad, eta["terminal_t"])
+    assert torch.allclose(cache_leaf.grad, eta["cache_leaves"][0])
 
 
 def test_tbptt_window_reduces_saved_tensor_bytes_trend():
