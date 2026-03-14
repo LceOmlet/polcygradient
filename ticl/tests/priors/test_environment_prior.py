@@ -6060,7 +6060,7 @@ def test_environment_prior_terminal_tail_event_from_signal_requires_non_extreme_
     assert torch.equal(terminal_next, torch.tensor([True]))
 
 
-def test_environment_prior_terminal_history_and_bonus_are_detached_from_terminal_signal():
+def test_environment_prior_terminal_history_is_detached_but_bonus_keeps_terminal_gradient():
     prior = EnvironmentPrior({})
     terminal_signal = torch.tensor([[2.0]], dtype=torch.float32, requires_grad=True)
     signal_history = torch.zeros((2, 1), dtype=torch.float32)
@@ -6090,7 +6090,8 @@ def test_environment_prior_terminal_history_and_bonus_are_detached_from_terminal
     assert signal_history[0].grad_fn is None
 
     reward_next.sum().backward()
-    assert terminal_signal.grad is None
+    assert terminal_signal.grad is not None
+    assert float(terminal_signal.grad.abs().max().item()) > 0.0
     assert reward_base.grad is not None
     assert torch.allclose(reward_base.grad, torch.ones_like(reward_base))
 

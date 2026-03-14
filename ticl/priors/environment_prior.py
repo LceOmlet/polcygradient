@@ -5036,6 +5036,18 @@ class EnvironmentPrior:
         return scale_t * torch.tanh(raw_bonus / c_t)
 
     @staticmethod
+    def _terminal_bonus_base_from_signal(terminal_signal, *, tanh_c=10.0):
+        raw_bonus = terminal_signal
+        if not torch.is_tensor(raw_bonus):
+            raw_bonus = torch.as_tensor(raw_bonus, dtype=torch.float32)
+        if raw_bonus.ndim > 0 and raw_bonus.shape[-1] == 1:
+            raw_bonus = raw_bonus.squeeze(-1)
+        c_t = torch.as_tensor(tanh_c, device=raw_bonus.device, dtype=raw_bonus.dtype)
+        while c_t.ndim < raw_bonus.ndim:
+            c_t = c_t.unsqueeze(0)
+        return torch.tanh(raw_bonus / c_t)
+
+    @staticmethod
     def _terminal_bonus_scale_from_draw(draw, *, scale_min, scale_max):
         draw_t = draw
         if not torch.is_tensor(draw_t):
@@ -5073,11 +5085,15 @@ class EnvironmentPrior:
         if len(generator_output) == 2:
             state_out, reward_out = generator_output
             terminal_signal = None
+            terminal_bonus_base = None
         elif len(generator_output) == 3:
             state_out, reward_out, terminal_signal = generator_output
+            terminal_bonus_base = None
+        elif len(generator_output) == 4:
+            state_out, reward_out, terminal_signal, terminal_bonus_base = generator_output
         else:
-            raise ValueError("transition generator output must have length 2 or 3")
-        return state_out, reward_out, terminal_signal
+            raise ValueError("transition generator output must have length 2, 3 or 4")
+        return state_out, reward_out, terminal_signal, terminal_bonus_base
 
     @staticmethod
     def _eval_terminal_signal_generator(terminal_generator, env_in, *, generator=None, generators_for_noise=None):
@@ -5122,6 +5138,7 @@ class EnvironmentPrior:
         reset_state,
         enabled,
         terminal_signal=None,
+        terminal_bonus_base=None,
         terminal_signal_history=None,
         history_index=None,
         history_warmup_count=None,
@@ -5142,17 +5159,18 @@ class EnvironmentPrior:
         )
         if terminal_signal is None:
             terminal_signal_t = state_next.mean(dim=-1)
-            terminal_bonus_t = bonus_scale_t * torch.tanh(terminal_signal_t.detach() / torch.as_tensor(
-                bonus_tanh_c,
-                device=state_next.device,
-                dtype=state_next.dtype,
-            ))
         else:
             terminal_signal_t = terminal_signal.to(device=state_next.device, dtype=state_next.dtype)
+        if terminal_bonus_base is None:
             terminal_bonus_t = self._terminal_bonus_from_signal(
-                terminal_signal_t.detach(),
+                terminal_signal_t,
                 bonus_scale=bonus_scale_t,
                 tanh_c=bonus_tanh_c,
+            )
+        else:
+            terminal_bonus_t = bonus_scale_t * terminal_bonus_base.to(
+                device=state_next.device,
+                dtype=state_next.dtype,
             )
         # Terminal events are discrete control flow. History/quantile bookkeeping
         # must not retain the pathwise graph across time; only the bonus term keeps
@@ -7501,6 +7519,7 @@ class EnvironmentPrior:
                 transition_generator = self._wrap_transition_with_terminal_extra(
                     transition_generator,
                     state_dim,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
             else:
                 x_generator_full = x_generator
@@ -7513,6 +7532,7 @@ class EnvironmentPrior:
                     y_generator,
                     batch_size=1,
                     state_cap=state_dim,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
         state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
         state_highway_lambda = float(self._resolve_state_highway_lambda(h))
@@ -9975,22 +9995,42 @@ class EnvironmentPrior:
                 state_fn._noise_scale = noise_scale[..., :state_cap_int]
         return state_fn
 
-    def _wrap_transition_with_terminal_extra(self, transition_fn_full, state_cap, terminal_enabled=None):
+    def _wrap_transition_with_terminal_extra(
+        self,
+        transition_fn_full,
+        state_cap,
+        terminal_enabled=None,
+        terminal_bonus_tanh_c=None,
+    ):
         def transition_fn(*args, **kwargs):
             out = transition_fn_full(*args, **kwargs)
             if (not isinstance(out, tuple)) or len(out) < 2:
                 raise RuntimeError("transition generator with terminal extra must return (state, reward)")
             if len(out) >= 3:
                 state_out, reward_out, terminal_signal = out[:3]
+                terminal_bonus_base = None
+                if len(out) >= 4:
+                    terminal_bonus_base = out[3]
+                elif terminal_bonus_tanh_c is not None and terminal_signal is not None:
+                    terminal_bonus_base = self._terminal_bonus_base_from_signal(
+                        terminal_signal,
+                        tanh_c=terminal_bonus_tanh_c,
+                    )
                 state_main = self._trim_state_output(state_out, state_cap)
-                return state_main, reward_out, terminal_signal
+                return state_main, reward_out, terminal_signal, terminal_bonus_base
             state_out, reward_out = out[:2]
             state_main, terminal_signal = self._split_state_with_terminal_extra(
                 state_out,
                 state_cap,
                 terminal_enabled=terminal_enabled,
             )
-            return state_main, reward_out, terminal_signal
+            terminal_bonus_base = None
+            if terminal_bonus_tanh_c is not None:
+                terminal_bonus_base = self._terminal_bonus_base_from_signal(
+                    terminal_signal,
+                    tanh_c=terminal_bonus_tanh_c,
+                )
+            return state_main, reward_out, terminal_signal, terminal_bonus_base
 
         return self._copy_transition_runtime_attrs(transition_fn, transition_fn_full)
 
@@ -10001,6 +10041,7 @@ class EnvironmentPrior:
         batch_size,
         state_cap,
         terminal_enabled=None,
+        terminal_bonus_tanh_c=None,
     ):
         batch_size = int(batch_size)
         if torch.is_tensor(state_cap):
@@ -10079,7 +10120,13 @@ class EnvironmentPrior:
                 state_cap,
                 terminal_enabled=terminal_enabled,
             )
-            return state_main, reward_next[:, :1], terminal_signal
+            terminal_bonus_base = None
+            if terminal_bonus_tanh_c is not None:
+                terminal_bonus_base = self._terminal_bonus_base_from_signal(
+                    terminal_signal,
+                    tanh_c=terminal_bonus_tanh_c,
+                )
+            return state_main, reward_next[:, :1], terminal_signal, terminal_bonus_base
 
         transition_fn._envgen_checkpoint_enabled = checkpoint_enabled
         return transition_fn
@@ -10822,6 +10869,7 @@ class EnvironmentPrior:
                     transition_generator,
                     state_dims,
                     terminal_enabled=terminal_reset_enabled,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
             elif x_generator_full is not None:
                 transition_generator = self._build_terminal_shared_transition_fn(
@@ -10830,6 +10878,7 @@ class EnvironmentPrior:
                     batch_size=batch_size,
                     state_cap=state_dims,
                     terminal_enabled=terminal_reset_enabled,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
@@ -11436,6 +11485,7 @@ class EnvironmentPrior:
                     transition_generator,
                     state_dim,
                     terminal_enabled=terminal_reset_enabled,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
             elif x_generator_full is not None:
                 transition_generator = self._build_terminal_shared_transition_fn(
@@ -11444,6 +11494,7 @@ class EnvironmentPrior:
                     batch_size=batch_size,
                     state_cap=state_dim,
                     terminal_enabled=terminal_reset_enabled,
+                    terminal_bonus_tanh_c=terminal_bonus_tanh_c,
                 )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
@@ -12788,12 +12839,13 @@ class EnvironmentPrior:
             transition_generator = env.get("transition_generator", None)
             terminal_generator = env.get("terminal_generator", None)
             terminal_signal_next = None
+            terminal_bonus_base_next = None
             if callable(transition_generator):
                 transition_out = transition_generator(
                     env_in,
                     generators_for_noise=rollout_generators,
                 )
-                x_next, reward_unit, terminal_signal_next = self._unpack_transition_output(transition_out)
+                x_next, reward_unit, terminal_signal_next, terminal_bonus_base_next = self._unpack_transition_output(transition_out)
                 reward_next_raw = env["reward_scale"] * reward_unit.reshape(batch_size)
             else:
                 reward_next_raw = env["reward_scale"] * env["y_generator"](
@@ -12857,6 +12909,7 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_bonus_base=terminal_bonus_base_next,
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
                     history_warmup_count=env.get("terminal_reset_count_target", None),
@@ -13723,12 +13776,13 @@ class EnvironmentPrior:
             transition_generator = env.get("transition_generator", None)
             terminal_generator = env.get("terminal_generator", None)
             terminal_signal_next = None
+            terminal_bonus_base_next = None
             if callable(transition_generator):
                 transition_out = transition_generator(
                     env_in,
                     generators_for_noise=env_noise_generators,
                 )
-                x_next, reward_unit, terminal_signal_next = self._unpack_transition_output(transition_out)
+                x_next, reward_unit, terminal_signal_next, terminal_bonus_base_next = self._unpack_transition_output(transition_out)
                 reward_next_raw = env["reward_scale"] * reward_unit.reshape(batch_size)
             else:
                 reward_next_raw = env["reward_scale"] * env["y_generator"](
@@ -13841,6 +13895,7 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_state_t,
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_bonus_base=terminal_bonus_base_next,
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
@@ -15404,6 +15459,7 @@ class EnvironmentPrior:
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
             terminal_signal_next = None
+            terminal_bonus_base_next = None
             action_env = action_next.detach() if detach_action_in_env else action_next
             if first_pg_action_grad_clip_value > 0.0:
                 action_env = self._clip_tensor_grad_by_value(
@@ -15562,10 +15618,21 @@ class EnvironmentPrior:
                                     generators_for_noise=group["rollout_generators"],
                                     x_is_dual_packed=False,
                                 )
-                            x_next_g, reward_next_raw_g, terminal_signal_next_g = self._unpack_transition_output(
+                            x_next_g, reward_next_raw_g, terminal_signal_next_g, terminal_bonus_base_next_g = self._unpack_transition_output(
                                 transition_out_g
                             )
                             reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
+                            if terminal_bonus_base_next_g is not None:
+                                if terminal_bonus_base_next is None:
+                                    terminal_bonus_base_next = torch.zeros(
+                                        (batch_size,),
+                                        device=device,
+                                        dtype=terminal_bonus_base_next_g.dtype,
+                                    )
+                                if group_slice is None:
+                                    terminal_bonus_base_next.index_copy_(0, group_indices, terminal_bonus_base_next_g.reshape(-1))
+                                else:
+                                    terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
                             if async_group_commit_in_stream:
                                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                                 reward_next_raw[group_slice] = reward_next_raw_g
@@ -15600,11 +15667,22 @@ class EnvironmentPrior:
                                 generators_for_noise=group["rollout_generators"],
                                 x_is_dual_packed=False,
                             )
-                        x_next_g, reward_next_raw_g, terminal_signal_next_g = self._unpack_transition_output(
+                        x_next_g, reward_next_raw_g, terminal_signal_next_g, terminal_bonus_base_next_g = self._unpack_transition_output(
                             transition_out_g
                         )
                         _accumulate_gp_projection_profile(transition_generator_g)
                         reward_next_raw_g = reward_scale_g * reward_next_raw_g.reshape(-1)
+                        if terminal_bonus_base_next_g is not None:
+                            if terminal_bonus_base_next is None:
+                                terminal_bonus_base_next = torch.zeros(
+                                    (batch_size,),
+                                    device=device,
+                                    dtype=terminal_bonus_base_next_g.dtype,
+                                )
+                            if group_slice is None:
+                                terminal_bonus_base_next.index_copy_(0, group_indices, terminal_bonus_base_next_g.reshape(-1))
+                            else:
+                                terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
                         if profile_rollout_timing and fused_wall_t0 is not None:
                             transition_fused_wall_s += (time.perf_counter() - fused_wall_t0)
                         transition_fused_call_count += 1
@@ -15796,6 +15874,7 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_bonus_base=terminal_bonus_base_next,
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
@@ -16902,9 +16981,10 @@ class EnvironmentPrior:
             transition_generator = env.get("transition_generator", None)
             terminal_generator = env.get("terminal_generator", None)
             terminal_signal_next = None
+            terminal_bonus_base_next = None
             if callable(transition_generator):
                 transition_out = transition_generator(env_in, generator=local_generator)
-                x_next, reward_unit, terminal_signal_next = self._unpack_transition_output(transition_out)
+                x_next, reward_unit, terminal_signal_next, terminal_bonus_base_next = self._unpack_transition_output(transition_out)
                 x_next = x_next.squeeze(0)
                 reward_next_raw = env["reward_scale"] * reward_unit.reshape(())
             else:
@@ -16997,6 +17077,7 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t].unsqueeze(0),
                     enabled=True,
                     terminal_signal=None if terminal_signal_next is None else terminal_signal_next.reshape(1, 1),
+                    terminal_bonus_base=None if terminal_bonus_base_next is None else terminal_bonus_base_next.reshape(1),
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
                     history_warmup_count=env.get("terminal_reset_count_target", None),
@@ -17649,12 +17730,13 @@ class EnvironmentPrior:
             transition_generator = env.get("transition_generator", None)
             terminal_generator = env.get("terminal_generator", None)
             terminal_signal_next = None
+            terminal_bonus_base_next = None
             if callable(transition_generator):
                 transition_out = transition_generator(
                     env_in,
                     generators_for_noise=rollout_generators,
                 )
-                x_next, reward_unit, terminal_signal_next = self._unpack_transition_output(transition_out)
+                x_next, reward_unit, terminal_signal_next, terminal_bonus_base_next = self._unpack_transition_output(transition_out)
                 reward_next_raw = reward_scale * reward_unit.reshape(batch_size)
             elif rollout_generators is None:
                 reward_next_raw = reward_scale * env["y_generator"](env_in).reshape(batch_size)
@@ -17723,6 +17805,7 @@ class EnvironmentPrior:
                     reset_state=terminal_reset_states[t],
                     enabled=terminal_reset_enabled,
                     terminal_signal=terminal_signal_next,
+                    terminal_bonus_base=terminal_bonus_base_next,
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
@@ -20624,6 +20707,7 @@ class EnvironmentPrior:
                 reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
                 state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
                 terminal_signal_next = None
+                terminal_bonus_base_next = None
                 action_env = action_next
                 if first_pg_action_grad_clip_value > 0.0:
                     action_env = self._clip_tensor_grad_by_value(action_env, max_abs=first_pg_action_grad_clip_value)
@@ -20708,8 +20792,15 @@ class EnvironmentPrior:
                                 generators_for_noise=group["rollout_generators"],
                                 x_is_dual_packed=False,
                             )
-                        x_next_g, reward_next_raw_g, terminal_signal_next_g = self._unpack_transition_output(transition_out_g)
+                        x_next_g, reward_next_raw_g, terminal_signal_next_g, terminal_bonus_base_next_g = self._unpack_transition_output(transition_out_g)
                         reward_next_raw_g = group["reward_scale_view"] * reward_next_raw_g.reshape(-1)
+                        if terminal_bonus_base_next_g is not None:
+                            if terminal_bonus_base_next is None:
+                                terminal_bonus_base_next = torch.zeros((batch_size,), device=device, dtype=terminal_bonus_base_next_g.dtype)
+                            if group_slice is None:
+                                terminal_bonus_base_next.index_copy_(0, group_indices, terminal_bonus_base_next_g.reshape(-1))
+                            else:
+                                terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
                     else:
                         reward_next_raw_g = group["reward_scale_view"] * env_g["y_generator"](
                             transition_input,
@@ -20794,9 +20885,10 @@ class EnvironmentPrior:
                         bonus_scale_min=terminal_bonus_scale_min,
                         bonus_scale_max=terminal_bonus_scale_max,
                         bonus_tanh_c=terminal_bonus_tanh_c,
-                    reset_state=terminal_reset_states[t],
+                        reset_state=terminal_reset_states[t],
                         enabled=terminal_reset_enabled,
                         terminal_signal=terminal_signal_next,
+                        terminal_bonus_base=terminal_bonus_base_next,
                         terminal_signal_history=terminal_signal_history,
                         history_index=t,
                         history_warmup_count=terminal_reset_count_target,
