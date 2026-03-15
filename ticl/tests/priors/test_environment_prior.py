@@ -5858,6 +5858,14 @@ def test_environment_prior_terminal_reset_single_rollout_adds_bonus_and_resets_s
     assert torch.all(x[1:, terminal_col] == 1.0)
 
 
+def test_environment_prior_reward_tanh_bound_allows_zero_and_bonus_range_stays_one_to_ten():
+    assert EnvironmentPrior._resolve_reinforce_reward_tanh_bound(
+        {"reinforce_reward_tanh_bound": 0.0}
+    ) == 0.0
+    assert EnvironmentPrior._resolve_terminal_bonus_scale_min({}) == 1.0
+    assert EnvironmentPrior._resolve_terminal_bonus_scale_max({}) == 10.0
+
+
 def test_environment_prior_terminal_tail_event_from_signal_selects_two_sided_tails_from_history():
     prior = EnvironmentPrior({})
     terminal_signal = torch.tensor([[-1.0], [-0.25], [0.25], [1.0]], dtype=torch.float32)

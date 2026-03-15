@@ -33,6 +33,12 @@ def main() -> int:
     parser.add_argument("--mutable-kv", type=_bool_flag, default=True)
     parser.add_argument("--tbptt-stream", type=_bool_flag, default=True)
     parser.add_argument("--tbptt-window", type=int, default=32)
+    parser.add_argument(
+        "--execution-mode",
+        choices=["fit_model", "direct"],
+        default="fit_model",
+        help="fit_model matches train-loop defaults (skyline env, autocast, scaler, optimizer step); direct keeps payload-only chunk loss.",
+    )
     # Safety defaults are intentionally conservative because prior attempts
     # have destabilized the host. Override only deliberately.
     parser.add_argument("--gpu-guard-mib", type=int, default=5000)
@@ -67,7 +73,7 @@ def main() -> int:
     tbptt_window = int(max(1, args.tbptt_window))
     objective = str(args.objective)
     label = (
-        f"{git_rev}_{objective}_ckpt{int(args.checkpoint)}_reent{int(args.reentrant)}_"
+        f"{git_rev}_{objective}_{args.execution_mode}_ckpt{int(args.checkpoint)}_reent{int(args.reentrant)}_"
         f"mutable{int(args.mutable_kv)}_stream{int(args.tbptt_stream)}"
     )
     log_path = out_dir / f"{label}.log"
@@ -152,12 +158,19 @@ def main() -> int:
         return 5
 
     inner = f"""
-import json, sys, time, torch
+import json, os, sys, time, torch
 sys.path.insert(0, {repr(str(target_repo))})
+from ticl.fit_model import _apply_rlpfn_skyline_env_defaults
+_apply_rlpfn_skyline_env_defaults(['rlpfn'])
 from ticl.model_configs import get_model_default_config
 from ticl.model_builder import get_model
 from ticl.priors.environment_prior import EnvironmentPrior
-from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
+from ticl.train import (
+    _amp_autocast_context,
+    _build_policy_step_fn,
+    _compute_policy_rollout_chunk_loss,
+    _resolve_policy_autocast_dtype,
+)
 
 config = get_model_default_config('rlpfn')
 config['optimizer']['rl_objective'] = {objective!r}
@@ -182,7 +195,12 @@ env['alpha_grad_local_coordinate_enabled'] = False
 env['alpha_grad_unit_grad_enabled'] = False
 env['first_policy_gradient_action_grad_clip_value'] = 4.0
 env['first_policy_gradient_action_grad_clip_norm'] = 0.0
-config['transformer']['x_obs_dim'] = int(env['obs_slot_dim']) + 2
+config['transformer']['x_obs_dim'] = (
+    int(env['obs_slot_dim'])
+    + 2
+    + 1  # phase token
+    + int(bool(env.get('terminal_reset_enabled', False)))
+)
 
 _, model, _, _ = get_model(config, device='cuda', should_train=False, verbose=False)
 model = model.to('cuda')
@@ -201,52 +219,86 @@ step_fn = _build_policy_step_fn(
     pg_torch_compile_fullgraph=False,
     pg_torch_compile_dynamic=False,
 )
-
+policy_autocast_dtype = _resolve_policy_autocast_dtype('cuda')
 torch.cuda.reset_peak_memory_stats()
 start = time.time()
 streamed_roots = []
+optimizer = None
+scaler = None
+
+if {args.execution_mode == "fit_model"}:
+    adamw_kwargs = dict(
+        lr=float(config['optimizer']['learning_rate']),
+        weight_decay=float(config['optimizer']['weight_decay']),
+        betas=(float(config['optimizer']['adam_beta1']), 0.999),
+    )
+    try:
+        optimizer = torch.optim.AdamW(model.parameters(), fused=True, **adamw_kwargs)
+    except Exception:
+        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+    optimizer.zero_grad(set_to_none=True)
+    scaler = torch.amp.GradScaler('cuda')
+else:
+    model.zero_grad(set_to_none=True)
 
 def _tbptt_sink(loss_root):
     streamed_roots.append(float(loss_root.detach().cpu()))
-    loss_root.backward()
+    if scaler is None:
+        loss_root.backward()
+    else:
+        scaler.scale(loss_root).backward()
 
-loss, rollout, stats = _compute_policy_rollout_chunk_loss(
-    env_prior=prior,
-    policy_step_fn=step_fn,
-    batch_size=64,
-    n_samples=1024,
-    num_features=int(config['prior']['num_features']),
-    device='cuda',
-    single_eval_pos=697,
-    collect_x=False,
-    policy_rollout_checkpoint={bool(args.checkpoint)} and (not {bool(args.tbptt_stream)}),
-    policy_rollout_checkpoint_reentrant={bool(args.reentrant)},
-    pg_saved_tensors_cpu_offload=True,
-    pg_saved_tensors_cpu_offload_scope='policy',
-    pg_saved_tensors_pin_memory=False,
-    pg_saved_tensors_cpu_offload_auto_disable_when_safe=False,
-    pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
-    pg_saved_tensors_cpu_offload_auto_max_batch_size=64,
-    pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
-    pg_tbptt_window={tbptt_window},
-    tbptt_loss_sink=(_tbptt_sink if {bool(args.tbptt_stream)} else None),
-    rl_objective={objective!r},
-)
+with _amp_autocast_context(scaler, device='cuda', dtype=policy_autocast_dtype):
+    loss, rollout, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=64,
+        n_samples=1024,
+        num_features=int(config['prior']['num_features']),
+        device='cuda',
+        single_eval_pos=697,
+        collect_x=False,
+        policy_rollout_checkpoint={bool(args.checkpoint)} and (not {bool(args.tbptt_stream)}),
+        policy_rollout_checkpoint_reentrant={bool(args.reentrant)},
+        pg_saved_tensors_cpu_offload=True,
+        pg_saved_tensors_cpu_offload_scope='policy',
+        pg_saved_tensors_pin_memory=False,
+        pg_saved_tensors_cpu_offload_auto_disable_when_safe=False,
+        pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
+        pg_saved_tensors_cpu_offload_auto_max_batch_size=64,
+        pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
+        pg_tbptt_window={tbptt_window},
+        tbptt_loss_sink=(_tbptt_sink if {bool(args.tbptt_stream)} else None),
+        rl_objective={objective!r},
+    )
 mid = time.time()
-model.zero_grad(set_to_none=True)
 if len(streamed_roots) == 0:
-    loss.backward()
+    if scaler is None:
+        loss.backward()
+    else:
+        scaler.scale(loss).backward()
+after_backward = time.time()
+peak_alloc_after_backward_mib = torch.cuda.max_memory_allocated() / (1024**2)
+peak_reserved_after_backward_mib = torch.cuda.max_memory_reserved() / (1024**2)
+if optimizer is not None:
+    scaler.step(optimizer)
+    scaler.update()
+    optimizer.zero_grad(set_to_none=True)
 end = time.time()
 print(json.dumps({{
     'payload_status': 'ok',
+    'execution_mode': {args.execution_mode!r},
     'rollout_plus_loss_s': mid - start,
-    'backward_s': end - mid,
+    'backward_s': after_backward - mid,
+    'step_s': end - after_backward,
     'wall_s': end - start,
     'tbptt_stream': {bool(args.tbptt_stream)},
     'tbptt_window': {tbptt_window},
     'streamed_root_count': int(len(streamed_roots)),
     'peak_alloc_mib': torch.cuda.max_memory_allocated() / (1024**2),
     'peak_reserved_mib': torch.cuda.max_memory_reserved() / (1024**2),
+    'peak_alloc_after_backward_mib': float(peak_alloc_after_backward_mib),
+    'peak_reserved_after_backward_mib': float(peak_reserved_after_backward_mib),
     'objective_value': float(stats['objective'].detach().cpu()),
     'rl_objective': {objective!r},
     'reward_mean': float(stats['reward_mean'].detach().cpu()),
@@ -311,20 +363,35 @@ print(json.dumps({{
     start_time = time.time()
 
     with log_path.open("w") as lf:
+        log_lock = threading.Lock()
+
+        def _emit(msg: str) -> None:
+            print(msg, flush=True)
+            with log_lock:
+                lf.write(msg + "\n")
+                lf.flush()
+
         def poll():
             nonlocal peak_rss_sum, peak_gpu_process, peak_gpu_total, status
             rss_guard_bytes = int(args.rss_guard_gb * (1024 ** 3))
             while proc.poll() is None:
                 if (time.time() - start_time) > int(args.timeout_sec):
                     status = "timeout_kill"
+                    _emit(
+                        f"[monitor] label={label} status={status} "
+                        f"rss_gib={peak_rss_sum / (1024 ** 3):.3f} "
+                        f"gpu_process_mib={peak_gpu_process} gpu_total_mib={peak_gpu_total}"
+                    )
                     proc.kill()
                     break
+                rss_sum = 0
+                process_mib = peak_gpu_process
+                total_mib = peak_gpu_total
                 try:
                     pids = {proc.pid} | {c.pid for c in root.children(recursive=True)}
                 except Exception:
                     pids = {proc.pid}
                 try:
-                    rss_sum = 0
                     for pid in pids:
                         try:
                             rss_sum += psutil.Process(pid).memory_info().rss
@@ -333,6 +400,13 @@ print(json.dumps({{
                     peak_rss_sum = max(peak_rss_sum, rss_sum)
                     if rss_sum > rss_guard_bytes:
                         status = "rss_guard_kill"
+                        _emit(
+                            f"[monitor] label={label} status={status} "
+                            f"rss_gib={rss_sum / (1024 ** 3):.3f} "
+                            f"peak_rss_gib={peak_rss_sum / (1024 ** 3):.3f} "
+                            f"gpu_process_mib={peak_gpu_process} peak_gpu_process_mib={peak_gpu_process} "
+                            f"gpu_total_mib={peak_gpu_total} peak_gpu_total_mib={peak_gpu_total}"
+                        )
                         proc.kill()
                         break
                 except Exception:
@@ -350,9 +424,17 @@ print(json.dumps({{
                     )
                     total_vals = [int(x.strip().split()[0]) for x in totals.strip().splitlines() if x.strip()]
                     if total_vals:
+                        total_mib = max(total_vals)
                         peak_gpu_total = max(peak_gpu_total, max(total_vals))
                         if peak_gpu_total > int(args.gpu_total_guard_mib):
                             status = "gpu_total_guard_kill"
+                            _emit(
+                                f"[monitor] label={label} status={status} "
+                                f"rss_gib={rss_sum / (1024 ** 3):.3f} "
+                                f"peak_rss_gib={peak_rss_sum / (1024 ** 3):.3f} "
+                                f"gpu_process_mib={peak_gpu_process} peak_gpu_process_mib={peak_gpu_process} "
+                                f"gpu_total_mib={total_mib} peak_gpu_total_mib={peak_gpu_total}"
+                            )
                             proc.kill()
                             break
                     for line in out.strip().splitlines():
@@ -360,20 +442,37 @@ print(json.dumps({{
                             continue
                         pid_s, mem_s = [x.strip() for x in line.split(",")[:2]]
                         if int(pid_s) in pids:
+                            process_mib = max(process_mib, int(float(mem_s)))
                             peak_gpu_process = max(peak_gpu_process, int(float(mem_s)))
                     if peak_gpu_process > int(args.gpu_guard_mib):
                         status = "gpu_guard_kill"
+                        _emit(
+                            f"[monitor] label={label} status={status} "
+                            f"rss_gib={rss_sum / (1024 ** 3):.3f} "
+                            f"peak_rss_gib={peak_rss_sum / (1024 ** 3):.3f} "
+                            f"gpu_process_mib={process_mib} peak_gpu_process_mib={peak_gpu_process} "
+                            f"gpu_total_mib={total_mib} peak_gpu_total_mib={peak_gpu_total}"
+                        )
                         proc.kill()
                         break
                 except Exception:
                     pass
+                _emit(
+                    f"[monitor] label={label} status=running "
+                    f"rss_gib={rss_sum / (1024 ** 3):.3f} "
+                    f"peak_rss_gib={peak_rss_sum / (1024 ** 3):.3f} "
+                    f"gpu_process_mib={process_mib} peak_gpu_process_mib={peak_gpu_process} "
+                    f"gpu_total_mib={total_mib} peak_gpu_total_mib={peak_gpu_total}"
+                )
                 time.sleep(max(0.05, float(args.poll_interval_sec)))
 
         t = threading.Thread(target=poll, daemon=True)
         t.start()
         for line in proc.stdout:
-            lf.write(line)
-            lf.flush()
+            print(line, end="", flush=True)
+            with log_lock:
+                lf.write(line)
+                lf.flush()
         rc = proc.wait()
         t.join(timeout=2)
 

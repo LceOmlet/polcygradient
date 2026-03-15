@@ -485,14 +485,14 @@ def get_rlpfn_default_config():
         "reinforce_reward_transform": "tanh",
         "reinforce_reward_rms_eps": 1e-6,
         "reinforce_reward_tanh_c": 10.0,
-        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 1.0, "max": 10.0},
+        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
         "reinforce_action_transform": "rms",
         "reinforce_action_rms_eps": 1e-6,
         "first_policy_gradient_state_grad_clip_norm": 4.0,
-        "first_policy_gradient_action_grad_clip_value": 0.0,
-        "first_policy_gradient_action_grad_clip_norm": 1.0,
-        "alpha_grad_local_coordinate_enabled": True,
-        "alpha_grad_unit_grad_enabled": True,
+        "first_policy_gradient_action_grad_clip_value": 4.0,
+        "first_policy_gradient_action_grad_clip_norm": 0.0,
+        "alpha_grad_local_coordinate_enabled": False,
+        "alpha_grad_unit_grad_enabled": False,
         "alpha_grad_unit_grad_delta": 1e-6,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
@@ -505,7 +505,7 @@ def get_rlpfn_default_config():
         "batch_shared_environment": False,
         "batch_vectorized_grouping": "family",
         "reference_scm_partition_max_bytes": 2 * 1024 * 1024 * 1024,
-        "terminal_reset_enabled": True,
+        "terminal_reset_enabled": False,
     })
 
     # Keep a strict fixed feature width for split heads.
@@ -576,7 +576,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024

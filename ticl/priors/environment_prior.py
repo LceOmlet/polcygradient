@@ -4621,7 +4621,7 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_reinforce_reward_tanh_bound(h):
         v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
-        if (not math.isfinite(v)) or v <= 0.0:
+        if (not math.isfinite(v)) or v < 0.0:
             return 10.0
         return float(v)
 

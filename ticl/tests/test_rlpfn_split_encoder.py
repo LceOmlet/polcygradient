@@ -9,12 +9,12 @@ from ticl.models.tabpfn import TabPFN
 def test_rlpfn_default_config_uses_split_encoder():
     cfg = get_model_default_config("rlpfn")
     assert cfg["prior"]["prior_type"] == "environment_only"
-    assert cfg["prior"]["num_features"] == 434
+    assert cfg["prior"]["num_features"] == 433
     assert cfg["prior"]["environment"]["batch_parallel_backend"] == "torch_vectorized"
     assert cfg["prior"]["environment"]["batch_shared_environment"] is False
     assert cfg["prior"]["environment"]["batch_vectorized_grouping"] == "family"
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
-    assert cfg["transformer"]["x_obs_dim"] == 404
+    assert cfg["transformer"]["x_obs_dim"] == 403
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
@@ -35,16 +35,16 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
-        "min": 1.0,
+        "min": 0.0,
         "max": 10.0,
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
-    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
-    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
-    assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
-    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 4.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 0.0
+    assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is False
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is False
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
@@ -97,8 +97,8 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
-    assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
+    assert cfg["prior"]["environment"]["terminal_reset_enabled"] is False
     assert cfg["prior"]["environment"]["reference_scm_partition_max_bytes"] == 2 * 1024 * 1024 * 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 64
@@ -119,11 +119,11 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 
 
-def test_rlpfn_default_terminal_reset_expands_split_obs_slots():
+def test_rlpfn_default_terminal_reset_is_disabled_in_split_obs_slots():
     cfg = model_configs.get_rlpfn_default_config()
-    assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
-    assert cfg["transformer"]["x_obs_dim"] == 404
-    assert cfg["prior"]["num_features"] == 434
+    assert cfg["prior"]["environment"]["terminal_reset_enabled"] is False
+    assert cfg["transformer"]["x_obs_dim"] == 403
+    assert cfg["prior"]["num_features"] == 433
 
 
 def test_tabpfn_split_obs_action_encoder_forward():
