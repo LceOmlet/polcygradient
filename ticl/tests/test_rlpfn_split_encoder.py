@@ -97,7 +97,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
     assert cfg["prior"]["environment"]["reference_scm_partition_max_bytes"] == 2 * 1024 * 1024 * 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0

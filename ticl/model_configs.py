@@ -580,7 +580,9 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    # Keep the active skyline on forced policy-only offload instead of silently
+    # bypassing it when the batch happens to look "safe".
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
