@@ -489,10 +489,10 @@ def get_rlpfn_default_config():
         "reinforce_action_transform": "rms",
         "reinforce_action_rms_eps": 1e-6,
         "first_policy_gradient_state_grad_clip_norm": 4.0,
-        "first_policy_gradient_action_grad_clip_value": 4.0,
-        "first_policy_gradient_action_grad_clip_norm": 0.0,
-        "alpha_grad_local_coordinate_enabled": False,
-        "alpha_grad_unit_grad_enabled": False,
+        "first_policy_gradient_action_grad_clip_value": 0.0,
+        "first_policy_gradient_action_grad_clip_norm": 1.0,
+        "alpha_grad_local_coordinate_enabled": True,
+        "alpha_grad_unit_grad_enabled": True,
         "alpha_grad_unit_grad_delta": 1e-6,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
@@ -505,7 +505,7 @@ def get_rlpfn_default_config():
         "batch_shared_environment": False,
         "batch_vectorized_grouping": "family",
         "reference_scm_partition_max_bytes": 2 * 1024 * 1024 * 1024,
-        "terminal_reset_enabled": False,
+        "terminal_reset_enabled": True,
     })
 
     # Keep a strict fixed feature width for split heads.
