@@ -531,6 +531,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--rl-validate-max-steps', type=int, help='Max steps per episode during rlpfn validation.')
     orchestration.add_argument('--rl-validate-action-candidates', type=int, help='Number of sampled continuous actions per step.')
     orchestration.add_argument('--rl-validate-seed', type=int, help='Base random seed for rlpfn validation.')
+    orchestration.add_argument('--rl-validate-context-lower-bound', type=int,
+                               help='Switch rlpfn validation from explore (E=0) to exploit (E=1) once context_len + mean_explore_rollout_len exceeds this bound.')
 
     if model_type == 'rlpfn':
         orchestration.set_defaults(
@@ -540,6 +542,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
         )
     else:
         orchestration.set_defaults(
@@ -549,6 +552,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
         )
 
     # orchestration options are not part of the default config

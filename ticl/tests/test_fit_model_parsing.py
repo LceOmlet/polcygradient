@@ -89,6 +89,18 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
+    assert args.orchestration.rl_validate_context_lower_bound == 2048
+
+
+def test_rlpfn_parser_accepts_rl_validate_context_lower_bound():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-validate-context-lower-bound", "4096",
+        ]
+    )
+    assert args.orchestration.rl_validate_context_lower_bound == 4096
 
 
 def test_rlpfn_parser_accepts_aev5_next_flags():
