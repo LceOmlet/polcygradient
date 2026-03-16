@@ -486,7 +486,7 @@ def get_rlpfn_default_config():
         "reinforce_reward_transform": "tanh",
         "reinforce_reward_rms_eps": 1e-6,
         "reinforce_reward_tanh_c": 10.0,
-        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 1.0, "max": 10.0},
+        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
         "reinforce_action_transform": "rms",
         "reinforce_action_rms_eps": 1e-6,
         "first_policy_gradient_state_grad_clip_norm": 4.0,
@@ -495,6 +495,8 @@ def get_rlpfn_default_config():
         "alpha_grad_local_coordinate_enabled": True,
         "alpha_grad_unit_grad_enabled": True,
         "alpha_grad_unit_grad_delta": 1e-6,
+        "pg_one_hop_replay_enabled": True,
+        "alpha_grad_one_hop_replay_enabled": True,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,
@@ -502,6 +504,11 @@ def get_rlpfn_default_config():
         "reward_dropout_ratio_min": 0.1,
         "reward_dropout_ratio_max": 1.0,
         "reward_dropout_impute_zero": True,
+        "terminal_reset_enabled": True,
+        "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 20.0},
+        "terminal_bonus_tanh_c": 10.0,
+        "terminal_bonus_scale_min": 1.0,
+        "terminal_bonus_scale_max": 10.0,
         "batch_parallel_backend": "torch_vectorized",
         "batch_shared_environment": False,
         "batch_vectorized_grouping": "family",
@@ -514,8 +521,13 @@ def get_rlpfn_default_config():
     config['transformer']['classification_task'] = False
     config['transformer']['y_encoder'] = 'linear'
     config['transformer']['x_encoder_type'] = 'split_obs_action'
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
+    terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
+    phase_obs_extra = 1
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + phase_obs_extra + terminal_obs_extra
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
+    config['prior']['num_features'] = (
+        int(config['transformer']['x_obs_dim']) + int(config['transformer']['x_action_dim'])
+    )
     config['transformer']['single_eval_causal'] = True
     config['optimizer']['rl_objective'] = 'alpha_grad'
     # Policy-gradient rollout chunking over batch columns.
@@ -572,7 +584,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 1024
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32

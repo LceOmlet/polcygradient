@@ -820,11 +820,96 @@ def test_policy_step_fn_prefers_split_fastpath_and_falls_back_on_slot_mismatch()
     assert model.calls["split"] == 1
     assert model.calls["legacy"] == 0
 
-    env_info_mismatch = {"obs_slot_dim": 5, "action_slot_dim": 4, "action_dim": 4}
+    env_info_mismatch = {"obs_slot_dim": 6, "action_slot_dim": 3, "action_dim": 4}
     action_next_mismatch, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 1, env_info_mismatch)
     assert torch.allclose(action_next_mismatch, torch.full((2, 4), 3.0))
     assert model.calls["split"] == 1
     assert model.calls["legacy"] == 1
+
+
+def test_policy_step_fn_passes_phase_token_to_split_policy():
+    class _DummyEncoder:
+        obs_dim = 10
+        action_dim = 4
+
+    class _DummyModel:
+        def __init__(self):
+            self.x_encoder_type = "split_obs_action"
+            self.encoder = _DummyEncoder()
+            self.phase_seen = None
+            self.terminal_seen = None
+
+        def forward_policy_step_split(
+            self,
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=None,
+            terminal_t=None,
+            kv_cache=None,
+            **kwargs,
+        ):
+            del obs_t, action_t, reward_t, reward_mask_t, kwargs
+            self.phase_seen = None if phase_t is None else phase_t.detach().clone()
+            self.terminal_seen = None if terminal_t is None else terminal_t.detach().clone()
+            out = torch.zeros((1, 2, 4), dtype=torch.float32)
+            return out, kv_cache
+
+        def forward_policy_step(self, *args, **kwargs):
+            raise AssertionError("split fastpath should be used")
+
+    model = _DummyModel()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=16,
+        max_cache_len=12,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    obs_t = torch.randn(2, 6, dtype=torch.float32)
+    action_t = torch.randn(2, 4, dtype=torch.float32)
+    reward_t = torch.randn(2, 1, dtype=torch.float32)
+    reward_mask_t = torch.ones(2, 1, dtype=torch.float32)
+    phase_t = torch.tensor([[0.0], [1.0]], dtype=torch.float32)
+    terminal_t = torch.tensor([[1.0], [0.0]], dtype=torch.float32)
+    env_info = {
+        "obs_slot_dim": 6,
+        "action_slot_dim": 4,
+        "action_dim": 4,
+        "phase_t": phase_t,
+        "terminal_t": terminal_t,
+    }
+
+    step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 0, env_info)
+    assert torch.allclose(model.phase_seen, phase_t)
+    assert torch.allclose(model.terminal_seen, terminal_t)
+
+
+def test_environment_prior_collect_x_marks_phase_from_single_eval_pos():
+    _seed_everything(20260314)
+    env_cfg = _fixed_env_cfg()
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["terminal_reset_enabled"] = False
+
+    prior = EnvironmentPrior(env_cfg)
+    single_eval_pos = 5
+    num_features = 17
+    x, _, _ = prior.get_batch(
+        batch_size=2,
+        n_samples=8,
+        num_features=num_features,
+        device="cpu",
+        single_eval_pos=single_eval_pos,
+    )
+
+    phase_col = 12 + 2
+    assert torch.all(x[:single_eval_pos, :, phase_col] == 0)
+    assert torch.all(x[single_eval_pos:, :, phase_col] == 1)
 
 
 def test_policy_rollout_chunk_torch_vectorized_matches_serial_semantics():
@@ -1713,6 +1798,7 @@ def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend
     family_env_cfg = dict(full_cfg["prior"]["environment"])
     family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
     family_env_cfg["batch_vectorized_grouping"] = "family"
+    family_env_cfg["batch_vectorized_strict_rng_match"] = True
 
     stats_structure, grads_structure, roots_structure = _run_streaming_tbptt_chunk(
         env_cfg=structure_env_cfg,
@@ -1881,9 +1967,9 @@ def test_pg_phase_start_is_written_before_rollout_finishes(tmp_path):
         train_mod.traceback.print_exc = orig_print_exc
 
     lines = log_path.read_text().splitlines()
-    assert any(line.startswith("[pg-phase-start]") for line in lines)
-    assert not any(line.startswith("[pg-phase]") for line in lines)
-    start_line = next(line for line in lines if line.startswith("[pg-phase-start]"))
+    assert any("[pg-phase-start]" in line for line in lines)
+    assert not any("[pg-phase]" in line and "[pg-phase-start]" not in line for line in lines)
+    start_line = next(line for line in lines if "[pg-phase-start]" in line)
     assert "epoch=0" in start_line
     assert "batch=0" in start_line
     assert "status=start" in start_line
@@ -1944,8 +2030,8 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
 
     assert torch.isfinite(torch.tensor(loss))
     lines = log_path.read_text().splitlines()
-    start_lines = [line for line in lines if line.startswith("[pg-phase-start]")]
-    finish_lines = [line for line in lines if line.startswith("[pg-phase]")]
+    start_lines = [line for line in lines if "[pg-phase-start]" in line]
+    finish_lines = [line for line in lines if "[pg-phase]" in line and "[pg-phase-start]" not in line]
     assert len(start_lines) == 1
     assert len(finish_lines) == 1
     assert "status=start" in start_lines[0]

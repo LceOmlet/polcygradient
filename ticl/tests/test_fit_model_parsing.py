@@ -85,10 +85,11 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_saved_tensors_pin_memory is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 64
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 1024
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
+    assert args.orchestration.rl_validate_context_lower_bound == 2048
 
 
 def test_rlpfn_parser_accepts_aev5_next_flags():
@@ -106,6 +107,25 @@ def test_rlpfn_parser_accepts_aev5_next_flags():
     assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_lo == 0.97
     assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_hi == 1.02
     assert args.prior.environment.anti_explosion_vanishing_v5_next_step_grad_rms_hi == 0.05
+
+
+def test_rlpfn_parser_refreshes_split_dims_when_terminal_flag_changes():
+    parser = make_model_level_argparser()
+
+    args_terminal_on = parser.parse_args(["rlpfn"])
+    assert args_terminal_on.prior.environment.terminal_reset_enabled is True
+    assert args_terminal_on.transformer.x_obs_dim == 404
+    assert args_terminal_on.prior.num_features == 434
+
+    args_terminal_off = parser.parse_args(
+        [
+            "rlpfn",
+            "--terminal-reset-enabled", "false",
+        ]
+    )
+    assert args_terminal_off.prior.environment.terminal_reset_enabled is False
+    assert args_terminal_off.transformer.x_obs_dim == 403
+    assert args_terminal_off.prior.num_features == 433
 
 
 def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
@@ -164,6 +184,17 @@ def test_rlpfn_parser_accepts_alpha_grad_objective():
     assert args.optimizer.rl_objective == "alpha_grad"
 
 
+def test_rlpfn_parser_accepts_pg_one_hop_replay_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-one-hop-replay-enabled", "false",
+        ]
+    )
+    assert args.prior.environment.pg_one_hop_replay_enabled is False
+
+
 def test_rlpfn_parser_accepts_first_pg_action_grad_clip_options():
     parser = make_model_level_argparser()
     args = parser.parse_args(
@@ -212,7 +243,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
-        "min": 1.0,
+        "min": 0.0,
         "max": 10.0,
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
@@ -223,12 +254,13 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
+    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 64
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",

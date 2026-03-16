@@ -29,11 +29,43 @@ class GroupedArgParser(argparse.ArgumentParser):
                     parent_namespace = getattr(parent_namespace, part)
                 setattr(parent_namespace, parts[-1], new_subnamespace)
 
+        self._refresh_rlpfn_split_dims(nested_by_groups)
+
         return nested_by_groups, args
+
+    @staticmethod
+    def _refresh_rlpfn_split_dims(args):
+        model_type = getattr(args, "model_type", None)
+        if model_type != "rlpfn":
+            return
+        transformer = getattr(args, "transformer", None)
+        prior = getattr(args, "prior", None)
+        if transformer is None or prior is None:
+            return
+        environment = getattr(prior, "environment", None)
+        if environment is None:
+            return
+        if getattr(transformer, "x_encoder_type", None) != "split_obs_action":
+            return
+        obs_slot_dim = int(getattr(environment, "obs_slot_dim", 400))
+        action_slot_dim = int(getattr(environment, "action_slot_dim", 30))
+        terminal_enabled = bool(getattr(environment, "terminal_reset_enabled", False))
+        x_obs_dim = int(obs_slot_dim) + 3 + (1 if terminal_enabled else 0)
+        x_action_dim = int(action_slot_dim)
+        transformer.x_obs_dim = x_obs_dim
+        transformer.x_action_dim = x_action_dim
+        prior.num_features = x_obs_dim + x_action_dim
+
+
+class RootArgParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        results, args = super().parse_known_args(args=args, namespace=namespace)
+        GroupedArgParser._refresh_rlpfn_split_dims(results)
+        return results, args
 
 
 def make_model_level_argparser(description="Train transformer-style model on synthetic data"):
-    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = RootArgParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     subparsers = parser.add_subparsers(required=True, parser_class=GroupedArgParser,
                                        description="Choose the model type to train.", dest='model_type')
     mothernet_parser = subparsers.add_parser('mothernet', help='Train a mothernet model')
@@ -369,6 +401,10 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='If true, alpha_grad computes alpha from unit-normalized g0/g1 blocks while still mixing raw gradients.')
     environment_prior.add_argument('--alpha-grad-unit-grad-delta', type=float,
                                    help='Positive delta added to the unit-gradient normalization denominator used by alpha_grad.')
+    environment_prior.add_argument('--pg-one-hop-replay-enabled', type=str2bool,
+                                   help='If true, TBPTT replays one-hop boundary cotangents into the previous window for supported stochastic PG objectives.')
+    environment_prior.add_argument('--alpha-grad-one-hop-replay-enabled', type=str2bool,
+                                   help='Backward-compatible alias for the one-hop TBPTT replay toggle.')
     environment_prior.add_argument('--anti-explosion-vanishing-v2-enabled', type=str2bool,
                                    help='Enable anti-explosion&vanishing-v2 (two-sided state-gain corridor regularization).')
     environment_prior.add_argument('--anti-explosion-vanishing-v2-lambda', type=float,
@@ -487,6 +523,16 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-dropout-ratio-min', type=float, help='Minimum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-ratio-max', type=float, help='Maximum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-impute-zero', type=str2bool, help='Use zero imputation for dropped rewards.')
+    environment_prior.add_argument('--terminal-reset-enabled', type=str2bool,
+                                   help='Enable terminal bonus/reset dynamics driven by the extra terminal signal state.')
+    environment_prior.add_argument('--terminal-reset-count-target', type=float,
+                                   help='Expected number of terminal resets over one rollout horizon.')
+    environment_prior.add_argument('--terminal-bonus-tanh-c', type=float,
+                                   help='Tanh temperature used to map terminal signal into terminal bonus.')
+    environment_prior.add_argument('--terminal-bonus-scale-min', type=float,
+                                   help='Minimum sampled terminal bonus scale.')
+    environment_prior.add_argument('--terminal-bonus-scale-max', type=float,
+                                   help='Maximum sampled terminal bonus scale.')
     environment_prior.add_argument('--batch-parallel-workers', type=int, help='Parallel workers for independent per-column rollout in get_batch.')
     environment_prior.add_argument('--batch-parallel-backend', type=str, choices=['python_thread', 'torch_vectorized'],
                                    help='Backend for batch generation parallelism in environment prior.')
@@ -531,6 +577,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--rl-validate-max-steps', type=int, help='Max steps per episode during rlpfn validation.')
     orchestration.add_argument('--rl-validate-action-candidates', type=int, help='Number of sampled continuous actions per step.')
     orchestration.add_argument('--rl-validate-seed', type=int, help='Base random seed for rlpfn validation.')
+    orchestration.add_argument('--rl-validate-context-lower-bound', type=int,
+                               help='Switch rlpfn validation from explore (E=0) to exploit (E=1) once context_len + mean_explore_rollout_len exceeds this bound.')
 
     if model_type == 'rlpfn':
         orchestration.set_defaults(
@@ -540,6 +588,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
         )
     else:
         orchestration.set_defaults(
@@ -549,6 +598,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
         )
 
     # orchestration options are not part of the default config

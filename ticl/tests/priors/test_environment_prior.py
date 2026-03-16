@@ -7510,3 +7510,402 @@ def test_environment_prior_lipschitz_gp_keeps_rollout_grads_finite_under_tiny_le
     for p in policy.parameters():
         if p.grad is not None:
             assert torch.isfinite(p.grad).all()
+
+
+def _install_constant_terminal_builders(prior, monkeypatch):
+    def _constant_policy_builder(in_dim, out_dim, h, device, generator=None, apply_output_tanh=True):
+        del in_dim, h, generator, apply_output_tanh
+
+        def _fn(x, generators_for_noise=None, generator=None):
+            del generators_for_noise, generator
+            return torch.zeros((x.shape[0], out_dim), device=device, dtype=torch.float32)
+
+        _fn._applies_output_tanh = False
+        return _fn
+
+    def _constant_policy_batch_builder(in_dim, out_dim, h_list, device, generators=None, apply_output_tanh=True):
+        del in_dim, h_list, generators, apply_output_tanh
+
+        def _fn(x, generators_for_noise=None, generator=None):
+            del generators_for_noise, generator
+            return torch.zeros((x.shape[0], out_dim), device=device, dtype=torch.float32)
+
+        _fn._applies_output_tanh = False
+        return _fn
+
+    def _constant_transition_builder(in_dim, state_dim, h, device, generator=None):
+        del in_dim, h, generator
+
+        def _fn(x, generators_for_noise=None, generator=None):
+            del generators_for_noise, generator
+            state = torch.full((x.shape[0], state_dim), 2.0, device=device, dtype=torch.float32)
+            reward = torch.zeros((x.shape[0], 1), device=device, dtype=torch.float32)
+            terminal_signal = torch.full((x.shape[0], 1), 5.0, device=device, dtype=torch.float32)
+            return state, reward, terminal_signal
+
+        _fn._applies_output_tanh = False
+        return _fn
+
+    def _constant_transition_batch_builder(in_dim, state_dim, h_list, device, generators=None):
+        del in_dim, h_list, generators
+
+        def _fn(x, generators_for_noise=None, generator=None, **kwargs):
+            del generators_for_noise, generator, kwargs
+            state = torch.full((x.shape[0], state_dim), 2.0, device=device, dtype=torch.float32)
+            reward = torch.zeros((x.shape[0], 1), device=device, dtype=torch.float32)
+            terminal_signal = torch.full((x.shape[0], 1), 5.0, device=device, dtype=torch.float32)
+            return state, reward, terminal_signal
+
+        _fn._applies_output_tanh = False
+        return _fn
+
+    monkeypatch.setattr(prior, "_build_scm_fn", _constant_policy_builder)
+    monkeypatch.setattr(prior, "_build_scm_batch_fn", _constant_policy_batch_builder)
+    monkeypatch.setattr(prior, "_build_scm_joint_transition_fn", _constant_transition_builder)
+    monkeypatch.setattr(prior, "_build_scm_joint_transition_batch_fn", _constant_transition_batch_builder)
+    monkeypatch.setattr(prior, "_build_reference_scm_joint_transition_fn", _constant_transition_builder)
+    monkeypatch.setattr(prior, "_build_reference_scm_joint_transition_batch_fn", _constant_transition_batch_builder)
+
+
+def _zero_policy_step(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+    del obs_t, reward_t, reward_mask_t, cache, step_idx, env_info
+    return torch.zeros_like(action_t)
+
+
+def _make_terminal_sampled_h_list():
+    specs = [
+        dict(state_dim=3, obs_dim=2, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=2),
+        dict(state_dim=5, obs_dim=3, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=3),
+        dict(state_dim=4, obs_dim=2, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=2),
+        dict(state_dim=6, obs_dim=4, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=3),
+    ]
+    sampled = []
+    for spec in specs:
+        h = _manual_sampled_h(family="scm", **spec)
+        h["strict_joint_transition_enabled"] = True
+        h["obs_slot_dim"] = 4
+        h["action_slot_dim"] = 2
+        h["init_state_std"] = 0.0
+        h["init_action_std"] = 0.0
+        h["alpha"] = 1.0
+        h["reward_scale"] = 1.0
+        h["reward_clip"] = 10.0
+        h["state_full_rms_enabled"] = False
+        h["state_noise_std"] = 0.0
+        h["action_noise_train_std"] = 0.0
+        h["action_noise_eval_std"] = 0.0
+        h["terminal_reset_enabled"] = True
+        h["terminal_reset_count_target"] = 4
+        h["terminal_bonus_tanh_c"] = 10.0
+        h["terminal_bonus_scale_min"] = 3.0
+        h["terminal_bonus_scale_max"] = 3.0
+        h["reinforce_reward_transform"] = "none"
+        sampled.append(h)
+    return sampled
+
+
+def test_environment_prior_rollout_policy_gradient_loss_reports_terminal_count_stats(monkeypatch):
+    _seed_everything(20260313)
+    sampled = _make_terminal_sampled_h_list()[:1]
+    sampled[0]["action_noise_train_std"] = 0.1
+    sampled[0]["action_noise_eval_std"] = 0.1
+    prior = EnvironmentPrior(dict(get_prior_config()["prior"]["environment"], batch_parallel_backend="python_thread"))
+    _install_constant_terminal_builders(prior, monkeypatch)
+
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=_zero_policy_step,
+        batch_size=1,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=[11],
+        rollout_seeds_override=[101],
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    del loss
+    assert isinstance(rollout.get("terminal_stats", None), dict)
+    assert float(stats["terminal_count_mean"]) == 4.0
+    assert float(stats["terminal_count_min"]) == 4.0
+    assert float(stats["terminal_count_max"]) == 4.0
+    assert float(stats["terminal_count_target_mean"]) == 4.0
+    assert float(stats["terminal_count_target_min"]) == 4.0
+    assert float(stats["terminal_count_target_max"]) == 4.0
+
+
+def test_environment_prior_rollout_with_policy_structure_grouping_matches_serial_with_terminal_reset(monkeypatch):
+    _seed_everything(20260313)
+    sampled = _make_terminal_sampled_h_list()
+    env_seeds = [11, 23, 37, 41]
+    rollout_seeds = [101, 211, 307, 401]
+
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+
+    prior_serial = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="python_thread"))
+    prior_vec = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="structure"))
+    _install_constant_terminal_builders(prior_serial, monkeypatch)
+    _install_constant_terminal_builders(prior_vec, monkeypatch)
+    prior_serial._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior_vec._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+
+    rollout_serial = prior_serial.rollout_with_policy(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+    rollout_vec = prior_vec.rollout_with_policy(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+
+    expected_bonus = 3.0 * math.tanh(5.0 / 10.0)
+    assert torch.allclose(rollout_serial["x"], rollout_vec["x"], atol=1.5e-2, rtol=1e-6)
+    assert torch.allclose(rollout_serial["rewards"], rollout_vec["rewards"], atol=1.5e-2, rtol=1e-6)
+    assert torch.allclose(rollout_vec["rewards"], torch.full_like(rollout_vec["rewards"], expected_bonus), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rollout_vec["x"][:, :, :2], torch.zeros_like(rollout_vec["x"][:, :, :2]), atol=1e-6, rtol=1e-6)
+    terminal_col = int(sampled[0]["obs_slot_dim"]) + 2
+    assert torch.all(rollout_vec["x"][0, :, terminal_col] == 0.0)
+    assert torch.all(rollout_vec["x"][1:, :, terminal_col] == 1.0)
+    assert isinstance(rollout_vec.get("terminal_stats", None), dict)
+    assert float(rollout_vec["terminal_stats"]["terminal_count_mean"]) == 4.0
+
+
+def test_environment_prior_rollout_with_policy_family_grouping_matches_serial_with_terminal_reset(monkeypatch):
+    _seed_everything(20260313)
+    base_h = _make_terminal_sampled_h_list()[0]
+    sampled = [dict(base_h) for _ in range(4)]
+    env_seeds = [11, 23, 37, 41]
+    rollout_seeds = [101, 211, 307, 401]
+
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+
+    prior_serial = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="python_thread"))
+    prior_vec = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
+    _install_constant_terminal_builders(prior_serial, monkeypatch)
+    _install_constant_terminal_builders(prior_vec, monkeypatch)
+    prior_serial._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior_vec._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior_vec._sample_environment_family_coarse_batch = (
+        lambda h_list, device, rng_seeds=None, **_: prior_vec._sample_environment_batch(
+            h_list=h_list,
+            device=device,
+            rng_seeds=rng_seeds,
+        )
+    )
+
+    rollout_serial = prior_serial.rollout_with_policy(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+    rollout_vec = prior_vec.rollout_with_policy(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+    )
+
+    expected_bonus = 3.0 * math.tanh(5.0 / 10.0)
+    assert torch.allclose(rollout_serial["x"], rollout_vec["x"], atol=1.5e-2, rtol=1e-6)
+    assert torch.allclose(rollout_serial["rewards"], rollout_vec["rewards"], atol=1.5e-2, rtol=1e-6)
+    assert torch.allclose(rollout_vec["rewards"], torch.full_like(rollout_vec["rewards"], expected_bonus), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(rollout_vec["x"][:, :, :2], torch.zeros_like(rollout_vec["x"][:, :, :2]), atol=1e-6, rtol=1e-6)
+    terminal_col = int(sampled[0]["obs_slot_dim"]) + 2
+    assert torch.all(rollout_vec["x"][0, :, terminal_col] == 0.0)
+    assert torch.all(rollout_vec["x"][1:, :, terminal_col] == 1.0)
+    assert isinstance(rollout_vec.get("terminal_stats", None), dict)
+    assert float(rollout_vec["terminal_stats"]["terminal_count_mean"]) == 4.0
+    assert float(rollout_vec["terminal_stats"]["terminal_count_min"]) == 4.0
+    assert float(rollout_vec["terminal_stats"]["terminal_count_max"]) == 4.0
+    assert float(rollout_vec["terminal_stats"]["terminal_count_target_mean"]) == 4.0
+
+
+def test_environment_prior_rollout_policy_gradient_loss_family_reports_terminal_count_stats(monkeypatch):
+    _seed_everything(20260314)
+    base_h = _make_terminal_sampled_h_list()[0]
+    sampled = [dict(base_h) for _ in range(4)]
+    for h in sampled:
+        h["action_noise_train_std"] = 0.1
+        h["action_noise_eval_std"] = 0.1
+
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+
+    prior = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
+    _install_constant_terminal_builders(prior, monkeypatch)
+    prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior._sample_environment_family_coarse_batch = (
+        lambda h_list, device, rng_seeds=None, **_: prior._sample_environment_batch(
+            h_list=h_list,
+            device=device,
+            rng_seeds=rng_seeds,
+        )
+    )
+
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        h_list_override=sampled,
+        env_seeds_override=[11, 23, 37, 41],
+        rollout_seeds_override=[101, 211, 307, 401],
+        policy_objective_kind="first_policy_gradient",
+    )
+
+    del loss
+    assert isinstance(rollout.get("terminal_stats", None), dict)
+    assert float(stats["terminal_count_mean"]) == 4.0
+    assert float(stats["terminal_count_min"]) == 4.0
+    assert float(stats["terminal_count_max"]) == 4.0
+    assert float(stats["terminal_count_target_mean"]) == 4.0
+
+
+def test_environment_prior_alpha_grad_family_tbptt_reports_terminal_count_stats(monkeypatch):
+    _seed_everything(20260314)
+    base_h = _make_terminal_sampled_h_list()[0]
+    sampled = [dict(base_h) for _ in range(4)]
+    for h in sampled:
+        h["action_noise_train_std"] = 0.1
+        h["action_noise_eval_std"] = 0.1
+
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["batch_parallel_workers"] = 1
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+
+    prior = EnvironmentPrior(dict(env_cfg, batch_parallel_backend="torch_vectorized", batch_vectorized_grouping="family"))
+    _install_constant_terminal_builders(prior, monkeypatch)
+    prior._sample_batch_hypers = lambda batch_size: sampled[:batch_size]
+    prior._sample_environment_family_coarse_batch = (
+        lambda h_list, device, rng_seeds=None, **_: prior._sample_environment_batch(
+            h_list=h_list,
+            device=device,
+            rng_seeds=rng_seeds,
+        )
+    )
+
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=_zero_policy_step,
+        batch_size=4,
+        n_samples=4,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        h_list_override=sampled,
+        env_seeds_override=[11, 23, 37, 41],
+        rollout_seeds_override=[101, 211, 307, 401],
+        policy_objective_kind="alpha_grad",
+    )
+
+    del loss
+    assert isinstance(rollout.get("terminal_stats", None), dict)
+    assert float(rollout["terminal_stats"]["terminal_count_mean"]) == 4.0
+    assert float(rollout["terminal_stats"]["terminal_count_target_mean"]) == 4.0
+    assert float(stats["terminal_count_mean"]) == 4.0
+    assert float(stats["terminal_count_target_mean"]) == 4.0
+    assert int(stats["alpha_grad_enabled"]) == 1
+
+
+def test_environment_prior_reinforce_family_tbptt_reports_one_hop_replay_stats():
+    _seed_everything(2082)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+    env_seeds = prior._sample_seed_list(4)
+    rollout_seeds = prior._sample_seed_list(4)
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=6,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="reinforce",
+    )
+
+    assert torch.isfinite(loss)
+    assert int(stats["reinforce_enabled"]) == 1
+    assert int(stats["pg_one_hop_replay_enabled"]) == 1
+    assert int(stats["pg_bridge_replay_count"]) >= 1

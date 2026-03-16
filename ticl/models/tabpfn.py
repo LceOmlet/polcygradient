@@ -458,6 +458,8 @@ class TabPFN(nn.Module):
         action_t,
         reward_t,
         reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
         kv_cache=None,
         max_cache_len=None,
         kv_cache_mode: str = "auto",
@@ -487,6 +489,12 @@ class TabPFN(nn.Module):
 
         reward_scalar = reward_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
         reward_mask_scalar = reward_mask_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        phase_scalar = None
+        if phase_t is not None:
+            phase_scalar = phase_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        terminal_scalar = None
+        if terminal_t is not None:
+            terminal_scalar = terminal_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
 
         obs_encoder = self.encoder.obs_encoder
         action_encoder = self.encoder.action_encoder
@@ -503,9 +511,28 @@ class TabPFN(nn.Module):
             y_bias_vec = None
         obs_dim = int(self.encoder.obs_dim)
         action_dim = int(self.encoder.action_dim)
-        obs_slot_dim = int(max(0, obs_dim - 2))
+        extra_scalar_slots = int(max(0, obs_dim - int(obs_t.shape[-1]) - 2))
+        phase_slot_expected = int(phase_scalar is not None)
+        terminal_slot_expected = int(terminal_scalar is not None)
+        remaining_slots = int(max(0, extra_scalar_slots - phase_slot_expected - terminal_slot_expected))
+        if remaining_slots > 0 and phase_scalar is None:
+            phase_scalar = torch.zeros((batch_size, 1), device=obs_t.device, dtype=obs_t.dtype)
+            phase_slot_expected = 1
+            remaining_slots -= 1
+        if remaining_slots > 0 and terminal_scalar is None:
+            terminal_scalar = torch.zeros((batch_size, 1), device=obs_t.device, dtype=obs_t.dtype)
+            terminal_slot_expected = 1
+            remaining_slots -= 1
+        scalar_slots = 2 + phase_slot_expected + terminal_slot_expected
+        obs_slot_dim = int(max(0, obs_dim - scalar_slots))
         reward_idx = obs_slot_dim
         mask_idx = obs_slot_dim + 1
+        phase_idx = obs_slot_dim + 2 if phase_slot_expected else None
+        terminal_idx = (
+            obs_slot_dim + 2 + phase_slot_expected
+            if terminal_slot_expected
+            else None
+        )
 
         obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
         action_copy = int(min(int(action_t.shape[-1]), action_dim))
@@ -541,6 +568,12 @@ class TabPFN(nn.Module):
             if mask_idx < obs_dim:
                 fused_inputs.append(reward_mask_scalar)
                 fused_weights.append(obs_weight[:, mask_idx].unsqueeze(1))
+            if phase_idx is not None and phase_idx < obs_dim:
+                fused_inputs.append(phase_scalar)
+                fused_weights.append(obs_weight[:, phase_idx].unsqueeze(1))
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                fused_inputs.append(terminal_scalar)
+                fused_weights.append(obs_weight[:, terminal_idx].unsqueeze(1))
 
             fused_bias = obs_bias + action_bias
             if y_bias_vec is not None:
@@ -571,6 +604,10 @@ class TabPFN(nn.Module):
                 obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
             if mask_idx < obs_dim:
                 obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+            if phase_idx is not None and phase_idx < obs_dim:
+                obs_enc = obs_enc + phase_scalar * obs_weight[:, phase_idx].unsqueeze(0)
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                obs_enc = obs_enc + terminal_scalar * obs_weight[:, terminal_idx].unsqueeze(0)
             if y_bias_vec is not None:
                 obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
 
