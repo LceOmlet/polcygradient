@@ -12928,8 +12928,12 @@ class EnvironmentPrior:
         return _clone(cache), tuple(leaves)
 
     @staticmethod
-    def _policy_cache_replay_leaves(cache):
+    def _policy_cache_replay_leaves(cache, *, emulate_tbptt_detach=False):
         leaves = []
+        tail_freeze_env = str(os.environ.get("TICL_POLICY_TAIL_FREEZE", "1")).strip().lower()
+        tail_freeze_enabled = tail_freeze_env not in {"0", "false", "no", "off"}
+        compact_prefix_env = str(os.environ.get("TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH", "1")).strip().lower()
+        compact_prefix_enabled = compact_prefix_env not in {"0", "false", "no", "off"}
 
         def _visit(node):
             if node is None:
@@ -12949,11 +12953,47 @@ class EnvironmentPrior:
             if isinstance(node, dict):
                 cache_mode = str(node.get("cache_mode", "")).strip().lower()
                 if cache_mode == "paged":
-                    # Prefix tensors are already detached at TBPTT boundaries.
-                    # One-hop only needs the mutable/recent tail that can still
-                    # propagate gradients into the immediately previous window.
-                    _visit(node.get("k_pages", None))
-                    _visit(node.get("v_pages", None))
+                    k_pages = node.get("k_pages", None)
+                    v_pages = node.get("v_pages", None)
+                    if not isinstance(k_pages, list) or not isinstance(v_pages, list):
+                        return
+                    if len(k_pages) != len(v_pages):
+                        raise RuntimeError("paged cache k/v page count mismatch")
+                    try:
+                        valid_len = int(node.get("valid_len", 0))
+                    except Exception:
+                        valid_len = 0
+                    k_prefix = node.get("k_prefix", None)
+                    prefix_base_len = int(node.get("prefix_base_len", 0) or 0)
+                    prefix_covered_len = int(prefix_base_len)
+                    if torch.is_tensor(k_prefix):
+                        prefix_covered_len = int(min(int(valid_len), int(k_prefix.shape[2])))
+                    try:
+                        prefix_pages = int(node.get("prefix_pages", 0))
+                    except Exception:
+                        prefix_pages = 0
+                    prefix_pages = int(max(0, min(int(prefix_pages), int(len(k_pages)))))
+                    pages_for_replay = list(zip(k_pages, v_pages))
+                    if bool(emulate_tbptt_detach) and tail_freeze_enabled and compact_prefix_enabled and (len(pages_for_replay) > 1):
+                        prefix_covered_len += sum(int(k_page.shape[2]) for k_page, _ in pages_for_replay[:-1])
+                        pages_for_replay = [pages_for_replay[-1]]
+                        prefix_pages = 0
+                    remaining = int(max(0, int(valid_len) - int(prefix_covered_len)))
+                    if prefix_pages > 0:
+                        for k_page, v_page in pages_for_replay[:prefix_pages]:
+                            if torch.is_tensor(k_page):
+                                leaves.append(k_page)
+                            if torch.is_tensor(v_page):
+                                leaves.append(v_page)
+                    for k_page, v_page in pages_for_replay[prefix_pages:]:
+                        if remaining <= 0:
+                            break
+                        take = int(min(int(k_page.shape[2]), int(remaining)))
+                        if take <= 0:
+                            continue
+                        leaves.append(k_page[:, :, :take, :])
+                        leaves.append(v_page[:, :, :take, :])
+                        remaining -= take
                     return
                 if ("k" in node) or ("v" in node):
                     _visit(node.get("k", None))
@@ -14244,7 +14284,10 @@ class EnvironmentPrior:
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(
+                                cache,
+                                emulate_tbptt_detach=True,
+                            ),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
@@ -16311,7 +16354,10 @@ class EnvironmentPrior:
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(
+                                cache,
+                                emulate_tbptt_detach=True,
+                            ),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
@@ -17569,7 +17615,10 @@ class EnvironmentPrior:
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(
+                                cache,
+                                emulate_tbptt_detach=True,
+                            ),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()

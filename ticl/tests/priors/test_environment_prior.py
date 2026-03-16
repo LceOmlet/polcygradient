@@ -7930,13 +7930,48 @@ def test_environment_prior_one_hop_replay_leaves_skip_paged_prefix():
     }
 
     replay_leaves = EnvironmentPrior._policy_cache_replay_leaves(cache)
-    assert replay_leaves == (k_page, v_page)
+    assert len(replay_leaves) == 2
+    assert tuple(replay_leaves[0].shape) == tuple(k_page.shape)
+    assert tuple(replay_leaves[1].shape) == tuple(v_page.shape)
+    assert torch.allclose(replay_leaves[0], k_page)
+    assert torch.allclose(replay_leaves[1], v_page)
 
     replay_grad_targets = EnvironmentPrior._enable_policy_cache_grad(cache)
-    assert replay_grad_targets == (k_page, v_page)
-    assert k_page.requires_grad and v_page.requires_grad
+    assert len(replay_grad_targets) == 2
+    assert tuple(replay_grad_targets[0].shape) == tuple(k_page.shape)
+    assert tuple(replay_grad_targets[1].shape) == tuple(v_page.shape)
+    assert torch.allclose(replay_grad_targets[0], k_page)
+    assert torch.allclose(replay_grad_targets[1], v_page)
+    assert replay_grad_targets[0].requires_grad
+    assert replay_grad_targets[1].requires_grad
     assert not k_prefix.requires_grad
     assert not v_prefix.requires_grad
+
+
+def test_environment_prior_one_hop_replay_output_leaves_match_tbptt_detach_tail():
+    k_page0 = torch.randn(2, 3, 4, 7)
+    v_page0 = torch.randn(2, 3, 4, 7)
+    k_page1 = torch.randn(2, 3, 4, 7)
+    v_page1 = torch.randn(2, 3, 4, 7)
+    cache_live = {
+        "cache_mode": "paged",
+        "k_pages": [k_page0, k_page1],
+        "v_pages": [v_page0, v_page1],
+        "valid_len": 6,
+        "prefix_base_len": 0,
+        "prefix_pages": 0,
+        "tail_frozen": False,
+    }
+    cache_detached = EnvironmentPrior._detach_policy_cache(cache_live, clone_tensors=False)
+
+    output_leaves = EnvironmentPrior._policy_cache_replay_leaves(cache_live, emulate_tbptt_detach=True)
+    input_leaves = EnvironmentPrior._policy_cache_replay_leaves(cache_detached)
+
+    assert len(output_leaves) == len(input_leaves) == 2
+    assert output_leaves[0].shape == input_leaves[0].shape
+    assert output_leaves[1].shape == input_leaves[1].shape
+    assert tuple(output_leaves[0].shape) == (2, 3, 2, 7)
+    assert tuple(output_leaves[1].shape) == (2, 3, 2, 7)
 
 
 @pytest.mark.parametrize("objective_kind", ["reinforce", "alpha_grad"])
