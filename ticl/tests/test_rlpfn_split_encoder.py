@@ -45,7 +45,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
-    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
+    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is False
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
         "min": 1e-2,

@@ -254,7 +254,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
-    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
+    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False

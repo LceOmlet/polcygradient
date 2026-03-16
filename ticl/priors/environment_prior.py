@@ -12625,6 +12625,27 @@ class EnvironmentPrior:
         env_noise_start = env_layout["noise_start"]
         state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
+            if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
+                window_start_idx = int(t)
+                window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
+                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                cache_grad_targets = tuple()
+                if needs_boundary_eta:
+                    state_t.requires_grad_(True)
+                    action_t.requires_grad_(True)
+                    reward_t.requires_grad_(True)
+                    reward_mask_t.requires_grad_(True)
+                    terminal_t.requires_grad_(True)
+                    cache_grad_targets = self._enable_policy_cache_grad(cache)
+                tbptt_boundary_in = {
+                    "state_t": state_t,
+                    "action_t": action_t,
+                    "reward_t": reward_t,
+                    "reward_mask_t": reward_mask_t,
+                    "terminal_t": terminal_t,
+                    "cache": cache,
+                    "cache_grad_targets": cache_grad_targets,
+                }
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
             token_row.zero_()
@@ -12907,6 +12928,35 @@ class EnvironmentPrior:
         return _clone(cache), tuple(leaves)
 
     @staticmethod
+    def _enable_policy_cache_grad(cache):
+        leaves = []
+
+        def _visit(node):
+            if node is None:
+                return
+            if torch.is_tensor(node):
+                if torch.is_floating_point(node):
+                    if not bool(node.requires_grad):
+                        node.requires_grad_(True)
+                    leaves.append(node)
+                return
+            if isinstance(node, list):
+                for item in node:
+                    _visit(item)
+                return
+            if isinstance(node, tuple):
+                for item in node:
+                    _visit(item)
+                return
+            if isinstance(node, dict):
+                for item in node.values():
+                    _visit(item)
+                return
+
+        _visit(cache)
+        return tuple(leaves)
+
+    @staticmethod
     def _flatten_policy_cache_tensors(cache):
         leaves = []
 
@@ -12974,6 +13024,101 @@ class EnvironmentPrior:
         }
 
     @staticmethod
+    def _alpha_tbptt_boundary_eta_from_boundary_groups(loss, boundary_groups):
+        if (not torch.is_tensor(loss)) or (not bool(loss.requires_grad)):
+            return tuple()
+        if not isinstance(boundary_groups, (tuple, list)):
+            return tuple()
+        grad_targets = []
+        group_specs = []
+        for group_idx, boundary_group in enumerate(boundary_groups):
+            if not isinstance(boundary_group, dict):
+                continue
+            boundary_in = boundary_group.get("boundary_in", None)
+            if not isinstance(boundary_in, dict):
+                continue
+            cache_grad_targets = tuple(boundary_in.get("cache_grad_targets", tuple()) or tuple())
+            group_targets = (
+                boundary_in.get("state_t", None),
+                boundary_in.get("action_t", None),
+                boundary_in.get("reward_t", None),
+                boundary_in.get("reward_mask_t", None),
+                boundary_in.get("terminal_t", None),
+            ) + cache_grad_targets
+            if any((not torch.is_tensor(target)) or (not bool(target.requires_grad)) for target in group_targets):
+                continue
+            grad_targets.extend(group_targets)
+            group_specs.append(
+                {
+                    "indices": tuple(int(i) for i in boundary_group.get("indices", tuple()) or tuple()),
+                    "cache_grad_count": int(len(cache_grad_targets)),
+                    "group_idx": int(group_idx),
+                    "boundary_in": boundary_in,
+                }
+            )
+        if not grad_targets:
+            return tuple()
+        grad_parts = torch.autograd.grad(
+            loss,
+            tuple(grad_targets),
+            retain_graph=True,
+            allow_unused=True,
+        )
+        eta_groups = []
+        offset = 0
+        for spec in group_specs:
+            boundary_in = spec["boundary_in"]
+            cache_grad_count = int(spec["cache_grad_count"])
+            group_grad_parts = grad_parts[offset: offset + 5 + cache_grad_count]
+            offset += 5 + cache_grad_count
+            state_grad = (
+                group_grad_parts[0]
+                if group_grad_parts[0] is not None
+                else torch.zeros_like(boundary_in["state_t"])
+            )
+            action_grad = (
+                group_grad_parts[1]
+                if group_grad_parts[1] is not None
+                else torch.zeros_like(boundary_in["action_t"])
+            )
+            reward_grad = (
+                group_grad_parts[2]
+                if group_grad_parts[2] is not None
+                else torch.zeros_like(boundary_in["reward_t"])
+            )
+            reward_mask_grad = (
+                group_grad_parts[3]
+                if group_grad_parts[3] is not None
+                else torch.zeros_like(boundary_in["reward_mask_t"])
+            )
+            terminal_grad = (
+                group_grad_parts[4]
+                if group_grad_parts[4] is not None
+                else torch.zeros_like(boundary_in["terminal_t"])
+            )
+            cache_grads = []
+            cache_grad_targets = tuple(boundary_in.get("cache_grad_targets", tuple()) or tuple())
+            for grad_part, cache_target in zip(group_grad_parts[5:], cache_grad_targets):
+                cache_grads.append(
+                    grad_part.detach() if grad_part is not None else torch.zeros_like(cache_target)
+                )
+            eta_groups.append(
+                {
+                    "indices": spec["indices"],
+                    "group_idx": int(spec["group_idx"]),
+                    "eta": {
+                        "state_t": state_grad.detach(),
+                        "action_t": action_grad.detach(),
+                        "reward_t": reward_grad.detach(),
+                        "reward_mask_t": reward_mask_grad.detach(),
+                        "terminal_t": terminal_grad.detach(),
+                        "cache_leaves": tuple(cache_grads),
+                    },
+                }
+            )
+        return tuple(eta_groups)
+
+    @staticmethod
     def _alpha_tbptt_bridge_loss_from_eta(boundary_out, boundary_eta):
         if boundary_eta is None:
             return None
@@ -12996,6 +13141,77 @@ class EnvironmentPrior:
                 cache_leaf * eta_leaf.to(device=cache_leaf.device, dtype=cache_leaf.dtype)
             ).sum()
         return bridge_loss
+
+    @staticmethod
+    def _alpha_tbptt_bridge_loss_from_boundary_groups(boundary_groups, eta_groups):
+        if not isinstance(boundary_groups, (tuple, list)) or not isinstance(eta_groups, (tuple, list)):
+            return None
+        eta_by_key = {}
+        for eta_group in eta_groups:
+            if not isinstance(eta_group, dict):
+                continue
+            eta = eta_group.get("eta", None)
+            if not isinstance(eta, dict):
+                continue
+            key = tuple(int(i) for i in eta_group.get("indices", tuple()) or tuple())
+            eta_by_key[key] = eta
+        bridge_loss = None
+        for group_idx, boundary_group in enumerate(boundary_groups):
+            if not isinstance(boundary_group, dict):
+                continue
+            boundary_out = boundary_group.get("boundary_out", None)
+            if not isinstance(boundary_out, dict):
+                continue
+            key = tuple(int(i) for i in boundary_group.get("indices", tuple()) or tuple())
+            eta = eta_by_key.get(key, None)
+            if eta is None and len(eta_by_key) == 1 and len(key) == 0:
+                eta = next(iter(eta_by_key.values()))
+            if eta is None:
+                matching = next(
+                    (
+                        item.get("eta", None)
+                        for item in eta_groups
+                        if isinstance(item, dict) and int(item.get("group_idx", -1)) == int(group_idx)
+                    ),
+                    None,
+                )
+                eta = matching if isinstance(matching, dict) else None
+            if eta is None:
+                continue
+            group_bridge = EnvironmentPrior._alpha_tbptt_bridge_loss_from_eta(boundary_out, eta)
+            if group_bridge is None:
+                continue
+            bridge_loss = group_bridge if bridge_loss is None else (bridge_loss + group_bridge)
+        return bridge_loss
+
+    @staticmethod
+    def _drop_tbptt_boundary_inputs(boundary_groups):
+        if not isinstance(boundary_groups, (tuple, list)):
+            return
+        for boundary_group in boundary_groups:
+            if not isinstance(boundary_group, dict):
+                continue
+            boundary_in = boundary_group.get("boundary_in", None)
+            if not isinstance(boundary_in, dict):
+                continue
+            boundary_in["cache_grad_targets"] = tuple()
+            boundary_group["boundary_in"] = None
+
+    @staticmethod
+    def _release_tbptt_boundary_groups(boundary_groups):
+        if not isinstance(boundary_groups, (tuple, list)):
+            return
+        for boundary_group in boundary_groups:
+            if not isinstance(boundary_group, dict):
+                continue
+            boundary_in = boundary_group.get("boundary_in", None)
+            if isinstance(boundary_in, dict):
+                boundary_in["cache_grad_targets"] = tuple()
+                boundary_in.clear()
+            boundary_out = boundary_group.get("boundary_out", None)
+            if isinstance(boundary_out, dict):
+                boundary_out.clear()
+            boundary_group.clear()
 
     def _rollout_distinct_envs_vectorized_with_policy(
         self,
@@ -13195,6 +13411,14 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        tbptt_one_hop_boundary_active = bool(
+            tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+            and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
+            and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
+        )
+        tbptt_boundary_in = None
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -13985,6 +14209,16 @@ class EnvironmentPrior:
                     if tbptt_action_mask_buffer is not None:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
                         tbptt_action_mask_buffer = []
+                    boundary_out = None
+                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                        boundary_out = {
+                            "state_t": state_t,
+                            "action_t": action_t,
+                            "reward_t": reward_t,
+                            "reward_mask_t": reward_mask_t,
+                            "terminal_t": terminal_t,
+                            "cache": cache,
+                        }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -14023,6 +14257,15 @@ class EnvironmentPrior:
                                     "action_mean": action_mean_window,
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
+                                }
+                            if tbptt_one_hop_boundary_active:
+                                payload_aux["_tbptt_boundary"] = {
+                                    "groups": (
+                                        {
+                                            "boundary_in": tbptt_boundary_in,
+                                            "boundary_out": boundary_out,
+                                        },
+                                    ),
                                 }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
@@ -14088,6 +14331,7 @@ class EnvironmentPrior:
                                 tbptt_reward_sink((rewards_window, payload_aux))
                         else:
                             tbptt_reward_sink((rewards_window, {"_tbptt_meta": window_meta}))
+                        tbptt_boundary_in = None
 
         if collect_runtime_info:
             reward_drop_frac = reward_drop_count.to(dtype=torch.float32) / float(max(1, n_samples))
@@ -14937,6 +15181,14 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        tbptt_one_hop_boundary_active = bool(
+            tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+            and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
+            and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
+        )
+        tbptt_boundary_in = None
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -15245,6 +15497,27 @@ class EnvironmentPrior:
             transition_gp_shared_call_count += int(gp_stats.get("shared_call_count", 0) or 0)
 
         for t in range(n_samples):
+            if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
+                window_start_idx = int(t)
+                window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
+                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                cache_grad_targets = tuple()
+                if needs_boundary_eta:
+                    state_t.requires_grad_(True)
+                    action_t.requires_grad_(True)
+                    reward_t.requires_grad_(True)
+                    reward_mask_t.requires_grad_(True)
+                    terminal_t.requires_grad_(True)
+                    cache_grad_targets = self._enable_policy_cache_grad(cache)
+                tbptt_boundary_in = {
+                    "state_t": state_t,
+                    "action_t": action_t,
+                    "reward_t": reward_t,
+                    "reward_mask_t": reward_mask_t,
+                    "terminal_t": terminal_t,
+                    "cache": cache,
+                    "cache_grad_targets": cache_grad_targets,
+                }
             obs_t = state_t[:, :max_obs_dim] * obs_mask
             if collect_x:
                 with torch.no_grad():
@@ -15997,6 +16270,16 @@ class EnvironmentPrior:
                     if tbptt_action_mask_buffer is not None:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
                         tbptt_action_mask_buffer = []
+                    boundary_out = None
+                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                        boundary_out = {
+                            "state_t": state_t,
+                            "action_t": action_t,
+                            "reward_t": reward_t,
+                            "reward_mask_t": reward_mask_t,
+                            "terminal_t": terminal_t,
+                            "cache": cache,
+                        }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -16036,6 +16319,15 @@ class EnvironmentPrior:
                                     "action_mean": action_mean_window,
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
+                                }
+                            if tbptt_one_hop_boundary_active:
+                                payload_aux["_tbptt_boundary"] = {
+                                    "groups": (
+                                        {
+                                            "boundary_in": tbptt_boundary_in,
+                                            "boundary_out": boundary_out,
+                                        },
+                                    ),
                                 }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
@@ -16107,6 +16399,7 @@ class EnvironmentPrior:
                                 )
                             else:
                                 tbptt_reward_sink((rewards_window, {"_tbptt_meta": window_meta}))
+                        tbptt_boundary_in = None
 
         if needs_unpermute:
             if y_steps is not None:
@@ -16605,6 +16898,14 @@ class EnvironmentPrior:
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
+        tbptt_one_hop_boundary_active = bool(
+            tbptt_window_active
+            and (tbptt_reward_sink is not None)
+            and bool(tbptt_reward_sink_supports_aux)
+            and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
+            and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
+        )
+        tbptt_boundary_in = None
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=state_t.dtype, aev3_cfg=aev3_cfg)
@@ -16741,6 +17042,27 @@ class EnvironmentPrior:
         action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
 
         for t in range(n_samples):
+            if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
+                window_start_idx = int(t)
+                window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
+                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                cache_grad_targets = tuple()
+                if needs_boundary_eta:
+                    state_t.requires_grad_(True)
+                    action_t.requires_grad_(True)
+                    reward_t.requires_grad_(True)
+                    reward_mask_t.requires_grad_(True)
+                    terminal_t.requires_grad_(True)
+                    cache_grad_targets = self._enable_policy_cache_grad(cache)
+                tbptt_boundary_in = {
+                    "state_t": state_t,
+                    "action_t": action_t,
+                    "reward_t": reward_t,
+                    "reward_mask_t": reward_mask_t,
+                    "terminal_t": terminal_t,
+                    "cache": cache,
+                    "cache_grad_targets": cache_grad_targets,
+                }
             obs_t = state_t[:obs_dim]  # observable subset of state
             if collect_x:
                 with torch.no_grad():
@@ -17200,6 +17522,16 @@ class EnvironmentPrior:
                     if tbptt_action_mask_buffer is not None:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0).reshape(-1, 1, action_dim)
                         tbptt_action_mask_buffer = []
+                    boundary_out = None
+                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                        boundary_out = {
+                            "state_t": state_t,
+                            "action_t": action_t,
+                            "reward_t": reward_t,
+                            "reward_mask_t": reward_mask_t,
+                            "terminal_t": terminal_t,
+                            "cache": cache,
+                        }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -17237,6 +17569,15 @@ class EnvironmentPrior:
                                     "action_mean": action_mean_window,
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
+                                }
+                            if tbptt_one_hop_boundary_active:
+                                payload_aux["_tbptt_boundary"] = {
+                                    "groups": (
+                                        {
+                                            "boundary_in": tbptt_boundary_in,
+                                            "boundary_out": boundary_out,
+                                        },
+                                    ),
                                 }
                             if aev2_streaming_sink:
                                 aev2_window_summary = self._aev2_finalize_accumulator(
@@ -17304,6 +17645,7 @@ class EnvironmentPrior:
                                 tbptt_reward_sink((rewards_window, payload_aux))
                         else:
                             tbptt_reward_sink((rewards_window, {"_tbptt_meta": window_meta}))
+                        tbptt_boundary_in = None
 
         x = x_steps
         y = y_steps
@@ -18146,6 +18488,7 @@ class EnvironmentPrior:
                 reinforce_window = aux.get("reinforce", None)
                 policy_trace_window = aux.get("policy_trace", None)
                 tbptt_meta = aux.get("_tbptt_meta", None)
+                boundary_window = aux.get("_tbptt_boundary", None)
                 if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires reinforce log_probs in every group payload")
                 log_prob_score_window = reinforce_window.get("log_prob_score", None)
@@ -18197,6 +18540,7 @@ class EnvironmentPrior:
                             dtype=torch.bool,
                         ),
                         "group_traces": [],
+                        "boundary_groups": [],
                         "_tbptt_meta": tbptt_meta,
                     }
                     tbptt_alpha_window_buckets[local_window_idx] = bucket
@@ -18238,6 +18582,19 @@ class EnvironmentPrior:
                             "action_mask": action_mask_window,
                         }
                     )
+                if isinstance(boundary_window, dict):
+                    boundary_groups = boundary_window.get("groups", None)
+                    if isinstance(boundary_groups, (tuple, list)):
+                        for boundary_group in boundary_groups:
+                            if not isinstance(boundary_group, dict):
+                                continue
+                            bucket["boundary_groups"].append(
+                                {
+                                    "indices": idx_tuple,
+                                    "boundary_in": boundary_group.get("boundary_in", None),
+                                    "boundary_out": boundary_group.get("boundary_out", None),
+                                }
+                            )
                 bucket["received"] += 1
                 while True:
                     ready = tbptt_alpha_window_buckets.get(tbptt_alpha_next_flush, None)
@@ -18257,6 +18614,11 @@ class EnvironmentPrior:
                                     "action_mask": ready["action_mask"],
                                     "group_traces": tuple(ready["group_traces"]) if ready["group_traces"] else None,
                                 },
+                                "_tbptt_boundary": (
+                                    {"groups": tuple(ready["boundary_groups"])}
+                                    if ready["boundary_groups"]
+                                    else None
+                                ),
                                 "_tbptt_meta": ready.get("_tbptt_meta", None),
                             },
                         )
@@ -20001,10 +20363,15 @@ class EnvironmentPrior:
         objective_kind = self._normalize_policy_objective_kind(objective_kind)
         reinforce_enabled = objective_kind == "reinforce"
         alpha_grad_enabled = objective_kind == "alpha_grad"
+        one_hop_replay_enabled = bool(self._resolve_pg_one_hop_replay_enabled(self.config))
         if (not reinforce_enabled) and (not alpha_grad_enabled):
             raise ValueError(
                 "family TBPTT one-hop runner only supports reinforce or alpha_grad, "
                 f"got {objective_kind!r}"
+            )
+        if not one_hop_replay_enabled:
+            raise RuntimeError(
+                "family TBPTT one-hop runner should only be used when pg_one_hop_replay_enabled=true"
             )
         single_eval_pos = self._sample_single_eval_pos(int(n_samples), single_eval_pos)
         if tbptt_window is None:
@@ -20669,7 +21036,6 @@ class EnvironmentPrior:
         total_eval_steps = int(max(0, n_samples - int(single_eval_pos)))
         phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
         phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
-        one_hop_replay_enabled = bool(self._resolve_pg_one_hop_replay_enabled(self.config))
         bridge_replay_count = 0
         eval_window_count = 0
         eval_step_count_total = 0
@@ -21608,31 +21974,12 @@ class EnvironmentPrior:
         backend = self._resolve_batch_parallel_backend()
         grouping_mode = self._resolve_batch_vectorized_grouping()
         strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
-        if (
-            (alpha_grad_enabled or reinforce_enabled)
+        one_hop_replay_enabled = bool(self._resolve_pg_one_hop_replay_enabled(self.config))
+        one_hop_tbptt_active = bool(
+            one_hop_replay_enabled
             and tbptt_window_active
-            and (not collect_x)
-            and backend == "torch_vectorized"
-            and str(grouping_mode) == "family"
-            and (not bool(strict_rng_match))
-        ):
-            return self._rollout_alpha_grad_family_tbptt_windowed_loss(
-                policy_step_fn=policy_step_fn,
-                batch_size=batch_size,
-                n_samples=n_samples,
-                num_features=num_features,
-                device=device,
-                epoch=epoch,
-                single_eval_pos=single_eval_pos,
-                discount=discount,
-                collect_x=collect_x,
-                tbptt_window=tbptt_window_size,
-                tbptt_loss_sink=tbptt_loss_sink,
-                h_list_override=h_list_override,
-                env_seeds_override=env_seeds_override,
-                rollout_seeds_override=rollout_seeds_override,
-                objective_kind=objective_kind,
-            )
+            and (reinforce_enabled or alpha_grad_enabled)
+        )
         aev2_cfg = self._resolve_aev2_config()
         aev2_enabled = bool(aev2_cfg.get("enabled", False))
         aev2_lambda = float(aev2_cfg.get("lambda", 0.0))
@@ -22314,6 +22661,28 @@ class EnvironmentPrior:
         n_samples_f = float(max(1, n_samples))
         total_eval_steps_f = float(max(1, n_samples - int(single_eval_pos)))
         batch_size_f = float(max(1, batch_size))
+        bridge_replay_count = 0
+        pending_one_hop_window = None
+
+        def _emit_tbptt_window_loss(loss_root):
+            if loss_root is None:
+                return
+            if tbptt_loss_sink is None:
+                weighted_losses.append(loss_root)
+            else:
+                tbptt_loss_sink(loss_root)
+
+        def _flush_pending_one_hop_window(*, bridge_loss=None):
+            nonlocal pending_one_hop_window, bridge_replay_count
+            if pending_one_hop_window is None:
+                return
+            loss_root = pending_one_hop_window.get("weighted_loss", None)
+            if bridge_loss is not None:
+                loss_root = bridge_loss if loss_root is None else (loss_root + bridge_loss)
+                bridge_replay_count += 1
+            _emit_tbptt_window_loss(loss_root)
+            self._release_tbptt_boundary_groups(pending_one_hop_window.get("boundary_groups", None))
+            pending_one_hop_window = None
 
         def _tbptt_reward_sink(reward_payload):
             nonlocal reward_sum, reward_sumsq, reward_count
@@ -22340,12 +22709,14 @@ class EnvironmentPrior:
             nonlocal reward_nonfinite_share_accum, reward_nan_share_accum, reward_inf_share_accum
             nonlocal reinforce_return_nonfinite_share_accum
             nonlocal reinforce_log_prob_nonfinite_share_accum, reinforce_adv_nonfinite_share_accum
+            nonlocal pending_one_hop_window
             aev2_window = None
             aev3_window = None
             aev4_window = None
             reinforce_window = None
             policy_trace_window = None
             tbptt_meta = None
+            boundary_window = None
             rewards_window = reward_payload
             if isinstance(reward_payload, tuple) and len(reward_payload) == 2:
                 rewards_window, aux = reward_payload
@@ -22353,6 +22724,7 @@ class EnvironmentPrior:
                     tbptt_meta = aux.get("_tbptt_meta", None)
                     reinforce_window = aux.get("reinforce", None)
                     policy_trace_window = aux.get("policy_trace", None)
+                    boundary_window = aux.get("_tbptt_boundary", None)
                 if isinstance(aux, dict) and (("aev2" in aux) or ("aev3" in aux) or ("aev4" in aux)):
                     aev2_window = aux.get("aev2", None)
                     aev3_window = aux.get("aev3", None)
@@ -22368,12 +22740,17 @@ class EnvironmentPrior:
             if isinstance(tbptt_meta, dict):
                 window_start = int(tbptt_meta.get("window_start", 0) or 0)
             eval_start_local = int(max(0, int(single_eval_pos) - window_start))
-            if eval_start_local >= int(rewards_window.shape[0]):
-                return
-            rewards_window = rewards_window[eval_start_local:]
+            boundary_groups = None
+            if isinstance(boundary_window, dict):
+                raw_boundary_groups = boundary_window.get("groups", None)
+                if isinstance(raw_boundary_groups, (tuple, list)):
+                    boundary_groups = tuple(group for group in raw_boundary_groups if isinstance(group, dict))
+            has_eval_steps = bool(eval_start_local < int(rewards_window.shape[0]))
+            if has_eval_steps:
+                rewards_window = rewards_window[eval_start_local:]
             if isinstance(reinforce_window, dict):
                 log_probs_window_full = reinforce_window.get("log_probs", None)
-                if torch.is_tensor(log_probs_window_full):
+                if has_eval_steps and torch.is_tensor(log_probs_window_full):
                     reinforce_window = dict(reinforce_window)
                     reinforce_window["log_probs"] = log_probs_window_full[eval_start_local:]
                     log_prob_score_full = reinforce_window.get("log_prob_score", None)
@@ -22382,21 +22759,23 @@ class EnvironmentPrior:
             if isinstance(policy_trace_window, dict):
                 policy_trace_window = dict(policy_trace_window)
                 action_mask_full = policy_trace_window.get("action_mask", None)
-                if torch.is_tensor(action_mask_full):
+                if has_eval_steps and torch.is_tensor(action_mask_full):
                     policy_trace_window["action_mask"] = action_mask_full[eval_start_local:]
                 action_mean_full = policy_trace_window.get("action_mean", None)
-                if torch.is_tensor(action_mean_full):
+                if has_eval_steps and torch.is_tensor(action_mean_full):
                     policy_trace_window["action_mean"] = action_mean_full[eval_start_local:]
                 roots_full = policy_trace_window.get("action_mean_roots", None)
-                if isinstance(roots_full, tuple):
+                if has_eval_steps and isinstance(roots_full, tuple):
                     policy_trace_window["action_mean_roots"] = tuple(roots_full[eval_start_local:])
                 group_traces_full = policy_trace_window.get("group_traces", None)
-                if isinstance(group_traces_full, tuple):
+                if has_eval_steps and isinstance(group_traces_full, tuple):
                     policy_trace_window["group_traces"] = _slice_group_traces_after_eval(
                         group_traces_full,
                         eval_start_local,
                     )
-            if reinforce_enabled:
+            loss_window = None
+            stats_window = None
+            if has_eval_steps and reinforce_enabled:
                 if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
                     raise RuntimeError("TBPTT reinforce rollout did not provide log_probs window")
                 loss_window, stats_window = self.reinforce_loss_from_rewards(
@@ -22405,11 +22784,11 @@ class EnvironmentPrior:
                     discount=discount,
                     baseline_mode="leave_one_out",
                 )
-            elif first_pg_enabled:
+            elif has_eval_steps and first_pg_enabled:
                 loss_window, stats_window = self.first_policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
                 )
-            elif alpha_grad_enabled:
+            elif has_eval_steps and alpha_grad_enabled:
                 if not isinstance(reinforce_window, dict) or (not torch.is_tensor(reinforce_window.get("log_probs", None))):
                     raise RuntimeError("TBPTT alpha_grad rollout did not provide log_probs window")
                 if (
@@ -22435,7 +22814,7 @@ class EnvironmentPrior:
                     log_prob_score=reinforce_window.get("log_prob_score", None),
                     discount=discount,
                 )
-            else:
+            elif has_eval_steps:
                 loss_window, stats_window = self.policy_gradient_loss_from_rewards(
                     rewards=rewards_window,
                     normalize=normalize,
@@ -22446,27 +22825,73 @@ class EnvironmentPrior:
                     aev5_cfg=aev5_cfg,
                     aev5_next_cfg=aev5_next_cfg,
                 )
-            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev2_enabled and isinstance(aev2_window, dict):
+            if has_eval_steps and (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev2_enabled and isinstance(aev2_window, dict):
                 aev2_penalty_window = aev2_window.get("penalty_mean", None)
                 if torch.is_tensor(aev2_penalty_window):
                     if aev2_lambda > 0.0:
                         loss_window = loss_window + (aev2_penalty_window * aev2_lambda)
-            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev3_enabled and isinstance(aev3_window, dict):
+            if has_eval_steps and (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev3_enabled and isinstance(aev3_window, dict):
                 aev3_penalty_window = aev3_window.get("penalty_mean", None)
                 if torch.is_tensor(aev3_penalty_window):
                     loss_window = loss_window + aev3_penalty_window
-            if (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev4_enabled and isinstance(aev4_window, dict):
+            if has_eval_steps and (not first_pg_enabled) and (not reinforce_enabled) and (not alpha_grad_enabled) and aev4_enabled and isinstance(aev4_window, dict):
                 aev4_penalty_window = aev4_window.get("penalty_mean", None)
                 if torch.is_tensor(aev4_penalty_window):
                     loss_window = loss_window + aev4_penalty_window
-            time_weight = float(rewards_window.shape[0]) / total_eval_steps_f
-            batch_weight = float(rewards_window.shape[1]) / batch_size_f
-            window_weight = time_weight * batch_weight
-            weighted_loss = loss_window * window_weight
-            if tbptt_loss_sink is None:
-                weighted_losses.append(weighted_loss)
+            weighted_loss = None
+            window_weight = 0.0
+            if has_eval_steps and (loss_window is not None):
+                time_weight = float(rewards_window.shape[0]) / total_eval_steps_f
+                batch_weight = float(rewards_window.shape[1]) / batch_size_f
+                window_weight = time_weight * batch_weight
+                weighted_loss = loss_window * window_weight
+
+            if one_hop_tbptt_active:
+                bridge_loss = None
+                if (
+                    has_eval_steps
+                    and (weighted_loss is not None)
+                    and (pending_one_hop_window is not None)
+                    and isinstance(boundary_groups, tuple)
+                    and len(boundary_groups) > 0
+                ):
+                    boundary_eta_groups = self._alpha_tbptt_boundary_eta_from_boundary_groups(
+                        weighted_loss,
+                        boundary_groups,
+                    )
+                    if boundary_eta_groups:
+                        bridge_loss = self._alpha_tbptt_bridge_loss_from_boundary_groups(
+                            pending_one_hop_window.get("boundary_groups", None),
+                            boundary_eta_groups,
+                        )
+                    self._drop_tbptt_boundary_inputs(boundary_groups)
+                elif isinstance(boundary_groups, tuple):
+                    self._drop_tbptt_boundary_inputs(boundary_groups)
+                if pending_one_hop_window is not None:
+                    _flush_pending_one_hop_window(bridge_loss=bridge_loss)
+                carry_boundary_groups = None
+                if isinstance(boundary_groups, tuple):
+                    carry_boundary_groups = tuple(
+                        boundary_group
+                        for boundary_group in boundary_groups
+                        if isinstance(boundary_group, dict)
+                        and isinstance(boundary_group.get("boundary_out", None), dict)
+                    )
+                if carry_boundary_groups:
+                    pending_one_hop_window = {
+                        "weighted_loss": weighted_loss,
+                        "boundary_groups": carry_boundary_groups,
+                    }
+                else:
+                    _emit_tbptt_window_loss(weighted_loss)
+                    self._release_tbptt_boundary_groups(boundary_groups)
+                if stats_window is None:
+                    return
             else:
-                tbptt_loss_sink(weighted_loss)
+                _emit_tbptt_window_loss(weighted_loss)
+                self._release_tbptt_boundary_groups(boundary_groups)
+                if stats_window is None:
+                    return
 
             objective_term = stats_window["objective"] * window_weight
             if objective_accum is None:
@@ -22865,6 +23290,9 @@ class EnvironmentPrior:
             _policy_collect_action_trace=bool(alpha_grad_enabled),
         )
 
+        if one_hop_tbptt_active:
+            _flush_pending_one_hop_window()
+
         if tbptt_loss_sink is None:
             if not weighted_losses:
                 raise RuntimeError("TBPTT rollout produced no window losses.")
@@ -23223,6 +23651,12 @@ class EnvironmentPrior:
             stats["first_policy_gradient_enabled"] = 1
         if alpha_grad_enabled:
             stats["alpha_grad_enabled"] = 1
+        if one_hop_tbptt_active:
+            stats["pg_one_hop_replay_enabled"] = int(one_hop_replay_enabled)
+            stats["pg_bridge_replay_count"] = int(bridge_replay_count)
+            if alpha_grad_enabled:
+                stats["alpha_grad_one_hop_replay_enabled"] = int(one_hop_replay_enabled)
+                stats["alpha_grad_bridge_replay_count"] = int(bridge_replay_count)
         if (not first_pg_enabled) and (not alpha_grad_enabled) and aev2_enabled:
             zero_t = torch.zeros((), device=rollout["rewards"].device, dtype=torch.float32)
             if aev2_penalty_mean is None:

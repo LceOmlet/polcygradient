@@ -495,8 +495,12 @@ def get_rlpfn_default_config():
         "alpha_grad_local_coordinate_enabled": True,
         "alpha_grad_unit_grad_enabled": True,
         "alpha_grad_unit_grad_delta": 1e-6,
-        "pg_one_hop_replay_enabled": True,
-        "alpha_grad_one_hop_replay_enabled": True,
+        # Keep the default PG/TBPTT path on the long-maintained safe runner.
+        # One-hop boundary replay is opt-in so the default command line stays on
+        # the established memory/throughput baseline for both REINFORCE and
+        # alpha-grad.
+        "pg_one_hop_replay_enabled": False,
+        "alpha_grad_one_hop_replay_enabled": False,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,
@@ -584,7 +588,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 1024
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 8
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32
@@ -602,7 +606,7 @@ def get_rlpfn_default_config():
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 1024
+    config['dataloader']['batch_size'] = 64 * 8
     config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
     config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
     config['prior']['environment']['lipschitz_enforce'] = False
