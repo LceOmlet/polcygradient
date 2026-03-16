@@ -7974,6 +7974,98 @@ def test_environment_prior_one_hop_replay_output_leaves_match_tbptt_detach_tail(
     assert tuple(output_leaves[1].shape) == (2, 3, 2, 7)
 
 
+def test_environment_prior_one_hop_boundary_eta_keeps_only_active_fields():
+    state_t = torch.randn(2, 4, requires_grad=True)
+    action_t = torch.randn(2, 5, requires_grad=True)
+    reward_t = torch.randn(2, requires_grad=True)
+    reward_mask_t = torch.randn(2, requires_grad=True)
+    terminal_t = torch.randn(2, requires_grad=True)
+    cache_leaf = torch.randn(2, 3, requires_grad=True)
+
+    loss = (
+        (state_t ** 2).sum()
+        + (action_t[:, :2] ** 2).sum()
+        + (reward_t ** 2).sum()
+        + (cache_leaf ** 2).sum()
+    )
+    boundary = {
+        "state_t": state_t,
+        "action_t": action_t,
+        "action_replay_dim": 2,
+        "reward_t": reward_t,
+    }
+
+    eta = EnvironmentPrior._alpha_tbptt_boundary_eta_from_loss(loss, boundary, (cache_leaf,))
+
+    assert set(eta.keys()) == {"state_t", "action_t", "reward_t", "cache_leaves"}
+    assert tuple(eta["action_t"].shape) == (2, 2)
+    assert len(eta["cache_leaves"]) == 1
+    assert torch.allclose(eta["state_t"], 2.0 * state_t.detach())
+    assert torch.allclose(eta["action_t"], 2.0 * action_t[:, :2].detach())
+    assert torch.allclose(eta["reward_t"], 2.0 * reward_t.detach())
+    assert torch.allclose(eta["cache_leaves"][0], 2.0 * cache_leaf.detach())
+    assert "reward_mask_t" not in eta
+    assert "terminal_t" not in eta
+
+
+def test_environment_prior_reinforce_one_hop_supports_immediate_tbptt_backward():
+    _seed_everything(2084)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    env_cfg["alpha_grad_one_hop_replay_enabled"] = True
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    policy.zero_grad(set_to_none=True)
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=6,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        tbptt_loss_sink=lambda loss_root: loss_root.backward(),
+        h_list_override=h_list,
+        policy_objective_kind="reinforce",
+    )
+
+    assert float(loss.detach()) == 0.0
+    grads = [p.grad for p in policy.parameters() if p.grad is not None]
+    assert grads
+    assert all(torch.isfinite(g).all() for g in grads)
+    assert int(stats["pg_one_hop_replay_enabled"]) == 1
+    assert int(stats["pg_bridge_replay_count"]) >= 1
+
+
 @pytest.mark.parametrize("objective_kind", ["reinforce", "alpha_grad"])
 def test_environment_prior_family_tbptt_uses_safe_runner_when_one_hop_disabled(monkeypatch, objective_kind):
     _seed_everything(2083)

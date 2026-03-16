@@ -588,7 +588,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 8
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 16
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32
@@ -606,7 +606,7 @@ def get_rlpfn_default_config():
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 64 * 8
+    config['dataloader']['batch_size'] = 64 * 16
     config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
     config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
     config['prior']['environment']['lipschitz_enforce'] = False

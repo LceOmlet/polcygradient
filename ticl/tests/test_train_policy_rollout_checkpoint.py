@@ -416,6 +416,87 @@ def test_policy_saved_tensors_offload_auto_bypass_only_applies_to_policy_scope(m
     ) is False
 
 
+def test_policy_saved_tensors_offload_auto_bypass_keeps_offload_for_one_hop(monkeypatch):
+    monkeypatch.setattr(train_mod.torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(
+        train_mod.torch.cuda,
+        "mem_get_info",
+        lambda device=None: (12 * (1024 ** 3), 24 * (1024 ** 3)),
+    )
+
+    enabled = train_mod._resolve_effective_policy_saved_tensors_offload(
+        enabled=True,
+        scope="policy",
+        device="cuda:0",
+        batch_size=1024,
+        n_samples=1024,
+        one_hop_replay_enabled=True,
+        auto_disable_when_safe=True,
+        auto_min_free_gb=8.0,
+        auto_max_batch_size=1024,
+        auto_max_n_samples=1024,
+    )
+
+    assert enabled is True
+
+
+def test_compute_policy_rollout_chunk_loss_keeps_policy_offload_when_one_hop_enabled(monkeypatch):
+    _seed_everything(20260317)
+    model = _build_tiny_policy_model()
+    env_cfg = _fixed_env_cfg()
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=16,
+        max_cache_len=4,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+
+    seen = {}
+
+    def _resolve_effective(**kwargs):
+        seen["one_hop_replay_enabled"] = bool(kwargs.get("one_hop_replay_enabled", False))
+        return True
+
+    def _wrap(policy_step_fn, *, enabled, pin_memory):
+        seen["enabled"] = bool(enabled)
+        seen["pin_memory"] = bool(pin_memory)
+        return policy_step_fn
+
+    monkeypatch.setattr(train_mod, "_resolve_effective_policy_saved_tensors_offload", _resolve_effective)
+    monkeypatch.setattr(train_mod, "_wrap_policy_step_fn_saved_tensors_offload", _wrap)
+
+    _compute_policy_rollout_chunk_loss(
+        prior,
+        step_fn,
+        batch_size=2,
+        n_samples=4,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        pg_saved_tensors_cpu_offload=True,
+        pg_saved_tensors_cpu_offload_scope="policy",
+        pg_saved_tensors_pin_memory=False,
+        pg_saved_tensors_cpu_offload_auto_disable_when_safe=True,
+        pg_saved_tensors_cpu_offload_auto_min_free_gb=8.0,
+        pg_saved_tensors_cpu_offload_auto_max_batch_size=1024,
+        pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
+        rl_objective="reinforce",
+    )
+
+    assert seen["one_hop_replay_enabled"] is True
+    assert seen["enabled"] is True
+
+
 def test_policy_rollout_checkpoint_preserves_aev5_next_stats_and_semantics():
     env_cfg = _fixed_env_cfg()
     env_cfg["anti_explosion_vanishing_v5_enabled"] = False

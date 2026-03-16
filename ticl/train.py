@@ -330,6 +330,28 @@ def _resolve_environment_prior(prior):
     return None
 
 
+def _resolve_env_prior_pg_one_hop_replay_enabled(prior) -> bool:
+    env_prior = _resolve_environment_prior(prior)
+    if env_prior is None:
+        return False
+    cfg = getattr(env_prior, "config", None)
+    resolve_fn = getattr(env_prior, "_resolve_pg_one_hop_replay_enabled", None)
+    if callable(resolve_fn):
+        try:
+            return bool(resolve_fn(cfg if isinstance(cfg, dict) else {}))
+        except Exception:
+            pass
+    if not isinstance(cfg, dict):
+        return False
+    for key in ("pg_one_hop_replay_enabled", "alpha_grad_one_hop_replay_enabled"):
+        if key in cfg:
+            try:
+                return bool(cfg.get(key))
+            except Exception:
+                return False
+    return False
+
+
 def _saved_tensors_cpu_offload_context(enabled: bool, pin_memory: bool):
     if not bool(enabled):
         return nullcontext()
@@ -362,6 +384,7 @@ def _resolve_effective_policy_saved_tensors_offload(
     device,
     batch_size,
     n_samples,
+    one_hop_replay_enabled=False,
     auto_disable_when_safe=False,
     auto_min_free_gb=8.0,
     auto_max_batch_size=64,
@@ -372,6 +395,8 @@ def _resolve_effective_policy_saved_tensors_offload(
     if (not enabled) or scope != "policy":
         return enabled
     if not bool(auto_disable_when_safe):
+        return enabled
+    if bool(one_hop_replay_enabled):
         return enabled
     try:
         batch_size = int(batch_size)
@@ -1116,12 +1141,14 @@ def _compute_policy_rollout_chunk_loss(
     offload_scope = str(pg_saved_tensors_cpu_offload_scope or "all").strip().lower()
     if offload_scope not in {"all", "policy"}:
         offload_scope = "all"
+    one_hop_replay_enabled = _resolve_env_prior_pg_one_hop_replay_enabled(env_prior)
     effective_policy_saved_tensors_cpu_offload = _resolve_effective_policy_saved_tensors_offload(
         enabled=pg_saved_tensors_cpu_offload,
         scope=offload_scope,
         device=device,
         batch_size=batch_size,
         n_samples=n_samples,
+        one_hop_replay_enabled=one_hop_replay_enabled,
         auto_disable_when_safe=pg_saved_tensors_cpu_offload_auto_disable_when_safe,
         auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
         auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
