@@ -12629,23 +12629,23 @@ class EnvironmentPrior:
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
                 needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
-                cache_grad_targets = tuple()
+                tbptt_boundary_in = None
                 if needs_boundary_eta:
+                    cache_grad_targets = tuple()
                     state_t.requires_grad_(True)
                     action_t.requires_grad_(True)
                     reward_t.requires_grad_(True)
                     reward_mask_t.requires_grad_(True)
                     terminal_t.requires_grad_(True)
                     cache_grad_targets = self._enable_policy_cache_grad(cache)
-                tbptt_boundary_in = {
-                    "state_t": state_t,
-                    "action_t": action_t,
-                    "reward_t": reward_t,
-                    "reward_mask_t": reward_mask_t,
-                    "terminal_t": terminal_t,
-                    "cache": cache,
-                    "cache_grad_targets": cache_grad_targets,
-                }
+                    tbptt_boundary_in = {
+                        "state_t": state_t,
+                        "action_t": action_t,
+                        "reward_t": reward_t,
+                        "reward_mask_t": reward_mask_t,
+                        "terminal_t": terminal_t,
+                        "cache_grad_targets": cache_grad_targets,
+                    }
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
             token_row.zero_()
@@ -12928,7 +12928,7 @@ class EnvironmentPrior:
         return _clone(cache), tuple(leaves)
 
     @staticmethod
-    def _enable_policy_cache_grad(cache):
+    def _policy_cache_replay_leaves(cache):
         leaves = []
 
         def _visit(node):
@@ -12936,8 +12936,6 @@ class EnvironmentPrior:
                 return
             if torch.is_tensor(node):
                 if torch.is_floating_point(node):
-                    if not bool(node.requires_grad):
-                        node.requires_grad_(True)
                     leaves.append(node)
                 return
             if isinstance(node, list):
@@ -12949,11 +12947,32 @@ class EnvironmentPrior:
                     _visit(item)
                 return
             if isinstance(node, dict):
+                cache_mode = str(node.get("cache_mode", "")).strip().lower()
+                if cache_mode == "paged":
+                    # Prefix tensors are already detached at TBPTT boundaries.
+                    # One-hop only needs the mutable/recent tail that can still
+                    # propagate gradients into the immediately previous window.
+                    _visit(node.get("k_pages", None))
+                    _visit(node.get("v_pages", None))
+                    return
+                if ("k" in node) or ("v" in node):
+                    _visit(node.get("k", None))
+                    _visit(node.get("v", None))
+                    return
                 for item in node.values():
                     _visit(item)
                 return
 
         _visit(cache)
+        return tuple(leaves)
+
+    @staticmethod
+    def _enable_policy_cache_grad(cache):
+        leaves = []
+        for leaf in EnvironmentPrior._policy_cache_replay_leaves(cache):
+            if not bool(leaf.requires_grad):
+                leaf.requires_grad_(True)
+            leaves.append(leaf)
         return tuple(leaves)
 
     @staticmethod
@@ -13129,7 +13148,9 @@ class EnvironmentPrior:
             + (boundary_out["reward_mask_t"] * boundary_eta["reward_mask_t"]).sum()
             + (boundary_out["terminal_t"] * boundary_eta["terminal_t"]).sum()
         )
-        cache_out_leaves = EnvironmentPrior._flatten_policy_cache_tensors(boundary_out["cache"])
+        cache_out_leaves = boundary_out.get("cache_replay_leaves", None)
+        if cache_out_leaves is None:
+            cache_out_leaves = EnvironmentPrior._flatten_policy_cache_tensors(boundary_out["cache"])
         eta_cache_leaves = boundary_eta.get("cache_leaves", tuple())
         if len(cache_out_leaves) != len(eta_cache_leaves):
             raise RuntimeError(
@@ -14210,14 +14231,20 @@ class EnvironmentPrior:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
                         tbptt_action_mask_buffer = []
                     boundary_out = None
-                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                    window_end_idx = int(t + 1)
+                    next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
+                    if (
+                        tbptt_one_hop_boundary_active
+                        and (window_end_idx < n_samples)
+                        and (next_window_end_idx > int(single_eval_pos))
+                    ):
                         boundary_out = {
                             "state_t": state_t,
                             "action_t": action_t,
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache": cache,
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
@@ -14258,7 +14285,7 @@ class EnvironmentPrior:
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
                                 }
-                            if tbptt_one_hop_boundary_active:
+                            if tbptt_boundary_in is not None or boundary_out is not None:
                                 payload_aux["_tbptt_boundary"] = {
                                     "groups": (
                                         {
@@ -15501,23 +15528,23 @@ class EnvironmentPrior:
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
                 needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
-                cache_grad_targets = tuple()
+                tbptt_boundary_in = None
                 if needs_boundary_eta:
+                    cache_grad_targets = tuple()
                     state_t.requires_grad_(True)
                     action_t.requires_grad_(True)
                     reward_t.requires_grad_(True)
                     reward_mask_t.requires_grad_(True)
                     terminal_t.requires_grad_(True)
                     cache_grad_targets = self._enable_policy_cache_grad(cache)
-                tbptt_boundary_in = {
-                    "state_t": state_t,
-                    "action_t": action_t,
-                    "reward_t": reward_t,
-                    "reward_mask_t": reward_mask_t,
-                    "terminal_t": terminal_t,
-                    "cache": cache,
-                    "cache_grad_targets": cache_grad_targets,
-                }
+                    tbptt_boundary_in = {
+                        "state_t": state_t,
+                        "action_t": action_t,
+                        "reward_t": reward_t,
+                        "reward_mask_t": reward_mask_t,
+                        "terminal_t": terminal_t,
+                        "cache_grad_targets": cache_grad_targets,
+                    }
             obs_t = state_t[:, :max_obs_dim] * obs_mask
             if collect_x:
                 with torch.no_grad():
@@ -16271,14 +16298,20 @@ class EnvironmentPrior:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
                         tbptt_action_mask_buffer = []
                     boundary_out = None
-                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                    window_end_idx = int(t + 1)
+                    next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
+                    if (
+                        tbptt_one_hop_boundary_active
+                        and (window_end_idx < n_samples)
+                        and (next_window_end_idx > int(single_eval_pos))
+                    ):
                         boundary_out = {
                             "state_t": state_t,
                             "action_t": action_t,
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache": cache,
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
@@ -16320,7 +16353,7 @@ class EnvironmentPrior:
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
                                 }
-                            if tbptt_one_hop_boundary_active:
+                            if tbptt_boundary_in is not None or boundary_out is not None:
                                 payload_aux["_tbptt_boundary"] = {
                                     "groups": (
                                         {
@@ -17046,23 +17079,23 @@ class EnvironmentPrior:
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
                 needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
-                cache_grad_targets = tuple()
+                tbptt_boundary_in = None
                 if needs_boundary_eta:
+                    cache_grad_targets = tuple()
                     state_t.requires_grad_(True)
                     action_t.requires_grad_(True)
                     reward_t.requires_grad_(True)
                     reward_mask_t.requires_grad_(True)
                     terminal_t.requires_grad_(True)
                     cache_grad_targets = self._enable_policy_cache_grad(cache)
-                tbptt_boundary_in = {
-                    "state_t": state_t,
-                    "action_t": action_t,
-                    "reward_t": reward_t,
-                    "reward_mask_t": reward_mask_t,
-                    "terminal_t": terminal_t,
-                    "cache": cache,
-                    "cache_grad_targets": cache_grad_targets,
-                }
+                    tbptt_boundary_in = {
+                        "state_t": state_t,
+                        "action_t": action_t,
+                        "reward_t": reward_t,
+                        "reward_mask_t": reward_mask_t,
+                        "terminal_t": terminal_t,
+                        "cache_grad_targets": cache_grad_targets,
+                    }
             obs_t = state_t[:obs_dim]  # observable subset of state
             if collect_x:
                 with torch.no_grad():
@@ -17523,14 +17556,20 @@ class EnvironmentPrior:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0).reshape(-1, 1, action_dim)
                         tbptt_action_mask_buffer = []
                     boundary_out = None
-                    if tbptt_one_hop_boundary_active and (t < (n_samples - 1)):
+                    window_end_idx = int(t + 1)
+                    next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
+                    if (
+                        tbptt_one_hop_boundary_active
+                        and (window_end_idx < n_samples)
+                        and (next_window_end_idx > int(single_eval_pos))
+                    ):
                         boundary_out = {
                             "state_t": state_t,
                             "action_t": action_t,
                             "reward_t": reward_t,
                             "reward_mask_t": reward_mask_t,
                             "terminal_t": terminal_t,
-                            "cache": cache,
+                            "cache_replay_leaves": self._policy_cache_replay_leaves(cache),
                         }
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
@@ -17570,7 +17609,7 @@ class EnvironmentPrior:
                                     "action_mean_roots": action_mean_window_roots,
                                     "action_mask": action_mask_window,
                                 }
-                            if tbptt_one_hop_boundary_active:
+                            if tbptt_boundary_in is not None or boundary_out is not None:
                                 payload_aux["_tbptt_boundary"] = {
                                     "groups": (
                                         {

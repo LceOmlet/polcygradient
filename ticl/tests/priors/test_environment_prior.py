@@ -7913,6 +7913,32 @@ def test_environment_prior_reinforce_family_tbptt_reports_one_hop_replay_stats()
     assert int(stats["pg_bridge_replay_count"]) >= 1
 
 
+def test_environment_prior_one_hop_replay_leaves_skip_paged_prefix():
+    k_prefix = torch.randn(2, 3, 5, 7)
+    v_prefix = torch.randn(2, 3, 5, 7)
+    k_page = torch.randn(2, 3, 2, 7)
+    v_page = torch.randn(2, 3, 2, 7)
+    cache = {
+        "cache_mode": "paged",
+        "k_prefix": k_prefix,
+        "v_prefix": v_prefix,
+        "k_pages": [k_page],
+        "v_pages": [v_page],
+        "valid_len": 7,
+        "prefix_base_len": 5,
+        "tail_frozen": True,
+    }
+
+    replay_leaves = EnvironmentPrior._policy_cache_replay_leaves(cache)
+    assert replay_leaves == (k_page, v_page)
+
+    replay_grad_targets = EnvironmentPrior._enable_policy_cache_grad(cache)
+    assert replay_grad_targets == (k_page, v_page)
+    assert k_page.requires_grad and v_page.requires_grad
+    assert not k_prefix.requires_grad
+    assert not v_prefix.requires_grad
+
+
 @pytest.mark.parametrize("objective_kind", ["reinforce", "alpha_grad"])
 def test_environment_prior_family_tbptt_uses_safe_runner_when_one_hop_disabled(monkeypatch, objective_kind):
     _seed_everything(2083)
