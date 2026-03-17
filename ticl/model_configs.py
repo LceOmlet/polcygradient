@@ -51,6 +51,9 @@ def get_optimizer_config():
         "train_gpu_observer_interval_sec": 1.0,
         "train_gpu_observer_output_path": None,
         "train_gpu_stage_output_path": None,
+        "train_host_rss_limit_gib": None,
+        "train_host_rss_limit_poll_interval_sec": 0.02,
+        "train_host_rss_limit_try_rlimit_as": False,
         "train_kernel_profiler_enabled": False,
         "train_kernel_profiler_output_dir": None,
         "train_kernel_profiler_wait_steps": 1,
@@ -501,6 +504,9 @@ def get_rlpfn_default_config():
         # alpha-grad.
         "pg_one_hop_replay_enabled": False,
         "alpha_grad_one_hop_replay_enabled": False,
+        "pg_markov_adjacent_replay_enabled": False,
+        "pg_markov_adjacent_replay_sample_prob": 0.03125,
+        "pg_replay_window_depth": 1,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,
@@ -567,6 +573,12 @@ def get_rlpfn_default_config():
     config['optimizer']['train_gpu_observer_interval_sec'] = 1.0
     config['optimizer']['train_gpu_observer_output_path'] = None
     config['optimizer']['train_gpu_stage_output_path'] = None
+    # Keep a hard fail-fast host-RSS guard on the maintained 1024-batch RL path.
+    # The in-process watchdog is not a kernel-enforced cgroup limit, but it
+    # catches host-memory runaway earlier than per-batch logging.
+    config['optimizer']['train_host_rss_limit_gib'] = 32.0
+    config['optimizer']['train_host_rss_limit_poll_interval_sec'] = 0.02
+    config['optimizer']['train_host_rss_limit_try_rlimit_as'] = False
     config['optimizer']['train_kernel_profiler_enabled'] = False
     config['optimizer']['train_kernel_profiler_output_dir'] = None
     config['optimizer']['train_kernel_profiler_wait_steps'] = 1

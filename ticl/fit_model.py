@@ -86,6 +86,7 @@ from ticl.utils import (
 from ticl.config_utils import compare_dicts, flatten_dict, update_config
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.model_configs import get_model_default_config
+from ticl.host_memory_guard import install_host_rss_limit_guard
 from argparse import Namespace
 
 
@@ -171,6 +172,11 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--anti-explosion-vanishing-v5-next-step-low-boost-cap", "anti_explosion_vanishing_v5_next_step_low_boost_cap"),
         ("--anti-explosion-vanishing-v5-next-eps", "anti_explosion_vanishing_v5_next_eps"),
         ("--anti-explosion-vanishing-v5-next-detach-reference", "anti_explosion_vanishing_v5_next_detach_reference"),
+        ("--pg-one-hop-replay-enabled", "pg_one_hop_replay_enabled"),
+        ("--alpha-grad-one-hop-replay-enabled", "alpha_grad_one_hop_replay_enabled"),
+        ("--pg-markov-adjacent-replay-enabled", "pg_markov_adjacent_replay_enabled"),
+        ("--pg-markov-adjacent-replay-sample-prob", "pg_markov_adjacent_replay_sample_prob"),
+        ("--pg-replay-window-depth", "pg_replay_window_depth"),
     )
     for flag, key in env_override_flags:
         if _cli_flag_is_set(argv, flag):
@@ -191,6 +197,9 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-gpu-observer-interval-sec", "train_gpu_observer_interval_sec"),
         ("--train-gpu-observer-output-path", "train_gpu_observer_output_path"),
         ("--train-gpu-stage-output-path", "train_gpu_stage_output_path"),
+        ("--train-host-rss-limit-gib", "train_host_rss_limit_gib"),
+        ("--train-host-rss-limit-poll-interval-sec", "train_host_rss_limit_poll_interval_sec"),
+        ("--train-host-rss-limit-try-rlimit-as", "train_host_rss_limit_try_rlimit_as"),
         ("--train-kernel-profiler-enabled", "train_kernel_profiler_enabled"),
         ("--train-kernel-profiler-output-dir", "train_kernel_profiler_output_dir"),
         ("--train-kernel-profiler-wait-steps", "train_kernel_profiler_wait_steps"),
@@ -291,6 +300,47 @@ def main(argv, extra_config=None):
     if extra_config is not None:
         update_config(config, extra_config)
 
+    host_rss_guard = None
+    host_rss_guard_status = None
+    try:
+        host_rss_guard, host_rss_guard_status = install_host_rss_limit_guard(
+            limit_gib=config["optimizer"].get("train_host_rss_limit_gib", None),
+            poll_interval_sec=config["optimizer"].get("train_host_rss_limit_poll_interval_sec", 0.02),
+            try_rlimit_as=config["optimizer"].get("train_host_rss_limit_try_rlimit_as", False),
+        )
+    except Exception as exc:
+        host_rss_guard = None
+        host_rss_guard_status = {
+            "enabled": False,
+            "limit_gib": None,
+            "poll_interval_sec": None,
+            "try_rlimit_as": bool(config["optimizer"].get("train_host_rss_limit_try_rlimit_as", False)),
+            "rlimit_as": {"requested": False, "applied": False, "reason": f"guard_init_failed: {exc}"},
+        }
+    if isinstance(host_rss_guard_status, dict) and bool(host_rss_guard_status.get("enabled", False)):
+        rlimit_status = host_rss_guard_status.get("rlimit_as", {})
+        rlimit_msg = "disabled"
+        if isinstance(rlimit_status, dict) and bool(host_rss_guard_status.get("try_rlimit_as", False)):
+            if bool(rlimit_status.get("applied", False)):
+                rlimit_msg = "applied"
+            else:
+                rlimit_msg = f"skipped({rlimit_status.get('reason', 'unknown')})"
+        print(
+            "Host RSS guard:",
+            f"limit_gib={float(host_rss_guard_status['limit_gib']):.2f}",
+            f"poll_interval_sec={float(host_rss_guard_status['poll_interval_sec']):.3f}",
+            f"try_rlimit_as={bool(host_rss_guard_status.get('try_rlimit_as', False))}",
+            f"rlimit_as={rlimit_msg}",
+        )
+    elif (
+        isinstance(host_rss_guard_status, dict)
+        and config["optimizer"].get("train_host_rss_limit_gib", None) is not None
+        and not bool(host_rss_guard_status.get("sensor_available", True))
+    ):
+        print(
+            "[host-rss-limit] disabled because current RSS sensor is unavailable on this platform/runtime."
+        )
+
     save_every = orchestration.save_every
 
     model_state, optimizer_state, scheduler = None, None, None
@@ -381,56 +431,13 @@ def main(argv, extra_config=None):
             config=wandb_config,
         )
 
-    if (not orchestration.use_mlflow) or mlflow_hostname is None:
-        print("Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.")
-        total_loss, model, dl, epoch = get_model(
-            config, 
-            device, 
-            should_train=True,
-            verbose=1, 
-            epoch_callback=save_callback, 
-            model_state=model_state,
-            optimizer_state=optimizer_state, 
-            scheduler=scheduler,
-            load_model_strict=orchestration.continue_run or orchestration.load_strict
-        )
-    else:
-        print(f"Logging run with mlflow at host {mlflow_hostname}")
-        mlflow.set_tracking_uri(f"http://{mlflow_hostname}:5000")
-
-        tries = 0
-        while tries < 5:
-            try:
-                mlflow.set_experiment(orchestration.experiment)
-                break
-            except:
-                tries += 1
-                print(f"Failed to set experiment, retrying {tries}/5")
-                time.sleep(5)
-
-        if orchestration.continue_run and not orchestration.create_new_run:
-            # find run id via mlflow
-            run_ids = mlflow.search_runs(filter_string=f"attribute.run_name='{model_string}'")['run_id']
-            if len(run_ids) > 1:
-                raise ValueError(f"Found more than one run with name {model_string}")
-            if len(run_ids) < 1:
-                raise ValueError(f"Found no run with name {model_string}")
-            run_id = run_ids.iloc[0]
-            run_args = {'run_id': run_id}
-
-        else:
-            run_args = {'run_name': model_string}
-
-        path = os.path.dirname(os.path.abspath(__file__))
-        run_args['tags'] = {'mlflow.source.git.commit': Repo(path, search_parent_directories=True).head.object.hexsha}
-
-        with mlflow.start_run(**run_args):
-            mlflow.log_param('hostname', socket.gethostname())
-            mlflow.log_params({k: v for k, v in flatten_dict(config).items() if k not in ['wallclock_times', 'losses', 'learning_rates']})
+    try:
+        if (not orchestration.use_mlflow) or mlflow_hostname is None:
+            print("Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.")
             total_loss, model, dl, epoch = get_model(
                 config, 
                 device, 
-                should_train=True, 
+                should_train=True,
                 verbose=1, 
                 epoch_callback=save_callback, 
                 model_state=model_state,
@@ -438,6 +445,53 @@ def main(argv, extra_config=None):
                 scheduler=scheduler,
                 load_model_strict=orchestration.continue_run or orchestration.load_strict
             )
+        else:
+            print(f"Logging run with mlflow at host {mlflow_hostname}")
+            mlflow.set_tracking_uri(f"http://{mlflow_hostname}:5000")
+
+            tries = 0
+            while tries < 5:
+                try:
+                    mlflow.set_experiment(orchestration.experiment)
+                    break
+                except:
+                    tries += 1
+                    print(f"Failed to set experiment, retrying {tries}/5")
+                    time.sleep(5)
+
+            if orchestration.continue_run and not orchestration.create_new_run:
+                # find run id via mlflow
+                run_ids = mlflow.search_runs(filter_string=f"attribute.run_name='{model_string}'")['run_id']
+                if len(run_ids) > 1:
+                    raise ValueError(f"Found more than one run with name {model_string}")
+                if len(run_ids) < 1:
+                    raise ValueError(f"Found no run with name {model_string}")
+                run_id = run_ids.iloc[0]
+                run_args = {'run_id': run_id}
+
+            else:
+                run_args = {'run_name': model_string}
+
+            path = os.path.dirname(os.path.abspath(__file__))
+            run_args['tags'] = {'mlflow.source.git.commit': Repo(path, search_parent_directories=True).head.object.hexsha}
+
+            with mlflow.start_run(**run_args):
+                mlflow.log_param('hostname', socket.gethostname())
+                mlflow.log_params({k: v for k, v in flatten_dict(config).items() if k not in ['wallclock_times', 'losses', 'learning_rates']})
+                total_loss, model, dl, epoch = get_model(
+                    config, 
+                    device, 
+                    should_train=True, 
+                    verbose=1, 
+                    epoch_callback=save_callback, 
+                    model_state=model_state,
+                    optimizer_state=optimizer_state, 
+                    scheduler=scheduler,
+                    load_model_strict=orchestration.continue_run or orchestration.load_strict
+                )
+    finally:
+        if host_rss_guard is not None:
+            host_rss_guard.stop()
 
     if rank == 0:
         save_callback(model, None, None, "on_exit")

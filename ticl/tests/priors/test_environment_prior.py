@@ -7913,6 +7913,171 @@ def test_environment_prior_reinforce_family_tbptt_reports_one_hop_replay_stats()
     assert int(stats["pg_bridge_replay_count"]) >= 1
 
 
+def test_environment_prior_reinforce_family_tbptt_clamps_replay_depth_to_safe_one_hop():
+    _seed_everything(2083)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    env_cfg["alpha_grad_one_hop_replay_enabled"] = True
+    env_cfg["pg_replay_window_depth"] = 2
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=4,
+        collect_x=False,
+        tbptt_window=2,
+        h_list_override=h_list,
+        policy_objective_kind="reinforce",
+    )
+
+    assert torch.isfinite(loss)
+    assert int(stats["pg_one_hop_replay_enabled"]) == 1
+    assert int(stats["pg_replay_window_depth"]) == 1
+    assert int(stats["pg_bridge_replay_count"]) >= 1
+
+
+def test_environment_prior_reinforce_family_tbptt_markov_adjacent_future_replay_reports_sampled_bridges():
+    _seed_everything(2084)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    env_cfg["alpha_grad_one_hop_replay_enabled"] = True
+    env_cfg["pg_markov_adjacent_replay_enabled"] = True
+    env_cfg["pg_markov_adjacent_replay_sample_prob"] = 1.0
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        h_list_override=h_list,
+        policy_objective_kind="reinforce",
+    )
+
+    assert torch.isfinite(loss)
+    assert int(stats["pg_markov_adjacent_replay_enabled"]) == 1
+    assert float(stats["pg_markov_adjacent_replay_sample_prob"]) == 1.0
+    assert int(stats["pg_markov_adjacent_bridge_sampled_count"]) == 2
+    assert int(stats["pg_bridge_replay_count"]) == 3
+
+
+def test_environment_prior_reinforce_family_tbptt_skips_bridge_when_phase_boundary_is_in_first_window():
+    _seed_everything(2085)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    env_cfg["alpha_grad_one_hop_replay_enabled"] = True
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=1,
+        collect_x=False,
+        tbptt_window=4,
+        h_list_override=h_list,
+        policy_objective_kind="reinforce",
+    )
+
+    assert torch.isfinite(loss)
+    assert int(stats["pg_one_hop_replay_enabled"]) == 1
+    assert int(stats["pg_bridge_replay_count"]) == 0
+
+
 def test_environment_prior_one_hop_replay_leaves_skip_paged_prefix():
     k_prefix = torch.randn(2, 3, 5, 7)
     v_prefix = torch.randn(2, 3, 5, 7)

@@ -364,9 +364,12 @@ def _saved_tensors_cpu_offload_context(enabled: bool, pin_memory: bool):
 def _wrap_policy_step_fn_saved_tensors_offload(policy_step_fn, *, enabled: bool, pin_memory: bool):
     if (not bool(enabled)) or policy_step_fn is None:
         return policy_step_fn
+    offload_state = {"enabled": bool(enabled)}
 
     @wraps(policy_step_fn)
     def _wrapped(*args, **kwargs):
+        if not bool(offload_state["enabled"]):
+            return policy_step_fn(*args, **kwargs)
         with _saved_tensors_cpu_offload_context(enabled=True, pin_memory=bool(pin_memory)):
             return policy_step_fn(*args, **kwargs)
 
@@ -374,6 +377,16 @@ def _wrap_policy_step_fn_saved_tensors_offload(policy_step_fn, *, enabled: bool,
         _wrapped.__dict__.update(getattr(policy_step_fn, "__dict__", {}))
     except Exception:
         pass
+    _wrapped._ticl_saved_tensors_cpu_offload_default_enabled = bool(enabled)
+
+    def _set_saved_tensors_cpu_offload_enabled(flag):
+        offload_state["enabled"] = bool(flag)
+
+    def _get_saved_tensors_cpu_offload_enabled():
+        return bool(offload_state["enabled"])
+
+    _wrapped._ticl_set_saved_tensors_cpu_offload_enabled = _set_saved_tensors_cpu_offload_enabled
+    _wrapped._ticl_get_saved_tensors_cpu_offload_enabled = _get_saved_tensors_cpu_offload_enabled
     return _wrapped
 
 
@@ -2679,6 +2692,7 @@ def train_epoch_policy_gradient(
                     batch_terminal_bonus_min_value = None
                     batch_terminal_bonus_max_value = None
                     batch_terminal_bonus_event_mean_value = None
+                    batch_pg_bridge_replay_count_value = 0
                     batch_reinforce_return_nonfinite_share = 0.0
                     batch_reinforce_log_prob_nonfinite_share = 0.0
                     batch_reinforce_adv_nonfinite_share = 0.0
@@ -3588,6 +3602,14 @@ def train_epoch_policy_gradient(
                                     batch_terminal_bonus_event_mean_value = contrib
                                 else:
                                     batch_terminal_bonus_event_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_bridge_replay_count = pg_stats_chunk.get("pg_bridge_replay_count", None)
+                        if chunk_bridge_replay_count is not None:
+                            try:
+                                batch_pg_bridge_replay_count_value += int(
+                                    torch.as_tensor(chunk_bridge_replay_count).detach().cpu().item()
+                                )
                             except Exception:
                                 pass
                         chunk_reinforce_return_nonfinite = pg_stats_chunk.get("reinforce_return_nonfinite_share", None)
@@ -6507,6 +6529,7 @@ def train_epoch_policy_gradient(
                         f"[pg-phase] epoch={batch_epoch_for_profile} batch={batch}{replay_phase_suffix} "
                         f"rollout_s={batch_rollout_wall:.3f} backward_s={batch_backward_wall:.3f} "
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
+                        f"bridge_count={int(batch_pg_bridge_replay_count_value)} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
                         f"objective={float(batch_objective.detach().cpu()):+.3e} "
                         f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
@@ -6702,6 +6725,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           train_gpu_observer_interval_sec=1.0,
           train_gpu_observer_output_path=None,
           train_gpu_stage_output_path=None,
+          train_host_rss_limit_gib=None,
+          train_host_rss_limit_poll_interval_sec=0.02,
+          train_host_rss_limit_try_rlimit_as=False,
           train_kernel_profiler_enabled=False,
           train_kernel_profiler_output_dir=None,
           train_kernel_profiler_wait_steps=1,
@@ -6749,6 +6775,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_phase_log_every_batches=1,
           pg_phase_log_file=None,
           ):
+    del train_host_rss_limit_gib, train_host_rss_limit_poll_interval_sec, train_host_rss_limit_try_rlimit_as
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
     if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}:

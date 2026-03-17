@@ -5586,6 +5586,22 @@ class EnvironmentPrior:
         return EnvironmentPrior._coerce_bool(h.get("alpha_grad_one_hop_replay_enabled", True))
 
     @staticmethod
+    def _resolve_pg_replay_window_depth(h):
+        del h
+        return 1
+
+    @staticmethod
+    def _resolve_pg_markov_adjacent_replay_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("pg_markov_adjacent_replay_enabled", False))
+
+    @staticmethod
+    def _resolve_pg_markov_adjacent_replay_sample_prob(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("pg_markov_adjacent_replay_sample_prob", 0.03125))
+        if not math.isfinite(v):
+            return 0.03125
+        return float(min(1.0, max(0.0, v)))
+
+    @staticmethod
     def _resolve_alpha_grad_one_hop_replay_enabled(h):
         return EnvironmentPrior._resolve_pg_one_hop_replay_enabled(h)
 
@@ -12637,7 +12653,29 @@ class EnvironmentPrior:
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
-                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
+                    window_start_idx=window_start_idx,
+                    window_end_idx=window_end_idx,
+                    next_window_end_idx=min(n_samples, window_end_idx + int(tbptt_window_size)),
+                    n_samples=n_samples,
+                    single_eval_pos=single_eval_pos,
+                    replay_window_depth=tbptt_replay_window_depth,
+                    markov_adjacent_replay=tbptt_markov_adjacent_replay,
+                )
+                one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
+                    raw_one_hop_boundary_roles,
+                    markov_adjacent_eta_pending=tbptt_markov_adjacent_eta_pending,
+                    markov_adjacent_sample_prob=tbptt_markov_adjacent_sample_prob,
+                )
+                tbptt_window_one_hop_roles = one_hop_boundary_roles
+                self._set_policy_step_saved_tensors_offload_enabled(
+                    policy_step_fn,
+                    self._tbptt_window_one_hop_policy_offload_needed(
+                        tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
+                        one_hop_boundary_roles=one_hop_boundary_roles,
+                    ),
+                )
+                needs_boundary_eta = bool(one_hop_boundary_roles["needs_boundary_eta"])
                 tbptt_boundary_in = None
                 if needs_boundary_eta:
                     tbptt_boundary_in = self._build_tbptt_boundary_in(
@@ -13044,6 +13082,93 @@ class EnvironmentPrior:
             "include_terminal": bool(terminal_token_enabled and (int(token_terminal_idx) < num_features)),
             "action_replay_dim": action_replay_dim,
         }
+
+    @staticmethod
+    def _tbptt_one_hop_phase_boundary_roles(
+        *,
+        window_start_idx,
+        window_end_idx,
+        next_window_end_idx,
+        n_samples,
+        single_eval_pos,
+        replay_window_depth=1,
+        markov_adjacent_replay=False,
+    ):
+        window_start_idx = int(window_start_idx)
+        window_end_idx = int(window_end_idx)
+        next_window_end_idx = int(next_window_end_idx)
+        n_samples = int(n_samples)
+        single_eval_pos = int(single_eval_pos)
+        del replay_window_depth
+        phase_boundary_carry = bool(
+            (window_end_idx < n_samples)
+            and (window_end_idx <= single_eval_pos)
+            and (next_window_end_idx > single_eval_pos)
+        )
+        phase_boundary_eta = bool(
+            (window_start_idx > 0)
+            and (window_start_idx <= single_eval_pos)
+            and (window_end_idx > single_eval_pos)
+        )
+        markov_adjacent_carry = bool(
+            bool(markov_adjacent_replay)
+            and (window_end_idx < n_samples)
+            and (window_start_idx >= single_eval_pos)
+        )
+        markov_adjacent_eta = bool(
+            bool(markov_adjacent_replay)
+            and (window_start_idx > 0)
+            and (window_start_idx >= single_eval_pos)
+        )
+        return {
+            "carry_boundary_out": bool(phase_boundary_carry or markov_adjacent_carry),
+            "needs_boundary_eta": bool(phase_boundary_eta or markov_adjacent_eta),
+            "phase_boundary_carry": phase_boundary_carry,
+            "phase_boundary_eta": phase_boundary_eta,
+            "markov_adjacent_carry": markov_adjacent_carry,
+            "markov_adjacent_eta": markov_adjacent_eta,
+        }
+
+    @staticmethod
+    def _tbptt_resolve_window_one_hop_roles(
+        raw_roles,
+        *,
+        markov_adjacent_eta_pending=False,
+        markov_adjacent_sample_prob=0.0,
+    ):
+        roles = dict(raw_roles) if isinstance(raw_roles, dict) else {}
+        phase_boundary_carry = bool(roles.get("phase_boundary_carry", False))
+        phase_boundary_eta = bool(roles.get("phase_boundary_eta", False))
+        raw_markov_adjacent_carry = bool(roles.get("markov_adjacent_carry", False))
+        sampled_markov_adjacent_carry = False
+        sample_prob = float(min(1.0, max(0.0, float(markov_adjacent_sample_prob))))
+        if raw_markov_adjacent_carry and (sample_prob > 0.0):
+            sampled_markov_adjacent_carry = bool(
+                (sample_prob >= 1.0) or (float(np.random.random()) < sample_prob)
+            )
+        roles["markov_adjacent_carry"] = bool(sampled_markov_adjacent_carry)
+        roles["markov_adjacent_eta"] = bool(markov_adjacent_eta_pending)
+        roles["carry_boundary_out"] = bool(phase_boundary_carry or sampled_markov_adjacent_carry)
+        roles["needs_boundary_eta"] = bool(phase_boundary_eta or markov_adjacent_eta_pending)
+        return roles
+
+    @staticmethod
+    def _set_policy_step_saved_tensors_offload_enabled(policy_step_fn, enabled):
+        setter = getattr(policy_step_fn, "_ticl_set_saved_tensors_cpu_offload_enabled", None)
+        if callable(setter):
+            setter(bool(enabled))
+
+    @staticmethod
+    def _tbptt_window_one_hop_policy_offload_needed(*, tbptt_one_hop_boundary_active, one_hop_boundary_roles):
+        if not bool(tbptt_one_hop_boundary_active):
+            return False
+        if not isinstance(one_hop_boundary_roles, dict):
+            return False
+        # One-hop extends graph lifetime only for the carry window that keeps a
+        # boundary alive into the next TBPTT window. The eta window can stay on
+        # the baseline fast path once the retained carry graph is already
+        # protected.
+        return bool(one_hop_boundary_roles.get("carry_boundary_out", False))
 
     @staticmethod
     def _build_tbptt_boundary_in(
@@ -13605,7 +13730,23 @@ class EnvironmentPrior:
             and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
             and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
         )
+        tbptt_markov_adjacent_replay = bool(
+            tbptt_one_hop_boundary_active
+            and bool(self._resolve_pg_markov_adjacent_replay_enabled(self.config))
+        )
+        tbptt_replay_window_depth = (
+            int(self._resolve_pg_replay_window_depth(self.config))
+            if tbptt_one_hop_boundary_active
+            else 0
+        )
+        tbptt_markov_adjacent_sample_prob = (
+            float(self._resolve_pg_markov_adjacent_replay_sample_prob(self.config))
+            if tbptt_markov_adjacent_replay
+            else 0.0
+        )
         tbptt_boundary_in = None
+        tbptt_window_one_hop_roles = None
+        tbptt_markov_adjacent_eta_pending = False
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -14403,28 +14544,6 @@ class EnvironmentPrior:
                         action_mask_window = torch.stack(tbptt_action_mask_buffer, dim=0)
                         tbptt_action_mask_buffer = []
                     boundary_out = None
-                    window_end_idx = int(t + 1)
-                    next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
-                    if (
-                        tbptt_one_hop_boundary_active
-                        and (window_end_idx < n_samples)
-                        and (next_window_end_idx > int(single_eval_pos))
-                    ):
-                        boundary_out = self._build_tbptt_boundary_out(
-                            state_t=state_t,
-                            action_t=action_t,
-                            reward_t=reward_t,
-                            reward_mask_t=reward_mask_t,
-                            terminal_t=terminal_t,
-                            cache_replay_leaves=self._policy_cache_replay_leaves(
-                                cache,
-                                emulate_tbptt_detach=True,
-                            ),
-                            action_replay_dim=tbptt_boundary_usage["action_replay_dim"],
-                            include_reward=tbptt_boundary_usage["include_reward"],
-                            include_reward_mask=tbptt_boundary_usage["include_reward_mask"],
-                            include_terminal=tbptt_boundary_usage["include_terminal"],
-                        )
                     if t < (n_samples - 1):
                         state_t = state_t.detach()
                         action_t = action_t.detach()
@@ -15394,7 +15513,23 @@ class EnvironmentPrior:
             and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
             and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
         )
+        tbptt_markov_adjacent_replay = bool(
+            tbptt_one_hop_boundary_active
+            and bool(self._resolve_pg_markov_adjacent_replay_enabled(self.config))
+        )
+        tbptt_replay_window_depth = (
+            int(self._resolve_pg_replay_window_depth(self.config))
+            if tbptt_one_hop_boundary_active
+            else 0
+        )
+        tbptt_markov_adjacent_sample_prob = (
+            float(self._resolve_pg_markov_adjacent_replay_sample_prob(self.config))
+            if tbptt_markov_adjacent_replay
+            else 0.0
+        )
         tbptt_boundary_in = None
+        tbptt_window_one_hop_roles = None
+        tbptt_markov_adjacent_eta_pending = False
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=torch.float32)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=torch.float32, aev3_cfg=aev3_cfg)
@@ -15582,6 +15717,630 @@ class EnvironmentPrior:
                     dtype=torch.float32,
                 ).transpose(0, 1) * init_state_std[None, :, None] * state_mask.unsqueeze(0)
 
+        def _move_tensor_tree_to_device(node, target_device):
+            if node is None:
+                return None
+            if torch.is_tensor(node):
+                return node.detach().to(device=target_device, copy=True)
+            if isinstance(node, list):
+                return [_move_tensor_tree_to_device(item, target_device) for item in node]
+            if isinstance(node, tuple):
+                return tuple(_move_tensor_tree_to_device(item, target_device) for item in node)
+            if isinstance(node, dict):
+                return {key: _move_tensor_tree_to_device(value, target_device) for key, value in node.items()}
+            return node
+
+        def _snapshot_tbptt_replay_boundary_to_cpu():
+            return {
+                "state_t": state_t.detach().to(device="cpu", copy=True),
+                "action_t": action_t.detach().to(device="cpu", copy=True),
+                "reward_t": reward_t.detach().to(device="cpu", copy=True),
+                "reward_mask_t": reward_mask_t.detach().to(device="cpu", copy=True),
+                "terminal_t": terminal_t.detach().to(device="cpu", copy=True),
+                "cache": _move_tensor_tree_to_device(
+                    self._detach_policy_cache(cache, clone_tensors=True),
+                    torch.device("cpu"),
+                ),
+            }
+
+        def _capture_tbptt_replay_rng_state():
+            cpu_state = torch.get_rng_state()
+            cuda_state = None
+            if device_obj.type == "cuda" and torch.cuda.is_available():
+                cuda_state = torch.cuda.get_rng_state(device_obj)
+            return {
+                "cpu": cpu_state,
+                "cuda": cuda_state,
+            }
+
+        def _run_tbptt_reverse_replay_window(
+            replay_window,
+            *,
+            bridge_eta=None,
+            need_boundary_eta=False,
+            replay_discount=None,
+        ):
+            if not isinstance(replay_window, dict):
+                return {"bridge_loss": None, "boundary_eta": None}
+            window_start = int(replay_window.get("window_start", 0) or 0)
+            window_end = int(replay_window.get("window_end", window_start) or window_start)
+            if window_end <= window_start:
+                return {"bridge_loss": None, "boundary_eta": None}
+            replay_boundary_cpu = replay_window.get("boundary_start", None)
+            if not isinstance(replay_boundary_cpu, dict):
+                return {"bridge_loss": None, "boundary_eta": None}
+
+            saved_cpu_rng_state = torch.get_rng_state()
+            saved_cuda_rng_state = None
+            if device_obj.type == "cuda" and torch.cuda.is_available():
+                saved_cuda_rng_state = torch.cuda.get_rng_state(device_obj)
+            replay_rng_state = replay_window.get("rng_state", None)
+            prev_offload_enabled = None
+            get_offload_enabled = getattr(policy_step_fn, "_ticl_get_saved_tensors_cpu_offload_enabled", None)
+            if callable(get_offload_enabled):
+                try:
+                    prev_offload_enabled = bool(get_offload_enabled())
+                except Exception:
+                    prev_offload_enabled = None
+            try:
+                if isinstance(replay_rng_state, dict):
+                    replay_cpu_state = replay_rng_state.get("cpu", None)
+                    replay_cuda_state = replay_rng_state.get("cuda", None)
+                    if torch.is_tensor(replay_cpu_state):
+                        torch.set_rng_state(replay_cpu_state)
+                    if (
+                        torch.is_tensor(replay_cuda_state)
+                        and device_obj.type == "cuda"
+                        and torch.cuda.is_available()
+                    ):
+                        torch.cuda.set_rng_state(replay_cuda_state, device=device_obj)
+
+                self._set_policy_step_saved_tensors_offload_enabled(policy_step_fn, True)
+
+                boundary_materialized = _move_tensor_tree_to_device(replay_boundary_cpu, device_obj)
+                state_local = boundary_materialized["state_t"]
+                action_local = boundary_materialized["action_t"]
+                reward_local = boundary_materialized["reward_t"]
+                reward_mask_local = boundary_materialized["reward_mask_t"]
+                terminal_local = boundary_materialized["terminal_t"]
+                cache_local = boundary_materialized["cache"]
+                cache_grad_targets = tuple()
+                if need_boundary_eta:
+                    state_local.requires_grad_(True)
+                    action_local.requires_grad_(True)
+                    reward_local.requires_grad_(True)
+                    reward_mask_local.requires_grad_(True)
+                    terminal_local.requires_grad_(True)
+                    cache_local, cache_grad_targets = self._clone_policy_cache_with_grad(cache_local)
+                boundary_in = {
+                    "state_t": state_local,
+                    "action_t": action_local,
+                    "reward_t": reward_local,
+                    "reward_mask_t": reward_mask_local,
+                    "terminal_t": terminal_local,
+                    "cache_grad_targets": cache_grad_targets,
+                    "action_replay_dim": int(max_action_dim),
+                }
+                reward_buffer = []
+                log_prob_buffer = []
+                log_prob_score_buffer = [] if collect_log_prob_score else None
+                action_mean_buffer = [] if collect_action_trace else None
+                action_mask_buffer = [] if collect_action_trace else None
+                terminal_signal_history_local = (
+                    terminal_signal_history.clone() if terminal_signal_history is not None else None
+                )
+                replay_noise_block_start = 0
+                replay_noise_block_end = 0
+                replay_transition_noise_block = None
+                replay_action_noise_train_block = None
+                replay_action_noise_eval_block = None
+                replay_state_noise_block = None
+                replay_dropout_draws_block = None
+                replay_terminal_reset_draws_block = None
+                replay_terminal_bonus_scale_draws_block = None
+                replay_terminal_reset_states_block = None
+
+                def _refresh_replay_noise_block(block_start_idx):
+                    nonlocal replay_noise_block_start, replay_noise_block_end
+                    nonlocal replay_transition_noise_block, replay_action_noise_train_block
+                    nonlocal replay_action_noise_eval_block, replay_state_noise_block
+                    nonlocal replay_dropout_draws_block, replay_terminal_reset_draws_block
+                    nonlocal replay_terminal_bonus_scale_draws_block, replay_terminal_reset_states_block
+                    block_start_idx = int(block_start_idx)
+                    block_len = int(min(noise_block_size, n_samples - block_start_idx))
+                    replay_noise_block_start = block_start_idx
+                    replay_noise_block_end = block_start_idx + block_len
+                    replay_transition_noise_block = self._stack_randn_with_generators(
+                        rollout_generators,
+                        (batch_size, block_len, max_noise_dim),
+                        device=device,
+                        dtype=torch.float32,
+                    ).transpose(0, 1) * noise_mask.unsqueeze(0)
+                    if torch.any(action_noise_train_std > 0):
+                        replay_action_noise_train_block = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len, max_action_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1) * action_mask.unsqueeze(0)
+                    else:
+                        replay_action_noise_train_block = None
+                    if torch.any(action_noise_eval_std > 0):
+                        replay_action_noise_eval_block = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len, max_action_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1) * action_mask.unsqueeze(0)
+                    else:
+                        replay_action_noise_eval_block = None
+                    if torch.any(state_noise_std > 0):
+                        replay_state_noise_block = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len, max_state_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1) * state_mask.unsqueeze(0)
+                    else:
+                        replay_state_noise_block = None
+                    if torch.any(dropout_active):
+                        replay_dropout_draws_block = self._stack_rand_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1)
+                    else:
+                        replay_dropout_draws_block = None
+                    if terminal_token_enabled:
+                        replay_terminal_reset_draws_block = self._stack_rand_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1)
+                        replay_terminal_bonus_scale_draws_block = self._stack_rand_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1)
+                        replay_terminal_reset_states_block = self._stack_randn_with_generators(
+                            rollout_generators,
+                            (batch_size, block_len, max_state_dim),
+                            device=device,
+                            dtype=torch.float32,
+                        ).transpose(0, 1) * init_state_std[None, :, None] * state_mask.unsqueeze(0)
+                    else:
+                        replay_terminal_reset_draws_block = None
+                        replay_terminal_bonus_scale_draws_block = None
+                        replay_terminal_reset_states_block = None
+
+                for t_replay in range(window_start, window_end):
+                    obs_t_replay = state_local[:, :max_obs_dim] * obs_mask
+                    if terminal_token_enabled:
+                        env_info["terminal_t"] = terminal_local.reshape(batch_size, 1)
+                    else:
+                        env_info.pop("terminal_t", None)
+                    env_info["phase_t"] = phase_eval_t if t_replay >= single_eval_pos else phase_train_t
+                    if policy_accepts_reward_mask:
+                        policy_out_replay = policy_step_fn(
+                            obs_t_replay,
+                            action_local,
+                            reward_local.reshape(batch_size, 1),
+                            reward_mask_local.reshape(batch_size, 1),
+                            cache_local,
+                            t_replay,
+                            env_info,
+                        )
+                    else:
+                        policy_out_replay = policy_step_fn(
+                            obs_t_replay,
+                            action_local,
+                            reward_local.reshape(batch_size, 1),
+                            cache_local,
+                            t_replay,
+                            env_info,
+                        )
+                    if isinstance(policy_out_replay, tuple):
+                        action_next_replay, cache_local = policy_out_replay
+                    else:
+                        action_next_replay = policy_out_replay
+                    if action_next_replay.ndim == 1:
+                        action_next_replay = action_next_replay.reshape(batch_size, 1)
+                    action_mean_replay = action_next_replay
+                    reinforce_log_prob_t_replay = None
+                    reinforce_log_prob_score_t_replay = None
+                    action_mask_bool_replay = action_mask.to(dtype=torch.bool)
+
+                    noise_block_idx_replay = None
+                    if noise_streaming_mode:
+                        if t_replay >= replay_noise_block_end:
+                            _refresh_replay_noise_block(t_replay)
+                        noise_block_idx_replay = int(t_replay - replay_noise_block_start)
+
+                    if t_replay < single_eval_pos:
+                        action_std_t_replay = action_noise_train_std
+                        if noise_streaming_mode:
+                            action_eps_t_replay = replay_action_noise_train_block[noise_block_idx_replay]
+                        else:
+                            action_eps_t_replay = action_noise_train[t_replay]
+                    else:
+                        action_std_t_replay = action_noise_eval_std
+                        if noise_streaming_mode:
+                            action_eps_t_replay = replay_action_noise_eval_block[noise_block_idx_replay]
+                        else:
+                            action_eps_t_replay = action_noise_eval[t_replay]
+                    action_pre_tanh_replay = action_mean_replay + (
+                        action_eps_t_replay * action_std_t_replay[:, None]
+                    )
+                    action_next_replay = self._transform_reinforce_action(
+                        action_pre_tanh_replay,
+                        mode=env_info.get("reinforce_action_transform", "rms"),
+                        rms_eps=env_info.get("reinforce_action_rms_eps", 1e-6),
+                        mask=action_mask,
+                    )
+                    reinforce_log_prob_t_replay = self._squashed_gaussian_log_prob(
+                        action_pre_tanh_replay.detach(),
+                        action_mean_replay,
+                        action_std_t_replay,
+                        action=action_next_replay.detach(),
+                        mask=action_mask,
+                    )
+                    if collect_log_prob_score:
+                        reinforce_log_prob_score_t_replay = self._reinforce_log_prob_score_wrt_action_mean(
+                            action_pre_tanh_replay.detach(),
+                            action_mean_replay.detach(),
+                            action_std_t_replay,
+                            mask=action_mask,
+                        ).detach().to(dtype=torch.float32)
+                        reinforce_log_prob_t_replay = reinforce_log_prob_t_replay.detach()
+
+                    if noise_streaming_mode:
+                        noise_t_replay = replay_transition_noise_block[noise_block_idx_replay]
+                        state_noise_t_replay = (
+                            None if replay_state_noise_block is None else replay_state_noise_block[noise_block_idx_replay]
+                        )
+                        dropout_draw_t_replay = (
+                            None if replay_dropout_draws_block is None else replay_dropout_draws_block[noise_block_idx_replay]
+                        )
+                        terminal_draw_t_replay = (
+                            None
+                            if replay_terminal_reset_draws_block is None
+                            else replay_terminal_reset_draws_block[noise_block_idx_replay]
+                        )
+                        terminal_bonus_scale_draw_t_replay = (
+                            None
+                            if replay_terminal_bonus_scale_draws_block is None
+                            else replay_terminal_bonus_scale_draws_block[noise_block_idx_replay]
+                        )
+                        terminal_reset_state_t_replay = (
+                            None
+                            if replay_terminal_reset_states_block is None
+                            else replay_terminal_reset_states_block[noise_block_idx_replay]
+                        )
+                    else:
+                        noise_t_replay = transition_noise[t_replay]
+                        state_noise_t_replay = None if state_noise is None else state_noise[t_replay]
+                        dropout_draw_t_replay = None if dropout_draws is None else dropout_draws[t_replay]
+                        terminal_draw_t_replay = (
+                            None if terminal_reset_draws is None else terminal_reset_draws[t_replay]
+                        )
+                        terminal_bonus_scale_draw_t_replay = (
+                            None if terminal_bonus_scale_draws is None else terminal_bonus_scale_draws[t_replay]
+                        )
+                        terminal_reset_state_t_replay = (
+                            None if terminal_reset_states is None else terminal_reset_states[t_replay]
+                        )
+
+                    reward_next_raw_replay = torch.empty((batch_size,), device=device, dtype=torch.float32)
+                    reward_mask_next_replay = torch.ones((batch_size,), device=device, dtype=torch.float32)
+                    state_next_replay = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
+                    terminal_signal_next_replay = None
+                    terminal_bonus_base_next_replay = None
+                    action_env_replay = action_next_replay.detach() if detach_action_in_env else action_next_replay
+                    if first_pg_action_grad_clip_value > 0.0:
+                        action_env_replay = self._clip_tensor_grad_by_value(
+                            action_env_replay,
+                            max_abs=first_pg_action_grad_clip_value,
+                        )
+                    if first_pg_action_grad_clip_norm > 0.0:
+                        action_env_replay = self._clip_tensor_grad_by_global_norm(
+                            action_env_replay,
+                            max_norm=first_pg_action_grad_clip_norm,
+                        )
+
+                    for group in transition_groups:
+                        group_slice = group["slice"]
+                        group_indices = group["indices"]
+                        env_g = group["env"]
+                        state_dim_g = int(group["state_dim"])
+                        obs_dim_g = int(group["obs_dim"])
+                        action_dim_g = int(group["action_dim"])
+                        noise_dim_g = int(group["noise_dim"])
+                        if group_slice is None:
+                            state_in = state_local.index_select(0, group_indices)[:, :state_dim_g]
+                            obs_in = obs_t_replay.index_select(0, group_indices)[:, :obs_dim_g]
+                            action_in = action_env_replay.index_select(0, group_indices)[:, :action_dim_g]
+                            noise_in = noise_t_replay.index_select(0, group_indices)[:, :noise_dim_g]
+                        else:
+                            state_in = state_local[group_slice, :state_dim_g]
+                            obs_in = obs_t_replay[group_slice, :obs_dim_g]
+                            action_in = action_env_replay[group_slice, :action_dim_g]
+                            noise_in = noise_t_replay[group_slice, :noise_dim_g]
+                        state_in = self._scale_state_env_input(state_in, group.get("state_input_scale_view", 1.0))
+                        env_obs_start = group["env_obs_start"]
+                        env_action_start = int(group["env_action_start"])
+                        env_noise_start = int(group["env_noise_start"])
+                        if bool(group.get("packed_input_enabled", False)):
+                            transition_input = torch.zeros_like(group["packed_input"])
+                            transition_input[:, :state_dim_g] = state_in * group["packed_state_mask"]
+                            packed_obs_rows = group.get("packed_obs_rows", None)
+                            if packed_obs_rows is not None and int(packed_obs_rows.numel()) > 0:
+                                transition_input[packed_obs_rows, group["packed_obs_dst_cols"]] = obs_in[
+                                    packed_obs_rows, group["packed_obs_src_cols"]
+                                ]
+                            packed_action_rows = group.get("packed_action_rows", None)
+                            if packed_action_rows is not None and int(packed_action_rows.numel()) > 0:
+                                transition_input[packed_action_rows, group["packed_action_dst_cols"]] = action_in[
+                                    packed_action_rows, group["packed_action_src_cols"]
+                                ]
+                            packed_noise_rows = group.get("packed_noise_rows", None)
+                            if packed_noise_rows is not None and int(packed_noise_rows.numel()) > 0:
+                                transition_input[packed_noise_rows, group["packed_noise_dst_cols"]] = noise_in[
+                                    packed_noise_rows, group["packed_noise_src_cols"]
+                                ]
+                        else:
+                            env_in = torch.zeros_like(group["env_in"])
+                            env_in[:, :state_dim_g] = state_in
+                            if env_obs_start is not None:
+                                env_in[:, env_obs_start: env_obs_start + obs_dim_g] = obs_in
+                            env_in[:, env_action_start: env_action_start + action_dim_g] = action_in
+                            env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
+                            transition_input = env_in
+
+                        transition_generator_g = group.get("transition_generator", None)
+                        terminal_signal_next_g = None
+                        terminal_bonus_base_next_g = None
+                        if bool(group.get("use_fused_transition", False)) and callable(transition_generator_g):
+                            if bool(group.get("packed_input_enabled", False)):
+                                transition_out_g = transition_generator_g(
+                                    transition_input,
+                                    generators_for_noise=group["rollout_generators"],
+                                    x_is_dual_packed=False,
+                                    x_input_is_packed=True,
+                                )
+                            else:
+                                transition_out_g = transition_generator_g(
+                                    transition_input,
+                                    generators_for_noise=group["rollout_generators"],
+                                    x_is_dual_packed=False,
+                                )
+                            x_next_g, reward_unit_g, terminal_signal_next_g, terminal_bonus_base_next_g = (
+                                self._unpack_transition_output(transition_out_g)
+                            )
+                            reward_next_raw_g = group["reward_scale_view"] * reward_unit_g.reshape(-1)
+                        else:
+                            if terminal_token_enabled:
+                                raise RuntimeError(
+                                    "terminal-reset family rollout replay expected a fused/shared transition generator"
+                                )
+                            reward_next_raw_g = group["reward_scale_view"] * env_g["y_generator"](
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                            ).reshape(-1)
+                            x_next_g = env_g["x_generator"](
+                                transition_input,
+                                generators_for_noise=group["rollout_generators"],
+                            )
+                        state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
+                        if group_slice is None:
+                            reward_next_raw_replay.index_copy_(0, group_indices, reward_next_raw_g)
+                            state_next_replay[group_indices, :state_dim_g] = state_next_g
+                            if terminal_signal_next_g is not None:
+                                if terminal_signal_next_replay is None:
+                                    terminal_signal_next_replay = torch.zeros(
+                                        (batch_size, 1),
+                                        device=device,
+                                        dtype=terminal_signal_next_g.dtype,
+                                    )
+                                terminal_signal_next_replay.index_copy_(0, group_indices, terminal_signal_next_g)
+                            if terminal_bonus_base_next_g is not None:
+                                if terminal_bonus_base_next_replay is None:
+                                    terminal_bonus_base_next_replay = torch.zeros(
+                                        (batch_size,),
+                                        device=device,
+                                        dtype=terminal_bonus_base_next_g.dtype,
+                                    )
+                                terminal_bonus_base_next_replay.index_copy_(
+                                    0,
+                                    group_indices,
+                                    terminal_bonus_base_next_g.reshape(-1),
+                                )
+                        else:
+                            reward_next_raw_replay[group_slice] = reward_next_raw_g
+                            state_next_replay[group_slice, :state_dim_g] = state_next_g
+                            if terminal_signal_next_g is not None:
+                                if terminal_signal_next_replay is None:
+                                    terminal_signal_next_replay = torch.zeros(
+                                        (batch_size, 1),
+                                        device=device,
+                                        dtype=terminal_signal_next_g.dtype,
+                                    )
+                                terminal_signal_next_replay[group_slice] = terminal_signal_next_g
+                            if terminal_bonus_base_next_g is not None:
+                                if terminal_bonus_base_next_replay is None:
+                                    terminal_bonus_base_next_replay = torch.zeros(
+                                        (batch_size,),
+                                        device=device,
+                                        dtype=terminal_bonus_base_next_g.dtype,
+                                    )
+                                terminal_bonus_base_next_replay[group_slice] = terminal_bonus_base_next_g.reshape(-1)
+
+                    reward_next_replay = torch.maximum(
+                        torch.minimum(reward_next_raw_replay, reward_clip),
+                        -reward_clip,
+                    )
+                    if dropout_draw_t_replay is not None:
+                        drop_mask_replay = dropout_active & (dropout_draw_t_replay < reward_dropout_ratio)
+                        reward_mask_next_replay = torch.where(
+                            drop_mask_replay,
+                            torch.zeros_like(reward_mask_next_replay),
+                            reward_mask_next_replay,
+                        )
+                        impute_mask_replay = drop_mask_replay & reward_dropout_impute_zero
+                        reward_next_replay = torch.where(
+                            impute_mask_replay,
+                            torch.zeros_like(reward_next_replay),
+                            reward_next_replay,
+                        )
+                    reward_next_replay = self._transform_rollout_reward(
+                        reward_next_replay,
+                        mode=self._resolve_reinforce_reward_transform(self.config),
+                        rms_eps=reinforce_reward_rms_eps,
+                        tanh_c=reinforce_reward_tanh_c,
+                        tanh_bound=reinforce_reward_tanh_bound,
+                    )
+                    if state_noise_t_replay is not None:
+                        state_next_replay = state_next_replay + state_noise_t_replay * state_noise_std[:, None]
+                    if not bool(reference_semantics.all().item()):
+                        state_next_post_replay = self._apply_state_postprocess(
+                            state_next_raw=state_next_replay,
+                            state_prev=state_local,
+                            state_clip=state_clip,
+                            state_highway_enabled=state_highway_enabled,
+                            state_highway_lambda=state_highway_lambda,
+                        )
+                        state_next_replay = torch.where(
+                            reference_semantics[:, None],
+                            state_next_replay,
+                            state_next_post_replay,
+                        )
+                    state_next_replay = self._apply_state_full_rms(
+                        state_next_replay,
+                        enabled=state_full_rms_enabled,
+                        target=state_full_rms_target,
+                        state_mask=state_mask,
+                    )
+                    if terminal_token_enabled:
+                        state_next_replay, reward_next_replay, terminal_next_replay = self._apply_terminal_reset_step(
+                            state_next=state_next_replay,
+                            reward_next=reward_next_replay,
+                            terminal_draw=terminal_draw_t_replay,
+                            reset_prob=terminal_reset_prob,
+                            bonus_scale_draw=terminal_bonus_scale_draw_t_replay,
+                            bonus_scale_min=terminal_bonus_scale_min,
+                            bonus_scale_max=terminal_bonus_scale_max,
+                            bonus_tanh_c=terminal_bonus_tanh_c,
+                            reset_state=terminal_reset_state_t_replay,
+                            enabled=terminal_reset_enabled,
+                            terminal_signal=terminal_signal_next_replay,
+                            terminal_bonus_base=terminal_bonus_base_next_replay,
+                            terminal_signal_history=terminal_signal_history_local,
+                            history_index=t_replay,
+                        )
+                    else:
+                        terminal_next_replay = torch.zeros((batch_size,), device=device, dtype=reward_next_replay.dtype)
+                    state_next_replay = state_next_replay * state_mask
+                    if first_pg_state_grad_clip_norm > 0.0:
+                        state_next_replay = self._clip_tensor_grad_by_global_norm(
+                            state_next_replay,
+                            max_norm=first_pg_state_grad_clip_norm,
+                        )
+                    action_next_replay = action_next_replay * action_mask
+                    if t_replay >= single_eval_pos:
+                        reward_buffer.append(reward_next_replay)
+                        log_prob_buffer.append(reinforce_log_prob_t_replay)
+                        if collect_log_prob_score:
+                            log_prob_score_buffer.append(reinforce_log_prob_score_t_replay)
+                        if collect_action_trace:
+                            action_mean_buffer.append(action_mean_replay)
+                            action_mask_buffer.append(action_mask_bool_replay)
+                    state_local = state_next_replay
+                    action_local = action_env_replay
+                    reward_local = reward_next_replay
+                    reward_mask_local = reward_mask_next_replay
+                    terminal_local = terminal_next_replay
+
+                boundary_out = self._build_tbptt_boundary_out(
+                    state_t=state_local,
+                    action_t=action_local,
+                    reward_t=reward_local,
+                    reward_mask_t=reward_mask_local,
+                    terminal_t=terminal_local,
+                    cache_replay_leaves=self._policy_cache_replay_leaves(
+                        cache_local,
+                        emulate_tbptt_detach=True,
+                    ),
+                    action_replay_dim=int(max_action_dim),
+                    include_reward=True,
+                    include_reward_mask=bool(policy_accepts_reward_mask),
+                    include_terminal=bool(terminal_token_enabled),
+                )
+                local_weighted_loss = None
+                eval_step_count = len(reward_buffer)
+                if eval_step_count > 0:
+                    rewards_window_replay = torch.stack(reward_buffer, dim=0)
+                    log_probs_window_replay = torch.stack(log_prob_buffer, dim=0)
+                    if needs_unpermute:
+                        rewards_window_replay = rewards_window_replay.index_select(1, inv_perm)
+                        log_probs_window_replay = log_probs_window_replay.index_select(1, inv_perm)
+                    if reinforce_enabled:
+                        loss_window_replay, _ = self.reinforce_loss_from_rewards(
+                            rewards=rewards_window_replay,
+                            log_probs=log_probs_window_replay,
+                            discount=replay_discount,
+                            baseline_mode="leave_one_out",
+                        )
+                    else:
+                        log_prob_score_window_replay = torch.stack(log_prob_score_buffer, dim=0)
+                        action_mean_roots_replay = tuple(action_mean_buffer)
+                        action_mask_window_replay = torch.stack(action_mask_buffer, dim=0)
+                        if needs_unpermute:
+                            log_prob_score_window_replay = log_prob_score_window_replay.index_select(1, inv_perm)
+                            action_mask_window_replay = action_mask_window_replay.index_select(1, inv_perm)
+                            action_mean_roots_replay = tuple(
+                                root.index_select(0, inv_perm) for root in action_mean_roots_replay
+                            )
+                        loss_window_replay, _ = self.alpha_grad_loss_from_rollout_tensors(
+                            rewards=rewards_window_replay,
+                            log_probs=log_probs_window_replay,
+                            action_mean=action_mean_roots_replay,
+                            action_mask=action_mask_window_replay,
+                            log_prob_score=log_prob_score_window_replay,
+                            discount=replay_discount,
+                        )
+                    local_weighted_loss = loss_window_replay * (
+                        float(eval_step_count) / float(max(1, n_samples - int(single_eval_pos)))
+                    )
+                bridge_loss = self._alpha_tbptt_bridge_loss_from_eta(boundary_out, bridge_eta)
+                total_replay_loss = bridge_loss
+                if local_weighted_loss is not None:
+                    total_replay_loss = (
+                        local_weighted_loss if total_replay_loss is None else (local_weighted_loss + total_replay_loss)
+                    )
+                boundary_eta = None
+                if need_boundary_eta and (total_replay_loss is not None):
+                    boundary_eta = self._alpha_tbptt_boundary_eta_from_loss(
+                        total_replay_loss,
+                        boundary_in,
+                        cache_grad_targets,
+                    )
+                return {
+                    "bridge_loss": bridge_loss,
+                    "boundary_eta": boundary_eta,
+                }
+            finally:
+                if prev_offload_enabled is not None:
+                    self._set_policy_step_saved_tensors_offload_enabled(policy_step_fn, prev_offload_enabled)
+                torch.set_rng_state(saved_cpu_rng_state)
+                if (
+                    saved_cuda_rng_state is not None
+                    and device_obj.type == "cuda"
+                    and torch.cuda.is_available()
+                ):
+                    torch.cuda.set_rng_state(saved_cuda_rng_state, device=device_obj)
+
         policy_accepts_reward_mask = self._policy_step_accepts_reward_mask(policy_step_fn)
         obs_slot_dim_max = int(obs_slot_dims.max().item())
         action_slot_dim_max = int(action_slot_dims.max().item())
@@ -15620,6 +16379,8 @@ class EnvironmentPrior:
             "aev4_update_scale": aev4_update_scale,
             "aev4_update_clip": aev4_update_clip,
         }
+        phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
+        phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
 
         # Precompute token-layout scatter metadata once and reuse in the rollout
         # loop. This is semantically equivalent and reduces per-step index work.
@@ -15712,7 +16473,29 @@ class EnvironmentPrior:
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
-                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
+                    window_start_idx=window_start_idx,
+                    window_end_idx=window_end_idx,
+                    next_window_end_idx=min(n_samples, window_end_idx + int(tbptt_window_size)),
+                    n_samples=n_samples,
+                    single_eval_pos=single_eval_pos,
+                    replay_window_depth=tbptt_replay_window_depth,
+                    markov_adjacent_replay=tbptt_markov_adjacent_replay,
+                )
+                one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
+                    raw_one_hop_boundary_roles,
+                    markov_adjacent_eta_pending=tbptt_markov_adjacent_eta_pending,
+                    markov_adjacent_sample_prob=tbptt_markov_adjacent_sample_prob,
+                )
+                tbptt_window_one_hop_roles = one_hop_boundary_roles
+                self._set_policy_step_saved_tensors_offload_enabled(
+                    policy_step_fn,
+                    self._tbptt_window_one_hop_policy_offload_needed(
+                        tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
+                        one_hop_boundary_roles=one_hop_boundary_roles,
+                    ),
+                )
+                needs_boundary_eta = bool(one_hop_boundary_roles["needs_boundary_eta"])
                 tbptt_boundary_in = None
                 if needs_boundary_eta:
                     tbptt_boundary_in = self._build_tbptt_boundary_in(
@@ -16482,10 +17265,25 @@ class EnvironmentPrior:
                     boundary_out = None
                     window_end_idx = int(t + 1)
                     next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
+                    one_hop_boundary_roles = tbptt_window_one_hop_roles
+                    if not isinstance(one_hop_boundary_roles, dict):
+                        raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
+                            window_start_idx=int(window_end_idx - int(rewards_window.shape[0])),
+                            window_end_idx=window_end_idx,
+                            next_window_end_idx=next_window_end_idx,
+                            n_samples=n_samples,
+                            single_eval_pos=single_eval_pos,
+                            replay_window_depth=tbptt_replay_window_depth,
+                            markov_adjacent_replay=False,
+                        )
+                        one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
+                            raw_one_hop_boundary_roles,
+                            markov_adjacent_eta_pending=False,
+                            markov_adjacent_sample_prob=0.0,
+                        )
                     if (
                         tbptt_one_hop_boundary_active
-                        and (window_end_idx < n_samples)
-                        and (next_window_end_idx > int(single_eval_pos))
+                        and bool(one_hop_boundary_roles["carry_boundary_out"])
                     ):
                         boundary_out = self._build_tbptt_boundary_out(
                             state_t=state_t,
@@ -16523,6 +17321,9 @@ class EnvironmentPrior:
                         window_meta = {
                             "window_start": int(t + 1 - int(rewards_window.shape[0])),
                             "window_end": int(t + 1),
+                            "one_hop_boundary_roles": (
+                                dict(one_hop_boundary_roles) if isinstance(one_hop_boundary_roles, dict) else None
+                            ),
                         }
                         if (
                             aev2_streaming_sink
@@ -16615,12 +17416,16 @@ class EnvironmentPrior:
                             else:
                                 tbptt_reward_sink((payload_rewards, payload_aux))
                         else:
+                            payload_meta = {"_tbptt_meta": window_meta}
                             if needs_unpermute:
-                                tbptt_reward_sink(
-                                    (rewards_window.index_select(1, inv_perm), {"_tbptt_meta": window_meta})
-                                )
+                                tbptt_reward_sink((rewards_window.index_select(1, inv_perm), payload_meta))
                             else:
-                                tbptt_reward_sink((rewards_window, {"_tbptt_meta": window_meta}))
+                                tbptt_reward_sink((rewards_window, payload_meta))
+                        tbptt_markov_adjacent_eta_pending = bool(
+                            isinstance(one_hop_boundary_roles, dict)
+                            and bool(one_hop_boundary_roles.get("markov_adjacent_carry", False))
+                        )
+                        tbptt_window_one_hop_roles = None
                         tbptt_boundary_in = None
 
         if needs_unpermute:
@@ -17127,7 +17932,23 @@ class EnvironmentPrior:
             and bool(self._resolve_pg_one_hop_replay_enabled(self.config))
             and str(policy_objective_kind).strip().lower() in {"reinforce", "alpha_grad"}
         )
+        tbptt_markov_adjacent_replay = bool(
+            tbptt_one_hop_boundary_active
+            and bool(self._resolve_pg_markov_adjacent_replay_enabled(self.config))
+        )
+        tbptt_replay_window_depth = (
+            int(self._resolve_pg_replay_window_depth(self.config))
+            if tbptt_one_hop_boundary_active
+            else 0
+        )
+        tbptt_markov_adjacent_sample_prob = (
+            float(self._resolve_pg_markov_adjacent_replay_sample_prob(self.config))
+            if tbptt_markov_adjacent_replay
+            else 0.0
+        )
         tbptt_boundary_in = None
+        tbptt_window_one_hop_roles = None
+        tbptt_markov_adjacent_eta_pending = False
         aev2_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev2_det_acc = self._aev2_new_accumulator(aev2_enabled, device=device, dtype=state_t.dtype)
         aev3_acc = self._aev3_new_accumulator(aev3_enabled, device=device, dtype=state_t.dtype, aev3_cfg=aev3_cfg)
@@ -17273,7 +18094,29 @@ class EnvironmentPrior:
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
-                needs_boundary_eta = bool((window_start_idx > 0) and (window_end_idx > int(single_eval_pos)))
+                raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
+                    window_start_idx=window_start_idx,
+                    window_end_idx=window_end_idx,
+                    next_window_end_idx=min(n_samples, window_end_idx + int(tbptt_window_size)),
+                    n_samples=n_samples,
+                    single_eval_pos=single_eval_pos,
+                    replay_window_depth=tbptt_replay_window_depth,
+                    markov_adjacent_replay=tbptt_markov_adjacent_replay,
+                )
+                one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
+                    raw_one_hop_boundary_roles,
+                    markov_adjacent_eta_pending=tbptt_markov_adjacent_eta_pending,
+                    markov_adjacent_sample_prob=tbptt_markov_adjacent_sample_prob,
+                )
+                tbptt_window_one_hop_roles = one_hop_boundary_roles
+                self._set_policy_step_saved_tensors_offload_enabled(
+                    policy_step_fn,
+                    self._tbptt_window_one_hop_policy_offload_needed(
+                        tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
+                        one_hop_boundary_roles=one_hop_boundary_roles,
+                    ),
+                )
+                needs_boundary_eta = bool(one_hop_boundary_roles["needs_boundary_eta"])
                 tbptt_boundary_in = None
                 if needs_boundary_eta:
                     tbptt_boundary_in = self._build_tbptt_boundary_in(
@@ -17750,10 +18593,25 @@ class EnvironmentPrior:
                     boundary_out = None
                     window_end_idx = int(t + 1)
                     next_window_end_idx = int(min(n_samples, window_end_idx + int(tbptt_window_size)))
+                    one_hop_boundary_roles = tbptt_window_one_hop_roles
+                    if not isinstance(one_hop_boundary_roles, dict):
+                        raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
+                            window_start_idx=int(window_end_idx - int(rewards_window.shape[0])),
+                            window_end_idx=window_end_idx,
+                            next_window_end_idx=next_window_end_idx,
+                            n_samples=n_samples,
+                            single_eval_pos=single_eval_pos,
+                            replay_window_depth=tbptt_replay_window_depth,
+                            markov_adjacent_replay=False,
+                        )
+                        one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
+                            raw_one_hop_boundary_roles,
+                            markov_adjacent_eta_pending=False,
+                            markov_adjacent_sample_prob=0.0,
+                        )
                     if (
                         tbptt_one_hop_boundary_active
-                        and (window_end_idx < n_samples)
-                        and (next_window_end_idx > int(single_eval_pos))
+                        and bool(one_hop_boundary_roles["carry_boundary_out"])
                     ):
                         boundary_out = self._build_tbptt_boundary_out(
                             state_t=state_t,
@@ -17789,6 +18647,9 @@ class EnvironmentPrior:
                         window_meta = {
                             "window_start": int(t + 1 - int(rewards_window.shape[0])),
                             "window_end": int(t + 1),
+                            "one_hop_boundary_roles": (
+                                dict(one_hop_boundary_roles) if isinstance(one_hop_boundary_roles, dict) else None
+                            ),
                         }
                         if (
                             aev2_streaming_sink
@@ -17883,6 +18744,11 @@ class EnvironmentPrior:
                                 tbptt_reward_sink((rewards_window, payload_aux))
                         else:
                             tbptt_reward_sink((rewards_window, {"_tbptt_meta": window_meta}))
+                        tbptt_markov_adjacent_eta_pending = bool(
+                            isinstance(one_hop_boundary_roles, dict)
+                            and bool(one_hop_boundary_roles.get("markov_adjacent_carry", False))
+                        )
+                        tbptt_window_one_hop_roles = None
                         tbptt_boundary_in = None
 
         x = x_steps
@@ -22213,6 +23079,10 @@ class EnvironmentPrior:
         grouping_mode = self._resolve_batch_vectorized_grouping()
         strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
         one_hop_replay_enabled = bool(self._resolve_pg_one_hop_replay_enabled(self.config))
+        markov_adjacent_replay_enabled = bool(self._resolve_pg_markov_adjacent_replay_enabled(self.config))
+        markov_adjacent_replay_sample_prob = float(
+            self._resolve_pg_markov_adjacent_replay_sample_prob(self.config)
+        )
         one_hop_tbptt_active = bool(
             one_hop_replay_enabled
             and tbptt_window_active
@@ -22900,6 +23770,8 @@ class EnvironmentPrior:
         total_eval_steps_f = float(max(1, n_samples - int(single_eval_pos)))
         batch_size_f = float(max(1, batch_size))
         bridge_replay_count = 0
+        markov_adjacent_bridge_sampled_count = 0
+        replay_window_depth = 1
         pending_one_hop_window = None
 
         def _emit_tbptt_window_loss(loss_root):
@@ -22911,13 +23783,6 @@ class EnvironmentPrior:
                 weighted_losses.append(loss_root)
             else:
                 tbptt_loss_sink(loss_root)
-
-        def _clear_pending_one_hop_window():
-            nonlocal pending_one_hop_window
-            if pending_one_hop_window is None:
-                return
-            self._release_tbptt_boundary_groups(pending_one_hop_window.get("boundary_groups", None))
-            pending_one_hop_window = None
 
         def _flush_pending_one_hop_window(*, bridge_loss=None, addon_loss=None):
             nonlocal pending_one_hop_window
@@ -22957,7 +23822,7 @@ class EnvironmentPrior:
             nonlocal reward_nonfinite_share_accum, reward_nan_share_accum, reward_inf_share_accum
             nonlocal reinforce_return_nonfinite_share_accum
             nonlocal reinforce_log_prob_nonfinite_share_accum, reinforce_adv_nonfinite_share_accum
-            nonlocal pending_one_hop_window, bridge_replay_count
+            nonlocal pending_one_hop_window, bridge_replay_count, markov_adjacent_bridge_sampled_count
             aev2_window = None
             aev3_window = None
             aev4_window = None
@@ -22985,8 +23850,29 @@ class EnvironmentPrior:
                     elif aev4_enabled:
                         aev4_window = aux
             window_start = 0
+            window_end = 0
+            window_roles = None
             if isinstance(tbptt_meta, dict):
                 window_start = int(tbptt_meta.get("window_start", 0) or 0)
+                window_end = int(tbptt_meta.get("window_end", 0) or 0)
+                meta_window_roles = tbptt_meta.get("one_hop_boundary_roles", None)
+                if isinstance(meta_window_roles, dict):
+                    window_roles = {
+                        str(k): bool(v)
+                        for k, v in meta_window_roles.items()
+                    }
+            if window_end <= window_start:
+                window_end = int(window_start + int(rewards_window.shape[0]))
+            if tbptt_window_active and (window_roles is None):
+                window_roles = self._tbptt_one_hop_phase_boundary_roles(
+                    window_start_idx=window_start,
+                    window_end_idx=window_end,
+                    next_window_end_idx=min(int(n_samples), int(window_end + int(tbptt_window_size))),
+                    n_samples=n_samples,
+                    single_eval_pos=single_eval_pos,
+                    replay_window_depth=replay_window_depth,
+                    markov_adjacent_replay=markov_adjacent_replay_enabled,
+                )
             eval_start_local = int(max(0, int(single_eval_pos) - window_start))
             boundary_groups = None
             if isinstance(boundary_window, dict):
@@ -23114,6 +24000,8 @@ class EnvironmentPrior:
                                 boundary_eta_groups,
                             )
                             bridge_replay_count += 1
+                            if isinstance(window_roles, dict) and bool(window_roles.get("markov_adjacent_eta", False)):
+                                markov_adjacent_bridge_sampled_count += 1
                     else:
                         self._drop_tbptt_boundary_inputs(boundary_groups)
                 elif isinstance(boundary_groups, tuple):
@@ -23902,7 +24790,11 @@ class EnvironmentPrior:
             stats["alpha_grad_enabled"] = 1
         if one_hop_tbptt_active:
             stats["pg_one_hop_replay_enabled"] = int(one_hop_replay_enabled)
+            stats["pg_replay_window_depth"] = int(replay_window_depth)
             stats["pg_bridge_replay_count"] = int(bridge_replay_count)
+            stats["pg_markov_adjacent_replay_enabled"] = int(markov_adjacent_replay_enabled)
+            stats["pg_markov_adjacent_replay_sample_prob"] = float(markov_adjacent_replay_sample_prob)
+            stats["pg_markov_adjacent_bridge_sampled_count"] = int(markov_adjacent_bridge_sampled_count)
             if alpha_grad_enabled:
                 stats["alpha_grad_one_hop_replay_enabled"] = int(one_hop_replay_enabled)
                 stats["alpha_grad_bridge_replay_count"] = int(bridge_replay_count)

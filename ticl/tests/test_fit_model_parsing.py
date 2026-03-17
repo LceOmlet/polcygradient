@@ -65,6 +65,9 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_gpu_observer_interval_sec == 1.0
     assert args.optimizer.train_gpu_observer_output_path is None
     assert args.optimizer.train_gpu_stage_output_path is None
+    assert args.optimizer.train_host_rss_limit_gib == 32.0
+    assert args.optimizer.train_host_rss_limit_poll_interval_sec == 0.02
+    assert args.optimizer.train_host_rss_limit_try_rlimit_as is False
     assert args.optimizer.train_kernel_profiler_enabled is False
     assert args.optimizer.train_kernel_profiler_output_dir is None
     assert args.optimizer.train_kernel_profiler_wait_steps == 1
@@ -151,6 +154,21 @@ def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 512
 
 
+def test_rlpfn_parser_accepts_host_rss_limit_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--train-host-rss-limit-gib", "28",
+            "--train-host-rss-limit-poll-interval-sec", "0.05",
+            "--train-host-rss-limit-try-rlimit-as", "true",
+        ]
+    )
+    assert args.optimizer.train_host_rss_limit_gib == 28.0
+    assert args.optimizer.train_host_rss_limit_poll_interval_sec == 0.05
+    assert args.optimizer.train_host_rss_limit_try_rlimit_as is True
+
+
 def test_rlpfn_parser_accepts_reinforce_objective():
     parser = make_model_level_argparser()
     args = parser.parse_args(
@@ -193,6 +211,43 @@ def test_rlpfn_parser_accepts_pg_one_hop_replay_flag():
         ]
     )
     assert args.prior.environment.pg_one_hop_replay_enabled is False
+
+
+def test_rlpfn_parser_accepts_pg_replay_window_depth_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-replay-window-depth", "3",
+        ]
+    )
+    assert args.prior.environment.pg_replay_window_depth == 3
+
+
+def test_rlpfn_parser_accepts_pg_markov_adjacent_replay_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-markov-adjacent-replay-enabled", "true",
+            "--pg-markov-adjacent-replay-sample-prob", "0.25",
+        ]
+    )
+    assert args.prior.environment.pg_markov_adjacent_replay_enabled is True
+    assert args.prior.environment.pg_markov_adjacent_replay_sample_prob == 0.25
+
+
+def test_rlpfn_parser_accepts_pg_phase_logging_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-phase-log-every-batches", "4",
+            "--pg-phase-log-file", "/tmp/pg-phase.log",
+        ]
+    )
+    assert args.optimizer.pg_phase_log_every_batches == 4
+    assert args.optimizer.pg_phase_log_file == "/tmp/pg-phase.log"
 
 
 def test_rlpfn_parser_accepts_first_pg_action_grad_clip_options():
@@ -240,6 +295,9 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is False
+    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_sample_prob"] == 0.03125
+    assert cfg["prior"]["environment"]["pg_replay_window_depth"] == 1
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
@@ -258,6 +316,9 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
+    assert cfg["optimizer"]["train_host_rss_limit_gib"] == 32.0
+    assert cfg["optimizer"]["train_host_rss_limit_poll_interval_sec"] == 0.02
+    assert cfg["optimizer"]["train_host_rss_limit_try_rlimit_as"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
