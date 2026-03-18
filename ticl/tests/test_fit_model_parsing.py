@@ -93,6 +93,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
     assert args.orchestration.rl_validate_context_lower_bound == 2048
+    assert args.orchestration.rl_validate_max_parallel_columns == 96
 
 
 def test_rlpfn_parser_accepts_aev5_next_flags():
@@ -200,6 +201,17 @@ def test_rlpfn_parser_accepts_alpha_grad_objective():
         ]
     )
     assert args.optimizer.rl_objective == "alpha_grad"
+
+
+def test_rlpfn_parser_accepts_rl_validate_max_parallel_columns():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-validate-max-parallel-columns", "128",
+        ]
+    )
+    assert args.orchestration.rl_validate_max_parallel_columns == 128
 
 
 def test_rlpfn_parser_accepts_pg_one_hop_replay_flag():

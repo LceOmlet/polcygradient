@@ -85,6 +85,7 @@ def _score_candidate_action_jobs(
     action_slot_dim,
     num_features,
     terminal_token_enabled,
+    max_parallel_columns=None,
 ):
     if not jobs:
         return []
@@ -102,38 +103,48 @@ def _score_candidate_action_jobs(
                 for job_idx, _ in entries:
                     score_list[job_idx] = np.zeros((n_candidates,), dtype=np.float32)
                 continue
+            if max_parallel_columns is None:
+                max_entries_per_call = len(entries)
+            else:
+                max_cols = int(max_parallel_columns)
+                if max_cols <= 0:
+                    max_entries_per_call = len(entries)
+                else:
+                    max_entries_per_call = max(1, max_cols // max(1, n_candidates))
 
-            total_columns = len(entries) * n_candidates
-            x_stack = np.zeros((t + 1, total_columns, int(num_features)), dtype=np.float32)
-            y_stack = np.zeros((t + 1, total_columns), dtype=np.float32)
+            for chunk_start in range(0, len(entries), max_entries_per_call):
+                chunk_entries = entries[chunk_start: chunk_start + max_entries_per_call]
+                total_columns = len(chunk_entries) * n_candidates
+                x_stack = np.zeros((t + 1, total_columns, int(num_features)), dtype=np.float32)
+                y_stack = np.zeros((t + 1, total_columns), dtype=np.float32)
 
-            for entry_idx, (job_idx, job) in enumerate(entries):
-                col_start = entry_idx * n_candidates
-                col_end = col_start + n_candidates
-                x_prev = np.asarray(job["x_hist"], dtype=np.float32)
-                y_prev = np.asarray(job["y_hist"], dtype=np.float32)
-                x_stack[:t, col_start:col_end, :] = np.repeat(x_prev[:, None, :], n_candidates, axis=1)
-                y_stack[:t, col_start:col_end] = np.repeat(y_prev[:, None], n_candidates, axis=1)
-                for candidate_idx in range(n_candidates):
-                    x_stack[t, col_start + candidate_idx, :] = _pack_token(
-                        obs=job["obs"],
-                        action=job["action_candidates"][candidate_idx],
-                        reward=job["prev_reward"],
-                        reward_mask=1.0,
-                        obs_slot_dim=obs_slot_dim,
-                        action_slot_dim=action_slot_dim,
-                        num_features=num_features,
-                        phase=job["phase"],
-                        terminal=job["terminal"],
-                        terminal_token_enabled=terminal_token_enabled,
-                    )
+                for entry_idx, (job_idx, job) in enumerate(chunk_entries):
+                    col_start = entry_idx * n_candidates
+                    col_end = col_start + n_candidates
+                    x_prev = np.asarray(job["x_hist"], dtype=np.float32)
+                    y_prev = np.asarray(job["y_hist"], dtype=np.float32)
+                    x_stack[:t, col_start:col_end, :] = np.repeat(x_prev[:, None, :], n_candidates, axis=1)
+                    y_stack[:t, col_start:col_end] = np.repeat(y_prev[:, None], n_candidates, axis=1)
+                    for candidate_idx in range(n_candidates):
+                        x_stack[t, col_start + candidate_idx, :] = _pack_token(
+                            obs=job["obs"],
+                            action=job["action_candidates"][candidate_idx],
+                            reward=job["prev_reward"],
+                            reward_mask=1.0,
+                            obs_slot_dim=obs_slot_dim,
+                            action_slot_dim=action_slot_dim,
+                            num_features=num_features,
+                            phase=job["phase"],
+                            terminal=job["terminal"],
+                            terminal_token_enabled=terminal_token_enabled,
+                        )
 
-            x_tensor = torch.from_numpy(x_stack).to(device=device)
-            y_tensor = torch.from_numpy(y_stack).to(device=device)
-            out = model((x_tensor, y_tensor), single_eval_pos=t)
-            scores = out[0, :, 0].detach().float().cpu().numpy().reshape(len(entries), n_candidates)
-            for entry_idx, (job_idx, _) in enumerate(entries):
-                score_list[job_idx] = scores[entry_idx]
+                x_tensor = torch.from_numpy(x_stack).to(device=device)
+                y_tensor = torch.from_numpy(y_stack).to(device=device)
+                out = model((x_tensor, y_tensor), single_eval_pos=t)
+                scores = out[0, :, 0].detach().float().cpu().numpy().reshape(len(chunk_entries), n_candidates)
+                for entry_idx, (job_idx, _) in enumerate(chunk_entries):
+                    score_list[job_idx] = scores[entry_idx]
 
     return score_list
 
@@ -275,6 +286,9 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     n_candidates = int(orch.get("rl_validate_action_candidates", 16))
     base_seed = int(orch.get("rl_validate_seed", 1))
     context_lower_bound = int(orch.get("rl_validate_context_lower_bound", 2048))
+    max_parallel_columns = int(orch.get("rl_validate_max_parallel_columns", 96))
+    if max_parallel_columns > 0:
+        max_parallel_columns = max(int(n_candidates), max_parallel_columns)
 
     env_cfg = config.get("prior", {}).get("environment", {})
     obs_slot_dim = int(env_cfg.get("obs_slot_dim", 400))
@@ -290,6 +304,8 @@ def evaluate_rlpfn_on_gym_envs(model, config):
 
     per_env = {}
     all_env_means = []
+    env_states = {}
+    env_action_bounds = {}
 
     try:
         for env_name in env_names:
@@ -324,12 +340,24 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 episodes=episodes,
                 base_seed=base_seed,
             )
+            env_states[env_name] = states
+            env_action_bounds[env_name] = (action_low, action_high)
 
-            try:
-                while any(not state["done"] for state in states):
-                    jobs = []
-                    job_state_indices = []
-                    for state_idx, state in enumerate(states):
+        all_states = [state for states in env_states.values() for state in states]
+
+        try:
+            while any(not state["done"] for state in all_states):
+                jobs = []
+                job_states = []
+                for env_name in env_names:
+                    states = env_states.get(env_name, None)
+                    if not isinstance(states, list):
+                        continue
+                    action_bounds = env_action_bounds.get(env_name, None)
+                    if action_bounds is None:
+                        continue
+                    action_low, action_high = action_bounds
+                    for state in states:
                         if bool(state["done"]):
                             continue
                         if int(state["current_rollout_len"]) >= int(max_steps):
@@ -352,53 +380,57 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                                 "action_candidates": candidates,
                             }
                         )
-                        job_state_indices.append((state_idx, candidates))
+                        job_states.append((state, candidates))
 
-                    if jobs:
-                        score_list = _score_candidate_action_jobs(
-                            model=model,
-                            device=device,
-                            jobs=jobs,
+                if jobs:
+                    score_list = _score_candidate_action_jobs(
+                        model=model,
+                        device=device,
+                        jobs=jobs,
+                        obs_slot_dim=obs_slot_dim,
+                        action_slot_dim=action_slot_dim,
+                        num_features=num_features,
+                        terminal_token_enabled=terminal_token_enabled,
+                        max_parallel_columns=max_parallel_columns,
+                    )
+                else:
+                    score_list = []
+
+                for (state, candidates), scores in zip(job_states, score_list):
+                    action = candidates[int(np.argmax(scores))]
+                    state["x_hist"].append(
+                        _pack_token(
+                            obs=state["obs"],
+                            action=action,
+                            reward=state["prev_reward"],
+                            reward_mask=1.0,
                             obs_slot_dim=obs_slot_dim,
                             action_slot_dim=action_slot_dim,
                             num_features=num_features,
+                            phase=state["phase_flag"],
+                            terminal=state["prev_terminal"],
                             terminal_token_enabled=terminal_token_enabled,
                         )
-                    else:
-                        score_list = []
+                    )
+                    obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
+                    reward_next = float(reward_next)
+                    done_flag = bool(terminated or truncated)
+                    state["y_hist"].append(reward_next)
+                    state["obs"] = obs_next
+                    state["prev_reward"] = reward_next
+                    state["prev_terminal"] = 1.0 if done_flag else 0.0
+                    state["current_rollout_return"] += reward_next
+                    state["current_rollout_len"] += 1
 
-                    for (state_idx, candidates), scores in zip(job_state_indices, score_list):
-                        state = states[state_idx]
-                        action = candidates[int(np.argmax(scores))]
-                        state["x_hist"].append(
-                            _pack_token(
-                                obs=state["obs"],
-                                action=action,
-                                reward=state["prev_reward"],
-                                reward_mask=1.0,
-                                obs_slot_dim=obs_slot_dim,
-                                action_slot_dim=action_slot_dim,
-                                num_features=num_features,
-                                phase=state["phase_flag"],
-                                terminal=state["prev_terminal"],
-                                terminal_token_enabled=terminal_token_enabled,
-                            )
-                        )
-                        obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
-                        reward_next = float(reward_next)
-                        done_flag = bool(terminated or truncated)
-                        state["y_hist"].append(reward_next)
-                        state["obs"] = obs_next
-                        state["prev_reward"] = reward_next
-                        state["prev_terminal"] = 1.0 if done_flag else 0.0
-                        state["current_rollout_return"] += reward_next
-                        state["current_rollout_len"] += 1
+                    if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+                        if int(state["current_rollout_len"]) >= int(max_steps):
+                            state["prev_terminal"] = 1.0
+                        _finalize_validation_rollout(state, context_lower_bound)
 
-                        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
-                            if int(state["current_rollout_len"]) >= int(max_steps):
-                                state["prev_terminal"] = 1.0
-                            _finalize_validation_rollout(state, context_lower_bound)
-
+            for env_name in env_names:
+                states = env_states.get(env_name, None)
+                if not isinstance(states, list):
+                    continue
                 returns = [float(state["reported_return"]) for state in states if state["reported_return"] is not None]
                 lengths = [float(state["reported_len"]) for state in states if state["reported_len"] is not None]
                 context_lengths = [
@@ -416,31 +448,30 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     for state in states
                     if state["explore_rollout_len_mean"] is not None
                 ]
-            finally:
-                for state in states:
-                    try:
-                        state["env"].close()
-                    except Exception:
-                        pass
-
-            if returns:
-                mean_ret = float(np.mean(returns))
-                mean_len = float(np.mean(lengths))
-                per_env[env_name] = {
-                    "return_mean": mean_ret,
-                    "len_mean": mean_len,
-                    "make_failed": 0,
-                    "context_len_before_eval_mean": (
-                        float(np.mean(context_lengths)) if context_lengths else float("nan")
-                    ),
-                    "explore_rollout_count_mean": (
-                        float(np.mean(explore_rollout_counts)) if explore_rollout_counts else float("nan")
-                    ),
-                    "explore_rollout_len_mean": (
-                        float(np.mean(explore_rollout_len_means)) if explore_rollout_len_means else float("nan")
-                    ),
-                }
-                all_env_means.append(mean_ret)
+                if returns:
+                    mean_ret = float(np.mean(returns))
+                    mean_len = float(np.mean(lengths))
+                    per_env[env_name] = {
+                        "return_mean": mean_ret,
+                        "len_mean": mean_len,
+                        "make_failed": 0,
+                        "context_len_before_eval_mean": (
+                            float(np.mean(context_lengths)) if context_lengths else float("nan")
+                        ),
+                        "explore_rollout_count_mean": (
+                            float(np.mean(explore_rollout_counts)) if explore_rollout_counts else float("nan")
+                        ),
+                        "explore_rollout_len_mean": (
+                            float(np.mean(explore_rollout_len_means)) if explore_rollout_len_means else float("nan")
+                        ),
+                    }
+                    all_env_means.append(mean_ret)
+        finally:
+            for state in all_states:
+                try:
+                    state["env"].close()
+                except Exception:
+                    pass
     finally:
         if was_training:
             model.train()

@@ -595,6 +595,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--rl-validate-seed', type=int, help='Base random seed for rlpfn validation.')
     orchestration.add_argument('--rl-validate-context-lower-bound', type=int,
                                help='Switch rlpfn validation from explore (E=0) to exploit (E=1) once context_len + mean_explore_rollout_len exceeds this bound.')
+    orchestration.add_argument('--rl-validate-max-parallel-columns', type=int,
+                               help='Upper bound on validation candidate columns scored together across envs; keeps GPU memory bounded while improving validation parallelism.')
 
     if model_type == 'rlpfn':
         orchestration.set_defaults(
@@ -605,6 +607,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
             rl_validate_context_lower_bound=2048,
+            rl_validate_max_parallel_columns=96,
         )
     else:
         orchestration.set_defaults(
@@ -615,6 +618,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
             rl_validate_context_lower_bound=2048,
+            rl_validate_max_parallel_columns=96,
         )
 
     # orchestration options are not part of the default config

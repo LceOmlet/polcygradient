@@ -101,6 +101,7 @@ class _PhaseRecordingModel:
         self.training = False
         self.phase_calls = []
         self.terminal_calls = []
+        self.call_widths = []
         self.phase_idx = int(phase_idx)
         self.terminal_idx = int(terminal_idx)
 
@@ -115,6 +116,7 @@ class _PhaseRecordingModel:
     def __call__(self, inputs, single_eval_pos=None):
         del single_eval_pos
         x_tensor, _ = inputs
+        self.call_widths.append(int(x_tensor.shape[1]))
         last_token = x_tensor[-1, 0]
         self.phase_calls.append(float(last_token[self.phase_idx].item()))
         self.terminal_calls.append(float(last_token[self.terminal_idx].item()))
@@ -205,3 +207,73 @@ def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_thresho
     assert per_env["DummyEnv-v1"]["explore_rollout_len_mean"] == 3.0
     assert model.phase_calls == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
     assert model.terminal_calls == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+
+
+def test_evaluate_rlpfn_on_gym_envs_batches_across_envs_when_cap_allows(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+            },
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vA,DummyEnv-vB",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+            "rl_validate_max_parallel_columns": 2,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vA"]["return_mean"] == 2.0
+    assert per_env["DummyEnv-vB"]["return_mean"] == 2.0
+    assert max(model.call_widths) == 2
+
+
+def test_evaluate_rlpfn_on_gym_envs_respects_parallel_column_cap(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+            },
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vC,DummyEnv-vD",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+            "rl_validate_max_parallel_columns": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vC"]["return_mean"] == 2.0
+    assert per_env["DummyEnv-vD"]["return_mean"] == 2.0
+    assert max(model.call_widths) == 1
