@@ -5596,9 +5596,9 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_pg_markov_adjacent_replay_sample_prob(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("pg_markov_adjacent_replay_sample_prob", 0.03125))
+        v = EnvironmentPrior._resolve_scalar(h.get("pg_markov_adjacent_replay_sample_prob", 0.125))
         if not math.isfinite(v):
-            return 0.03125
+            return 0.125
         return float(min(1.0, max(0.0, v)))
 
     @staticmethod

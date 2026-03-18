@@ -86,11 +86,11 @@ def get_optimizer_config():
 
 def get_transformer_config():
     transformer = {
-        "emsize": 512,
-        "nlayers": 12,
+        "emsize": 256,
+        "nlayers": 6,
         "dropout": 0.0,
         "nhid_factor": 2,
-        'nhead': 512 // 128,
+        'nhead': 256 // 64,
         'init_method': None,
         'recompute_attn': True,
         'pre_norm': False,
@@ -498,14 +498,13 @@ def get_rlpfn_default_config():
         "alpha_grad_local_coordinate_enabled": True,
         "alpha_grad_unit_grad_enabled": True,
         "alpha_grad_unit_grad_delta": 1e-6,
-        # Keep the default PG/TBPTT path on the long-maintained safe runner.
-        # One-hop boundary replay is opt-in so the default command line stays on
-        # the established memory/throughput baseline for both REINFORCE and
-        # alpha-grad.
-        "pg_one_hop_replay_enabled": False,
-        "alpha_grad_one_hop_replay_enabled": False,
-        "pg_markov_adjacent_replay_enabled": False,
-        "pg_markov_adjacent_replay_sample_prob": 0.03125,
+        # Keep replay on the safe TBPTT runner, but make the maintained
+        # alpha-grad default explicitly include one-hop and sampled adjacent
+        # future replay.
+        "pg_one_hop_replay_enabled": True,
+        "alpha_grad_one_hop_replay_enabled": True,
+        "pg_markov_adjacent_replay_enabled": True,
+        "pg_markov_adjacent_replay_sample_prob": 0.125,
         "pg_replay_window_depth": 1,
         "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
         "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
