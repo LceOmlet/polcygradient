@@ -1,8 +1,16 @@
+import pytest
+
 from ticl.fit_model import main
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
+from ticl.model_configs import get_model_default_config, get_rlpfn_per_feature_v25_recommended_overrides
 from argparse import Namespace
-from ticl.fit_model import _cli_flag_is_set, _apply_continue_run_cli_overrides
+from ticl.fit_model import (
+    _cli_flag_is_set,
+    _apply_continue_run_cli_overrides,
+    _apply_rlpfn_backbone_runtime_env_defaults,
+)
+import os
 
 
 def test_fit_model_help():
@@ -62,6 +70,9 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_gpu_observer_interval_sec == 1.0
     assert args.optimizer.train_gpu_observer_output_path is None
     assert args.optimizer.train_gpu_stage_output_path is None
+    assert args.optimizer.train_host_rss_limit_gib == 32.0
+    assert args.optimizer.train_host_rss_limit_poll_interval_sec == 0.02
+    assert args.optimizer.train_host_rss_limit_try_rlimit_as is False
     assert args.optimizer.train_kernel_profiler_enabled is False
     assert args.optimizer.train_kernel_profiler_output_dir is None
     assert args.optimizer.train_kernel_profiler_wait_steps == 1
@@ -73,13 +84,57 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_kernel_profiler_with_stack is False
     assert args.optimizer.train_kernel_profiler_with_flops is False
     assert args.optimizer.train_kernel_profiler_log_every_batches == 0
-    assert args.optimizer.pg_tbptt_window == 64
-    assert args.optimizer.pg_env_replay_steps == 8
+    assert args.optimizer.pg_tbptt_window == 32
+    assert args.optimizer.pg_env_replay_steps == 1
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
+    assert args.optimizer.pg_saved_tensors_pin_memory is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 512
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
+    assert args.orchestration.rl_validate_context_lower_bound == 2048
+    assert args.orchestration.rl_validate_max_parallel_columns == 96
+
+
+def test_rlpfn_parser_accepts_aev5_next_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--anti-explosion-vanishing-v5-next-enabled", "true",
+            "--anti-explosion-vanishing-v5-next-state-gain-lo", "0.97",
+            "--anti-explosion-vanishing-v5-next-state-gain-hi", "1.02",
+            "--anti-explosion-vanishing-v5-next-step-grad-rms-hi", "0.05",
+        ]
+    )
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_enabled is True
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_lo == 0.97
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_hi == 1.02
+    assert args.prior.environment.anti_explosion_vanishing_v5_next_step_grad_rms_hi == 0.05
+
+
+def test_rlpfn_parser_refreshes_split_dims_when_terminal_flag_changes():
+    parser = make_model_level_argparser()
+
+    args_terminal_on = parser.parse_args(["rlpfn"])
+    assert args_terminal_on.prior.environment.terminal_reset_enabled is True
+    assert args_terminal_on.transformer.x_obs_dim == 404
+    assert args_terminal_on.prior.num_features == 434
+
+    args_terminal_off = parser.parse_args(
+        [
+            "rlpfn",
+            "--terminal-reset-enabled", "false",
+        ]
+    )
+    assert args_terminal_off.prior.environment.terminal_reset_enabled is False
+    assert args_terminal_off.transformer.x_obs_dim == 403
+    assert args_terminal_off.prior.num_features == 433
 
 
 def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
@@ -88,11 +143,213 @@ def test_rlpfn_parser_accepts_saved_tensors_offload_flags():
         [
             "rlpfn",
             "--pg-saved-tensors-cpu-offload", "true",
+            "--pg-saved-tensors-cpu-offload-scope", "policy",
             "--pg-saved-tensors-pin-memory", "false",
+            "--pg-saved-tensors-cpu-offload-auto-disable-when-safe", "true",
+            "--pg-saved-tensors-cpu-offload-auto-min-free-gb", "10",
+            "--pg-saved-tensors-cpu-offload-auto-max-batch-size", "32",
+            "--pg-saved-tensors-cpu-offload-auto-max-n-samples", "512",
         ]
     )
     assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 10.0
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 32
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 512
+
+
+def test_rlpfn_parser_accepts_host_rss_limit_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--train-host-rss-limit-gib", "28",
+            "--train-host-rss-limit-poll-interval-sec", "0.05",
+            "--train-host-rss-limit-try-rlimit-as", "true",
+        ]
+    )
+    assert args.optimizer.train_host_rss_limit_gib == 28.0
+    assert args.optimizer.train_host_rss_limit_poll_interval_sec == 0.05
+    assert args.optimizer.train_host_rss_limit_try_rlimit_as is True
+
+
+def test_rlpfn_parser_accepts_reinforce_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "reinforce",
+        ]
+    )
+    assert args.optimizer.rl_objective == "reinforce"
+
+
+def test_rlpfn_parser_accepts_first_policy_gradient_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "first_policy_gradient",
+        ]
+    )
+    assert args.optimizer.rl_objective == "first_policy_gradient"
+
+
+def test_rlpfn_parser_accepts_alpha_grad_objective():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "alpha_grad",
+        ]
+    )
+    assert args.optimizer.rl_objective == "alpha_grad"
+
+
+def test_rlpfn_parser_accepts_rl_validate_max_parallel_columns():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-validate-max-parallel-columns", "128",
+        ]
+    )
+    assert args.orchestration.rl_validate_max_parallel_columns == 128
+
+
+def test_rlpfn_parser_accepts_pg_one_hop_replay_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-one-hop-replay-enabled", "false",
+        ]
+    )
+    assert args.prior.environment.pg_one_hop_replay_enabled is False
+
+
+def test_rlpfn_parser_accepts_pg_replay_window_depth_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-replay-window-depth", "3",
+        ]
+    )
+    assert args.prior.environment.pg_replay_window_depth == 3
+
+
+def test_rlpfn_parser_accepts_pg_markov_adjacent_replay_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-markov-adjacent-replay-enabled", "true",
+            "--pg-markov-adjacent-replay-sample-prob", "0.25",
+        ]
+    )
+    assert args.prior.environment.pg_markov_adjacent_replay_enabled is True
+    assert args.prior.environment.pg_markov_adjacent_replay_sample_prob == 0.25
+
+
+def test_rlpfn_parser_accepts_pg_phase_logging_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--pg-phase-log-every-batches", "4",
+            "--pg-phase-log-file", "/tmp/pg-phase.log",
+        ]
+    )
+    assert args.optimizer.pg_phase_log_every_batches == 4
+    assert args.optimizer.pg_phase_log_file == "/tmp/pg-phase.log"
+
+
+def test_rlpfn_parser_accepts_first_pg_action_grad_clip_options():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--first-policy-gradient-action-grad-clip-value", "2.5",
+            "--first-policy-gradient-action-grad-clip-norm", "1.5",
+        ]
+    )
+    assert args.prior.environment.first_policy_gradient_action_grad_clip_value == 2.5
+    assert args.prior.environment.first_policy_gradient_action_grad_clip_norm == 1.5
+
+
+def test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--alpha-grad-local-coordinate-enabled", "false",
+            "--alpha-grad-unit-grad-enabled", "false",
+            "--alpha-grad-unit-grad-delta", "1e-4",
+        ]
+    )
+    assert args.prior.environment.alpha_grad_local_coordinate_enabled is False
+    assert args.prior.environment.alpha_grad_unit_grad_enabled is False
+    assert args.prior.environment.alpha_grad_unit_grad_delta == pytest.approx(1e-4)
+
+
+def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
+    cfg = get_model_default_config("rlpfn")
+
+    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
+    assert cfg["prior"]["environment"]["family"] == {
+        "distribution": "meta_choice",
+        "choice_values": ["scm"],
+    }
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_enabled"] is True
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_total_budget"] == 400
+    assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
+    assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
+    assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
+    assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
+    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
+    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_sample_prob"] == 0.125
+    assert cfg["prior"]["environment"]["pg_replay_window_depth"] == 1
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
+    assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 10.0,
+    }
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
+    assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
+    assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
+    assert cfg["prior"]["environment"]["alpha_grad_local_coordinate_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
+    assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
+    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
+    assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
+    assert cfg["optimizer"]["train_host_rss_limit_gib"] == 32.0
+    assert cfg["optimizer"]["train_host_rss_limit_poll_interval_sec"] == 0.02
+    assert cfg["optimizer"]["train_host_rss_limit_try_rlimit_as"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 512
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.2,
+    }
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == {
+        "distribution": "log_uniform",
+        "min": 1e-2,
+        "max": 0.1,
+    }
 
 
 def test_rlpfn_parser_accepts_pg_grad_mutable_kv_cache_flag():
@@ -124,10 +381,10 @@ def test_rlpfn_parser_accepts_pg_tbptt_window_flag():
     args = parser.parse_args(
         [
             "rlpfn",
-            "--pg-tbptt-window", "128",
+            "--pg-tbptt-window", "64",
         ]
     )
-    assert args.optimizer.pg_tbptt_window == 128
+    assert args.optimizer.pg_tbptt_window == 64
 
 
 def test_rlpfn_parser_accepts_pg_env_replay_steps_flag():
@@ -290,6 +547,105 @@ def test_rlpfn_parser_accepts_kernel_profiler_flags():
     assert args.optimizer.train_kernel_profiler_with_stack is True
     assert args.optimizer.train_kernel_profiler_with_flops is True
     assert args.optimizer.train_kernel_profiler_log_every_batches == 5
+
+
+def test_rlpfn_perfeature_v25_preset_recommends_resource_aware_overrides():
+    preset = get_rlpfn_per_feature_v25_recommended_overrides()
+    assert preset["transformer"]["backbone_variant"] == "per_feature_v25"
+    assert preset["transformer"]["emsize"] == 192
+    assert preset["transformer"]["nlayers"] == 8
+    assert preset["transformer"]["nhead"] == 3
+    assert preset["transformer"]["nhid_factor"] == 2
+    assert preset["transformer"]["features_per_group"] == 64
+    assert preset["optimizer"]["learning_rate"] == 4e-4
+    assert preset["optimizer"]["pg_tbptt_window"] == 32
+    assert preset["dataloader"]["batch_size"] == 256
+    assert preset["prior"]["n_samples"] == 1024
+
+
+def test_rlpfn_parser_applies_perfeature_v25_preset_when_backbone_is_selected():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(["rlpfn", "--backbone-variant", "per_feature_v25"])
+
+    assert args.transformer.backbone_variant == "per_feature_v25"
+    assert args.transformer.emsize == 192
+    assert args.transformer.nlayers == 8
+    assert args.transformer.nhead == 3
+    assert args.transformer.nhid_factor == 2
+    assert args.transformer.features_per_group == 64
+    assert args.transformer.feature_positional_embedding is True
+    assert args.transformer.recompute_attn is True
+    assert args.optimizer.learning_rate == 4e-4
+    assert args.optimizer.pg_tbptt_window == 32
+    assert args.optimizer.policy_rollout_chunk_size is None
+    assert args.dataloader.batch_size == 256
+    assert args.prior.n_samples == 1024
+
+
+def test_rlpfn_parser_keeps_explicit_overrides_on_top_of_perfeature_v25_preset():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--backbone-variant", "per_feature_v25",
+            "--batch-size", "8",
+            "--n-samples", "128",
+            "--emsize", "96",
+            "--nlayers", "3",
+            "--nhead", "6",
+            "--nhid-factor", "4",
+            "--features-per-group", "16",
+            "--feature-positional-embedding", "false",
+            "--learning-rate", "0.001",
+            "--pg-tbptt-window", "4",
+        ]
+    )
+
+    assert args.transformer.backbone_variant == "per_feature_v25"
+    assert args.transformer.emsize == 96
+    assert args.transformer.nlayers == 3
+    assert args.transformer.nhead == 6
+    assert args.transformer.nhid_factor == 4
+    assert args.transformer.features_per_group == 16
+    assert args.transformer.feature_positional_embedding is False
+    assert args.optimizer.learning_rate == 0.001
+    assert args.optimizer.pg_tbptt_window == 4
+    assert args.dataloader.batch_size == 8
+    assert args.prior.n_samples == 128
+
+def test_rlpfn_perfeature_v25_parser_keeps_explicit_rollout_chunk_override():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--backbone-variant", "per_feature_v25",
+            "--batch-size", "64",
+            "--policy-rollout-chunk-size", "16",
+        ]
+    )
+
+    assert args.dataloader.batch_size == 64
+    assert args.optimizer.policy_rollout_chunk_size == 16
+
+
+def test_rlpfn_perfeature_v25_runtime_env_defaults_enable_immutable_prefix_head_sharing(monkeypatch):
+    monkeypatch.delenv("TICL_POLICY_IMMUTABLE_PREFIX_HEAD_SHARING", raising=False)
+    config = {
+        "model_type": "rlpfn",
+        "transformer": {"backbone_variant": "per_feature_v25"},
+    }
+    _apply_rlpfn_backbone_runtime_env_defaults(config, "transformer")
+    assert os.environ["TICL_POLICY_IMMUTABLE_PREFIX_HEAD_SHARING"] == "mean"
+
+
+def test_rlpfn_standard_runtime_env_defaults_do_not_force_head_sharing(monkeypatch):
+    monkeypatch.delenv("TICL_POLICY_IMMUTABLE_PREFIX_HEAD_SHARING", raising=False)
+    config = {
+        "model_type": "rlpfn",
+        "transformer": {"backbone_variant": "standard"},
+    }
+    _apply_rlpfn_backbone_runtime_env_defaults(config, "transformer")
+    assert "TICL_POLICY_IMMUTABLE_PREFIX_HEAD_SHARING" not in os.environ
 
 
 def test_cli_flag_is_set_detects_split_and_equals_forms():

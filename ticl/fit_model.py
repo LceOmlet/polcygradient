@@ -1,6 +1,3 @@
-# import os
-# os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:512'
-
 import socket
 import sys
 import time
@@ -9,7 +6,6 @@ import mlflow
 
 import torch
 import os
-root_dir = os.path.dirname(os.path.abspath(__file__))
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -18,15 +14,93 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from git import Repo
 
+def _argv_targets_rlpfn(argv):
+    return bool(argv) and str(argv[0]).strip().lower() == "rlpfn"
+
+
+# Import-time env pinning is required here because several hot-path flags are
+# read while importing model/layer modules. Keep this scoped to the `rlpfn`
+# entrypoint so other model types do not inherit rollout-specific defaults.
+_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS = {
+    "TICL_POLICY_CAT_FUSION": "1",
+    "TICL_POLICY_SPLIT_ENCODE_FUSION": "1",
+    "TICL_POLICY_FINALIZE_2D_FASTPATH": "1",
+    "TICL_POLICY_STEP_PROJ_2D": "1",
+    "TICL_POLICY_STEP_LAYER_2D_LOOP": "1",
+    "TICL_POLICY_STEP_TOKEN_ALLOC_OPT": "1",
+    "TICL_POLICY_TOKEN_LAYOUT_PREPACK": "1",
+    "TICL_POLICY_TF32": "1",
+    "TICL_POLICY_CACHE_CONTAINER_REUSE": "1",
+    "TICL_POLICY_FUSED_TRANSITION_GENERATOR": "1",
+    "TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED": "1",
+    "TICL_POLICY_TRANSITION_INNER_GROUPING": "family",
+    "TICL_POLICY_TRANSITION_STREAM_FUSION": "1",
+    "TICL_POLICY_ROLLOUT_NOISE_STREAM": "1",
+    "TICL_POLICY_ENVGEN_BMM": "1",
+    "TICL_POLICY_ENVGEN_CHECKPOINT": "1",
+    "TICL_POLICY_TAIL_FREEZE": "1",
+    "TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH": "1",
+    "TICL_POLICY_FLASH_PREFIX_ASYNC": "1",
+    "TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH": "1",
+    "TICL_POLICY_OOM_FAIL_FAST": "1",
+}
+
+# Pin probe-only or falsified paths back to the retained skyline settings so
+# `python -m ticl.fit_model rlpfn` is reproducible and does not silently drift
+# with stale shell env or earlier exploratory defaults.
+_RLPFN_SKYLINE_GUARD_ENV_DEFAULTS = {
+    "TICL_POLICY_PAGED_ATTN_TRAIN_MODE": "auto",
+    "TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS": "64",
+    "TICL_POLICY_FLASH_PREFIX_TAIL_DENSE_MAX_TOKENS": "0",
+    "TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH": "0",
+    "TICL_POLICY_TRANSITION_STREAM_FUSION_MAX_GROUPS": "2",
+    "TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM": "auto",
+    "TICL_POLICY_TRANSITION_INNER_MIN_BUCKET": "0",
+    "TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS": "1",
+    "TICL_POLICY_TBPTT_STREAM_MERGE_AUTO": "0",
+    "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": "0",
+    "TICL_POLICY_ENVGEN_RAGGED_AFFINE": "0",
+    "TICL_POLICY_INPLACE_PAGED_KV": "0",
+}
+
+
+def _apply_rlpfn_skyline_env_defaults(argv=None):
+    argv = list(sys.argv[1:] if argv is None else argv)
+    if not _argv_targets_rlpfn(argv):
+        return
+    for env_map in (_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS, _RLPFN_SKYLINE_GUARD_ENV_DEFAULTS):
+        for key, value in env_map.items():
+            os.environ.setdefault(key, value)
+
+
+_apply_rlpfn_skyline_env_defaults()
+
+
+def _apply_rlpfn_backbone_runtime_env_defaults(config, attention_type):
+    if str(config.get("model_type", "")).strip().lower() != "rlpfn":
+        return
+    backbone_variant = str(
+        config.get(attention_type, {}).get("backbone_variant", "standard")
+    ).strip().lower()
+    if backbone_variant == "per_feature_v25":
+        # This is an approximate memory-saving mode, so keep it narrowly scoped
+        # to the per-feature v2.5 backbone and still allow explicit shell env
+        # overrides to win.
+        os.environ.setdefault("TICL_POLICY_IMMUTABLE_PREFIX_HEAD_SHARING", "mean")
+
 from ticl.model_builder import get_model
-from ticl.utils import init_device, get_model_string, synetune_handle_checkpoint, make_training_callback
+from ticl.utils import (
+    init_device,
+    get_model_string,
+    synetune_handle_checkpoint,
+    make_training_callback,
+    enforce_path_filename_limit,
+)
 from ticl.config_utils import compare_dicts, flatten_dict, update_config
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.model_configs import get_model_default_config
+from ticl.host_memory_guard import install_host_rss_limit_guard
 from argparse import Namespace
-
-import pandas as pd
-import pdb
 
 
 def _merge_missing_keys(dst, src):
@@ -62,6 +136,68 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         if "optimizer" not in config:
             config["optimizer"] = {}
         config["optimizer"]["pg_env_replay_steps"] = args.optimizer.pg_env_replay_steps
+    env_override_flags = (
+        ("--anti-explosion-vanishing-v2-enabled", "anti_explosion_vanishing_v2_enabled"),
+        ("--anti-explosion-vanishing-v2-lambda", "anti_explosion_vanishing_v2_lambda"),
+        ("--anti-explosion-vanishing-v2-gain-lo", "anti_explosion_vanishing_v2_gain_lo"),
+        ("--anti-explosion-vanishing-v2-gain-hi", "anti_explosion_vanishing_v2_gain_hi"),
+        ("--anti-explosion-vanishing-v2-huber-delta", "anti_explosion_vanishing_v2_huber_delta"),
+        ("--anti-explosion-vanishing-v2-eps", "anti_explosion_vanishing_v2_eps"),
+        ("--anti-explosion-vanishing-v2-detach-reference", "anti_explosion_vanishing_v2_detach_reference"),
+        ("--anti-explosion-vanishing-v3-enabled", "anti_explosion_vanishing_v3_enabled"),
+        ("--anti-explosion-vanishing-v3-lambda-drift", "anti_explosion_vanishing_v3_lambda_drift"),
+        ("--anti-explosion-vanishing-v3-lambda-tail", "anti_explosion_vanishing_v3_lambda_tail"),
+        ("--anti-explosion-vanishing-v3-gain-lo", "anti_explosion_vanishing_v3_gain_lo"),
+        ("--anti-explosion-vanishing-v3-gain-hi", "anti_explosion_vanishing_v3_gain_hi"),
+        ("--anti-explosion-vanishing-v3-tail-tau", "anti_explosion_vanishing_v3_tail_tau"),
+        ("--anti-explosion-vanishing-v3-eps", "anti_explosion_vanishing_v3_eps"),
+        ("--anti-explosion-vanishing-v3-detach-reference", "anti_explosion_vanishing_v3_detach_reference"),
+        ("--anti-explosion-vanishing-v4-enabled", "anti_explosion_vanishing_v4_enabled"),
+        ("--anti-explosion-vanishing-v4-lambda-drift", "anti_explosion_vanishing_v4_lambda_drift"),
+        ("--anti-explosion-vanishing-v4-lambda-tail", "anti_explosion_vanishing_v4_lambda_tail"),
+        ("--anti-explosion-vanishing-v4-gain-lo", "anti_explosion_vanishing_v4_gain_lo"),
+        ("--anti-explosion-vanishing-v4-gain-hi", "anti_explosion_vanishing_v4_gain_hi"),
+        ("--anti-explosion-vanishing-v4-tail-tau", "anti_explosion_vanishing_v4_tail_tau"),
+        ("--anti-explosion-vanishing-v4-eps", "anti_explosion_vanishing_v4_eps"),
+        ("--anti-explosion-vanishing-v4-detach-reference", "anti_explosion_vanishing_v4_detach_reference"),
+        ("--anti-explosion-vanishing-v4-highway-ratio", "anti_explosion_vanishing_v4_highway_ratio"),
+        ("--anti-explosion-vanishing-v4-update-scale", "anti_explosion_vanishing_v4_update_scale"),
+        ("--anti-explosion-vanishing-v4-update-clip", "anti_explosion_vanishing_v4_update_clip"),
+        ("--anti-explosion-vanishing-v5-enabled", "anti_explosion_vanishing_v5_enabled"),
+        ("--anti-explosion-vanishing-v5-target-std", "anti_explosion_vanishing_v5_target_std"),
+        ("--anti-explosion-vanishing-v5-scale-lo", "anti_explosion_vanishing_v5_scale_lo"),
+        ("--anti-explosion-vanishing-v5-scale-hi", "anti_explosion_vanishing_v5_scale_hi"),
+        ("--anti-explosion-vanishing-v5-eps", "anti_explosion_vanishing_v5_eps"),
+        ("--anti-explosion-vanishing-v5-detach-reference", "anti_explosion_vanishing_v5_detach_reference"),
+        ("--anti-explosion-vanishing-v5-next-enabled", "anti_explosion_vanishing_v5_next_enabled"),
+        ("--anti-explosion-vanishing-v5-next-state-gain-lo", "anti_explosion_vanishing_v5_next_state_gain_lo"),
+        ("--anti-explosion-vanishing-v5-next-state-gain-hi", "anti_explosion_vanishing_v5_next_state_gain_hi"),
+        ("--anti-explosion-vanishing-v5-next-state-rms-lo", "anti_explosion_vanishing_v5_next_state_rms_lo"),
+        ("--anti-explosion-vanishing-v5-next-state-rms-hi", "anti_explosion_vanishing_v5_next_state_rms_hi"),
+        ("--anti-explosion-vanishing-v5-next-state-reward-gate", "anti_explosion_vanishing_v5_next_state_reward_gate"),
+        ("--anti-explosion-vanishing-v5-next-state-low-boost-cap", "anti_explosion_vanishing_v5_next_state_low_boost_cap"),
+        ("--anti-explosion-vanishing-v5-next-loss-target-std", "anti_explosion_vanishing_v5_next_loss_target_std"),
+        ("--anti-explosion-vanishing-v5-next-loss-scale-lo", "anti_explosion_vanishing_v5_next_loss_scale_lo"),
+        ("--anti-explosion-vanishing-v5-next-loss-scale-hi", "anti_explosion_vanishing_v5_next_loss_scale_hi"),
+        ("--anti-explosion-vanishing-v5-next-step-grad-rms-lo", "anti_explosion_vanishing_v5_next_step_grad_rms_lo"),
+        ("--anti-explosion-vanishing-v5-next-step-grad-rms-hi", "anti_explosion_vanishing_v5_next_step_grad_rms_hi"),
+        ("--anti-explosion-vanishing-v5-next-step-reward-std-gate", "anti_explosion_vanishing_v5_next_step_reward_std_gate"),
+        ("--anti-explosion-vanishing-v5-next-step-low-boost-cap", "anti_explosion_vanishing_v5_next_step_low_boost_cap"),
+        ("--anti-explosion-vanishing-v5-next-eps", "anti_explosion_vanishing_v5_next_eps"),
+        ("--anti-explosion-vanishing-v5-next-detach-reference", "anti_explosion_vanishing_v5_next_detach_reference"),
+        ("--pg-one-hop-replay-enabled", "pg_one_hop_replay_enabled"),
+        ("--alpha-grad-one-hop-replay-enabled", "alpha_grad_one_hop_replay_enabled"),
+        ("--pg-markov-adjacent-replay-enabled", "pg_markov_adjacent_replay_enabled"),
+        ("--pg-markov-adjacent-replay-sample-prob", "pg_markov_adjacent_replay_sample_prob"),
+        ("--pg-replay-window-depth", "pg_replay_window_depth"),
+    )
+    for flag, key in env_override_flags:
+        if _cli_flag_is_set(argv, flag):
+            if "prior" not in config:
+                config["prior"] = {}
+            if "environment" not in config["prior"]:
+                config["prior"]["environment"] = {}
+            config["prior"]["environment"][key] = getattr(args.prior.environment, key)
     profiler_flags = (
         ("--train-profiler-enabled", "train_profiler_enabled"),
         ("--train-profiler-output-path", "train_profiler_output_path"),
@@ -74,6 +210,9 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-gpu-observer-interval-sec", "train_gpu_observer_interval_sec"),
         ("--train-gpu-observer-output-path", "train_gpu_observer_output_path"),
         ("--train-gpu-stage-output-path", "train_gpu_stage_output_path"),
+        ("--train-host-rss-limit-gib", "train_host_rss_limit_gib"),
+        ("--train-host-rss-limit-poll-interval-sec", "train_host_rss_limit_poll_interval_sec"),
+        ("--train-host-rss-limit-try-rlimit-as", "train_host_rss_limit_try_rlimit_as"),
         ("--train-kernel-profiler-enabled", "train_kernel_profiler_enabled"),
         ("--train-kernel-profiler-output-dir", "train_kernel_profiler_output_dir"),
         ("--train-kernel-profiler-wait-steps", "train_kernel_profiler_wait_steps"),
@@ -87,10 +226,13 @@ def _apply_continue_run_cli_overrides(config, args, argv):
         ("--train-kernel-profiler-log-every-batches", "train_kernel_profiler_log_every_batches"),
         ("--train-kernel-profiler-export-trace", "train_kernel_profiler_export_trace"),
         ("--train-kernel-profiler-summary-top-k", "train_kernel_profiler_summary_top_k"),
+        ("--pg-oom-fail-fast", "pg_oom_fail_fast"),
         ("--pg-compile-observe-recompiles", "pg_compile_observe_recompiles"),
         ("--pg-compile-observe-log-every-batches", "pg_compile_observe_log_every_batches"),
         ("--pg-compile-observe-output-path", "pg_compile_observe_output_path"),
         ("--pg-compile-observe-reset-after-warmup", "pg_compile_observe_reset_after_warmup"),
+        ("--pg-phase-log-every-batches", "pg_phase_log_every_batches"),
+        ("--pg-phase-log-file", "pg_phase_log_file"),
     )
     for flag, key in profiler_flags:
         if _cli_flag_is_set(argv, flag):
@@ -159,17 +301,63 @@ def main(argv, extra_config=None):
             config['mothernet']['decoder_type'] = 'average'
 
     warm_start_weights = orchestration.warm_start_from
-    config[attention_type]['nhead'] = config[attention_type]['emsize'] // 128
+    backbone_variant = str(config[attention_type].get('backbone_variant', 'standard')).strip().lower()
+    nhead_flag_set = _cli_flag_is_set(argv or [], "--nhead")
+    if (not nhead_flag_set) and backbone_variant != "per_feature_v25":
+        config[attention_type]['nhead'] = max(1, config[attention_type]['emsize'] // 128)
+    _apply_rlpfn_backbone_runtime_env_defaults(config, attention_type)
 
     config['dataloader']['num_steps'] = config['dataloader']['num_steps'] or 1024 * \
         64 // config['dataloader']['batch_size'] // config['optimizer']['aggregate_k_gradients']
 
     if args.orchestration.extra_fast_test:
         config['prior']['n_samples'] = 2 * 16
-        config[attention_type]['nhead'] = 1
+        if not nhead_flag_set:
+            config[attention_type]['nhead'] = 1
 
     if extra_config is not None:
         update_config(config, extra_config)
+
+    host_rss_guard = None
+    host_rss_guard_status = None
+    try:
+        host_rss_guard, host_rss_guard_status = install_host_rss_limit_guard(
+            limit_gib=config["optimizer"].get("train_host_rss_limit_gib", None),
+            poll_interval_sec=config["optimizer"].get("train_host_rss_limit_poll_interval_sec", 0.02),
+            try_rlimit_as=config["optimizer"].get("train_host_rss_limit_try_rlimit_as", False),
+        )
+    except Exception as exc:
+        host_rss_guard = None
+        host_rss_guard_status = {
+            "enabled": False,
+            "limit_gib": None,
+            "poll_interval_sec": None,
+            "try_rlimit_as": bool(config["optimizer"].get("train_host_rss_limit_try_rlimit_as", False)),
+            "rlimit_as": {"requested": False, "applied": False, "reason": f"guard_init_failed: {exc}"},
+        }
+    if isinstance(host_rss_guard_status, dict) and bool(host_rss_guard_status.get("enabled", False)):
+        rlimit_status = host_rss_guard_status.get("rlimit_as", {})
+        rlimit_msg = "disabled"
+        if isinstance(rlimit_status, dict) and bool(host_rss_guard_status.get("try_rlimit_as", False)):
+            if bool(rlimit_status.get("applied", False)):
+                rlimit_msg = "applied"
+            else:
+                rlimit_msg = f"skipped({rlimit_status.get('reason', 'unknown')})"
+        print(
+            "Host RSS guard:",
+            f"limit_gib={float(host_rss_guard_status['limit_gib']):.2f}",
+            f"poll_interval_sec={float(host_rss_guard_status['poll_interval_sec']):.3f}",
+            f"try_rlimit_as={bool(host_rss_guard_status.get('try_rlimit_as', False))}",
+            f"rlimit_as={rlimit_msg}",
+        )
+    elif (
+        isinstance(host_rss_guard_status, dict)
+        and config["optimizer"].get("train_host_rss_limit_gib", None) is not None
+        and not bool(host_rss_guard_status.get("sensor_available", True))
+    ):
+        print(
+            "[host-rss-limit] disabled because current RSS sensor is unavailable on this platform/runtime."
+        )
 
     save_every = orchestration.save_every
 
@@ -218,6 +406,23 @@ def main(argv, extra_config=None):
         torch.autograd.set_detect_anomaly(True)
 
     model_string = get_model_string(config, num_gpus, device, parser)
+    pg_phase_log_file_default = os.path.join(base_path, "log", f"{model_string}.log")
+    if "optimizer" not in config:
+        config["optimizer"] = {}
+    pg_phase_log_file_cfg = config["optimizer"].get("pg_phase_log_file", None)
+    if pg_phase_log_file_cfg is None or str(pg_phase_log_file_cfg).strip() == "":
+        config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_default
+    pg_phase_log_file_effective = config["optimizer"].get("pg_phase_log_file", None)
+    if pg_phase_log_file_effective is not None and str(pg_phase_log_file_effective).strip() != "":
+        pg_phase_log_file_safe = enforce_path_filename_limit(pg_phase_log_file_effective)
+        if str(pg_phase_log_file_safe) != str(pg_phase_log_file_effective):
+            print(
+                "[filename-limit] pg_phase_log_file basename was truncated to fit filesystem limits:"
+                f" {pg_phase_log_file_safe}"
+            )
+        config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_safe
+    if config["optimizer"].get("pg_phase_log_every_batches", None) is None:
+        config["optimizer"]["pg_phase_log_every_batches"] = 1
     save_callback = make_training_callback(
         save_every, 
         model_string, 
@@ -236,41 +441,6 @@ def main(argv, extra_config=None):
         from ticl.environment import WANDB_INFO
         wandb_data, flatten_key_dict = flatten_dict(config, track_keys=True)
         wandb_config = {k: v for k, v in wandb_data.items() if k not in ['wallclock_times', 'losses', 'learning_rates']}
-        # check_keys = pd.read_csv(f"{root_dir}/configs/{args.model_type}_configs.csv").columns
-        # flatten_check_keys = [flatten_key_dict[k] for k in check_keys] + ['model_type']
-
-        # api = wandb.Api(timeout=300)
-        # runs = api.runs(f"{WANDB_INFO['entity']}/{WANDB_INFO['project']}")
-        # find_existing_run = None
-        # for run in runs:
-        #     run_config_list = {k: v for k,v in run.config.items() if not k.startswith('_')}
-        #     this_run = True
-        #     for key in flatten_check_keys:
-        #         if key not in wandb_config or key not in run_config_list:
-        #             this_run = False
-        #             break
-        #         if (run_config_list[key] != wandb_config[key]):
-        #             # check whether they are numbers 
-        #             this_run = False
-        #             if (isinstance(run_config_list[key], (int, float))) and (isinstance(wandb_config[key], (int, float))):
-        #                 # check whether the numbers are close
-        #                 if abs(run_config_list[key] - wandb_config[key]) <= 1e-5:
-        #                     this_run = True
-        #             if not this_run: break
-        #     if this_run:
-
-        #         print("########"*3)
-        #         print(f"Find existing run in wandb: {run.name}")
-        #         print("########"*3)
-
-        #         if not orchestration.wandb_overwrite: 
-        #             find_existing_run = run
-        #             print(f'wandb_overwrite is set to {orchestration.wandb_overwrite}, exiting...')
-        #             exit(0)
-                
-            
-        # # initialize wandb
-        # if find_existing_run is None:
         wandb.init(
             dir=WANDB_INFO['dir'],
             project=WANDB_INFO['project'],
@@ -279,56 +449,13 @@ def main(argv, extra_config=None):
             config=wandb_config,
         )
 
-    if (not orchestration.use_mlflow) or mlflow_hostname is None:
-        print("Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.")
-        total_loss, model, dl, epoch = get_model(
-            config, 
-            device, 
-            should_train=True,
-            verbose=1, 
-            epoch_callback=save_callback, 
-            model_state=model_state,
-            optimizer_state=optimizer_state, 
-            scheduler=scheduler,
-            load_model_strict=orchestration.continue_run or orchestration.load_strict
-        )
-    else:
-        print(f"Logging run with mlflow at host {mlflow_hostname}")
-        mlflow.set_tracking_uri(f"http://{mlflow_hostname}:5000")
-
-        tries = 0
-        while tries < 5:
-            try:
-                mlflow.set_experiment(orchestration.experiment)
-                break
-            except:
-                tries += 1
-                print(f"Failed to set experiment, retrying {tries}/5")
-                time.sleep(5)
-
-        if orchestration.continue_run and not orchestration.create_new_run:
-            # find run id via mlflow
-            run_ids = mlflow.search_runs(filter_string=f"attribute.run_name='{model_string}'")['run_id']
-            if len(run_ids) > 1:
-                raise ValueError(f"Found more than one run with name {model_string}")
-            if len(run_ids) < 1:
-                raise ValueError(f"Found no run with name {model_string}")
-            run_id = run_ids.iloc[0]
-            run_args = {'run_id': run_id}
-
-        else:
-            run_args = {'run_name': model_string}
-
-        path = os.path.dirname(os.path.abspath(__file__))
-        run_args['tags'] = {'mlflow.source.git.commit': Repo(path, search_parent_directories=True).head.object.hexsha}
-
-        with mlflow.start_run(**run_args):
-            mlflow.log_param('hostname', socket.gethostname())
-            mlflow.log_params({k: v for k, v in flatten_dict(config).items() if k not in ['wallclock_times', 'losses', 'learning_rates']})
+    try:
+        if (not orchestration.use_mlflow) or mlflow_hostname is None:
+            print("Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.")
             total_loss, model, dl, epoch = get_model(
                 config, 
                 device, 
-                should_train=True, 
+                should_train=True,
                 verbose=1, 
                 epoch_callback=save_callback, 
                 model_state=model_state,
@@ -336,6 +463,53 @@ def main(argv, extra_config=None):
                 scheduler=scheduler,
                 load_model_strict=orchestration.continue_run or orchestration.load_strict
             )
+        else:
+            print(f"Logging run with mlflow at host {mlflow_hostname}")
+            mlflow.set_tracking_uri(f"http://{mlflow_hostname}:5000")
+
+            tries = 0
+            while tries < 5:
+                try:
+                    mlflow.set_experiment(orchestration.experiment)
+                    break
+                except:
+                    tries += 1
+                    print(f"Failed to set experiment, retrying {tries}/5")
+                    time.sleep(5)
+
+            if orchestration.continue_run and not orchestration.create_new_run:
+                # find run id via mlflow
+                run_ids = mlflow.search_runs(filter_string=f"attribute.run_name='{model_string}'")['run_id']
+                if len(run_ids) > 1:
+                    raise ValueError(f"Found more than one run with name {model_string}")
+                if len(run_ids) < 1:
+                    raise ValueError(f"Found no run with name {model_string}")
+                run_id = run_ids.iloc[0]
+                run_args = {'run_id': run_id}
+
+            else:
+                run_args = {'run_name': model_string}
+
+            path = os.path.dirname(os.path.abspath(__file__))
+            run_args['tags'] = {'mlflow.source.git.commit': Repo(path, search_parent_directories=True).head.object.hexsha}
+
+            with mlflow.start_run(**run_args):
+                mlflow.log_param('hostname', socket.gethostname())
+                mlflow.log_params({k: v for k, v in flatten_dict(config).items() if k not in ['wallclock_times', 'losses', 'learning_rates']})
+                total_loss, model, dl, epoch = get_model(
+                    config, 
+                    device, 
+                    should_train=True, 
+                    verbose=1, 
+                    epoch_callback=save_callback, 
+                    model_state=model_state,
+                    optimizer_state=optimizer_state, 
+                    scheduler=scheduler,
+                    load_model_strict=orchestration.continue_run or orchestration.load_strict
+                )
+    finally:
+        if host_rss_guard is not None:
+            host_rss_guard.stop()
 
     if rank == 0:
         save_callback(model, None, None, "on_exit")

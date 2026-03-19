@@ -11,6 +11,7 @@ from ticl.model_configs import get_model_default_config
 from ticl.models.mothernet_additive import MotherNetAdditive
 from ticl.models.perceiver import TabPerceiver
 from ticl.models.tabpfn import TabPFN
+from ticl.models.perfeature_tabpfn import PerFeatureTabPFN
 from ticl.models.biattention_tabpfn import BiAttentionTabPFN
 from ticl.models.gamformer import GAMformer
 from ticl.models.mothernet import MotherNet
@@ -247,7 +248,16 @@ def get_model(
             n_out=n_out, n_features=n_features,
             y_encoder_layer=y_encoder, **config['transformer'], **config['mothernet'], **config['additive'])
     elif model_type in ["tabpfn", "rlpfn"]:
-        model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **config['transformer'])
+        backbone_variant = str(config['transformer'].get('backbone_variant', 'standard')).strip().lower()
+        if backbone_variant == "per_feature_v25":
+            model = PerFeatureTabPFN(
+                n_out=n_out,
+                n_features=n_features,
+                y_encoder_layer=y_encoder,
+                **config['transformer'],
+            )
+        else:
+            model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **config['transformer'])
     elif model_type == "batabpfn":
         # FIXME hack
         config['transformer']['nhead'] = 4

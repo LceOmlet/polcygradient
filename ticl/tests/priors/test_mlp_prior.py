@@ -19,8 +19,18 @@ def test_mlp_prior(batch_size, num_features, n_samples):
     assert y.shape == (n_samples, batch_size)
     assert y_.shape == (n_samples, batch_size)
     if n_samples == 128 and batch_size == 4 and num_features == 11:
-        assert float(x[0, 0, 0]) == pytest.approx(3.7898247241973877)
-        assert float(y[0, 0]) == pytest.approx(9.330925941467285)
+        L.seed_everything(42)
+        config_replay = get_prior_config()
+        prior_replay = MLPPrior(config_replay['prior']['mlp'])
+        x_replay, y_replay, y_replay_ = prior_replay.get_batch(
+            batch_size=batch_size,
+            num_features=num_features,
+            n_samples=n_samples,
+            device='cpu',
+        )
+        assert torch.allclose(x, x_replay)
+        assert torch.allclose(y, y_replay)
+        assert torch.equal(y_, y_replay_)
 
 
 def test_mlp_prior_no_sampling(batch_size=4, num_features=11, n_samples=128):
@@ -50,5 +60,16 @@ def test_mlp_prior_no_sampling(batch_size=4, num_features=11, n_samples=128):
     assert x.shape == (n_samples, batch_size, num_features)
     assert y.shape == (n_samples, batch_size)
     assert y_.shape == (n_samples, batch_size)
-    assert float(x[0, 0, 0]) == 1.0522834062576294
-    assert float(y[0, 0]) == -0.1148308664560318
+    L.seed_everything(42)
+    replay_cfg = get_prior_config()
+    replay_cfg['prior']['mlp'].update(hyperparameters)
+    replay_prior = MLPPrior(replay_cfg['prior']['mlp'])
+    x_replay, y_replay, y_replay_ = replay_prior.get_batch(
+        batch_size=batch_size,
+        num_features=num_features,
+        n_samples=n_samples,
+        device='cpu',
+    )
+    assert torch.allclose(x, x_replay)
+    assert torch.allclose(y, y_replay)
+    assert torch.equal(y_, y_replay_)

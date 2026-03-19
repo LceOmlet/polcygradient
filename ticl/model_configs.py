@@ -3,6 +3,44 @@ import torch
 from ticl.config_utils import merge_dicts
 
 
+def get_rlpfn_per_feature_v25_recommended_overrides():
+    """
+    TabPFN-2.5-inspired preset for the high-dimensional RL path.
+
+    This intentionally keeps the main architectural choices from TabPFN-2.5
+    (per-feature backbone, emsize=192, nhead=3, nhid_factor=2, feature grouping)
+    while using coarser feature groups than vanilla TabPFN-2.5 for wide RL
+    tokens, and calibrating the default batch budget to the largest setting
+    we currently validate on a single 4090 with the maintained exact rollout
+    semantics.
+    """
+    return {
+        "transformer": {
+            "backbone_variant": "per_feature_v25",
+            "emsize": 192,
+            "nlayers": 8,
+            "nhead": 3,
+            "nhid_factor": 2,
+            # RL tokens are much wider than typical tabular datasets, so use
+            # coarser groups than the TabPFN-2.5 default of 3 to keep KV-cache
+            # growth compatible with the current runner.
+            "features_per_group": 64,
+            "feature_positional_embedding": True,
+            "recompute_attn": True,
+        },
+        "optimizer": {
+            "learning_rate": 4e-4,
+            "pg_tbptt_window": 32,
+        },
+        "dataloader": {
+            "batch_size": 64 * 4,
+        },
+        "prior": {
+            "n_samples": 1024,
+        },
+    }
+
+
 def get_optimizer_config():
     optimizer = {
         "aggregate_k_gradients": 1,
@@ -15,11 +53,17 @@ def get_optimizer_config():
         "policy_rollout_chunk_grow_factor": 2.0,
         "pg_grad_mutable_kv_cache": False,
         "pg_saved_tensors_cpu_offload": False,
+        "pg_saved_tensors_cpu_offload_scope": "all",
         "pg_saved_tensors_pin_memory": True,
+        "pg_saved_tensors_cpu_offload_auto_disable_when_safe": False,
+        "pg_saved_tensors_cpu_offload_auto_min_free_gb": 8.0,
+        "pg_saved_tensors_cpu_offload_auto_max_batch_size": 64,
+        "pg_saved_tensors_cpu_offload_auto_max_n_samples": 1024,
         "pg_oom_debug_raise": False,
+        "pg_oom_fail_fast": False,
         "pg_kv_cache_mode": "auto",
         "pg_kv_cache_page_size": None,
-        "pg_tbptt_window": 128,
+        "pg_tbptt_window": 64,
         "pg_env_replay_steps": 1,
         "pg_oom_reduce_tbptt_first": False,
         "pg_torch_compile": False,
@@ -31,6 +75,8 @@ def get_optimizer_config():
         "pg_compile_observe_log_every_batches": 1,
         "pg_compile_observe_output_path": None,
         "pg_compile_observe_reset_after_warmup": True,
+        "pg_phase_log_every_batches": 1,
+        "pg_phase_log_file": None,
         "adamw_fused": True,
         "train_profiler_enabled": False,
         "train_profiler_output_path": None,
@@ -43,6 +89,9 @@ def get_optimizer_config():
         "train_gpu_observer_interval_sec": 1.0,
         "train_gpu_observer_output_path": None,
         "train_gpu_stage_output_path": None,
+        "train_host_rss_limit_gib": None,
+        "train_host_rss_limit_poll_interval_sec": 0.02,
+        "train_host_rss_limit_try_rlimit_as": False,
         "train_kernel_profiler_enabled": False,
         "train_kernel_profiler_output_dir": None,
         "train_kernel_profiler_wait_steps": 1,
@@ -75,11 +124,11 @@ def get_optimizer_config():
 
 def get_transformer_config():
     transformer = {
-        "emsize": 512,
-        "nlayers": 12,
+        "emsize": 256,
+        "nlayers": 6,
         "dropout": 0.0,
         "nhid_factor": 2,
-        'nhead': 512 // 128,
+        'nhead': 256 // 64,
         'init_method': None,
         'recompute_attn': True,
         'pre_norm': False,
@@ -90,6 +139,12 @@ def get_transformer_config():
         'single_eval_causal': False,
         'input_normalization': False,
         'tabpfn_zero_weights': True,
+        # Backbone selection:
+        # - "standard": existing single-token transformer
+        # - "per_feature_v25": TabPFN-2.5 inspired grouped per-feature backbone
+        'backbone_variant': 'standard',
+        'features_per_group': 3,
+        'feature_positional_embedding': True,
         # x encoder layout:
         # - "single": one linear encoder over full num_features
         # - "split_obs_action": two heads (obs/reward/mask + action)
@@ -185,6 +240,9 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "obs_dim": {"distribution": "uniform_int", "min": 1, "max": 400},
         "noise_dim": {"distribution": "uniform_int", "min": 1, "max": 64},
         "zero_pad_dim": {"distribution": "uniform_int", "min": 0, "max": 400},
+        "constrained_dim_sampling_enabled": False,
+        "constrained_dim_sampling_total_budget": 400,
+        "strict_joint_transition_enabled": False,
         # Fixed token slots for PFN input:
         # head-1 uses [s_t(obs slot), r_t, r_mask_t] => 402 dims by default.
         # head-2 uses [a_t] => 30 dims by default.
@@ -223,6 +281,69 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reward_scale": {"distribution": "uniform", "min": 0.1, "max": 10.0},
         "reward_clip": 10.0,
         "state_clip": 8.0,
+        # Optional state residual highway (default off, no behavior change).
+        "state_highway_enabled": False,
+        "state_highway_lambda": 0.0,
+        # anti-explosion&vanishing-v2:
+        # two-sided corridor regularization on log gain of consecutive
+        # latent-state increments.
+        "anti_explosion_vanishing_v2_enabled": False,
+        "anti_explosion_vanishing_v2_lambda": 0.05,
+        "anti_explosion_vanishing_v2_gain_lo": 0.85,
+        "anti_explosion_vanishing_v2_gain_hi": 1.15,
+        "anti_explosion_vanishing_v2_huber_delta": 0.05,
+        "anti_explosion_vanishing_v2_eps": 1e-6,
+        "anti_explosion_vanishing_v2_detach_reference": True,
+        # anti-explosion&vanishing-v3:
+        # decoupled drift+tail regularization on per-step log gain of
+        # latent-state increments.
+        "anti_explosion_vanishing_v3_enabled": False,
+        "anti_explosion_vanishing_v3_lambda_drift": 0.02,
+        "anti_explosion_vanishing_v3_lambda_tail": 0.05,
+        "anti_explosion_vanishing_v3_gain_lo": 0.85,
+        "anti_explosion_vanishing_v3_gain_hi": 1.15,
+        "anti_explosion_vanishing_v3_tail_tau": 0.02,
+        "anti_explosion_vanishing_v3_eps": 1e-6,
+        "anti_explosion_vanishing_v3_detach_reference": True,
+        # anti-explosion&vanishing-v4:
+        # controlled highway-subspace update + drift/tail regularization
+        # on per-step update gain (TBPTT-friendly).
+        "anti_explosion_vanishing_v4_enabled": False,
+        "anti_explosion_vanishing_v4_lambda_drift": 0.08,
+        "anti_explosion_vanishing_v4_lambda_tail": 0.25,
+        "anti_explosion_vanishing_v4_gain_lo": 0.97,
+        "anti_explosion_vanishing_v4_gain_hi": 1.03,
+        "anti_explosion_vanishing_v4_tail_tau": 0.010,
+        "anti_explosion_vanishing_v4_eps": 1e-6,
+        "anti_explosion_vanishing_v4_detach_reference": True,
+        "anti_explosion_vanishing_v4_highway_ratio": 0.25,
+        "anti_explosion_vanishing_v4_update_scale": 0.08,
+        "anti_explosion_vanishing_v4_update_clip": 0.0,
+        # anti-explosion&vanishing-v5:
+        # detached reward-signal thermostat that rescales policy-gradient
+        # loss magnitude without changing ascent direction on sum of rewards.
+        "anti_explosion_vanishing_v5_enabled": False,
+        "anti_explosion_vanishing_v5_target_std": 0.25,
+        "anti_explosion_vanishing_v5_scale_lo": 0.5,
+        "anti_explosion_vanishing_v5_scale_hi": 4.0,
+        "anti_explosion_vanishing_v5_eps": 1e-6,
+        "anti_explosion_vanishing_v5_detach_reference": True,
+        "anti_explosion_vanishing_v5_next_enabled": False,
+        "anti_explosion_vanishing_v5_next_state_gain_lo": 0.985,
+        "anti_explosion_vanishing_v5_next_state_gain_hi": 1.035,
+        "anti_explosion_vanishing_v5_next_state_rms_lo": 4e-3,
+        "anti_explosion_vanishing_v5_next_state_rms_hi": 9e-2,
+        "anti_explosion_vanishing_v5_next_state_reward_gate": 0.05,
+        "anti_explosion_vanishing_v5_next_state_low_boost_cap": 1.5,
+        "anti_explosion_vanishing_v5_next_loss_target_std": 0.25,
+        "anti_explosion_vanishing_v5_next_loss_scale_lo": 0.5,
+        "anti_explosion_vanishing_v5_next_loss_scale_hi": 4.0,
+        "anti_explosion_vanishing_v5_next_step_grad_rms_lo": 1e-4,
+        "anti_explosion_vanishing_v5_next_step_grad_rms_hi": 3e-2,
+        "anti_explosion_vanishing_v5_next_step_reward_std_gate": 0.05,
+        "anti_explosion_vanishing_v5_next_step_low_boost_cap": 4.0,
+        "anti_explosion_vanishing_v5_next_eps": 1e-6,
+        "anti_explosion_vanishing_v5_next_detach_reference": True,
         # Policy-gradient stability knobs for differentiable rollout.
         # Train objective default: maximize raw discounted reward mean directly.
         "policy_gradient_normalize_rewards": False,
@@ -232,7 +353,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "discount": 1.0,
         # Lipschitz safeguards: project sampled generator matrices by
         # Frobenius norm and cap GP outputscale for bounded transition Jacobians.
-        "lipschitz_enforce": True,
+        "lipschitz_enforce": False,
         "lipschitz_weight_fro_norm_max": 1.0,
         "lipschitz_gp_outputscale_max": 1.0,
         # SCM (aligned with priors/mlp.py names).
@@ -274,7 +395,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
     prior['classification'] = classsification_prior
 
     dataloader = {
-        "batch_size": 8 * 8,
+        "batch_size": 8 * 16* 2 ,
         "num_steps": 8 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
@@ -399,13 +520,48 @@ def get_rlpfn_default_config():
 
     env_cfg = config['prior']['environment']
     env_cfg.update({
+        "family": {"distribution": "meta_choice", "choice_values": ["scm"]},
         "obs_slot_dim": 400,
         "action_slot_dim": 30,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_total_budget": 400,
+        "strict_joint_transition_enabled": True,
+        "state_input_scale_enabled": False,
+        "state_input_scale": 1.0,
+        "state_full_rms_enabled": True,
+        "state_full_rms_target": 1.0,
+        "reinforce_reward_transform": "tanh",
+        "reinforce_reward_rms_eps": 1e-6,
+        "reinforce_reward_tanh_c": 10.0,
+        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
+        "reinforce_action_transform": "rms",
+        "reinforce_action_rms_eps": 1e-6,
+        "first_policy_gradient_state_grad_clip_norm": 4.0,
+        "first_policy_gradient_action_grad_clip_value": 0.0,
+        "first_policy_gradient_action_grad_clip_norm": 1.0,
+        "alpha_grad_local_coordinate_enabled": True,
+        "alpha_grad_unit_grad_enabled": True,
+        "alpha_grad_unit_grad_delta": 1e-6,
+        # Keep replay on the safe TBPTT runner, but make the maintained
+        # alpha-grad default explicitly include one-hop and sampled adjacent
+        # future replay.
+        "pg_one_hop_replay_enabled": True,
+        "alpha_grad_one_hop_replay_enabled": True,
+        "pg_markov_adjacent_replay_enabled": True,
+        "pg_markov_adjacent_replay_sample_prob": 0.125,
+        "pg_replay_window_depth": 1,
+        "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
+        "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
         "reward_dropout_enabled": True,
         "reward_dropout_randomize": True,
         "reward_dropout_ratio_min": 0.1,
         "reward_dropout_ratio_max": 1.0,
         "reward_dropout_impute_zero": True,
+        "terminal_reset_enabled": True,
+        "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 20.0},
+        "terminal_bonus_tanh_c": 10.0,
+        "terminal_bonus_scale_min": 1.0,
+        "terminal_bonus_scale_max": 10.0,
         "batch_parallel_backend": "torch_vectorized",
         "batch_shared_environment": False,
         "batch_vectorized_grouping": "family",
@@ -418,10 +574,15 @@ def get_rlpfn_default_config():
     config['transformer']['classification_task'] = False
     config['transformer']['y_encoder'] = 'linear'
     config['transformer']['x_encoder_type'] = 'split_obs_action'
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2
+    terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
+    phase_obs_extra = 1
+    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + phase_obs_extra + terminal_obs_extra
     config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
+    config['prior']['num_features'] = (
+        int(config['transformer']['x_obs_dim']) + int(config['transformer']['x_action_dim'])
+    )
     config['transformer']['single_eval_causal'] = True
-    config['optimizer']['rl_objective'] = 'policy_gradient'
+    config['optimizer']['rl_objective'] = 'alpha_grad'
     # Policy-gradient rollout chunking over batch columns.
     # None means full-batch rollout chunk (max parallel width).
     config['optimizer']['policy_rollout_chunk_size'] = None
@@ -455,6 +616,12 @@ def get_rlpfn_default_config():
     config['optimizer']['train_gpu_observer_interval_sec'] = 1.0
     config['optimizer']['train_gpu_observer_output_path'] = None
     config['optimizer']['train_gpu_stage_output_path'] = None
+    # Keep a hard fail-fast host-RSS guard on the maintained 1024-batch RL path.
+    # The in-process watchdog is not a kernel-enforced cgroup limit, but it
+    # catches host-memory runaway earlier than per-batch logging.
+    config['optimizer']['train_host_rss_limit_gib'] = 32.0
+    config['optimizer']['train_host_rss_limit_poll_interval_sec'] = 0.02
+    config['optimizer']['train_host_rss_limit_try_rlimit_as'] = False
     config['optimizer']['train_kernel_profiler_enabled'] = False
     config['optimizer']['train_kernel_profiler_output_dir'] = None
     config['optimizer']['train_kernel_profiler_wait_steps'] = 1
@@ -468,19 +635,49 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     config['optimizer']['train_kernel_profiler_export_trace'] = True
     config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
-    # With reentrant rollout checkpoint defaulted on, saved-tensor CPU offload is
-    # not needed by default and can otherwise shift pressure to host RAM.
-    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
+    # Default to policy-only CPU offload: it captures most of the shared
+    # transformer memory reduction while keeping host/RSS and wall-time below
+    # full rollout offload on the maintained risky-load benchmark.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
+    config['optimizer']['pg_saved_tensors_pin_memory'] = False
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 8
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
-    config['optimizer']['pg_tbptt_window'] = 128
+    config['optimizer']['pg_tbptt_window'] = 32
     # Keep one rollout->update cycle per batch by default for throughput-first
     # benchmarking and simpler PG phase attribution.
     config['optimizer']['pg_env_replay_steps'] = 1
     # Keep rollout batch parallel width as large as possible under OOM:
     # shrink TBPTT window first before shrinking rollout chunk.
     config['optimizer']['pg_oom_reduce_tbptt_first'] = True
-    # Allow automatic OOM recovery (TBPTT/chunk shrink) by default.
+    # Fail fast on PG OOM during skyline/perf runs: avoid fallback retries
+    # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
+    config['optimizer']['pg_oom_fail_fast'] = True
+    # Longer TBPTT mainline needs a more conservative default step size.
+    config['optimizer']['learning_rate'] = 4e-4
+    # Current maintained memory-efficiency mainline should benchmark from
+    # physical batch 1024.
+    config['dataloader']['batch_size'] = 64 * 8
+    config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
+    config['prior']['environment']['lipschitz_enforce'] = False
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_lo'] = 0.985
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_hi'] = 1.035
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_lo'] = 4e-3
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_hi'] = 9e-2
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_reward_gate'] = 0.05
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_low_boost_cap'] = 1.5
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_target_std'] = 0.25
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_lo'] = 0.5
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_hi'] = 4.0
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_lo'] = 1e-4
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_hi'] = 3e-2
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_reward_std_gate'] = 0.05
+    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_low_boost_cap'] = 4.0
     return config
 
 

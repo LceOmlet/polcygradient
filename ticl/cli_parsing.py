@@ -1,6 +1,9 @@
 import argparse
 from ticl.config_utils import str2bool
-from ticl.model_configs import get_model_default_config
+from ticl.model_configs import (
+    get_model_default_config,
+    get_rlpfn_per_feature_v25_recommended_overrides,
+)
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
 
 
@@ -12,6 +15,7 @@ class GroupedArgParser(argparse.ArgumentParser):
     # nesting of groups is done by giving them names with dots in them
 
     def parse_known_args(self, args=None, namespace=None):
+        raw_args = list(args if args is not None else [])
         results, args = super().parse_known_args(args=args, namespace=namespace)
         nested_by_groups = argparse.Namespace()
         for group in self._action_groups:
@@ -29,11 +33,92 @@ class GroupedArgParser(argparse.ArgumentParser):
                     parent_namespace = getattr(parent_namespace, part)
                 setattr(parent_namespace, parts[-1], new_subnamespace)
 
+        self._apply_rlpfn_perfeature_v25_preset(nested_by_groups, raw_args)
+        self._refresh_rlpfn_split_dims(nested_by_groups)
         return nested_by_groups, args
+
+    @staticmethod
+    def _refresh_rlpfn_split_dims(args):
+        model_type = getattr(args, "model_type", None)
+        if model_type != "rlpfn":
+            return
+        transformer = getattr(args, "transformer", None)
+        prior = getattr(args, "prior", None)
+        if transformer is None or prior is None:
+            return
+        environment = getattr(prior, "environment", None)
+        if environment is None:
+            return
+        if getattr(transformer, "x_encoder_type", None) != "split_obs_action":
+            return
+        obs_slot_dim = int(getattr(environment, "obs_slot_dim", 400))
+        action_slot_dim = int(getattr(environment, "action_slot_dim", 30))
+        terminal_enabled = bool(getattr(environment, "terminal_reset_enabled", False))
+        x_obs_dim = int(obs_slot_dim) + 3 + (1 if terminal_enabled else 0)
+        x_action_dim = int(action_slot_dim)
+        transformer.x_obs_dim = x_obs_dim
+        transformer.x_action_dim = x_action_dim
+        prior.num_features = x_obs_dim + x_action_dim
+
+    @staticmethod
+    def _apply_rlpfn_perfeature_v25_preset(args, raw_args):
+        model_type = getattr(args, "model_type", None)
+        if model_type != "rlpfn":
+            return
+        transformer = getattr(args, "transformer", None)
+        if transformer is None:
+            return
+        if str(getattr(transformer, "backbone_variant", "standard")).strip().lower() != "per_feature_v25":
+            return
+
+        preset = get_rlpfn_per_feature_v25_recommended_overrides()
+        path_to_flags = {
+            ("transformer", "emsize"): ("--emsize", "-e"),
+            ("transformer", "nlayers"): ("--nlayers", "-N"),
+            ("transformer", "nhead"): ("--nhead",),
+            ("transformer", "nhid_factor"): ("--nhid-factor",),
+            ("transformer", "features_per_group"): ("--features-per-group",),
+            ("transformer", "feature_positional_embedding"): ("--feature-positional-embedding",),
+            ("transformer", "recompute_attn"): ("--recompute-attn",),
+            ("optimizer", "learning_rate"): ("--learning-rate", "-l"),
+            ("optimizer", "pg_tbptt_window"): ("--pg-tbptt-window",),
+            ("dataloader", "batch_size"): ("--batch-size", "-b"),
+            ("prior", "n_samples"): ("--n-samples",),
+        }
+        for path, flags in path_to_flags.items():
+            if _argv_has_flag(raw_args, *flags):
+                continue
+            preset_node = preset
+            for part in path:
+                preset_node = preset_node[part]
+            _namespace_path_set(args, path, preset_node)
+
+class RootArgParser(argparse.ArgumentParser):
+    def parse_known_args(self, args=None, namespace=None):
+        raw_args = list(args if args is not None else [])
+        results, args = super().parse_known_args(args=args, namespace=namespace)
+        GroupedArgParser._apply_rlpfn_perfeature_v25_preset(results, raw_args)
+        GroupedArgParser._refresh_rlpfn_split_dims(results)
+        return results, args
+
+
+def _argv_has_flag(argv, *flags):
+    for token in list(argv or []):
+        for flag in flags:
+            if token == flag or str(token).startswith(f"{flag}="):
+                return True
+    return False
+
+
+def _namespace_path_set(root, path, value):
+    node = root
+    for part in path[:-1]:
+        node = getattr(node, part)
+    setattr(node, path[-1], value)
 
 
 def make_model_level_argparser(description="Train transformer-style model on synthetic data"):
-    parser = argparse.ArgumentParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
+    parser = RootArgParser(description=description, formatter_class=argparse.ArgumentDefaultsHelpFormatter)
     subparsers = parser.add_subparsers(required=True, parser_class=GroupedArgParser,
                                        description="Choose the model type to train.", dest='model_type')
     mothernet_parser = subparsers.add_parser('mothernet', help='Train a mothernet model')
@@ -87,7 +172,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
-    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient'],
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'],
                            help='Training objective for RL-style models.')
     optimizer.add_argument('--policy-rollout-chunk-size', type=int,
                            help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')
@@ -105,10 +190,22 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Allow grad-enabled mutable KV cache during policy-gradient rollout (typically with paged mode). Only active with rollout checkpoint.')
     optimizer.add_argument('--pg-saved-tensors-cpu-offload', type=str2bool,
                            help='Offload autograd saved tensors to CPU during policy-gradient rollout (lower GPU memory, slower).')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-scope', type=str, choices=['all', 'policy'],
+                           help='Scope for saved-tensors CPU offload during policy-gradient rollout: all saved tensors or only policy forward tensors.')
     optimizer.add_argument('--pg-saved-tensors-pin-memory', type=str2bool,
                            help='When CPU-offloading saved tensors, use pinned host memory for faster H2D transfers.')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-auto-disable-when-safe', type=str2bool,
+                           help='When using policy-scope saved-tensors offload, bypass it on CUDA when free memory is safely above the configured threshold and the load stays within the validated safe envelope.')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-auto-min-free-gb', type=float,
+                           help='Minimum currently free GPU memory (GiB) required before policy-scope saved-tensors offload is auto-bypassed.')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-auto-max-batch-size', type=int,
+                           help='Maximum batch size eligible for automatic policy offload bypass.')
+    optimizer.add_argument('--pg-saved-tensors-cpu-offload-auto-max-n-samples', type=int,
+                           help='Maximum n_samples eligible for automatic policy offload bypass.')
     optimizer.add_argument('--pg-oom-debug-raise', type=str2bool,
                            help='When true, re-raise policy-gradient OOM exceptions immediately for full traceback debugging.')
+    optimizer.add_argument('--pg-oom-fail-fast', type=str2bool,
+                           help='When true, disable all policy-gradient OOM fallback (TBPTT/chunk) and fail immediately.')
     optimizer.add_argument('--pg-kv-cache-mode', type=str, choices=['auto', 'immutable', 'static', 'paged'],
                            help='KV-cache mode used by policy forward_step during policy-gradient rollout.')
     optimizer.add_argument('--pg-kv-cache-page-size', type=int,
@@ -161,6 +258,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Optional JSONL output path for raw GPU observer samples.')
     optimizer.add_argument('--train-gpu-stage-output-path', type=str,
                            help='Optional JSONL output path for stage-window GPU observer records.')
+    optimizer.add_argument('--train-host-rss-limit-gib', type=float,
+                           help='Hard fail-fast host RSS limit for the training process in GiB. <=0 disables the watchdog.')
+    optimizer.add_argument('--train-host-rss-limit-poll-interval-sec', type=float,
+                           help='Sampling period in seconds for the host RSS watchdog.')
+    optimizer.add_argument('--train-host-rss-limit-try-rlimit-as', type=str2bool,
+                           help='Also try to set RLIMIT_AS to the host RSS limit. More kernel-enforced, but may trip early on virtual-memory-heavy workloads.')
     optimizer.add_argument('--train-kernel-profiler-enabled', type=str2bool,
                            help='Enable torch.profiler kernel-level tracing during training.')
     optimizer.add_argument('--train-kernel-profiler-output-dir', type=str,
@@ -187,6 +290,10 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Export tensorboard trace files for kernel profiler. Disable for low-overhead summary-only profiling.')
     optimizer.add_argument('--train-kernel-profiler-summary-top-k', type=int,
                            help='Number of top operators to keep in each kernel-profiler summary record.')
+    optimizer.add_argument('--pg-phase-log-every-batches', type=int,
+                           help='Emit policy-gradient phase timing/stat logs every N batches.')
+    optimizer.add_argument('--pg-phase-log-file', type=str,
+                           help='Optional file path that receives pg-phase logs in addition to stdout.')
     optimizer.add_argument('-A', '--adaptive-batch-size', help='Wether to progressively increase effective batch size.',
                            type=str2bool)
     optimizer.add_argument('-w', '--weight-decay', type=float, help='Weight decay for AdamW.')
@@ -218,11 +325,21 @@ def argparser_from_config(parser, description="Train Mothernet"):
         transformer = parser.add_argument_group('transformer')
         transformer.add_argument('-e', '--emsize', type=int, help='embedding size')
         transformer.add_argument('-N', '--nlayers', type=int, help='number of transformer layers')
+        transformer.add_argument('--nhead', type=int, help='number of attention heads')
+        transformer.add_argument('--nhid-factor', type=int, help='feedforward expansion factor relative to emsize')
         transformer.add_argument('--init-method', help='Weight initialization method.')
         transformer.add_argument('--y-encoder', help='Encoder for labels. "linear", "onehot" or None.')
         transformer.add_argument('--tabpfn-zero-weights', help='Whether to use zeroing of weights from tabpfn code.', type=str2bool)
         transformer.add_argument('--pre-norm', action='store_true')
         transformer.add_argument('--classification-task', type=str2bool, help='Whether to use classification or regression.')
+        transformer.add_argument('--backbone-variant', choices=['standard', 'per_feature_v25'],
+                                 help='Backbone variant for transformer-style models.')
+        transformer.add_argument('--features-per-group', type=int,
+                                 help='Feature-group width for per_feature_v25 backbone.')
+        transformer.add_argument('--feature-positional-embedding', type=str2bool,
+                                 help='Enable learned/group positional embeddings in per_feature_v25 backbone.')
+        transformer.add_argument('--recompute-attn', type=str2bool,
+                                 help='Enable activation recomputation inside transformer blocks.')
         transformer.add_argument('--x-encoder-type', choices=['single', 'split_obs_action'],
                                  help='X encoder layout: single head or split obs/action heads.')
         transformer.add_argument('--x-obs-dim', type=int, help='Input width for obs/reward/mask head when using split encoder.')
@@ -345,6 +462,124 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
     environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')
+    environment_prior.add_argument('--first-policy-gradient-state-grad-clip-norm', type=float,
+                                   help='Per-sample global-norm clip applied to environment state adjoints for first_policy_gradient/alpha_grad.')
+    environment_prior.add_argument('--first-policy-gradient-action-grad-clip-value', type=float,
+                                   help='Elementwise absolute clip applied to environment action adjoints for first_policy_gradient/alpha_grad.')
+    environment_prior.add_argument('--first-policy-gradient-action-grad-clip-norm', type=float,
+                                   help='Per-sample global-norm clip applied to environment action adjoints for first_policy_gradient/alpha_grad.')
+    environment_prior.add_argument('--alpha-grad-local-coordinate-enabled', type=str2bool,
+                                   help='If true, alpha_grad computes alpha in per-group local coordinates instead of coarse dense coordinates.')
+    environment_prior.add_argument('--alpha-grad-unit-grad-enabled', type=str2bool,
+                                   help='If true, alpha_grad computes alpha from unit-normalized g0/g1 blocks while still mixing raw gradients.')
+    environment_prior.add_argument('--alpha-grad-unit-grad-delta', type=float,
+                                   help='Positive delta added to the unit-gradient normalization denominator used by alpha_grad.')
+    environment_prior.add_argument('--pg-one-hop-replay-enabled', type=str2bool,
+                                   help='If true, TBPTT replays one-hop boundary cotangents into the previous window for supported stochastic PG objectives.')
+    environment_prior.add_argument('--alpha-grad-one-hop-replay-enabled', type=str2bool,
+                                   help='Backward-compatible alias for the one-hop TBPTT replay toggle.')
+    environment_prior.add_argument('--pg-markov-adjacent-replay-enabled', type=str2bool,
+                                   help='If true, supported one-hop TBPTT windows may also replay future-window cotangents across sampled exploit-window boundaries.')
+    environment_prior.add_argument('--pg-markov-adjacent-replay-sample-prob', type=float,
+                                   help='Bernoulli sample probability for exploit-window adjacent replay when pg-markov-adjacent-replay-enabled is true.')
+    environment_prior.add_argument('--pg-replay-window-depth', type=int,
+                                   help='Compatibility knob for grafted TBPTT replay depth. The safe high-throughput runner currently clamps this to 1 (one-hop only).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v2 (two-sided state-gain corridor regularization).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-lambda', type=float,
+                                   help='Regularization weight for anti-explosion&vanishing-v2.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-gain-lo', type=float,
+                                   help='Lower gain corridor bound for anti-explosion&vanishing-v2.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-gain-hi', type=float,
+                                   help='Upper gain corridor bound for anti-explosion&vanishing-v2.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-huber-delta', type=float,
+                                   help='Huber delta for corridor-violation penalty in anti-explosion&vanishing-v2.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v2.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v2-detach-reference', type=str2bool,
+                                   help='Detach previous-step increment norm in anti-explosion&vanishing-v2 gain computation.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v3 (drift+tail log-gain regularization).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-lambda-drift', type=float,
+                                   help='Drift regularization weight for anti-explosion&vanishing-v3.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-lambda-tail', type=float,
+                                   help='Tail regularization weight for anti-explosion&vanishing-v3.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-gain-lo', type=float,
+                                   help='Lower gain corridor bound for anti-explosion&vanishing-v3.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-gain-hi', type=float,
+                                   help='Upper gain corridor bound for anti-explosion&vanishing-v3.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-tail-tau', type=float,
+                                   help='Softplus temperature for anti-explosion&vanishing-v3 tail penalty.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v3.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v3-detach-reference', type=str2bool,
+                                   help='Detach previous-step increment norm in anti-explosion&vanishing-v3 gain computation.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v4 (controlled highway update + gain regularization).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-lambda-drift', type=float,
+                                   help='Drift regularization weight for anti-explosion&vanishing-v4.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-lambda-tail', type=float,
+                                   help='Tail regularization weight for anti-explosion&vanishing-v4.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-gain-lo', type=float,
+                                   help='Lower gain corridor bound for anti-explosion&vanishing-v4.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-gain-hi', type=float,
+                                   help='Upper gain corridor bound for anti-explosion&vanishing-v4.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-tail-tau', type=float,
+                                   help='Softplus temperature for anti-explosion&vanishing-v4 tail penalty.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v4.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-detach-reference', type=str2bool,
+                                   help='Detach previous-step update norm in anti-explosion&vanishing-v4 gain computation.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-highway-ratio', type=float,
+                                   help='Fraction of state dims used by anti-explosion&vanishing-v4 highway update.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-update-scale', type=float,
+                                   help='Residual update scale on the v4 highway subspace.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v4-update-clip', type=float,
+                                   help='Absolute clip bound for v4 highway residual update (<=0 disables clipping).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v5 (detached reward-signal thermostat).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-target-std', type=float,
+                                   help='Target reward std used by anti-explosion&vanishing-v5 loss scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-scale-lo', type=float,
+                                   help='Lower bound of detached loss scale in anti-explosion&vanishing-v5.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-scale-hi', type=float,
+                                   help='Upper bound of detached loss scale in anti-explosion&vanishing-v5.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v5 std reference.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-detach-reference', type=str2bool,
+                                   help='Detach reward std reference in anti-explosion&vanishing-v5 scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-enabled', type=str2bool,
+                                   help='Enable anti-explosion&vanishing-v5_next (full-state corridor + detached thermostat).')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-gain-lo', type=float,
+                                   help='Lower directional gain corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-gain-hi', type=float,
+                                   help='Upper directional gain corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-rms-lo', type=float,
+                                   help='Lower RMS corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-rms-hi', type=float,
+                                   help='Upper RMS corridor for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-reward-gate', type=float,
+                                   help='Reward-magnitude gate for low-side anti-explosion&vanishing-v5_next state protection.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-state-low-boost-cap', type=float,
+                                   help='Maximum low-side boost for anti-explosion&vanishing-v5_next state updates.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-target-std', type=float,
+                                   help='Target reward std used by anti-explosion&vanishing-v5_next loss scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-scale-lo', type=float,
+                                   help='Lower bound of detached loss scale in anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-loss-scale-hi', type=float,
+                                   help='Upper bound of detached loss scale in anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-grad-rms-lo', type=float,
+                                   help='Lower train-step gradient RMS corridor for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-grad-rms-hi', type=float,
+                                   help='Upper train-step gradient RMS corridor for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-reward-std-gate', type=float,
+                                   help='Reward-std gate for low-side anti-explosion&vanishing-v5_next train-step protection.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-step-low-boost-cap', type=float,
+                                   help='Maximum low-side boost for anti-explosion&vanishing-v5_next train-step scaling.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-eps', type=float,
+                                   help='Numerical epsilon for anti-explosion&vanishing-v5_next.')
+    environment_prior.add_argument('--anti-explosion-vanishing-v5-next-detach-reference', type=str2bool,
+                                   help='Detach corridor references in anti-explosion&vanishing-v5_next.')
     environment_prior.add_argument('--lipschitz-enforce', type=str2bool,
                                    help='Enable Lipschitz safeguards for sampled environment generators.')
     environment_prior.add_argument('--lipschitz-weight-fro-norm-max', type=float,
@@ -367,6 +602,16 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-dropout-ratio-min', type=float, help='Minimum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-ratio-max', type=float, help='Maximum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-impute-zero', type=str2bool, help='Use zero imputation for dropped rewards.')
+    environment_prior.add_argument('--terminal-reset-enabled', type=str2bool,
+                                   help='Enable terminal bonus/reset dynamics driven by the extra terminal signal state.')
+    environment_prior.add_argument('--terminal-reset-count-target', type=float,
+                                   help='Expected number of terminal resets over one rollout horizon.')
+    environment_prior.add_argument('--terminal-bonus-tanh-c', type=float,
+                                   help='Tanh temperature used to map terminal signal into terminal bonus.')
+    environment_prior.add_argument('--terminal-bonus-scale-min', type=float,
+                                   help='Minimum sampled terminal bonus scale.')
+    environment_prior.add_argument('--terminal-bonus-scale-max', type=float,
+                                   help='Maximum sampled terminal bonus scale.')
     environment_prior.add_argument('--batch-parallel-workers', type=int, help='Parallel workers for independent per-column rollout in get_batch.')
     environment_prior.add_argument('--batch-parallel-backend', type=str, choices=['python_thread', 'torch_vectorized'],
                                    help='Backend for batch generation parallelism in environment prior.')
@@ -411,6 +656,10 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--rl-validate-max-steps', type=int, help='Max steps per episode during rlpfn validation.')
     orchestration.add_argument('--rl-validate-action-candidates', type=int, help='Number of sampled continuous actions per step.')
     orchestration.add_argument('--rl-validate-seed', type=int, help='Base random seed for rlpfn validation.')
+    orchestration.add_argument('--rl-validate-context-lower-bound', type=int,
+                               help='Switch rlpfn validation from explore (E=0) to exploit (E=1) once context_len + mean_explore_rollout_len exceeds this bound.')
+    orchestration.add_argument('--rl-validate-max-parallel-columns', type=int,
+                               help='Upper bound on validation candidate columns scored together across envs; keeps GPU memory bounded while improving validation parallelism.')
 
     if model_type == 'rlpfn':
         orchestration.set_defaults(
@@ -420,6 +669,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
+            rl_validate_max_parallel_columns=96,
         )
     else:
         orchestration.set_defaults(
@@ -429,6 +680,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_max_steps=1000,
             rl_validate_action_candidates=16,
             rl_validate_seed=1,
+            rl_validate_context_lower_bound=2048,
+            rl_validate_max_parallel_columns=96,
         )
 
     # orchestration options are not part of the default config

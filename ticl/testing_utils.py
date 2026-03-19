@@ -3,6 +3,8 @@ from sklearn.model_selection import train_test_split
 from sklearn.compose import make_column_transformer
 from sklearn.preprocessing import OrdinalEncoder
 import numpy as np
+import random
+import torch
 
 
 def count_parameters(model):
@@ -26,6 +28,9 @@ def get_model_path(results):
 
 def check_predict_iris(clf, check_accuracy=False):
     # smoke test for predict, models aren't trained enough to check for accuracy
+    random.seed(42)
+    np.random.seed(42)
+    torch.manual_seed(42)
     iris = load_iris()
     X_train, X_test, y_train, y_test = train_test_split(iris.data, iris.target, random_state=42)
     clf.fit(X_train, y_train)

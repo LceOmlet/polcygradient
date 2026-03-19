@@ -1,6 +1,7 @@
 import math
 import os
 import time
+from contextlib import contextmanager, nullcontext
 from functools import partial
 from typing import Optional
 
@@ -33,8 +34,163 @@ def _is_torch_compiling():
     return False
 
 
+def _tensor_storage_key(tensor):
+    if not torch.is_tensor(tensor):
+        return None
+    try:
+        storage = tensor.untyped_storage()
+    except Exception:
+        try:
+            storage = tensor.storage()
+        except Exception:
+            return None
+    try:
+        data_ptr = int(storage.data_ptr())
+    except Exception:
+        return None
+    if data_ptr == 0:
+        return None
+    device = getattr(tensor, "device", None)
+    device_type = getattr(device, "type", "unknown")
+    device_index = getattr(device, "index", None)
+    return (str(device_type), int(-1 if device_index is None else device_index), data_ptr)
+
+
+def _tensor_storage_nbytes(tensor):
+    if not torch.is_tensor(tensor):
+        return 0
+    try:
+        return int(tensor.untyped_storage().nbytes())
+    except Exception:
+        try:
+            return int(tensor.storage().nbytes())
+        except Exception:
+            return int(tensor.numel()) * int(tensor.element_size())
+
+
+def _tensor_nbytes(tensor):
+    if not torch.is_tensor(tensor):
+        return 0
+    try:
+        return int(tensor.numel()) * int(tensor.element_size())
+    except Exception:
+        return int(max(0, _tensor_storage_nbytes(tensor)))
+
+
+def _module_storage_keys(module):
+    keys = set()
+    try:
+        for tensor in list(module.parameters()) + list(module.buffers()):
+            key = _tensor_storage_key(tensor)
+            if key is not None:
+                keys.add(key)
+    except Exception:
+        return set()
+    return keys
+
+
+@contextmanager
+def _saved_tensors_profile_scope(*, module_storage_keys=None, enabled=False, tracked_tensors=None):
+    if not bool(enabled):
+        yield None
+        return
+    graph_mod = getattr(torch.autograd, "graph", None)
+    if graph_mod is None or not hasattr(graph_mod, "saved_tensors_hooks"):
+        yield None
+        return
+    stats = {
+        "nonparam_raw_bytes": 0,
+        "nonparam_unique_storage_bytes": 0,
+        "tracked_nonparam_raw_bytes": {},
+        "tracked_nonparam_unique_storage_bytes": {},
+    }
+    seen_nonparam_storage = set()
+    module_storage_keys = set(module_storage_keys or ())
+    tracked_storage_keys = {}
+    for name, tensor in dict(tracked_tensors or {}).items():
+        key = _tensor_storage_key(tensor)
+        if key is not None:
+            tracked_storage_keys[str(name)] = key
+    tracked_seen_storage = {name: set() for name in tracked_storage_keys}
+
+    def _pack(x):
+        if torch.is_tensor(x):
+            storage_key = _tensor_storage_key(x)
+            if not bool(storage_key is not None and storage_key in module_storage_keys):
+                tracked_name = "other"
+                for name, key in tracked_storage_keys.items():
+                    if storage_key is not None and storage_key == key:
+                        tracked_name = str(name)
+                        break
+                nbytes = int(max(0, _tensor_nbytes(x)))
+                storage_nbytes = int(max(0, _tensor_storage_nbytes(x)))
+                stats["nonparam_raw_bytes"] += int(max(0, _tensor_nbytes(x)))
+                if storage_key is None or storage_key not in seen_nonparam_storage:
+                    if storage_key is not None:
+                        seen_nonparam_storage.add(storage_key)
+                    stats["nonparam_unique_storage_bytes"] += int(max(0, _tensor_storage_nbytes(x)))
+                stats["tracked_nonparam_raw_bytes"][tracked_name] = int(
+                    stats["tracked_nonparam_raw_bytes"].get(tracked_name, 0) or 0
+                ) + nbytes
+                seen_for_name = tracked_seen_storage.setdefault(tracked_name, set())
+                if storage_key is None or storage_key not in seen_for_name:
+                    if storage_key is not None:
+                        seen_for_name.add(storage_key)
+                    stats["tracked_nonparam_unique_storage_bytes"][tracked_name] = int(
+                        stats["tracked_nonparam_unique_storage_bytes"].get(tracked_name, 0) or 0
+                    ) + storage_nbytes
+        return x
+
+    def _unpack(x):
+        return x
+
+    with graph_mod.saved_tensors_hooks(_pack, _unpack):
+        yield stats
+
+
 _CAT_FUSION_ENV = str(os.environ.get("TICL_POLICY_CAT_FUSION", "1")).strip().lower()
 _CAT_FUSION_ENABLED = _CAT_FUSION_ENV not in {"0", "false", "no", "off"}
+_TAIL_FREEZE_CLONE_APPEND_ENV = str(
+    os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND", "0")
+).strip().lower()
+_TAIL_FREEZE_CLONE_APPEND_ENABLED = _TAIL_FREEZE_CLONE_APPEND_ENV not in {"0", "false", "no", "off"}
+_TAIL_FREEZE_CLONE_APPEND_GUARD_ENV = str(
+    os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_GUARD", "1")
+).strip().lower()
+_TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED = _TAIL_FREEZE_CLONE_APPEND_GUARD_ENV not in {"0", "false", "no", "off"}
+try:
+    _TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB = float(
+        os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB", "8")
+    )
+except Exception:
+    _TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB = 8.0
+try:
+    _TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC = float(
+        os.environ.get("TICL_POLICY_TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC", "0.82")
+    )
+except Exception:
+    _TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC = 0.82
+
+
+def _tail_freeze_clone_append_allowed(device: torch.device) -> bool:
+    if not _TAIL_FREEZE_CLONE_APPEND_ENABLED:
+        return False
+    if (not _TAIL_FREEZE_CLONE_APPEND_GUARD_ENABLED) or (device.type != "cuda") or (not torch.cuda.is_available()):
+        return True
+    try:
+        device_index = device.index if device.index is not None else torch.cuda.current_device()
+        free_bytes, total_bytes = torch.cuda.mem_get_info(device_index)
+        reserved_bytes = torch.cuda.memory_reserved(device_index)
+        free_gib = float(free_bytes) / float(1024 ** 3)
+        reserved_frac = (float(reserved_bytes) / float(total_bytes)) if int(total_bytes) > 0 else 0.0
+        if free_gib < float(_TAIL_FREEZE_CLONE_APPEND_MIN_FREE_GB):
+            return False
+        if reserved_frac > float(_TAIL_FREEZE_CLONE_APPEND_MAX_RESERVED_FRAC):
+            return False
+    except Exception:
+        # Guard must never break the hot path; fail open.
+        return True
+    return True
 
 
 class BiAttentionEncoderLayer(Module):
@@ -152,6 +308,9 @@ class TransformerEncoderLayer(Module):
         self.dropout2 = Dropout(dropout)
         self.pre_norm = pre_norm
         self.recompute_attn = recompute_attn
+        self.recompute_attn_use_reentrant = True
+        paged_recompute_env = str(os.environ.get("TICL_POLICY_PAGED_RECOMPUTE_ATTN", "0")).strip().lower()
+        self.paged_recompute_attn = paged_recompute_env in {"1", "true", "yes", "on"}
         self.single_eval_causal = bool(single_eval_causal)
         paged_mode_env = str(os.environ.get("TICL_POLICY_PAGED_ATTN_TRAIN_MODE", "auto")).strip().lower()
         if paged_mode_env not in {"auto", "dense", "flash_merge", "flash_prefix"}:
@@ -183,30 +342,173 @@ class TransformerEncoderLayer(Module):
         self.force_flash_single_page = force_flash_single_page_env in {"1", "true", "yes", "on"}
         flash_prefix_async_env = str(os.environ.get("TICL_POLICY_FLASH_PREFIX_ASYNC", "1")).strip().lower()
         self.flash_prefix_async = flash_prefix_async_env in {"1", "true", "yes", "on"}
+        prefix_streaming_train_env = str(
+            os.environ.get("TICL_POLICY_PREFIX_STREAMING_TRAIN", "0")
+        ).strip().lower()
+        self.prefix_streaming_train = prefix_streaming_train_env in {"1", "true", "yes", "on"}
+        flash_prefix_zero_fastpath_env = str(
+            os.environ.get("TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH", "1")
+        ).strip().lower()
+        self.flash_prefix_zero_fastpath = flash_prefix_zero_fastpath_env in {"1", "true", "yes", "on"}
+        try:
+            flash_prefix_tail_dense_tokens_env = int(
+                os.environ.get("TICL_POLICY_FLASH_PREFIX_TAIL_DENSE_MAX_TOKENS", "0")
+            )
+        except Exception:
+            flash_prefix_tail_dense_tokens_env = 0
+        # When >0 and prefix exists, route small mutable tail to one dense SDPA
+        # to cut flash-prefix dual-dispatch launch overhead.
+        self.flash_prefix_tail_dense_max_tokens = int(max(0, flash_prefix_tail_dense_tokens_env))
+        inplace_clone_prefix_env = str(
+            os.environ.get("TICL_POLICY_INPLACE_CLONE_PREFIX", "0")
+        ).strip().lower()
+        self.inplace_clone_prefix = inplace_clone_prefix_env in {"1", "true", "yes", "on"}
+        try:
+            inplace_page_size_env = int(os.environ.get("TICL_POLICY_INPLACE_PAGED_PAGE_SIZE", "0"))
+        except Exception:
+            inplace_page_size_env = 0
+        self.inplace_paged_page_size = int(max(0, inplace_page_size_env))
+        try:
+            paged_cow_grow_max_tokens_env = int(
+                os.environ.get("TICL_POLICY_PAGED_COW_GROW_MAX_TOKENS", "0")
+            )
+        except Exception:
+            paged_cow_grow_max_tokens_env = 0
+        self.paged_cow_grow_max_tokens = int(max(0, paged_cow_grow_max_tokens_env))
         self._flash_prefix_streams = {}
-        step_profile_flag = str(os.environ.get("TICL_TRANSFORMER_LAYER_STEP_PROFILE", "")).strip().lower()
+        step_profile_flag = str(
+            os.environ.get(
+                "TICL_TRANSFORMER_LAYER_STEP_PROFILE",
+                os.environ.get("TICL_POLICY_STEP_PROFILE", ""),
+            )
+        ).strip().lower()
         self.layer_step_profile_enabled = step_profile_flag in {"1", "true", "yes", "on"}
         finalize_2d_flag = str(os.environ.get("TICL_POLICY_FINALIZE_2D_FASTPATH", "1")).strip().lower()
         self.finalize_2d_fastpath = finalize_2d_flag not in {"0", "false", "no", "off"}
+        finalize_2d_default_gelu_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH", "0")
+        ).strip().lower()
+        self.finalize_2d_zero_dropout_postnorm_gelu_fastpath = finalize_2d_default_gelu_flag not in {
+            "0",
+            "false",
+            "no",
+            "off",
+        }
+        finalize_compile_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE", "0")
+        ).strip().lower()
+        self.finalize_torch_compile = finalize_compile_flag in {"1", "true", "yes", "on"}
+        finalize_compile_backend = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_BACKEND", "inductor")
+        ).strip()
+        self.finalize_torch_compile_backend = finalize_compile_backend or "inductor"
+        finalize_compile_mode = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_MODE", "reduce-overhead")
+        ).strip()
+        self.finalize_torch_compile_mode = finalize_compile_mode or "reduce-overhead"
+        finalize_compile_fullgraph_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_FULLGRAPH", "0")
+        ).strip().lower()
+        self.finalize_torch_compile_fullgraph = finalize_compile_fullgraph_flag in {"1", "true", "yes", "on"}
+        finalize_compile_dynamic_flag = str(
+            os.environ.get("TICL_POLICY_FINALIZE_TORCH_COMPILE_DYNAMIC", "0")
+        ).strip().lower()
+        self.finalize_torch_compile_dynamic = finalize_compile_dynamic_flag in {"1", "true", "yes", "on"}
+        self._finalize_2d_compiled = None
+        self._finalize_2d_compiled_key = None
+        self._finalize_2d_compile_failed = False
         cache_reuse_flag = str(os.environ.get("TICL_POLICY_CACHE_CONTAINER_REUSE", "1")).strip().lower()
         self.cache_container_reuse = cache_reuse_flag not in {"0", "false", "no", "off"}
+        step_proj_2d_flag = str(os.environ.get("TICL_POLICY_STEP_PROJ_2D", "1")).strip().lower()
+        self.step_proj_2d_fastpath = step_proj_2d_flag not in {"0", "false", "no", "off"}
+        self._profile_param_storage_keys = _module_storage_keys(self)
         self._layer_step_profile_stats = {
             "calls": 0,
             "proj_wall_s": 0.0,
             "cache_wall_s": 0.0,
+            "cache_append_wall_s": 0.0,
+            "paged_grow_calls": 0,
+            "paged_grow_prev_total_bytes_last": 0,
+            "paged_grow_prev_total_bytes_max": 0,
+            "paged_grow_new_total_bytes_last": 0,
+            "paged_grow_new_total_bytes_max": 0,
+            "paged_grow_out_total_bytes_last": 0,
+            "paged_grow_out_total_bytes_max": 0,
+            "paged_grow_working_set_total_bytes_last": 0,
+            "paged_grow_working_set_total_bytes_max": 0,
+            "paged_grow_k_out_bytes_last": 0,
+            "paged_grow_k_out_bytes_max": 0,
+            "paged_grow_v_out_bytes_last": 0,
+            "paged_grow_v_out_bytes_max": 0,
+            "cache_prefix_maint_wall_s": 0.0,
             "attnff_wall_s": 0.0,
+            "attnff_saved_nonparam_raw_bytes_last": 0,
+            "attnff_saved_nonparam_unique_storage_bytes_last": 0,
             "attn_core_wall_s": 0.0,
+            "paged_view_build_wall_s": 0.0,
+            "paged_clone_wall_s": 0.0,
+            "paged_dispatch_single_page_wall_s": 0.0,
+            "paged_dispatch_flash_prefix_wall_s": 0.0,
+            "paged_dispatch_flash_merge_wall_s": 0.0,
+            "paged_dispatch_dense_wall_s": 0.0,
             "finalize_wall_s": 0.0,
+            "finalize_saved_nonparam_raw_bytes_last": 0,
+            "finalize_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prepare_prefix_wall_s": 0.0,
+            "flash_prefix_prefix_core_wall_s": 0.0,
+            "flash_prefix_tail_core_wall_s": 0.0,
+            "flash_prefix_merge_wall_s": 0.0,
+            "flash_prefix_wait_stream_wall_s": 0.0,
+            "flash_prefix_prefix_cast_norm_wall_s": 0.0,
+            "flash_prefix_tail_cast_norm_wall_s": 0.0,
+            "flash_prefix_merge_logaddexp_wall_s": 0.0,
+            "flash_prefix_merge_scale_wall_s": 0.0,
+            "flash_prefix_merge_blend_wall_s": 0.0,
+            "flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_merge_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last": 0,
+            "flash_merge_chunk_prep_wall_s": 0.0,
+            "flash_merge_chunk_core_wall_s": 0.0,
+            "flash_merge_lse_merge_wall_s": 0.0,
+            "flash_merge_chunk_count_sum": 0,
             "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_attn_outproj_linear_wall_s": 0.0,
+            "finalize_attn_outproj_norm_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_ffn_linear1_act_wall_s": 0.0,
+            "finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "finalize_ffn_linear2_wall_s": 0.0,
+            "finalize_ffn_residual_norm_wall_s": 0.0,
+            "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
+            "paged_path_flash_prefix_zero_fastpath": 0,
             "paged_path_flash_merge": 0,
             "paged_path_dense": 0,
+            "paged_page_count_sum": 0,
+            "paged_valid_len_sum": 0,
+            "paged_last_page_tokens_sum": 0,
+            "paged_prefix_len_sum": 0,
+            "flash_prefix_valid_tokens_sum": 0,
+            "flash_prefix_prefix_tokens_sum": 0,
+            "flash_prefix_tail_tokens_sum": 0,
+            "dense_valid_tokens_sum": 0,
+            "dense_prefix_tokens_sum": 0,
+            "dense_tail_tokens_sum": 0,
             "total_wall_s": 0.0,
         }
 
         self.activation = _get_activation_fn(activation)
+        activation_name = str(activation).strip().lower() if isinstance(activation, str) else ""
+        self.activation_is_gelu = (activation_name == "gelu") or (self.activation is F.gelu)
 
     def consume_forward_step_profile(self):
         if not bool(self.layer_step_profile_enabled):
@@ -216,15 +518,83 @@ class TransformerEncoderLayer(Module):
             "calls": 0,
             "proj_wall_s": 0.0,
             "cache_wall_s": 0.0,
+            "cache_append_wall_s": 0.0,
+            "paged_grow_calls": 0,
+            "paged_grow_prev_total_bytes_last": 0,
+            "paged_grow_prev_total_bytes_max": 0,
+            "paged_grow_new_total_bytes_last": 0,
+            "paged_grow_new_total_bytes_max": 0,
+            "paged_grow_out_total_bytes_last": 0,
+            "paged_grow_out_total_bytes_max": 0,
+            "paged_grow_working_set_total_bytes_last": 0,
+            "paged_grow_working_set_total_bytes_max": 0,
+            "paged_grow_k_out_bytes_last": 0,
+            "paged_grow_k_out_bytes_max": 0,
+            "paged_grow_v_out_bytes_last": 0,
+            "paged_grow_v_out_bytes_max": 0,
+            "cache_prefix_maint_wall_s": 0.0,
             "attnff_wall_s": 0.0,
+            "attnff_saved_nonparam_raw_bytes_last": 0,
+            "attnff_saved_nonparam_unique_storage_bytes_last": 0,
             "attn_core_wall_s": 0.0,
+            "paged_view_build_wall_s": 0.0,
+            "paged_clone_wall_s": 0.0,
+            "paged_dispatch_single_page_wall_s": 0.0,
+            "paged_dispatch_flash_prefix_wall_s": 0.0,
+            "paged_dispatch_flash_merge_wall_s": 0.0,
+            "paged_dispatch_dense_wall_s": 0.0,
             "finalize_wall_s": 0.0,
+            "finalize_saved_nonparam_raw_bytes_last": 0,
+            "finalize_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prepare_prefix_wall_s": 0.0,
+            "flash_prefix_prefix_core_wall_s": 0.0,
+            "flash_prefix_tail_core_wall_s": 0.0,
+            "flash_prefix_merge_wall_s": 0.0,
+            "flash_prefix_wait_stream_wall_s": 0.0,
+            "flash_prefix_prefix_cast_norm_wall_s": 0.0,
+            "flash_prefix_tail_cast_norm_wall_s": 0.0,
+            "flash_prefix_merge_logaddexp_wall_s": 0.0,
+            "flash_prefix_merge_scale_wall_s": 0.0,
+            "flash_prefix_merge_blend_wall_s": 0.0,
+            "flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_merge_saved_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last": 0,
+            "flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last": 0,
+            "flash_merge_chunk_prep_wall_s": 0.0,
+            "flash_merge_chunk_core_wall_s": 0.0,
+            "flash_merge_lse_merge_wall_s": 0.0,
+            "flash_merge_chunk_count_sum": 0,
             "finalize_attn_outproj_wall_s": 0.0,
+            "finalize_attn_outproj_linear_wall_s": 0.0,
+            "finalize_attn_outproj_norm_wall_s": 0.0,
             "finalize_ffn_wall_s": 0.0,
+            "finalize_ffn_linear1_act_wall_s": 0.0,
+            "finalize_ffn_linear2_residual_norm_wall_s": 0.0,
+            "finalize_ffn_linear2_wall_s": 0.0,
+            "finalize_ffn_residual_norm_wall_s": 0.0,
+            "finalize_compiled_wall_s": 0.0,
             "paged_path_single_page": 0,
             "paged_path_flash_prefix": 0,
+            "paged_path_flash_prefix_zero_fastpath": 0,
             "paged_path_flash_merge": 0,
             "paged_path_dense": 0,
+            "paged_page_count_sum": 0,
+            "paged_valid_len_sum": 0,
+            "paged_last_page_tokens_sum": 0,
+            "paged_prefix_len_sum": 0,
+            "flash_prefix_valid_tokens_sum": 0,
+            "flash_prefix_prefix_tokens_sum": 0,
+            "flash_prefix_tail_tokens_sum": 0,
+            "dense_valid_tokens_sum": 0,
+            "dense_prefix_tokens_sum": 0,
+            "dense_tail_tokens_sum": 0,
             "total_wall_s": 0.0,
         }
         return stats
@@ -271,30 +641,73 @@ class TransformerEncoderLayer(Module):
         bsz, n_heads, seq_len, head_dim = x_bhld.shape
         return x_bhld.transpose(1, 2).contiguous().view(bsz, seq_len, n_heads * head_dim)
 
-    def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
-        profile_enabled = self._step_profile_enabled_now()
-        outproj_t0 = time.perf_counter() if profile_enabled else None
-        input_was_3d = src_step.ndim == 3
-        if input_was_3d:
-            src_step_2d = src_step.squeeze(0)
-            src_step_3d = src_step
-        else:
-            src_step_2d = src_step
-            src_step_3d = src_step.unsqueeze(0)
-        use_2d_fastpath = bool(self.finalize_2d_fastpath) and int(attn_bhld.shape[2]) == 1
-        if use_2d_fastpath:
-            # forward_step hot path uses single-token query (L=1); keep
-            # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
-            attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
-            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)  # (B, E)
-            if self.training and float(self.dropout1.p) > 0.0:
-                attn_bld = F.dropout(attn_bld, p=float(self.dropout1.p), training=True)
-            src = src_step_2d + attn_bld  # (B, E)
-        else:
-            attn_bld = self._merge_heads(attn_bhld)
-            attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
-            src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
-            src = src_step_3d + self.dropout1(src2)
+    def finalize_compile_active(self):
+        return bool(self.finalize_torch_compile) and callable(getattr(torch, "compile", None))
+
+    def _finalize_2d_zero_dropout_postnorm_gelu_active(self):
+        return (
+            bool(self.finalize_2d_zero_dropout_postnorm_gelu_fastpath)
+            and (not self.pre_norm)
+            and bool(self.activation_is_gelu)
+            and float(self.dropout1.p) <= 0.0
+            and float(self.dropout.p) <= 0.0
+            and float(self.dropout2.p) <= 0.0
+        )
+
+    def _resolve_finalize_2d_callable(self):
+        eager_fn = self._finalize_forward_step_2d_eager
+        eager_key = "generic"
+        if self._finalize_2d_zero_dropout_postnorm_gelu_active():
+            eager_fn = self._finalize_forward_step_2d_zero_dropout_postnorm_gelu_eager
+            eager_key = "zero_dropout_postnorm_gelu"
+        if (not self.finalize_compile_active()) or self._finalize_2d_compile_failed or _is_torch_compiling():
+            return eager_fn, False
+        compiled_fn = self._finalize_2d_compiled
+        if (compiled_fn is None) or (self._finalize_2d_compiled_key != eager_key):
+            try:
+                compiled_fn = torch.compile(
+                    eager_fn,
+                    backend=str(self.finalize_torch_compile_backend),
+                    mode=str(self.finalize_torch_compile_mode),
+                    fullgraph=bool(self.finalize_torch_compile_fullgraph),
+                    dynamic=bool(self.finalize_torch_compile_dynamic),
+                )
+            except Exception:
+                self._finalize_2d_compile_failed = True
+                compiled_fn = None
+            self._finalize_2d_compiled = compiled_fn
+            self._finalize_2d_compiled_key = eager_key if compiled_fn is not None else None
+        if compiled_fn is None:
+            return eager_fn, False
+        return compiled_fn, True
+
+    def warmup_finalize_compile(self, batch_size: int):
+        finalize_fn, compiled_active = self._resolve_finalize_2d_callable()
+        if not bool(compiled_active):
+            return False
+        batch_size = int(max(1, int(batch_size)))
+        device = self.self_attn.out_proj.weight.device
+        dtype = self.self_attn.out_proj.weight.dtype
+        src_step_2d = torch.zeros(
+            (batch_size, int(self.self_attn.embed_dim)),
+            device=device,
+            dtype=dtype,
+            requires_grad=True,
+        )
+        attn_step_2d = torch.zeros_like(src_step_2d, requires_grad=True)
+        out = finalize_fn(src_step_2d, attn_step_2d)
+        out.square().mean().backward()
+        return True
+
+    def _finalize_forward_step_2d_eager(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        attn_step_2d = F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        if self.training and float(self.dropout1.p) > 0.0:
+            attn_step_2d = F.dropout(attn_step_2d, p=float(self.dropout1.p), training=True)
+        src = src_step_2d + attn_step_2d
         if not self.pre_norm:
             src = F.layer_norm(
                 src,
@@ -303,9 +716,6 @@ class TransformerEncoderLayer(Module):
                 self.norm1.bias,
                 self.norm1.eps,
             )
-        outproj_dt = (time.perf_counter() - outproj_t0) if outproj_t0 is not None else 0.0
-
-        ffn_t0 = time.perf_counter() if profile_enabled else None
         if self.pre_norm:
             src_ff = F.layer_norm(
                 src,
@@ -324,7 +734,6 @@ class TransformerEncoderLayer(Module):
         if self.training and float(self.dropout2.p) > 0.0:
             src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
         src = src + src2_ff
-
         if not self.pre_norm:
             src = F.layer_norm(
                 src,
@@ -333,14 +742,309 @@ class TransformerEncoderLayer(Module):
                 self.norm2.bias,
                 self.norm2.eps,
             )
-        ffn_dt = (time.perf_counter() - ffn_t0) if ffn_t0 is not None else 0.0
-        if profile_enabled:
-            stats = self._layer_step_profile_stats
-            stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
-            stats["finalize_ffn_wall_s"] += float(ffn_dt)
-        if use_2d_fastpath:
-            return src.unsqueeze(0) if input_was_3d else src
-        return src if input_was_3d else src.squeeze(0)
+        return src
+
+    def _finalize_forward_step_2d_zero_dropout_postnorm_gelu_eager(
+        self,
+        src_step_2d: Tensor,
+        attn_step_2d: Tensor,
+    ):
+        # This is an exact eager specialization for the dominant policy-step
+        # setting: single-token finalize, zero dropout, post-norm, GELU.
+        src = src_step_2d + F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        src = F.layer_norm(
+            src,
+            self.norm1.normalized_shape,
+            self.norm1.weight,
+            self.norm1.bias,
+            self.norm1.eps,
+        )
+        src2_ff = F.linear(src, self.linear1.weight, self.linear1.bias)
+        src2_ff = F.gelu(src2_ff)
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        src = src + src2_ff
+        return F.layer_norm(
+            src,
+            self.norm2.normalized_shape,
+            self.norm2.weight,
+            self.norm2.bias,
+            self.norm2.eps,
+        )
+
+    def _finalize_forward_step_2d_eager_profiled(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        outproj_linear_t0 = time.perf_counter()
+        attn_step_2d = F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        if self.training and float(self.dropout1.p) > 0.0:
+            attn_step_2d = F.dropout(attn_step_2d, p=float(self.dropout1.p), training=True)
+        src = src_step_2d + attn_step_2d
+        outproj_linear_dt = time.perf_counter() - outproj_linear_t0
+        outproj_norm_t0 = time.perf_counter()
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm1.normalized_shape,
+                self.norm1.weight,
+                self.norm1.bias,
+                self.norm1.eps,
+            )
+        outproj_norm_dt = time.perf_counter() - outproj_norm_t0
+        outproj_dt = outproj_linear_dt + outproj_norm_dt
+
+        ffn_linear1_act_t0 = time.perf_counter()
+        if self.pre_norm:
+            src_ff = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        else:
+            src_ff = src
+        src2_ff = F.linear(src_ff, self.linear1.weight, self.linear1.bias)
+        src2_ff = self.activation(src2_ff)
+        if self.training and float(self.dropout.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+        ffn_linear1_act_dt = time.perf_counter() - ffn_linear1_act_t0
+        ffn_linear2_t0 = time.perf_counter()
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        if self.training and float(self.dropout2.p) > 0.0:
+            src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+        ffn_linear2_dt = time.perf_counter() - ffn_linear2_t0
+        ffn_residual_norm_t0 = time.perf_counter()
+        src = src + src2_ff
+        if not self.pre_norm:
+            src = F.layer_norm(
+                src,
+                self.norm2.normalized_shape,
+                self.norm2.weight,
+                self.norm2.bias,
+                self.norm2.eps,
+            )
+        ffn_residual_norm_dt = time.perf_counter() - ffn_residual_norm_t0
+        ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+        ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
+        return (
+            src,
+            outproj_dt,
+            ffn_dt,
+            outproj_linear_dt,
+            outproj_norm_dt,
+            ffn_linear1_act_dt,
+            ffn_linear2_residual_norm_dt,
+            ffn_linear2_dt,
+            ffn_residual_norm_dt,
+        )
+
+    def _finalize_forward_step_2d_zero_dropout_postnorm_gelu_profiled(
+        self,
+        src_step_2d: Tensor,
+        attn_step_2d: Tensor,
+    ):
+        outproj_linear_t0 = time.perf_counter()
+        src = src_step_2d + F.linear(
+            attn_step_2d,
+            self.self_attn.out_proj.weight,
+            self.self_attn.out_proj.bias,
+        )
+        outproj_linear_dt = time.perf_counter() - outproj_linear_t0
+        outproj_norm_t0 = time.perf_counter()
+        src = F.layer_norm(
+            src,
+            self.norm1.normalized_shape,
+            self.norm1.weight,
+            self.norm1.bias,
+            self.norm1.eps,
+        )
+        outproj_norm_dt = time.perf_counter() - outproj_norm_t0
+        outproj_dt = outproj_linear_dt + outproj_norm_dt
+
+        ffn_linear1_act_t0 = time.perf_counter()
+        src2_ff = F.linear(src, self.linear1.weight, self.linear1.bias)
+        src2_ff = F.gelu(src2_ff)
+        ffn_linear1_act_dt = time.perf_counter() - ffn_linear1_act_t0
+        ffn_linear2_t0 = time.perf_counter()
+        src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+        ffn_linear2_dt = time.perf_counter() - ffn_linear2_t0
+        ffn_residual_norm_t0 = time.perf_counter()
+        src = src + src2_ff
+        src = F.layer_norm(
+            src,
+            self.norm2.normalized_shape,
+            self.norm2.weight,
+            self.norm2.bias,
+            self.norm2.eps,
+        )
+        ffn_residual_norm_dt = time.perf_counter() - ffn_residual_norm_t0
+        ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+        ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
+        return (
+            src,
+            outproj_dt,
+            ffn_dt,
+            outproj_linear_dt,
+            outproj_norm_dt,
+            ffn_linear1_act_dt,
+            ffn_linear2_residual_norm_dt,
+            ffn_linear2_dt,
+            ffn_residual_norm_dt,
+        )
+
+    def _finalize_forward_step_2d_profiled(self, src_step_2d: Tensor, attn_step_2d: Tensor):
+        if self._finalize_2d_zero_dropout_postnorm_gelu_active():
+            return self._finalize_forward_step_2d_zero_dropout_postnorm_gelu_profiled(
+                src_step_2d,
+                attn_step_2d,
+            )
+        return self._finalize_forward_step_2d_eager_profiled(src_step_2d, attn_step_2d)
+
+    def _finalize_forward_step_2d_direct(self, src_step_2d: Tensor, attn_step_2d: Tensor, profile_enabled: bool):
+        finalize_2d_fn, finalize_2d_compiled = self._resolve_finalize_2d_callable()
+        stats = self._layer_step_profile_stats if profile_enabled else None
+        if profile_enabled and (not bool(finalize_2d_compiled)):
+            (
+                src,
+                outproj_dt,
+                ffn_dt,
+                outproj_linear_dt,
+                outproj_norm_dt,
+                ffn_linear1_act_dt,
+                ffn_linear2_residual_norm_dt,
+                ffn_linear2_dt,
+                ffn_residual_norm_dt,
+            ) = self._finalize_forward_step_2d_profiled(src_step_2d, attn_step_2d)
+            if stats is not None:
+                stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
+                stats["finalize_attn_outproj_linear_wall_s"] += float(outproj_linear_dt)
+                stats["finalize_attn_outproj_norm_wall_s"] += float(outproj_norm_dt)
+                stats["finalize_ffn_wall_s"] += float(ffn_dt)
+                stats["finalize_ffn_linear1_act_wall_s"] += float(ffn_linear1_act_dt)
+                stats["finalize_ffn_linear2_residual_norm_wall_s"] += float(ffn_linear2_residual_norm_dt)
+                stats["finalize_ffn_linear2_wall_s"] += float(ffn_linear2_dt)
+                stats["finalize_ffn_residual_norm_wall_s"] += float(ffn_residual_norm_dt)
+            return src
+        compiled_t0 = time.perf_counter() if (profile_enabled and bool(finalize_2d_compiled)) else None
+        src = finalize_2d_fn(src_step_2d, attn_step_2d)
+        if stats is not None and compiled_t0 is not None:
+            stats["finalize_compiled_wall_s"] += float(time.perf_counter() - compiled_t0)
+        return src
+
+    def _finalize_forward_step(self, src_step: Tensor, attn_bhld: Tensor):
+        profile_enabled = self._step_profile_enabled_now()
+        with (
+            _saved_tensors_profile_scope(
+                module_storage_keys=self._profile_param_storage_keys,
+                enabled=bool(profile_enabled and torch.is_grad_enabled()),
+            )
+            if profile_enabled
+            else nullcontext(None)
+        ) as finalize_saved_stats:
+            outproj_linear_t0 = time.perf_counter() if profile_enabled else None
+            input_was_3d = src_step.ndim == 3
+            if input_was_3d:
+                src_step_2d = src_step.squeeze(0)
+                src_step_3d = src_step
+            else:
+                src_step_2d = src_step
+                src_step_3d = src_step.unsqueeze(0)
+            use_2d_fastpath = bool(self.finalize_2d_fastpath) and int(attn_bhld.shape[2]) == 1
+            if use_2d_fastpath:
+                # forward_step hot path uses single-token query (L=1); keep
+                # finalize in 2D (B, E) to avoid extra permute/contiguous overhead.
+                attn_bld = attn_bhld.squeeze(2).reshape(attn_bhld.shape[0], -1)  # (B, E)
+                src = self._finalize_forward_step_2d_direct(src_step_2d, attn_bld, profile_enabled=profile_enabled)
+                if profile_enabled and isinstance(finalize_saved_stats, dict):
+                    stats = self._layer_step_profile_stats
+                    stats["finalize_saved_nonparam_raw_bytes_last"] = int(
+                        finalize_saved_stats.get("nonparam_raw_bytes", 0) or 0
+                    )
+                    stats["finalize_saved_nonparam_unique_storage_bytes_last"] = int(
+                        finalize_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                    )
+                return src.unsqueeze(0) if input_was_3d else src
+            else:
+                attn_bld = self._merge_heads(attn_bhld)
+                attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
+                src2 = attn_bld.permute(1, 0, 2)  # (1, B, E)
+                src = src_step_3d + self.dropout1(src2)
+            outproj_linear_dt = (time.perf_counter() - outproj_linear_t0) if outproj_linear_t0 is not None else 0.0
+            outproj_norm_t0 = time.perf_counter() if profile_enabled else None
+            if not self.pre_norm:
+                src = F.layer_norm(
+                    src,
+                    self.norm1.normalized_shape,
+                    self.norm1.weight,
+                    self.norm1.bias,
+                    self.norm1.eps,
+                )
+            outproj_norm_dt = (time.perf_counter() - outproj_norm_t0) if outproj_norm_t0 is not None else 0.0
+            outproj_dt = outproj_linear_dt + outproj_norm_dt
+
+            ffn_linear1_act_t0 = time.perf_counter() if profile_enabled else None
+            if self.pre_norm:
+                src_ff = F.layer_norm(
+                    src,
+                    self.norm2.normalized_shape,
+                    self.norm2.weight,
+                    self.norm2.bias,
+                    self.norm2.eps,
+                )
+            else:
+                src_ff = src
+            src2_ff = F.linear(src_ff, self.linear1.weight, self.linear1.bias)
+            src2_ff = self.activation(src2_ff)
+            if self.training and float(self.dropout.p) > 0.0:
+                src2_ff = F.dropout(src2_ff, p=float(self.dropout.p), training=True)
+            ffn_linear1_act_dt = (
+                time.perf_counter() - ffn_linear1_act_t0
+            ) if ffn_linear1_act_t0 is not None else 0.0
+            ffn_linear2_t0 = time.perf_counter() if profile_enabled else None
+            src2_ff = F.linear(src2_ff, self.linear2.weight, self.linear2.bias)
+            if self.training and float(self.dropout2.p) > 0.0:
+                src2_ff = F.dropout(src2_ff, p=float(self.dropout2.p), training=True)
+            ffn_linear2_dt = (time.perf_counter() - ffn_linear2_t0) if ffn_linear2_t0 is not None else 0.0
+            ffn_residual_norm_t0 = time.perf_counter() if profile_enabled else None
+            src = src + src2_ff
+
+            if not self.pre_norm:
+                src = F.layer_norm(
+                    src,
+                    self.norm2.normalized_shape,
+                    self.norm2.weight,
+                    self.norm2.bias,
+                    self.norm2.eps,
+                )
+            ffn_residual_norm_dt = (
+                time.perf_counter() - ffn_residual_norm_t0
+            ) if ffn_residual_norm_t0 is not None else 0.0
+            ffn_linear2_residual_norm_dt = ffn_linear2_dt + ffn_residual_norm_dt
+            ffn_dt = ffn_linear1_act_dt + ffn_linear2_residual_norm_dt
+            if profile_enabled:
+                stats = self._layer_step_profile_stats
+                stats["finalize_attn_outproj_wall_s"] += float(outproj_dt)
+                stats["finalize_attn_outproj_linear_wall_s"] += float(outproj_linear_dt)
+                stats["finalize_attn_outproj_norm_wall_s"] += float(outproj_norm_dt)
+                stats["finalize_ffn_wall_s"] += float(ffn_dt)
+                stats["finalize_ffn_linear1_act_wall_s"] += float(ffn_linear1_act_dt)
+                stats["finalize_ffn_linear2_residual_norm_wall_s"] += float(ffn_linear2_residual_norm_dt)
+                stats["finalize_ffn_linear2_wall_s"] += float(ffn_linear2_dt)
+                stats["finalize_ffn_residual_norm_wall_s"] += float(ffn_residual_norm_dt)
+                if isinstance(finalize_saved_stats, dict):
+                    stats["finalize_saved_nonparam_raw_bytes_last"] = int(
+                        finalize_saved_stats.get("nonparam_raw_bytes", 0) or 0
+                    )
+                    stats["finalize_saved_nonparam_unique_storage_bytes_last"] = int(
+                        finalize_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                    )
+            return src if input_was_3d else src.squeeze(0)
 
     def _forward_step_attn_ff(self, src_step: Tensor, q_bhld: Tensor, k_all: Tensor, v_all: Tensor):
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
@@ -425,14 +1129,171 @@ class TransformerEncoderLayer(Module):
             )
             return out, lse
         except Exception:
-            out, lse = torch.ops.aten._scaled_dot_product_efficient_attention.default(
-                q_bhld,
-                k_chunk,
-                v_chunk,
-                True,
-                False,
-            )
-            return out, lse
+            try:
+                out, lse = torch.ops.aten._scaled_dot_product_efficient_attention.default(
+                    q_bhld,
+                    k_chunk,
+                    v_chunk,
+                    True,
+                    False,
+                )
+                return out, lse
+            except Exception:
+                scale = 1.0 / math.sqrt(float(q_bhld.shape[-1]))
+                scores = torch.matmul(q_bhld, k_chunk.transpose(-2, -1)) * scale
+                lse = torch.logsumexp(scores, dim=-1)
+                probs = torch.softmax(scores, dim=-1)
+                out = torch.matmul(probs, v_chunk)
+                return out, lse
+
+    @staticmethod
+    def _normalize_prefix_head_sharing_mode(mode):
+        mode = str(mode or "off").strip().lower()
+        if mode not in {"off", "first", "mean"}:
+            return "off"
+        return mode
+
+    @staticmethod
+    def _reduce_prefix_heads(prefix_k: Optional[Tensor], prefix_v: Optional[Tensor], mode):
+        mode = TransformerEncoderLayer._normalize_prefix_head_sharing_mode(mode)
+        if prefix_k is None or prefix_v is None or mode == "off":
+            return prefix_k, prefix_v, "off"
+        if int(prefix_k.shape[1]) <= 1 or int(prefix_v.shape[1]) <= 1:
+            return prefix_k, prefix_v, "off"
+        if mode == "first":
+            return prefix_k[:, :1, :, :], prefix_v[:, :1, :, :], mode
+        return prefix_k.mean(dim=1, keepdim=True), prefix_v.mean(dim=1, keepdim=True), mode
+
+    @staticmethod
+    def _expand_prefix_heads(prefix: Optional[Tensor], target_heads: Optional[int]):
+        if prefix is None or target_heads is None:
+            return prefix
+        target_heads = int(target_heads)
+        current_heads = int(prefix.shape[1])
+        if current_heads == target_heads:
+            return prefix
+        if current_heads == 1 and target_heads > 1:
+            return prefix.expand(prefix.shape[0], target_heads, prefix.shape[2], prefix.shape[3])
+        raise ValueError(f"prefix head mismatch: current={current_heads}, target={target_heads}")
+
+    @classmethod
+    def _prepare_prefix_chunk(
+        cls,
+        prefix_k: Optional[Tensor],
+        prefix_v: Optional[Tensor],
+        valid_len: int,
+        target_heads: Optional[int],
+        clone_for_grad: bool = False,
+    ):
+        if prefix_k is None or prefix_v is None:
+            return None, None, 0
+        prefix_len = int(min(int(valid_len), int(prefix_k.shape[2]), int(prefix_v.shape[2])))
+        if prefix_len <= 0:
+            return None, None, 0
+        prefix_k = cls._expand_prefix_heads(prefix_k[:, :, :prefix_len, :], target_heads)
+        prefix_v = cls._expand_prefix_heads(prefix_v[:, :, :prefix_len, :], target_heads)
+        if bool(clone_for_grad):
+            prefix_k = prefix_k.clone()
+            prefix_v = prefix_v.clone()
+        return prefix_k, prefix_v, prefix_len
+
+    def _merge_attention_chunks_with_lse(self, q_bhld: Tensor, chunk_iter):
+        q_len = int(q_bhld.shape[2])
+        merged_out = None
+        merged_lse = None
+        profile_enabled = self._step_profile_enabled_now()
+        stats = self._layer_step_profile_stats if profile_enabled else None
+        for k_chunk, v_chunk in chunk_iter:
+            core_t0 = time.perf_counter() if profile_enabled else None
+            out_chunk, lse_chunk = self._flash_sdpa_chunk_with_lse(q_bhld, k_chunk, v_chunk)
+            core_dt = (time.perf_counter() - core_t0) if core_t0 is not None else 0.0
+            lse_chunk_f32 = self._normalize_flash_lse(lse_chunk, q_len=q_len)
+            out_chunk_f32 = out_chunk.to(dtype=torch.float32)
+            if merged_out is None:
+                merged_out = out_chunk_f32
+                merged_lse = lse_chunk_f32
+            else:
+                merge_t0 = time.perf_counter() if profile_enabled else None
+                merged_lse_next = torch.logaddexp(merged_lse, lse_chunk_f32)
+                prev_scale = torch.exp(merged_lse - merged_lse_next)
+                curr_scale = torch.exp(lse_chunk_f32 - merged_lse_next)
+                merged_out = merged_out * prev_scale + out_chunk_f32 * curr_scale
+                merged_lse = merged_lse_next
+                merge_dt = (time.perf_counter() - merge_t0) if merge_t0 is not None else 0.0
+                if stats is not None:
+                    stats["flash_merge_lse_merge_wall_s"] += float(merge_dt)
+            if stats is not None:
+                stats["flash_merge_chunk_core_wall_s"] += float(core_dt)
+                stats["flash_merge_chunk_count_sum"] += 1
+        if merged_out is None:
+            raise ValueError("Paged KV attention produced no chunk output.")
+        return merged_out.to(dtype=q_bhld.dtype)
+
+    def _iter_paged_flash_chunks(
+        self,
+        q_bhld: Tensor,
+        k_pages,
+        v_pages,
+        valid_len: int,
+        chunk_token_cap: int,
+        prefix_k: Optional[Tensor] = None,
+        prefix_v: Optional[Tensor] = None,
+        clone_kv_for_grad: bool = False,
+        clone_prefix_for_grad: bool = False,
+    ):
+        target_heads = int(q_bhld.shape[1])
+        prefix_chunk_k, prefix_chunk_v, prefix_len = self._prepare_prefix_chunk(
+            prefix_k,
+            prefix_v,
+            valid_len,
+            target_heads,
+            clone_for_grad=bool(clone_kv_for_grad) and bool(clone_prefix_for_grad),
+        )
+        if prefix_len > 0:
+            yield prefix_chunk_k, prefix_chunk_v
+        remaining = int(max(0, int(valid_len) - int(prefix_len)))
+        if remaining <= 0:
+            return
+        chunk_token_cap = int(max(1, min(int(remaining), int(chunk_token_cap))))
+        page_idx = 0
+        num_pages = len(k_pages)
+        while remaining > 0 and page_idx < num_pages:
+            prep_t0 = time.perf_counter() if self._step_profile_enabled_now() else None
+            k_chunks = []
+            v_chunks = []
+            chunk_tokens = 0
+            while remaining > 0 and page_idx < num_pages and chunk_tokens < chunk_token_cap:
+                k_page = k_pages[page_idx]
+                v_page = v_pages[page_idx]
+                page_cap = int(k_page.shape[2])
+                take = min(page_cap, remaining, chunk_token_cap - chunk_tokens)
+                if take <= 0:
+                    break
+                k_chunks.append(k_page[:, :, :take, :])
+                v_chunks.append(v_page[:, :, :take, :])
+                remaining -= take
+                page_idx += 1
+                chunk_tokens += take
+            if len(k_chunks) == 1:
+                k_chunk = k_chunks[0]
+                v_chunk = v_chunks[0]
+            else:
+                k_chunk = self._concat_dim2(k_chunks)
+                v_chunk = self._concat_dim2(v_chunks)
+            if bool(clone_kv_for_grad):
+                clone_t0 = time.perf_counter() if self._step_profile_enabled_now() else None
+                k_chunk = k_chunk.clone()
+                v_chunk = v_chunk.clone()
+                clone_dt = (time.perf_counter() - clone_t0) if clone_t0 is not None else 0.0
+                if self._step_profile_enabled_now():
+                    self._layer_step_profile_stats["paged_clone_wall_s"] += float(clone_dt)
+            if prep_t0 is not None:
+                self._layer_step_profile_stats["flash_merge_chunk_prep_wall_s"] += float(
+                    time.perf_counter() - prep_t0
+                )
+            yield k_chunk, v_chunk
+        if remaining != 0:
+            raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
 
     def _get_flash_prefix_stream(self, device):
         if (not bool(self.flash_prefix_async)) or (device.type != "cuda") or (not torch.cuda.is_available()):
@@ -452,75 +1313,41 @@ class TransformerEncoderLayer(Module):
         v_pages,
         valid_len: int,
         chunk_token_cap: int,
+        prefix_k: Optional[Tensor] = None,
+        prefix_v: Optional[Tensor] = None,
         clone_kv_for_grad: bool = False,
+        clone_prefix_for_grad: bool = False,
     ):
-        remaining = int(valid_len)
-        if remaining <= 0:
+        valid_len = int(valid_len)
+        if valid_len <= 0:
             raise ValueError("Paged KV attention requires valid_len > 0.")
 
         chunk_token_cap = int(max(1, min(int(valid_len), int(chunk_token_cap))))
-        q_len = int(q_bhld.shape[2])
-        merged_out = None
-        merged_lse = None
-        page_idx = 0
-        num_pages = len(k_pages)
-
         profile_enabled = self._step_profile_enabled_now()
+        stats = self._layer_step_profile_stats if profile_enabled else None
         core_t0 = time.perf_counter() if profile_enabled else None
-        while remaining > 0 and page_idx < num_pages:
-            k_chunks = []
-            v_chunks = []
-            chunk_tokens = 0
-            while remaining > 0 and page_idx < num_pages and chunk_tokens < chunk_token_cap:
-                k_page = k_pages[page_idx]
-                v_page = v_pages[page_idx]
-                page_cap = int(k_page.shape[2])
-                take = min(page_cap, remaining, chunk_token_cap - chunk_tokens)
-                k_chunks.append(k_page[:, :, :take, :])
-                v_chunks.append(v_page[:, :, :take, :])
-                remaining -= take
-                page_idx += 1
-                chunk_tokens += take
-
-            if len(k_chunks) == 1:
-                k_chunk = k_chunks[0]
-                v_chunk = v_chunks[0]
-            else:
-                k_chunk = self._concat_dim2(k_chunks)
-                v_chunk = self._concat_dim2(v_chunks)
-
-            if bool(clone_kv_for_grad):
-                # In-place paged-grad mode mutates cache pages every step.
-                # Clone read views so autograd sees stable versions.
-                k_chunk = k_chunk.clone()
-                v_chunk = v_chunk.clone()
-
-            out_chunk, lse_chunk = self._flash_sdpa_chunk_with_lse(q_bhld, k_chunk, v_chunk)
-            lse_chunk_f32 = self._normalize_flash_lse(lse_chunk, q_len=q_len)
-            out_chunk_f32 = out_chunk.to(dtype=torch.float32)
-
-            if merged_out is None:
-                merged_out = out_chunk_f32
-                merged_lse = lse_chunk_f32
-            else:
-                merged_lse_next = torch.logaddexp(merged_lse, lse_chunk_f32)
-                prev_scale = torch.exp(merged_lse - merged_lse_next)
-                curr_scale = torch.exp(lse_chunk_f32 - merged_lse_next)
-                merged_out = merged_out * prev_scale + out_chunk_f32 * curr_scale
-                merged_lse = merged_lse_next
-
+        merged_out = self._merge_attention_chunks_with_lse(
+            q_bhld,
+            self._iter_paged_flash_chunks(
+                q_bhld,
+                k_pages,
+                v_pages,
+                valid_len,
+                chunk_token_cap,
+                prefix_k=prefix_k,
+                prefix_v=prefix_v,
+                clone_kv_for_grad=bool(clone_kv_for_grad),
+                clone_prefix_for_grad=bool(clone_prefix_for_grad),
+            ),
+        )
         core_dt = (time.perf_counter() - core_t0) if core_t0 is not None else 0.0
-        if remaining != 0:
-            raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
-        if merged_out is None:
-            raise ValueError("Paged KV attention produced no chunk output.")
         finalize_t0 = time.perf_counter() if profile_enabled else None
-        out = self._finalize_forward_step(src_step, merged_out.to(dtype=q_bhld.dtype))
+        out = self._finalize_forward_step(src_step, merged_out)
         finalize_dt = (time.perf_counter() - finalize_t0) if finalize_t0 is not None else 0.0
-        if profile_enabled:
-            stats = self._layer_step_profile_stats
+        if stats is not None:
             stats["attn_core_wall_s"] += float(core_dt)
             stats["finalize_wall_s"] += float(finalize_dt)
+            stats["paged_dispatch_flash_merge_wall_s"] += float(core_dt + finalize_dt)
         return out
 
     def _forward_step_attn_ff_paged_flash_prefix(
@@ -533,9 +1360,10 @@ class TransformerEncoderLayer(Module):
         prefix_k: Optional[Tensor] = None,
         prefix_v: Optional[Tensor] = None,
         clone_kv_for_grad: bool = False,
+        clone_prefix_for_grad: bool = True,
     ):
         profile_enabled = self._step_profile_enabled_now()
-        core_t0 = time.perf_counter() if profile_enabled else None
+        stats = self._layer_step_profile_stats if profile_enabled else None
         valid_len = int(valid_len)
         if valid_len <= 0:
             raise ValueError("Paged KV attention requires valid_len > 0.")
@@ -549,47 +1377,185 @@ class TransformerEncoderLayer(Module):
         tail_k = k_pages[-1][:, :, :tail_take, :]
         tail_v = v_pages[-1][:, :, :tail_take, :]
         if bool(clone_kv_for_grad):
+            clone_t0 = time.perf_counter() if profile_enabled else None
             tail_k = tail_k.clone()
             tail_v = tail_v.clone()
+            clone_dt = (time.perf_counter() - clone_t0) if clone_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_clone_wall_s"] += float(clone_dt)
+        if int(prefix_len) == 0 and bool(self.flash_prefix_zero_fastpath):
+            # Zero-prefix case dominates current auto mode in training:
+            # bypass flash-LSE merge/cast chain and dispatch a single SDPA.
+            if stats is not None:
+                stats["paged_path_flash_prefix_zero_fastpath"] += 1
+                stats["flash_prefix_valid_tokens_sum"] += int(valid_len)
+                stats["flash_prefix_prefix_tokens_sum"] += 0
+                stats["flash_prefix_tail_tokens_sum"] += int(tail_take)
+            return self._forward_step_attn_ff(src_step, q_bhld, tail_k, tail_v)
         q_len = int(q_bhld.shape[2])
         prefix_out = None
         prefix_lse = None
         prefix_stream = None
+        prepare_dt = 0.0
+        prefix_core_dt = 0.0
         if prefix_len > 0:
-            prefix_chunk_k = prefix_k
-            prefix_chunk_v = prefix_v
-            if bool(clone_kv_for_grad):
-                prefix_chunk_k = prefix_chunk_k.clone()
-                prefix_chunk_v = prefix_chunk_v.clone()
+            prepare_t0 = time.perf_counter() if profile_enabled else None
+            prefix_chunk_k, prefix_chunk_v, prefix_len = self._prepare_prefix_chunk(
+                prefix_k,
+                prefix_v,
+                valid_len,
+                int(q_bhld.shape[1]),
+                clone_for_grad=bool(clone_kv_for_grad) and bool(clone_prefix_for_grad),
+            )
+            prepare_dt = (time.perf_counter() - prepare_t0) if prepare_t0 is not None else 0.0
+            if stats is not None:
+                stats["flash_prefix_prepare_prefix_wall_s"] += float(prepare_dt)
             prefix_stream = self._get_flash_prefix_stream(q_bhld.device)
+            prefix_saved_ctx = (
+                _saved_tensors_profile_scope(
+                    module_storage_keys=self._profile_param_storage_keys,
+                    enabled=bool(profile_enabled and torch.is_grad_enabled()),
+                    tracked_tensors={
+                        "q": q_bhld,
+                        "k": prefix_chunk_k,
+                        "v": prefix_chunk_v,
+                    },
+                )
+                if profile_enabled
+                else nullcontext(None)
+            )
+            prefix_core_t0 = time.perf_counter() if profile_enabled else None
             if prefix_stream is not None:
                 with torch.cuda.stream(prefix_stream):
-                    prefix_out, prefix_lse = self._flash_sdpa_chunk_with_lse(q_bhld, prefix_chunk_k, prefix_chunk_v)
+                    with prefix_saved_ctx as prefix_saved_stats:
+                        prefix_out, prefix_lse = self._flash_sdpa_chunk_with_lse(
+                            q_bhld, prefix_chunk_k, prefix_chunk_v
+                        )
             else:
-                prefix_out, prefix_lse = self._flash_sdpa_chunk_with_lse(q_bhld, prefix_chunk_k, prefix_chunk_v)
+                with prefix_saved_ctx as prefix_saved_stats:
+                    prefix_out, prefix_lse = self._flash_sdpa_chunk_with_lse(
+                        q_bhld, prefix_chunk_k, prefix_chunk_v
+                    )
+            prefix_core_dt = (time.perf_counter() - prefix_core_t0) if prefix_core_t0 is not None else 0.0
+            if stats is not None:
+                stats["flash_prefix_prefix_core_wall_s"] += float(prefix_core_dt)
+                if isinstance(prefix_saved_stats, dict):
+                    stats["flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last"] = int(
+                        prefix_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                    )
+                    tracked_unique = prefix_saved_stats.get("tracked_nonparam_unique_storage_bytes", {}) or {}
+                    stats["flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last"] = int(
+                        tracked_unique.get("q", 0) or 0
+                    )
+                    stats["flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last"] = int(
+                        tracked_unique.get("k", 0) or 0
+                    )
+                    stats["flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last"] = int(
+                        tracked_unique.get("v", 0) or 0
+                    )
+                    stats["flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last"] = int(
+                        tracked_unique.get("other", 0) or 0
+                    )
 
-        tail_out, tail_lse = self._flash_sdpa_chunk_with_lse(q_bhld, tail_k, tail_v)
+        tail_saved_ctx = (
+            _saved_tensors_profile_scope(
+                module_storage_keys=self._profile_param_storage_keys,
+                enabled=bool(profile_enabled and torch.is_grad_enabled()),
+                tracked_tensors={
+                    "q": q_bhld,
+                    "k": tail_k,
+                    "v": tail_v,
+                },
+            )
+            if profile_enabled
+            else nullcontext(None)
+        )
+        tail_core_t0 = time.perf_counter() if profile_enabled else None
+        with tail_saved_ctx as tail_saved_stats:
+            tail_out, tail_lse = self._flash_sdpa_chunk_with_lse(q_bhld, tail_k, tail_v)
+        tail_core_dt = (time.perf_counter() - tail_core_t0) if tail_core_t0 is not None else 0.0
+        if stats is not None:
+            stats["flash_prefix_tail_core_wall_s"] += float(tail_core_dt)
+            if isinstance(tail_saved_stats, dict):
+                stats["flash_prefix_tail_saved_nonparam_unique_storage_bytes_last"] = int(
+                    tail_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                )
+                tracked_unique = tail_saved_stats.get("tracked_nonparam_unique_storage_bytes", {}) or {}
+                stats["flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last"] = int(
+                    tracked_unique.get("q", 0) or 0
+                )
+                stats["flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last"] = int(
+                    tracked_unique.get("k", 0) or 0
+                )
+                stats["flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last"] = int(
+                    tracked_unique.get("v", 0) or 0
+                )
+                stats["flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last"] = int(
+                    tracked_unique.get("other", 0) or 0
+                )
+        tail_cast_t0 = time.perf_counter() if profile_enabled else None
         merged_out = tail_out.to(dtype=torch.float32)
         merged_lse = self._normalize_flash_lse(tail_lse, q_len=q_len)
+        tail_cast_dt = (time.perf_counter() - tail_cast_t0) if tail_cast_t0 is not None else 0.0
+        if stats is not None:
+            stats["flash_prefix_tail_cast_norm_wall_s"] += float(tail_cast_dt)
 
+        merge_dt = 0.0
         if prefix_out is not None and prefix_lse is not None:
             if prefix_stream is not None:
+                wait_t0 = time.perf_counter() if profile_enabled else None
                 torch.cuda.current_stream(device=q_bhld.device).wait_stream(prefix_stream)
+                wait_dt = (time.perf_counter() - wait_t0) if wait_t0 is not None else 0.0
+                if stats is not None:
+                    stats["flash_prefix_wait_stream_wall_s"] += float(wait_dt)
+            prefix_cast_t0 = time.perf_counter() if profile_enabled else None
             prefix_out = prefix_out.to(dtype=torch.float32)
             prefix_lse = self._normalize_flash_lse(prefix_lse, q_len=q_len)
-            merged_lse_next = torch.logaddexp(prefix_lse, merged_lse)
-            prefix_scale = torch.exp(prefix_lse - merged_lse_next)
-            tail_scale = torch.exp(merged_lse - merged_lse_next)
-            merged_out = prefix_out * prefix_scale + merged_out * tail_scale
+            prefix_cast_dt = (time.perf_counter() - prefix_cast_t0) if prefix_cast_t0 is not None else 0.0
+            if stats is not None:
+                stats["flash_prefix_prefix_cast_norm_wall_s"] += float(prefix_cast_dt)
+            merge_saved_ctx = (
+                _saved_tensors_profile_scope(
+                    module_storage_keys=self._profile_param_storage_keys,
+                    enabled=bool(profile_enabled and torch.is_grad_enabled()),
+                )
+                if profile_enabled
+                else nullcontext(None)
+            )
+            merge_t0 = time.perf_counter() if profile_enabled else None
+            with merge_saved_ctx as merge_saved_stats:
+                logaddexp_t0 = time.perf_counter() if profile_enabled else None
+                merged_lse_next = torch.logaddexp(prefix_lse, merged_lse)
+                logaddexp_dt = (time.perf_counter() - logaddexp_t0) if logaddexp_t0 is not None else 0.0
+                scale_t0 = time.perf_counter() if profile_enabled else None
+                prefix_scale = torch.exp(prefix_lse - merged_lse_next)
+                tail_scale = torch.exp(merged_lse - merged_lse_next)
+                scale_dt = (time.perf_counter() - scale_t0) if scale_t0 is not None else 0.0
+                blend_t0 = time.perf_counter() if profile_enabled else None
+                merged_out = prefix_out * prefix_scale + merged_out * tail_scale
+                blend_dt = (time.perf_counter() - blend_t0) if blend_t0 is not None else 0.0
+            merge_dt = (time.perf_counter() - merge_t0) if merge_t0 is not None else 0.0
+            if stats is not None:
+                stats["flash_prefix_merge_wall_s"] += float(merge_dt)
+                stats["flash_prefix_merge_logaddexp_wall_s"] += float(logaddexp_dt)
+                stats["flash_prefix_merge_scale_wall_s"] += float(scale_dt)
+                stats["flash_prefix_merge_blend_wall_s"] += float(blend_dt)
+                if isinstance(merge_saved_stats, dict):
+                    stats["flash_prefix_merge_saved_nonparam_unique_storage_bytes_last"] = int(
+                        merge_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                    )
 
-        core_dt = (time.perf_counter() - core_t0) if core_t0 is not None else 0.0
+        core_dt = float(prepare_dt + prefix_core_dt + tail_core_dt + merge_dt)
         finalize_t0 = time.perf_counter() if profile_enabled else None
         out = self._finalize_forward_step(src_step, merged_out.to(dtype=q_bhld.dtype))
         finalize_dt = (time.perf_counter() - finalize_t0) if finalize_t0 is not None else 0.0
-        if profile_enabled:
-            stats = self._layer_step_profile_stats
+        if stats is not None:
             stats["attn_core_wall_s"] += float(core_dt)
             stats["finalize_wall_s"] += float(finalize_dt)
+            stats["flash_prefix_valid_tokens_sum"] += int(valid_len)
+            stats["flash_prefix_prefix_tokens_sum"] += int(prefix_len)
+            stats["flash_prefix_tail_tokens_sum"] += int(tail_take)
+            stats["paged_dispatch_flash_prefix_wall_s"] += float(core_dt + finalize_dt)
         return out
 
     def _forward_step_attn_ff_paged(
@@ -610,26 +1576,19 @@ class TransformerEncoderLayer(Module):
             raise ValueError("Paged KV attention requires valid_len > 0.")
         profile_enabled = self._step_profile_enabled_now()
         stats = self._layer_step_profile_stats if profile_enabled else None
+        if stats is not None:
+            stats["paged_page_count_sum"] += int(len(k_pages))
+            stats["paged_valid_len_sum"] += int(valid_len)
+            stats["paged_last_page_tokens_sum"] += int(k_pages[-1].shape[2]) if len(k_pages) > 0 else 0
+            stats["paged_prefix_len_sum"] += int(prefix_k.shape[2]) if prefix_k is not None else 0
         attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
-        train_mode = self.paged_attn_train_mode
-        if train_mode == "auto":
-            # Keep runtime routing consistent with training heuristic.
-            train_mode = "flash_prefix" if int(q_bhld.shape[0]) >= 32 else "dense"
-        if q_bhld.device.type != "cuda":
-            train_mode = "dense"
+        train_mode = self._resolve_paged_attn_train_mode(q_bhld)
 
         # Fast path: single-page cache can directly dispatch to SDPA.
         # This is important for no-grad/inference runs where we keep one large
         # page and avoid the per-page python loop entirely.
         if len(k_pages) == 1:
-            if (
-                bool(self.force_flash_single_page)
-                and
-                torch.is_grad_enabled()
-                and attn_dropout <= 0.0
-                and train_mode == "flash_prefix"
-                and (not bool(clone_kv_for_grad))
-            ):
+            if (prefix_k is not None) and (prefix_v is not None) and attn_dropout <= 0.0:
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
                 return self._forward_step_attn_ff_paged_flash_prefix(
@@ -640,47 +1599,69 @@ class TransformerEncoderLayer(Module):
                     valid_len,
                     prefix_k=prefix_k,
                     prefix_v=prefix_v,
-                    clone_kv_for_grad=False,
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                    clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
-            k_all = k_pages[0][:, :, :remaining, :]
-            v_all = v_pages[0][:, :, :remaining, :]
-            if bool(clone_kv_for_grad) and torch.is_grad_enabled():
+            build_t0 = time.perf_counter() if profile_enabled else None
+            k_all, v_all, prefix_len = self._build_prefix_aware_paged_views(
+                prefix_k,
+                prefix_v,
+                k_pages,
+                v_pages,
+                valid_len,
+                target_heads=int(q_bhld.shape[1]),
+            )
+            build_dt = (time.perf_counter() - build_t0) if build_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_view_build_wall_s"] += float(build_dt)
+            if bool(clone_kv_for_grad) and torch.is_grad_enabled() and int(prefix_len) <= 0:
                 # In in-place paged-grad mode, cache pages are mutated every step.
                 # Clone read views so backward does not observe version bumps.
+                clone_t0 = time.perf_counter() if profile_enabled else None
                 k_all = k_all.clone()
                 v_all = v_all.clone()
+                clone_dt = (time.perf_counter() - clone_t0) if clone_t0 is not None else 0.0
+                if stats is not None:
+                    stats["paged_clone_wall_s"] += float(clone_dt)
             if stats is not None:
                 stats["paged_path_single_page"] += 1
-            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+                stats["dense_valid_tokens_sum"] += int(valid_len)
+                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+            dispatch_t0 = time.perf_counter() if profile_enabled else None
+            out = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+            dispatch_dt = (time.perf_counter() - dispatch_t0) if dispatch_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_dispatch_single_page_wall_s"] += float(dispatch_dt)
+            return out
 
         # Training throughput route: dispatch fused SDPA on dense/flash views.
         # This removes many tiny per-page kernels in the grad-enabled hot path.
         if torch.is_grad_enabled():
             if (
+                bool(self.prefix_streaming_train)
+                and attn_dropout <= 0.0
+                and (prefix_k is not None)
+                and (prefix_v is not None)
+            ):
+                if stats is not None:
+                    stats["paged_path_flash_merge"] += 1
+                return self._forward_step_attn_ff_paged_flash_merge(
+                    src_step,
+                    q_bhld,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                    chunk_token_cap=self._resolve_train_flashmerge_chunk_tokens(q_bhld, valid_len),
+                    prefix_k=prefix_k,
+                    prefix_v=prefix_v,
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                    clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
+                )
+            if (
                 attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
-                and (not bool(clone_kv_for_grad))
             ):
-                dense_token_cap = int(max(0, self.paged_attn_flashprefix_dense_max_tokens))
-                if (
-                    dense_token_cap > 0
-                    and int(valid_len) <= dense_token_cap
-                    and (prefix_k is not None)
-                    and (prefix_v is not None)
-                ):
-                    prefix_len = int(prefix_k.shape[2])
-                    if prefix_len >= int(valid_len):
-                        k_all = prefix_k[:, :, :int(valid_len), :]
-                        v_all = prefix_v[:, :, :int(valid_len), :]
-                    else:
-                        tail_take = int(valid_len) - prefix_len
-                        tail_k = k_pages[-1][:, :, :tail_take, :]
-                        tail_v = v_pages[-1][:, :, :tail_take, :]
-                        k_all = self._concat_dim2([prefix_k, tail_k])
-                        v_all = self._concat_dim2([prefix_v, tail_v])
-                    if stats is not None:
-                        stats["paged_path_dense"] += 1
-                    return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
                 if stats is not None:
                     stats["paged_path_flash_prefix"] += 1
                 return self._forward_step_attn_ff_paged_flash_prefix(
@@ -691,7 +1672,8 @@ class TransformerEncoderLayer(Module):
                     valid_len,
                     prefix_k=prefix_k,
                     prefix_v=prefix_v,
-                    clone_kv_for_grad=False,
+                    clone_kv_for_grad=bool(clone_kv_for_grad),
+                    clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
                 )
             if attn_dropout <= 0.0 and train_mode == "flash_merge":
                 if stats is not None:
@@ -705,39 +1687,108 @@ class TransformerEncoderLayer(Module):
                     chunk_token_cap=self._resolve_train_flashmerge_chunk_tokens(q_bhld, valid_len),
                     clone_kv_for_grad=bool(clone_kv_for_grad),
                 )
-            if (
-                train_mode == "dense"
-                and (not bool(clone_kv_for_grad))
-                and (prefix_k is not None)
-                and (prefix_v is not None)
-            ):
-                prefix_len = int(prefix_k.shape[2])
-                if prefix_len >= int(valid_len):
-                    k_all = prefix_k[:, :, :int(valid_len), :]
-                    v_all = prefix_v[:, :, :int(valid_len), :]
-                else:
-                    tail_take = int(valid_len) - prefix_len
-                    tail_k = k_pages[-1][:, :, :tail_take, :]
-                    tail_v = v_pages[-1][:, :, :tail_take, :]
-                    k_all = self._concat_dim2([prefix_k, tail_k])
-                    v_all = self._concat_dim2([prefix_v, tail_v])
+            if train_mode == "dense":
+                build_t0 = time.perf_counter() if profile_enabled else None
+                k_all, v_all, prefix_len = self._build_prefix_aware_paged_views(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                    target_heads=int(q_bhld.shape[1]),
+                )
+                build_dt = (time.perf_counter() - build_t0) if build_t0 is not None else 0.0
+                if stats is not None:
+                    stats["paged_view_build_wall_s"] += float(build_dt)
+                if bool(clone_kv_for_grad) and int(prefix_len) <= 0:
+                    # Multi-page fallback for in-place paged-grad mode.
+                    clone_t0 = time.perf_counter() if profile_enabled else None
+                    k_all = k_all.clone()
+                    v_all = v_all.clone()
+                    clone_dt = (time.perf_counter() - clone_t0) if clone_t0 is not None else 0.0
+                    if stats is not None:
+                        stats["paged_clone_wall_s"] += float(clone_dt)
                 if stats is not None:
                     stats["paged_path_dense"] += 1
-                return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
-            k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
-            if bool(clone_kv_for_grad):
+                    stats["dense_valid_tokens_sum"] += int(valid_len)
+                    stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                    stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+                dispatch_t0 = time.perf_counter() if profile_enabled else None
+                out = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+                dispatch_dt = (time.perf_counter() - dispatch_t0) if dispatch_t0 is not None else 0.0
+                if stats is not None:
+                    stats["paged_dispatch_dense_wall_s"] += float(dispatch_dt)
+                return out
+            build_t0 = time.perf_counter() if profile_enabled else None
+            k_all, v_all, prefix_len = self._build_prefix_aware_paged_views(
+                prefix_k,
+                prefix_v,
+                k_pages,
+                v_pages,
+                valid_len,
+                target_heads=int(q_bhld.shape[1]),
+            )
+            build_dt = (time.perf_counter() - build_t0) if build_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_view_build_wall_s"] += float(build_dt)
+            if bool(clone_kv_for_grad) and int(prefix_len) <= 0:
                 # Multi-page fallback for in-place paged-grad mode.
+                clone_t0 = time.perf_counter() if profile_enabled else None
                 k_all = k_all.clone()
                 v_all = v_all.clone()
+                clone_dt = (time.perf_counter() - clone_t0) if clone_t0 is not None else 0.0
+                if stats is not None:
+                    stats["paged_clone_wall_s"] += float(clone_dt)
             if stats is not None:
                 stats["paged_path_dense"] += 1
-            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+                stats["dense_valid_tokens_sum"] += int(valid_len)
+                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+            dispatch_t0 = time.perf_counter() if profile_enabled else None
+            out = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+            dispatch_dt = (time.perf_counter() - dispatch_t0) if dispatch_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_dispatch_dense_wall_s"] += float(dispatch_dt)
+            return out
 
         if attn_dropout > 0.0:
-            k_all, v_all = self._build_paged_views(k_pages, v_pages, valid_len)
+            build_t0 = time.perf_counter() if profile_enabled else None
+            k_all, v_all, prefix_len = self._build_prefix_aware_paged_views(
+                prefix_k,
+                prefix_v,
+                k_pages,
+                v_pages,
+                valid_len,
+                target_heads=int(q_bhld.shape[1]),
+            )
             if stats is not None:
+                stats["paged_view_build_wall_s"] += float(time.perf_counter() - build_t0) if build_t0 is not None else 0.0
                 stats["paged_path_dense"] += 1
-            return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+                stats["dense_valid_tokens_sum"] += int(valid_len)
+                stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+            dispatch_t0 = time.perf_counter() if profile_enabled else None
+            out = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+            dispatch_dt = (time.perf_counter() - dispatch_t0) if dispatch_t0 is not None else 0.0
+            if stats is not None:
+                stats["paged_dispatch_dense_wall_s"] += float(dispatch_dt)
+            return out
+
+        if (prefix_k is not None) and (prefix_v is not None):
+            if stats is not None:
+                stats["paged_path_flash_merge"] += 1
+            return self._forward_step_attn_ff_paged_flash_merge(
+                src_step,
+                q_bhld,
+                k_pages,
+                v_pages,
+                valid_len,
+                chunk_token_cap=self._resolve_paged_chunk_tokens(q_bhld, valid_len),
+                prefix_k=prefix_k,
+                prefix_v=prefix_v,
+                clone_kv_for_grad=bool(clone_kv_for_grad),
+                clone_prefix_for_grad=False,
+            )
 
         scale = 1.0 / math.sqrt(float(q_bhld.shape[-1]))
         running_max = None
@@ -791,6 +1842,64 @@ class TransformerEncoderLayer(Module):
             raise ValueError("Paged KV cache has inconsistent valid_len/pages.")
         attn_bhld = running_num / running_denom.clamp_min(1e-12)
         return self._finalize_forward_step(src_step, attn_bhld)
+
+    def _forward_step_attn_ff_paged_checkpointed(
+        self,
+        src_step: Tensor,
+        q_bhld: Tensor,
+        k_pages,
+        v_pages,
+        valid_len: int,
+        *,
+        clone_kv_for_grad: bool = False,
+        prefix_k: Optional[Tensor] = None,
+        prefix_v: Optional[Tensor] = None,
+    ):
+        page_count = int(len(k_pages))
+        prefix_present = bool(torch.is_tensor(prefix_k) and torch.is_tensor(prefix_v))
+        tensor_args = [src_step, q_bhld]
+        if prefix_present:
+            tensor_args.extend([prefix_k, prefix_v])
+        tensor_args.extend(list(k_pages))
+        tensor_args.extend(list(v_pages))
+
+        def _wrapped(src_step_arg, q_bhld_arg, *tail_args):
+            offset = 0
+            prefix_k_arg = None
+            prefix_v_arg = None
+            if prefix_present:
+                prefix_k_arg = tail_args[0]
+                prefix_v_arg = tail_args[1]
+                offset = 2
+            k_pages_arg = list(tail_args[offset : offset + page_count])
+            offset += page_count
+            v_pages_arg = list(tail_args[offset : offset + page_count])
+            return self._forward_step_attn_ff_paged(
+                src_step_arg,
+                q_bhld_arg,
+                k_pages_arg,
+                v_pages_arg,
+                valid_len,
+                clone_kv_for_grad=clone_kv_for_grad,
+                prefix_k=prefix_k_arg,
+                prefix_v=prefix_v_arg,
+            )
+
+        return checkpoint(
+            _wrapped,
+            *tensor_args,
+            use_reentrant=bool(getattr(self, "recompute_attn_use_reentrant", True)),
+        )
+
+
+    def _resolve_paged_attn_train_mode(self, q_bhld: Tensor):
+        train_mode = self.paged_attn_train_mode
+        if train_mode == "auto":
+            # Keep runtime routing consistent with training heuristic.
+            train_mode = "flash_prefix" if int(q_bhld.shape[0]) >= 32 else "dense"
+        if q_bhld.device.type != "cuda":
+            train_mode = "dense"
+        return str(train_mode)
 
     @staticmethod
     def _cache_capacity_from_tensor(k_tensor: Tensor, requested_max_len: Optional[int]):
@@ -893,6 +2002,69 @@ class TransformerEncoderLayer(Module):
         return TransformerEncoderLayer._concat_dim2(k_chunks), TransformerEncoderLayer._concat_dim2(v_chunks)
 
     @staticmethod
+    def _combine_prefix_with_paged_tail(
+        prefix_k: Optional[Tensor],
+        prefix_v: Optional[Tensor],
+        k_pages,
+        v_pages,
+        valid_len: int,
+        target_heads: Optional[int] = None,
+    ):
+        valid_len = int(valid_len)
+        prefix_len = 0
+        if prefix_k is not None and prefix_v is not None:
+            prefix_len = int(prefix_k.shape[2])
+        if prefix_len >= valid_len:
+            if prefix_k is None or prefix_v is None:
+                raise ValueError("prefix tensors are required when prefix_len >= valid_len")
+            prefix_k = TransformerEncoderLayer._expand_prefix_heads(prefix_k[:, :, :valid_len, :], target_heads)
+            prefix_v = TransformerEncoderLayer._expand_prefix_heads(prefix_v[:, :, :valid_len, :], target_heads)
+            return prefix_k, prefix_v
+        tail_len = int(valid_len - prefix_len)
+        if tail_len <= 0:
+            if prefix_k is None or prefix_v is None:
+                raise ValueError("prefix tensors are required when tail_len <= 0")
+            prefix_k = TransformerEncoderLayer._expand_prefix_heads(prefix_k[:, :, :valid_len, :], target_heads)
+            prefix_v = TransformerEncoderLayer._expand_prefix_heads(prefix_v[:, :, :valid_len, :], target_heads)
+            return prefix_k, prefix_v
+        tail_k, tail_v = TransformerEncoderLayer._build_paged_views(k_pages, v_pages, tail_len)
+        if prefix_len <= 0:
+            return tail_k, tail_v
+        if target_heads is None:
+            target_heads = int(tail_k.shape[1])
+        prefix_k = TransformerEncoderLayer._expand_prefix_heads(prefix_k, target_heads)
+        prefix_v = TransformerEncoderLayer._expand_prefix_heads(prefix_v, target_heads)
+        return (
+            TransformerEncoderLayer._concat_dim2([prefix_k, tail_k]),
+            TransformerEncoderLayer._concat_dim2([prefix_v, tail_v]),
+        )
+
+    @staticmethod
+    def _build_prefix_aware_paged_views(
+        prefix_k: Optional[Tensor],
+        prefix_v: Optional[Tensor],
+        k_pages,
+        v_pages,
+        valid_len: int,
+        target_heads: Optional[int] = None,
+    ):
+        prefix_len = 0
+        if prefix_k is not None and prefix_v is not None:
+            prefix_len = int(min(int(valid_len), int(prefix_k.shape[2]), int(prefix_v.shape[2])))
+        if prefix_len > 0:
+            k_all, v_all = TransformerEncoderLayer._combine_prefix_with_paged_tail(
+                prefix_k,
+                prefix_v,
+                k_pages,
+                v_pages,
+                valid_len,
+                target_heads=target_heads,
+            )
+            return k_all, v_all, prefix_len
+        k_all, v_all = TransformerEncoderLayer._build_paged_views(k_pages, v_pages, valid_len)
+        return k_all, v_all, 0
+
+    @staticmethod
     def _append_to_kv_pages(
         k_pages,
         v_pages,
@@ -983,9 +2155,21 @@ class TransformerEncoderLayer(Module):
             return new_k_pages, new_v_pages, int(valid_len) + 1
 
         if bool(freeze_existing_tail):
-            # TBPTT detach can leave a long immutable tail page. Start a fresh
-            # mutable page for the new window to avoid repeatedly copying that
-            # detached history on every COW append.
+            # TBPTT detach leaves the current tail immutable for old autograd
+            # graphs. To cut later paged-attn launch count, prefer one COW clone
+            # of that tail page and keep appending into the cloned page.
+            # Fallback to opening a new tail page when clone-append is disabled
+            # or the page is already full.
+            if _tail_freeze_clone_append_allowed(k_new_bhld.device) and new_k_pages:
+                prev_k = new_k_pages[-1]
+                prev_v = new_v_pages[-1]
+                prev_len = int(prev_k.shape[2])
+                if prev_len < int(page_size):
+                    grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                    grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
+                    new_k_pages[-1] = grown_k
+                    new_v_pages[-1] = grown_v
+                    return new_k_pages, new_v_pages, int(valid_len) + 1
             new_k_pages.append(k_new_bhld.clone())
             new_v_pages.append(v_new_bhld.clone())
             return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1030,6 +2214,8 @@ class TransformerEncoderLayer(Module):
         page_size: int,
         max_cache_len: int,
         freeze_existing_tail: bool = False,
+        cow_grow_max_tokens: int = 0,
+        profile_stats=None,
     ):
         """
         Fast COW append for packed pages (no preallocated slack pages).
@@ -1040,7 +2226,65 @@ class TransformerEncoderLayer(Module):
         new_k_pages = list(k_pages)
         new_v_pages = list(v_pages)
 
+        grow_limit = int(max(0, cow_grow_max_tokens))
+
         if bool(freeze_existing_tail):
+            if _tail_freeze_clone_append_allowed(k_new_bhld.device) and new_k_pages:
+                prev_k = new_k_pages[-1]
+                prev_v = new_v_pages[-1]
+                prev_len = int(prev_k.shape[2])
+                can_grow = bool(
+                    prev_len < int(page_size)
+                    and (grow_limit <= 0 or prev_len < int(min(int(page_size), grow_limit)))
+                )
+                if can_grow:
+                    grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
+                    grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
+                    if isinstance(profile_stats, dict):
+                        prev_total_bytes = int(max(0, _tensor_storage_nbytes(prev_k))) + int(
+                            max(0, _tensor_storage_nbytes(prev_v))
+                        )
+                        new_total_bytes = int(max(0, _tensor_storage_nbytes(k_new_bhld))) + int(
+                            max(0, _tensor_storage_nbytes(v_new_bhld))
+                        )
+                        grown_k_bytes = int(max(0, _tensor_storage_nbytes(grown_k)))
+                        grown_v_bytes = int(max(0, _tensor_storage_nbytes(grown_v)))
+                        out_total_bytes = int(grown_k_bytes + grown_v_bytes)
+                        working_set_total_bytes = int(prev_total_bytes + new_total_bytes + out_total_bytes)
+                        profile_stats["paged_grow_calls"] = int(profile_stats.get("paged_grow_calls", 0) or 0) + 1
+                        profile_stats["paged_grow_prev_total_bytes_last"] = int(prev_total_bytes)
+                        profile_stats["paged_grow_prev_total_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_prev_total_bytes_max", 0) or 0),
+                            int(prev_total_bytes),
+                        )
+                        profile_stats["paged_grow_new_total_bytes_last"] = int(new_total_bytes)
+                        profile_stats["paged_grow_new_total_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_new_total_bytes_max", 0) or 0),
+                            int(new_total_bytes),
+                        )
+                        profile_stats["paged_grow_out_total_bytes_last"] = int(out_total_bytes)
+                        profile_stats["paged_grow_out_total_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_out_total_bytes_max", 0) or 0),
+                            int(out_total_bytes),
+                        )
+                        profile_stats["paged_grow_working_set_total_bytes_last"] = int(working_set_total_bytes)
+                        profile_stats["paged_grow_working_set_total_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_working_set_total_bytes_max", 0) or 0),
+                            int(working_set_total_bytes),
+                        )
+                        profile_stats["paged_grow_k_out_bytes_last"] = int(grown_k_bytes)
+                        profile_stats["paged_grow_k_out_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_k_out_bytes_max", 0) or 0),
+                            int(grown_k_bytes),
+                        )
+                        profile_stats["paged_grow_v_out_bytes_last"] = int(grown_v_bytes)
+                        profile_stats["paged_grow_v_out_bytes_max"] = max(
+                            int(profile_stats.get("paged_grow_v_out_bytes_max", 0) or 0),
+                            int(grown_v_bytes),
+                        )
+                    new_k_pages[-1] = grown_k
+                    new_v_pages[-1] = grown_v
+                    return new_k_pages, new_v_pages, int(valid_len) + 1
             new_k_pages.append(k_new_bhld.clone())
             new_v_pages.append(v_new_bhld.clone())
             return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1049,9 +2293,55 @@ class TransformerEncoderLayer(Module):
             prev_k = new_k_pages[-1]
             prev_v = new_v_pages[-1]
             prev_len = int(prev_k.shape[2])
-            if prev_len < int(page_size):
+            can_grow = bool(
+                prev_len < int(page_size)
+                and (grow_limit <= 0 or prev_len < int(min(int(page_size), grow_limit)))
+            )
+            if can_grow:
                 grown_k = TransformerEncoderLayer._concat_dim2((prev_k, k_new_bhld))
                 grown_v = TransformerEncoderLayer._concat_dim2((prev_v, v_new_bhld))
+                if isinstance(profile_stats, dict):
+                    prev_total_bytes = int(max(0, _tensor_storage_nbytes(prev_k))) + int(
+                        max(0, _tensor_storage_nbytes(prev_v))
+                    )
+                    new_total_bytes = int(max(0, _tensor_storage_nbytes(k_new_bhld))) + int(
+                        max(0, _tensor_storage_nbytes(v_new_bhld))
+                    )
+                    grown_k_bytes = int(max(0, _tensor_storage_nbytes(grown_k)))
+                    grown_v_bytes = int(max(0, _tensor_storage_nbytes(grown_v)))
+                    out_total_bytes = int(grown_k_bytes + grown_v_bytes)
+                    working_set_total_bytes = int(prev_total_bytes + new_total_bytes + out_total_bytes)
+                    profile_stats["paged_grow_calls"] = int(profile_stats.get("paged_grow_calls", 0) or 0) + 1
+                    profile_stats["paged_grow_prev_total_bytes_last"] = int(prev_total_bytes)
+                    profile_stats["paged_grow_prev_total_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_prev_total_bytes_max", 0) or 0),
+                        int(prev_total_bytes),
+                    )
+                    profile_stats["paged_grow_new_total_bytes_last"] = int(new_total_bytes)
+                    profile_stats["paged_grow_new_total_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_new_total_bytes_max", 0) or 0),
+                        int(new_total_bytes),
+                    )
+                    profile_stats["paged_grow_out_total_bytes_last"] = int(out_total_bytes)
+                    profile_stats["paged_grow_out_total_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_out_total_bytes_max", 0) or 0),
+                        int(out_total_bytes),
+                    )
+                    profile_stats["paged_grow_working_set_total_bytes_last"] = int(working_set_total_bytes)
+                    profile_stats["paged_grow_working_set_total_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_working_set_total_bytes_max", 0) or 0),
+                        int(working_set_total_bytes),
+                    )
+                    profile_stats["paged_grow_k_out_bytes_last"] = int(grown_k_bytes)
+                    profile_stats["paged_grow_k_out_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_k_out_bytes_max", 0) or 0),
+                        int(grown_k_bytes),
+                    )
+                    profile_stats["paged_grow_v_out_bytes_last"] = int(grown_v_bytes)
+                    profile_stats["paged_grow_v_out_bytes_max"] = max(
+                        int(profile_stats.get("paged_grow_v_out_bytes_max", 0) or 0),
+                        int(grown_v_bytes),
+                    )
                 new_k_pages[-1] = grown_k
                 new_v_pages[-1] = grown_v
                 return new_k_pages, new_v_pages, int(valid_len) + 1
@@ -1090,19 +2380,50 @@ class TransformerEncoderLayer(Module):
         else:
             src_norm = src_step
 
-        if src_norm.ndim == 3:
-            src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
+        use_step_proj_2d = bool(self.step_proj_2d_fastpath)
+        if use_step_proj_2d:
+            if src_norm.ndim == 3:
+                src_norm_be = src_norm.squeeze(0)  # (B, E)
+            else:
+                src_norm_be = src_norm  # (B, E)
+            n_heads = int(self.self_attn.num_heads)
+            head_dim = int(self.self_attn.embed_dim // n_heads)
+            bsz = int(src_norm_be.shape[0])
         else:
-            src_norm_bld = src_norm.unsqueeze(1)  # (B, 1, E)
+            if src_norm.ndim == 3:
+                src_norm_bld = src_norm.permute(1, 0, 2)  # (B, 1, E)
+            else:
+                src_norm_bld = src_norm.unsqueeze(1)  # (B, 1, E)
         proj_t0 = time.perf_counter() if profile_enabled else None
         if append_to_cache:
-            q_bld, k_new_bld, v_new_bld = self._project_qkv(src_norm_bld)
-            q_bhld = self._split_heads(q_bld)
-            k_new_bhld = self._split_heads(k_new_bld)
-            v_new_bhld = self._split_heads(v_new_bld)
+            if use_step_proj_2d:
+                qkv_be = F.linear(
+                    src_norm_be,
+                    self.self_attn.in_proj_weight,
+                    self.self_attn.in_proj_bias,
+                )
+                q_bld, k_new_bld, v_new_bld = qkv_be.chunk(3, dim=-1)
+                q_bhld = q_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+                k_new_bhld = k_new_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+                v_new_bhld = v_new_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+            else:
+                q_bld, k_new_bld, v_new_bld = self._project_qkv(src_norm_bld)
+                q_bhld = self._split_heads(q_bld)
+                k_new_bhld = self._split_heads(k_new_bld)
+                v_new_bhld = self._split_heads(v_new_bld)
         else:
-            q_bld = self._project_q(src_norm_bld)
-            q_bhld = self._split_heads(q_bld)
+            if use_step_proj_2d:
+                embed_dim = int(self.self_attn.embed_dim)
+                w_q = self.self_attn.in_proj_weight[:embed_dim]
+                if self.self_attn.in_proj_bias is not None:
+                    b_q = self.self_attn.in_proj_bias[:embed_dim]
+                else:
+                    b_q = None
+                q_bld = F.linear(src_norm_be, w_q, b_q)
+                q_bhld = q_bld.view(bsz, n_heads, head_dim).unsqueeze(2)
+            else:
+                q_bld = self._project_q(src_norm_bld)
+                q_bhld = self._split_heads(q_bld)
         proj_dt = (time.perf_counter() - proj_t0) if proj_t0 is not None else 0.0
         if max_cache_len is None and kv_cache is not None:
             max_cache_len = kv_cache.get("max_cache_len", None)
@@ -1142,10 +2463,19 @@ class TransformerEncoderLayer(Module):
             if (not torch.is_grad_enabled()) and (max_cache_len is not None):
                 effective_kv_page_size = int(max(1, max_cache_len))
             elif mutable_paged_grad:
-                if inplace_paged_grad and (max_cache_len is not None):
-                    # Keep one dense page in in-place mode so append stays
-                    # O(1) and avoids page-growth cat churn in TBPTT rollout.
-                    effective_kv_page_size = int(max(1, max_cache_len))
+                if inplace_paged_grad:
+                    # In-place mode with bounded pages:
+                    # avoids dense-page O(T) clone growth while keeping O(1)
+                    # append updates inside each page.
+                    if int(self.inplace_paged_page_size) > 0:
+                        target_page = int(max(8, self.inplace_paged_page_size))
+                    elif self.paged_attn_train_mode == "flash_prefix":
+                        target_page = int(max(8, self.paged_attn_flashprefix_page_size))
+                    elif self.paged_attn_train_mode == "dense":
+                        target_page = int(max(8, self.paged_attn_dense_page_size))
+                    else:
+                        target_page = int(max(8, kv_cache_page_size))
+                    effective_kv_page_size = int(max(8, min(int(kv_cache_page_size), target_page)))
                 else:
                     if self.paged_attn_train_mode == "flash_prefix":
                         # In COW mode, large pages amplify per-step cat/clone
@@ -1167,13 +2497,17 @@ class TransformerEncoderLayer(Module):
             effective_kv_page_size = kv_cache_page_size
 
         cache_t0 = time.perf_counter() if profile_enabled else None
+        cache_append_wall_s = 0.0
+        cache_prefix_maint_wall_s = 0.0
         paged_packed = False
+        prefix_base_len = 0
         if kv_cache is None:
             if not append_to_cache:
                 raise ValueError("predict-only step requires a non-empty kv_cache.")
             tail_frozen = False
             k_prefix = None
             v_prefix = None
+            prefix_head_sharing = "off"
             prefix_pages = 0
             if cache_mode == "static":
                 cap = self._cache_capacity_from_tensor(k_new_bhld, max_cache_len)
@@ -1224,12 +2558,19 @@ class TransformerEncoderLayer(Module):
             v_pages = kv_cache.get("v_pages", None)
             k_prefix = kv_cache.get("k_prefix", None)
             v_prefix = kv_cache.get("v_prefix", None)
+            prefix_head_sharing = self._normalize_prefix_head_sharing_mode(
+                kv_cache.get("prefix_head_sharing", "off")
+            )
             tail_frozen = bool(kv_cache.get("tail_frozen", False))
             paged_packed = bool(kv_cache.get("paged_packed", False))
             try:
                 prefix_pages = int(kv_cache.get("prefix_pages", 0))
             except Exception:
                 prefix_pages = 0
+            try:
+                prefix_base_len = int(kv_cache.get("prefix_base_len", 0))
+            except Exception:
+                prefix_base_len = 0
             if k_prev is None:
                 valid_len = int(kv_cache.get("valid_len", 0))
             else:
@@ -1258,62 +2599,80 @@ class TransformerEncoderLayer(Module):
                     k_pages = None
                     v_pages = None
                 elif cache_mode == "paged":
+                    prefix_covered_len = 0
+                    if torch.is_tensor(k_prefix) and torch.is_tensor(v_prefix):
+                        prefix_covered_len = int(
+                            min(int(valid_len), int(k_prefix.shape[2]), int(v_prefix.shape[2]))
+                        )
+                    tail_valid_len = int(max(0, int(valid_len) - int(prefix_covered_len)))
+                    tail_max_cache_len = (
+                        int(max(0, int(max_cache_len) - int(prefix_covered_len)))
+                        if max_cache_len is not None
+                        else None
+                    )
                     if k_pages is None or v_pages is None:
                         if k_prev is None or v_prev is None:
                             raise ValueError("paged cache requires either k_pages/v_pages or dense k/v tensors.")
                         k_pages = []
                         v_pages = []
-                        remaining = int(valid_len)
-                        offset = 0
+                        remaining = int(tail_valid_len)
+                        data_offset = int(prefix_covered_len)
+                        tail_offset = 0
                         while remaining > 0:
-                            page_cap = min(int(effective_kv_page_size), int(max_cache_len) - offset)
+                            page_cap = min(int(effective_kv_page_size), int(tail_max_cache_len) - tail_offset)
                             take = min(page_cap, remaining)
                             k_page = k_prev.new_empty((k_prev.shape[0], k_prev.shape[1], page_cap, k_prev.shape[3]))
                             v_page = v_prev.new_empty((v_prev.shape[0], v_prev.shape[1], page_cap, v_prev.shape[3]))
-                            k_page[:, :, :take, :] = k_prev[:, :, offset: offset + take, :]
-                            v_page[:, :, :take, :] = v_prev[:, :, offset: offset + take, :]
+                            k_page[:, :, :take, :] = k_prev[:, :, data_offset: data_offset + take, :]
+                            v_page[:, :, :take, :] = v_prev[:, :, data_offset: data_offset + take, :]
                             k_pages.append(k_page)
                             v_pages.append(v_page)
-                            offset += take
+                            data_offset += take
+                            tail_offset += take
                             remaining -= take
-                        paged_packed = self._paged_views_are_packed(k_pages, valid_len)
+                        paged_packed = self._paged_views_are_packed(k_pages, tail_valid_len)
+                    append_t0 = time.perf_counter() if profile_enabled else None
                     if torch.is_grad_enabled() and (not inplace_paged_grad):
                         if bool(paged_packed):
-                            k_pages, v_pages, valid_len = self._append_to_kv_pages_cow_packed(
+                            k_pages, v_pages, tail_valid_len = self._append_to_kv_pages_cow_packed(
                                 k_pages=k_pages,
                                 v_pages=v_pages,
-                                valid_len=valid_len,
+                                valid_len=tail_valid_len,
                                 k_new_bhld=k_new_bhld,
                                 v_new_bhld=v_new_bhld,
                                 page_size=effective_kv_page_size,
-                                max_cache_len=max_cache_len,
+                                max_cache_len=tail_max_cache_len,
                                 freeze_existing_tail=bool(tail_frozen),
+                                cow_grow_max_tokens=int(getattr(self, "paged_cow_grow_max_tokens", 0)),
+                                profile_stats=(self._layer_step_profile_stats if profile_enabled else None),
                             )
                         else:
-                            k_pages, v_pages, valid_len = self._append_to_kv_pages_cow(
+                            k_pages, v_pages, tail_valid_len = self._append_to_kv_pages_cow(
                                 k_pages=k_pages,
                                 v_pages=v_pages,
-                                valid_len=valid_len,
+                                valid_len=tail_valid_len,
                                 k_new_bhld=k_new_bhld,
                                 v_new_bhld=v_new_bhld,
                                 page_size=effective_kv_page_size,
-                                max_cache_len=max_cache_len,
+                                max_cache_len=tail_max_cache_len,
                                 freeze_existing_tail=bool(tail_frozen),
                             )
-                            paged_packed = self._paged_views_are_packed(k_pages, valid_len)
+                            paged_packed = self._paged_views_are_packed(k_pages, tail_valid_len)
                         tail_frozen = False
                     else:
-                        k_pages, v_pages, valid_len = self._append_to_kv_pages(
+                        k_pages, v_pages, tail_valid_len = self._append_to_kv_pages(
                             k_pages=k_pages,
                             v_pages=v_pages,
-                            valid_len=valid_len,
+                            valid_len=tail_valid_len,
                             k_new_bhld=k_new_bhld,
                             v_new_bhld=v_new_bhld,
                             page_size=effective_kv_page_size,
-                            max_cache_len=max_cache_len,
+                            max_cache_len=tail_max_cache_len,
                         )
                         tail_frozen = False
                         paged_packed = False
+                    cache_append_wall_s += (time.perf_counter() - append_t0) if append_t0 is not None else 0.0
+                    valid_len = int(prefix_covered_len) + int(tail_valid_len)
                     k_all = None
                     v_all = None
                     k_store = None
@@ -1350,8 +2709,6 @@ class TransformerEncoderLayer(Module):
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and (not bool(inplace_paged_grad))
-            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):
@@ -1359,28 +2716,31 @@ class TransformerEncoderLayer(Module):
             # consume [prefix + tail] instead of rebuilding all-page cat views.
             full_pages = int(max(0, len(k_pages) - 1))
             if full_pages <= 0:
-                k_prefix = None
-                v_prefix = None
+                if int(prefix_base_len) <= 0:
+                    k_prefix = None
+                    v_prefix = None
                 prefix_pages = 0
             else:
+                prefix_maint_t0 = time.perf_counter() if profile_enabled else None
                 rebuild_prefix = (
                     (k_prefix is None)
                     or (v_prefix is None)
-                    or (prefix_pages <= 0)
                     or (full_pages < prefix_pages)
                 )
                 if rebuild_prefix:
-                    if full_pages == 1:
-                        k_prefix = k_pages[0]
-                        v_prefix = v_pages[0]
-                    else:
-                        k_prefix = self._concat_dim2(k_pages[:full_pages])
-                        v_prefix = self._concat_dim2(v_pages[:full_pages])
-                    prefix_pages = full_pages
-                elif full_pages > prefix_pages:
+                    if int(prefix_base_len) <= 0:
+                        k_prefix = None
+                        v_prefix = None
+                    prefix_pages = 0
+                if full_pages > prefix_pages:
                     for idx in range(prefix_pages, full_pages):
                         k_full = k_pages[idx]
                         v_full = v_pages[idx]
+                        k_full, v_full, _ = self._reduce_prefix_heads(
+                            k_full,
+                            v_full,
+                            prefix_head_sharing,
+                        )
                         if k_prefix is None or v_prefix is None:
                             k_prefix = k_full
                             v_prefix = v_full
@@ -1388,35 +2748,69 @@ class TransformerEncoderLayer(Module):
                             k_prefix = self._concat_dim2([k_prefix, k_full])
                             v_prefix = self._concat_dim2([v_prefix, v_full])
                     prefix_pages = full_pages
+                if prefix_pages > 0:
+                    k_pages = list(k_pages[prefix_pages:])
+                    v_pages = list(v_pages[prefix_pages:])
+                    prefix_pages = 0
+                prefix_base_len = (
+                    int(k_prefix.shape[2])
+                    if (torch.is_tensor(k_prefix) and torch.is_tensor(v_prefix))
+                    else 0
+                )
+                cache_prefix_maint_wall_s += (
+                    time.perf_counter() - prefix_maint_t0
+                ) if prefix_maint_t0 is not None else 0.0
         else:
             k_prefix = None
             v_prefix = None
+            prefix_head_sharing = "off"
             prefix_pages = 0
+            prefix_base_len = 0
 
         cache_dt = (time.perf_counter() - cache_t0) if cache_t0 is not None else 0.0
         attnff_t0 = time.perf_counter() if profile_enabled else None
-        if cache_mode == "paged" and (k_pages is not None) and (v_pages is not None):
-            src = self._forward_step_attn_ff_paged(
-                src_step,
-                q_bhld,
-                k_pages,
-                v_pages,
-                valid_len,
-                clone_kv_for_grad=bool(inplace_paged_grad),
-                prefix_k=k_prefix,
-                prefix_v=v_prefix,
+        with (
+            _saved_tensors_profile_scope(
+                module_storage_keys=self._profile_param_storage_keys,
+                enabled=bool(profile_enabled and torch.is_grad_enabled()),
             )
-        elif self.recompute_attn and torch.is_grad_enabled():
-            src = checkpoint(
-                self._forward_step_attn_ff,
-                src_step,
-                q_bhld,
-                k_all,
-                v_all,
-                use_reentrant=True,
-            )
-        else:
-            src = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
+            if profile_enabled
+            else nullcontext(None)
+        ) as attnff_saved_stats:
+            if cache_mode == "paged" and (k_pages is not None) and (v_pages is not None):
+                if self.recompute_attn and self.paged_recompute_attn and torch.is_grad_enabled():
+                    src = self._forward_step_attn_ff_paged_checkpointed(
+                        src_step,
+                        q_bhld,
+                        k_pages,
+                        v_pages,
+                        valid_len,
+                        clone_kv_for_grad=bool(inplace_paged_grad),
+                        prefix_k=k_prefix,
+                        prefix_v=v_prefix,
+                    )
+                else:
+                    src = self._forward_step_attn_ff_paged(
+                        src_step,
+                        q_bhld,
+                        k_pages,
+                        v_pages,
+                        valid_len,
+                        clone_kv_for_grad=bool(inplace_paged_grad),
+                        prefix_k=k_prefix,
+                        prefix_v=v_prefix,
+                    )
+            elif self.recompute_attn and torch.is_grad_enabled():
+                src = checkpoint(
+                    self._forward_step_attn_ff,
+                    src_step,
+                    q_bhld,
+                    k_all,
+                    v_all,
+                    use_reentrant=bool(getattr(self, "recompute_attn_use_reentrant", True)),
+                )
+            else:
+                src = self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
         attnff_dt = (time.perf_counter() - attnff_t0) if attnff_t0 is not None else 0.0
 
         store_dense_paged_views = bool(
@@ -1445,7 +2839,9 @@ class TransformerEncoderLayer(Module):
             new_cache["valid_len"] = int(valid_len)
             new_cache["k_prefix"] = k_prefix
             new_cache["v_prefix"] = v_prefix
+            new_cache["prefix_head_sharing"] = prefix_head_sharing
             new_cache["prefix_pages"] = int(prefix_pages)
+            new_cache["prefix_base_len"] = int(prefix_base_len)
             new_cache["allow_grad_mutable_cache"] = bool(allow_grad_mutable_cache)
             new_cache["allow_grad_inplace_paged_cache"] = bool(allow_grad_inplace_paged_cache)
             new_cache["tail_frozen"] = bool(tail_frozen) if cache_mode == "paged" else False
@@ -1464,7 +2860,9 @@ class TransformerEncoderLayer(Module):
                 "valid_len": int(valid_len),
                 "k_prefix": k_prefix,
                 "v_prefix": v_prefix,
+                "prefix_head_sharing": prefix_head_sharing,
                 "prefix_pages": int(prefix_pages),
+                "prefix_base_len": int(prefix_base_len),
                 "allow_grad_mutable_cache": bool(allow_grad_mutable_cache),
                 "allow_grad_inplace_paged_cache": bool(allow_grad_inplace_paged_cache),
                 "tail_frozen": bool(tail_frozen) if cache_mode == "paged" else False,
@@ -1475,7 +2873,16 @@ class TransformerEncoderLayer(Module):
             stats["calls"] += 1
             stats["proj_wall_s"] += float(proj_dt)
             stats["cache_wall_s"] += float(cache_dt)
+            stats["cache_append_wall_s"] += float(cache_append_wall_s)
+            stats["cache_prefix_maint_wall_s"] += float(cache_prefix_maint_wall_s)
             stats["attnff_wall_s"] += float(attnff_dt)
+            if isinstance(attnff_saved_stats, dict):
+                stats["attnff_saved_nonparam_raw_bytes_last"] = int(
+                    attnff_saved_stats.get("nonparam_raw_bytes", 0) or 0
+                )
+                stats["attnff_saved_nonparam_unique_storage_bytes_last"] = int(
+                    attnff_saved_stats.get("nonparam_unique_storage_bytes", 0) or 0
+                )
             stats["total_wall_s"] += float(time.perf_counter() - total_t0)
         return src, new_cache
 
@@ -1552,24 +2959,54 @@ class TransformerEncoderLayer(Module):
         src_norm_bld = src_norm.permute(1, 0, 2)  # (B, Tq, E)
         q_bld = self._project_q(src_norm_bld)
         q_bhld = self._split_heads(q_bld)
+        attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
         k_pages = kv_cache.get("k_pages", None)
         v_pages = kv_cache.get("v_pages", None)
         if (k_pages is not None) and (v_pages is not None):
             valid_len = int(kv_cache.get("valid_len", 0))
-            k_bhld, v_bhld = self._build_paged_views(k_pages, v_pages, valid_len)
+            k_prefix = kv_cache.get("k_prefix", None)
+            v_prefix = kv_cache.get("v_prefix", None)
+            if attn_dropout <= 0.0:
+                attn_bhld = self._merge_attention_chunks_with_lse(
+                    q_bhld,
+                    self._iter_paged_flash_chunks(
+                        q_bhld,
+                        k_pages,
+                        v_pages,
+                        valid_len,
+                        chunk_token_cap=self._resolve_paged_chunk_tokens(q_bhld, valid_len),
+                        prefix_k=k_prefix,
+                        prefix_v=v_prefix,
+                        clone_kv_for_grad=False,
+                        clone_prefix_for_grad=False,
+                    ),
+                )
+                k_bhld = None
+                v_bhld = None
+            else:
+                k_bhld, v_bhld = self._combine_prefix_with_paged_tail(
+                    k_prefix,
+                    v_prefix,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                    target_heads=int(q_bhld.shape[1]),
+                )
+                attn_bhld = None
         else:
             k_bhld = kv_cache["k"]
             v_bhld = kv_cache["v"]
+            attn_bhld = None
 
-        attn_dropout = float(self.self_attn.dropout) if self.training else 0.0
-        attn_bhld = F.scaled_dot_product_attention(
-            q_bhld,
-            k_bhld,
-            v_bhld,
-            attn_mask=None,
-            dropout_p=attn_dropout,
-            is_causal=False,
-        )
+        if attn_bhld is None:
+            attn_bhld = F.scaled_dot_product_attention(
+                q_bhld,
+                k_bhld,
+                v_bhld,
+                attn_mask=None,
+                dropout_p=attn_dropout,
+                is_causal=False,
+            )
         attn_bld = self._merge_heads(attn_bhld)
         attn_bld = F.linear(attn_bld, self.self_attn.out_proj.weight, self.self_attn.out_proj.bias)
         src2 = attn_bld.permute(1, 0, 2)
@@ -1669,7 +3106,7 @@ class TransformerEncoderLayer(Module):
                     src_mask, # attn_mask: Optional[Tensor] = None,
                     True, # average_attn_weights: bool = True,
                     False, # is_causal : bool = False) -> Tuple[Tensor, Optional[Tensor]]:
-                    use_reentrant=True,
+                    use_reentrant=bool(getattr(self, "recompute_attn_use_reentrant", True)),
                 )[0]
             else:
                 src2 = self.self_attn(
@@ -1713,20 +3150,114 @@ class TransformerEncoderSimple(Module):
         self.layers = nn.ModuleList([encoder_layer_creator() for _ in range(num_layers)])
         self.num_layers = num_layers
         self.norm = norm
+        step_layer_2d_flag = str(os.environ.get("TICL_POLICY_STEP_LAYER_2D_LOOP", "1")).strip().lower()
+        self.step_layer_2d_loop = step_layer_2d_flag not in {"0", "false", "no", "off"}
+
+    def step_fastpath_compile_active(self):
+        for layer in self.layers:
+            active_fn = getattr(layer, "finalize_compile_active", None)
+            if callable(active_fn) and bool(active_fn()):
+                return True
+        return False
+
+    def step_fastpath_compile_config(self):
+        for layer in self.layers:
+            active_fn = getattr(layer, "finalize_compile_active", None)
+            if callable(active_fn) and bool(active_fn()):
+                return {
+                    "finalize_torch_compile": True,
+                    "backend": str(getattr(layer, "finalize_torch_compile_backend", "inductor")),
+                    "mode": str(getattr(layer, "finalize_torch_compile_mode", "reduce-overhead")),
+                    "fullgraph": bool(getattr(layer, "finalize_torch_compile_fullgraph", False)),
+                    "dynamic": bool(getattr(layer, "finalize_torch_compile_dynamic", False)),
+                }
+        return {"finalize_torch_compile": False}
+
+    def warmup_step_fastpaths(self, batch_size: int):
+        warmed = False
+        for layer in self.layers:
+            warmup_fn = getattr(layer, "warmup_finalize_compile", None)
+            if callable(warmup_fn):
+                warmed = bool(warmup_fn(batch_size=batch_size)) or bool(warmed)
+        return bool(warmed)
 
     def consume_step_profile(self):
         calls = 0
         proj_wall_s = 0.0
         cache_wall_s = 0.0
+        cache_append_wall_s = 0.0
+        paged_grow_calls = 0
+        paged_grow_prev_total_bytes_last = 0
+        paged_grow_prev_total_bytes_max = 0
+        paged_grow_new_total_bytes_last = 0
+        paged_grow_new_total_bytes_max = 0
+        paged_grow_out_total_bytes_last = 0
+        paged_grow_out_total_bytes_max = 0
+        paged_grow_working_set_total_bytes_last = 0
+        paged_grow_working_set_total_bytes_max = 0
+        paged_grow_k_out_bytes_last = 0
+        paged_grow_k_out_bytes_max = 0
+        paged_grow_v_out_bytes_last = 0
+        paged_grow_v_out_bytes_max = 0
+        cache_prefix_maint_wall_s = 0.0
         attnff_wall_s = 0.0
         attn_core_wall_s = 0.0
+        paged_view_build_wall_s = 0.0
+        paged_clone_wall_s = 0.0
+        paged_dispatch_single_page_wall_s = 0.0
+        paged_dispatch_flash_prefix_wall_s = 0.0
+        paged_dispatch_flash_merge_wall_s = 0.0
+        paged_dispatch_dense_wall_s = 0.0
         finalize_wall_s = 0.0
+        flash_prefix_prepare_prefix_wall_s = 0.0
+        flash_prefix_prefix_core_wall_s = 0.0
+        flash_prefix_tail_core_wall_s = 0.0
+        flash_prefix_merge_wall_s = 0.0
+        flash_prefix_wait_stream_wall_s = 0.0
+        flash_prefix_prefix_cast_norm_wall_s = 0.0
+        flash_prefix_tail_cast_norm_wall_s = 0.0
+        flash_prefix_merge_logaddexp_wall_s = 0.0
+        flash_prefix_merge_scale_wall_s = 0.0
+        flash_prefix_merge_blend_wall_s = 0.0
+        flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_tail_saved_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_merge_saved_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last = 0
+        flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last = 0
+        flash_merge_chunk_prep_wall_s = 0.0
+        flash_merge_chunk_core_wall_s = 0.0
+        flash_merge_lse_merge_wall_s = 0.0
+        flash_merge_chunk_count_sum = 0
         finalize_attn_outproj_wall_s = 0.0
+        finalize_attn_outproj_linear_wall_s = 0.0
+        finalize_attn_outproj_norm_wall_s = 0.0
         finalize_ffn_wall_s = 0.0
+        finalize_ffn_linear1_act_wall_s = 0.0
+        finalize_ffn_linear2_residual_norm_wall_s = 0.0
+        finalize_ffn_linear2_wall_s = 0.0
+        finalize_ffn_residual_norm_wall_s = 0.0
+        finalize_compiled_wall_s = 0.0
         paged_path_single_page = 0
         paged_path_flash_prefix = 0
+        paged_path_flash_prefix_zero_fastpath = 0
         paged_path_flash_merge = 0
         paged_path_dense = 0
+        paged_page_count_sum = 0
+        paged_valid_len_sum = 0
+        paged_last_page_tokens_sum = 0
+        paged_prefix_len_sum = 0
+        flash_prefix_valid_tokens_sum = 0
+        flash_prefix_prefix_tokens_sum = 0
+        flash_prefix_tail_tokens_sum = 0
+        dense_valid_tokens_sum = 0
+        dense_prefix_tokens_sum = 0
+        dense_tail_tokens_sum = 0
         total_wall_s = 0.0
         enabled = False
         for layer in self.layers:
@@ -1740,17 +3271,171 @@ class TransformerEncoderSimple(Module):
             calls += int(layer_stats.get("calls", 0) or 0)
             proj_wall_s += float(layer_stats.get("proj_wall_s", 0.0) or 0.0)
             cache_wall_s += float(layer_stats.get("cache_wall_s", 0.0) or 0.0)
+            cache_append_wall_s += float(layer_stats.get("cache_append_wall_s", 0.0) or 0.0)
+            paged_grow_calls += int(layer_stats.get("paged_grow_calls", 0) or 0)
+            paged_grow_prev_total_bytes_last = int(layer_stats.get("paged_grow_prev_total_bytes_last", 0) or 0)
+            paged_grow_prev_total_bytes_max = max(
+                int(paged_grow_prev_total_bytes_max),
+                int(layer_stats.get("paged_grow_prev_total_bytes_max", 0) or 0),
+            )
+            paged_grow_new_total_bytes_last = int(layer_stats.get("paged_grow_new_total_bytes_last", 0) or 0)
+            paged_grow_new_total_bytes_max = max(
+                int(paged_grow_new_total_bytes_max),
+                int(layer_stats.get("paged_grow_new_total_bytes_max", 0) or 0),
+            )
+            paged_grow_out_total_bytes_last = int(layer_stats.get("paged_grow_out_total_bytes_last", 0) or 0)
+            paged_grow_out_total_bytes_max = max(
+                int(paged_grow_out_total_bytes_max),
+                int(layer_stats.get("paged_grow_out_total_bytes_max", 0) or 0),
+            )
+            paged_grow_working_set_total_bytes_last = int(
+                layer_stats.get("paged_grow_working_set_total_bytes_last", 0) or 0
+            )
+            paged_grow_working_set_total_bytes_max = max(
+                int(paged_grow_working_set_total_bytes_max),
+                int(layer_stats.get("paged_grow_working_set_total_bytes_max", 0) or 0),
+            )
+            paged_grow_k_out_bytes_last = int(layer_stats.get("paged_grow_k_out_bytes_last", 0) or 0)
+            paged_grow_k_out_bytes_max = max(
+                int(paged_grow_k_out_bytes_max),
+                int(layer_stats.get("paged_grow_k_out_bytes_max", 0) or 0),
+            )
+            paged_grow_v_out_bytes_last = int(layer_stats.get("paged_grow_v_out_bytes_last", 0) or 0)
+            paged_grow_v_out_bytes_max = max(
+                int(paged_grow_v_out_bytes_max),
+                int(layer_stats.get("paged_grow_v_out_bytes_max", 0) or 0),
+            )
+            cache_prefix_maint_wall_s += float(layer_stats.get("cache_prefix_maint_wall_s", 0.0) or 0.0)
             attnff_wall_s += float(layer_stats.get("attnff_wall_s", 0.0) or 0.0)
             attn_core_wall_s += float(layer_stats.get("attn_core_wall_s", 0.0) or 0.0)
+            paged_view_build_wall_s += float(layer_stats.get("paged_view_build_wall_s", 0.0) or 0.0)
+            paged_clone_wall_s += float(layer_stats.get("paged_clone_wall_s", 0.0) or 0.0)
+            paged_dispatch_single_page_wall_s += float(
+                layer_stats.get("paged_dispatch_single_page_wall_s", 0.0) or 0.0
+            )
+            paged_dispatch_flash_prefix_wall_s += float(
+                layer_stats.get("paged_dispatch_flash_prefix_wall_s", 0.0) or 0.0
+            )
+            paged_dispatch_flash_merge_wall_s += float(
+                layer_stats.get("paged_dispatch_flash_merge_wall_s", 0.0) or 0.0
+            )
+            paged_dispatch_dense_wall_s += float(
+                layer_stats.get("paged_dispatch_dense_wall_s", 0.0) or 0.0
+            )
             finalize_wall_s += float(layer_stats.get("finalize_wall_s", 0.0) or 0.0)
+            flash_prefix_prepare_prefix_wall_s += float(
+                layer_stats.get("flash_prefix_prepare_prefix_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_prefix_core_wall_s += float(
+                layer_stats.get("flash_prefix_prefix_core_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_tail_core_wall_s += float(
+                layer_stats.get("flash_prefix_tail_core_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_merge_wall_s += float(
+                layer_stats.get("flash_prefix_merge_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_wait_stream_wall_s += float(
+                layer_stats.get("flash_prefix_wait_stream_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_prefix_cast_norm_wall_s += float(
+                layer_stats.get("flash_prefix_prefix_cast_norm_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_tail_cast_norm_wall_s += float(
+                layer_stats.get("flash_prefix_tail_cast_norm_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_merge_logaddexp_wall_s += float(
+                layer_stats.get("flash_prefix_merge_logaddexp_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_merge_scale_wall_s += float(
+                layer_stats.get("flash_prefix_merge_scale_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_merge_blend_wall_s += float(
+                layer_stats.get("flash_prefix_merge_blend_wall_s", 0.0) or 0.0
+            )
+            flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_tail_saved_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_tail_saved_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_merge_saved_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_merge_saved_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last = int(
+                layer_stats.get("flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last", 0) or 0
+            )
+            flash_merge_chunk_prep_wall_s += float(
+                layer_stats.get("flash_merge_chunk_prep_wall_s", 0.0) or 0.0
+            )
+            flash_merge_chunk_core_wall_s += float(
+                layer_stats.get("flash_merge_chunk_core_wall_s", 0.0) or 0.0
+            )
+            flash_merge_lse_merge_wall_s += float(
+                layer_stats.get("flash_merge_lse_merge_wall_s", 0.0) or 0.0
+            )
+            flash_merge_chunk_count_sum += int(layer_stats.get("flash_merge_chunk_count_sum", 0) or 0)
             finalize_attn_outproj_wall_s += float(
                 layer_stats.get("finalize_attn_outproj_wall_s", 0.0) or 0.0
             )
+            finalize_attn_outproj_linear_wall_s += float(
+                layer_stats.get("finalize_attn_outproj_linear_wall_s", 0.0) or 0.0
+            )
+            finalize_attn_outproj_norm_wall_s += float(
+                layer_stats.get("finalize_attn_outproj_norm_wall_s", 0.0) or 0.0
+            )
             finalize_ffn_wall_s += float(layer_stats.get("finalize_ffn_wall_s", 0.0) or 0.0)
+            finalize_ffn_linear1_act_wall_s += float(
+                layer_stats.get("finalize_ffn_linear1_act_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_linear2_residual_norm_wall_s += float(
+                layer_stats.get("finalize_ffn_linear2_residual_norm_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_linear2_wall_s += float(
+                layer_stats.get("finalize_ffn_linear2_wall_s", 0.0) or 0.0
+            )
+            finalize_ffn_residual_norm_wall_s += float(
+                layer_stats.get("finalize_ffn_residual_norm_wall_s", 0.0) or 0.0
+            )
+            finalize_compiled_wall_s += float(layer_stats.get("finalize_compiled_wall_s", 0.0) or 0.0)
             paged_path_single_page += int(layer_stats.get("paged_path_single_page", 0) or 0)
             paged_path_flash_prefix += int(layer_stats.get("paged_path_flash_prefix", 0) or 0)
+            paged_path_flash_prefix_zero_fastpath += int(
+                layer_stats.get("paged_path_flash_prefix_zero_fastpath", 0) or 0
+            )
             paged_path_flash_merge += int(layer_stats.get("paged_path_flash_merge", 0) or 0)
             paged_path_dense += int(layer_stats.get("paged_path_dense", 0) or 0)
+            paged_page_count_sum += int(layer_stats.get("paged_page_count_sum", 0) or 0)
+            paged_valid_len_sum += int(layer_stats.get("paged_valid_len_sum", 0) or 0)
+            paged_last_page_tokens_sum += int(layer_stats.get("paged_last_page_tokens_sum", 0) or 0)
+            paged_prefix_len_sum += int(layer_stats.get("paged_prefix_len_sum", 0) or 0)
+            flash_prefix_valid_tokens_sum += int(layer_stats.get("flash_prefix_valid_tokens_sum", 0) or 0)
+            flash_prefix_prefix_tokens_sum += int(layer_stats.get("flash_prefix_prefix_tokens_sum", 0) or 0)
+            flash_prefix_tail_tokens_sum += int(layer_stats.get("flash_prefix_tail_tokens_sum", 0) or 0)
+            dense_valid_tokens_sum += int(layer_stats.get("dense_valid_tokens_sum", 0) or 0)
+            dense_prefix_tokens_sum += int(layer_stats.get("dense_prefix_tokens_sum", 0) or 0)
+            dense_tail_tokens_sum += int(layer_stats.get("dense_tail_tokens_sum", 0) or 0)
             total_wall_s += float(layer_stats.get("total_wall_s", 0.0) or 0.0)
         if not enabled:
             return None
@@ -1758,15 +3443,101 @@ class TransformerEncoderSimple(Module):
             "calls": int(calls),
             "proj_wall_s": float(proj_wall_s),
             "cache_wall_s": float(cache_wall_s),
+            "cache_append_wall_s": float(cache_append_wall_s),
+            "paged_grow_calls": int(paged_grow_calls),
+            "paged_grow_prev_total_bytes_last": int(paged_grow_prev_total_bytes_last),
+            "paged_grow_prev_total_bytes_max": int(paged_grow_prev_total_bytes_max),
+            "paged_grow_new_total_bytes_last": int(paged_grow_new_total_bytes_last),
+            "paged_grow_new_total_bytes_max": int(paged_grow_new_total_bytes_max),
+            "paged_grow_out_total_bytes_last": int(paged_grow_out_total_bytes_last),
+            "paged_grow_out_total_bytes_max": int(paged_grow_out_total_bytes_max),
+            "paged_grow_working_set_total_bytes_last": int(paged_grow_working_set_total_bytes_last),
+            "paged_grow_working_set_total_bytes_max": int(paged_grow_working_set_total_bytes_max),
+            "paged_grow_k_out_bytes_last": int(paged_grow_k_out_bytes_last),
+            "paged_grow_k_out_bytes_max": int(paged_grow_k_out_bytes_max),
+            "paged_grow_v_out_bytes_last": int(paged_grow_v_out_bytes_last),
+            "paged_grow_v_out_bytes_max": int(paged_grow_v_out_bytes_max),
+            "cache_prefix_maint_wall_s": float(cache_prefix_maint_wall_s),
             "attnff_wall_s": float(attnff_wall_s),
             "attn_core_wall_s": float(attn_core_wall_s),
+            "paged_view_build_wall_s": float(paged_view_build_wall_s),
+            "paged_clone_wall_s": float(paged_clone_wall_s),
+            "paged_dispatch_single_page_wall_s": float(paged_dispatch_single_page_wall_s),
+            "paged_dispatch_flash_prefix_wall_s": float(paged_dispatch_flash_prefix_wall_s),
+            "paged_dispatch_flash_merge_wall_s": float(paged_dispatch_flash_merge_wall_s),
+            "paged_dispatch_dense_wall_s": float(paged_dispatch_dense_wall_s),
             "finalize_wall_s": float(finalize_wall_s),
+            "flash_prefix_prepare_prefix_wall_s": float(flash_prefix_prepare_prefix_wall_s),
+            "flash_prefix_prefix_core_wall_s": float(flash_prefix_prefix_core_wall_s),
+            "flash_prefix_tail_core_wall_s": float(flash_prefix_tail_core_wall_s),
+            "flash_prefix_merge_wall_s": float(flash_prefix_merge_wall_s),
+            "flash_prefix_wait_stream_wall_s": float(flash_prefix_wait_stream_wall_s),
+            "flash_prefix_prefix_cast_norm_wall_s": float(flash_prefix_prefix_cast_norm_wall_s),
+            "flash_prefix_tail_cast_norm_wall_s": float(flash_prefix_tail_cast_norm_wall_s),
+            "flash_prefix_merge_logaddexp_wall_s": float(flash_prefix_merge_logaddexp_wall_s),
+            "flash_prefix_merge_scale_wall_s": float(flash_prefix_merge_scale_wall_s),
+            "flash_prefix_merge_blend_wall_s": float(flash_prefix_merge_blend_wall_s),
+            "flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_prefix_saved_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_tail_saved_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_tail_saved_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_merge_saved_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_merge_saved_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_prefix_saved_q_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_prefix_saved_k_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_prefix_saved_v_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_prefix_saved_other_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_tail_saved_q_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_tail_saved_k_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_tail_saved_v_nonparam_unique_storage_bytes_last
+            ),
+            "flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last": int(
+                flash_prefix_tail_saved_other_nonparam_unique_storage_bytes_last
+            ),
+            "flash_merge_chunk_prep_wall_s": float(flash_merge_chunk_prep_wall_s),
+            "flash_merge_chunk_core_wall_s": float(flash_merge_chunk_core_wall_s),
+            "flash_merge_lse_merge_wall_s": float(flash_merge_lse_merge_wall_s),
+            "flash_merge_chunk_count_sum": int(flash_merge_chunk_count_sum),
             "finalize_attn_outproj_wall_s": float(finalize_attn_outproj_wall_s),
+            "finalize_attn_outproj_linear_wall_s": float(finalize_attn_outproj_linear_wall_s),
+            "finalize_attn_outproj_norm_wall_s": float(finalize_attn_outproj_norm_wall_s),
             "finalize_ffn_wall_s": float(finalize_ffn_wall_s),
+            "finalize_ffn_linear1_act_wall_s": float(finalize_ffn_linear1_act_wall_s),
+            "finalize_ffn_linear2_residual_norm_wall_s": float(finalize_ffn_linear2_residual_norm_wall_s),
+            "finalize_ffn_linear2_wall_s": float(finalize_ffn_linear2_wall_s),
+            "finalize_ffn_residual_norm_wall_s": float(finalize_ffn_residual_norm_wall_s),
+            "finalize_compiled_wall_s": float(finalize_compiled_wall_s),
             "paged_path_single_page": int(paged_path_single_page),
             "paged_path_flash_prefix": int(paged_path_flash_prefix),
+            "paged_path_flash_prefix_zero_fastpath": int(paged_path_flash_prefix_zero_fastpath),
             "paged_path_flash_merge": int(paged_path_flash_merge),
             "paged_path_dense": int(paged_path_dense),
+            "paged_page_count_sum": int(paged_page_count_sum),
+            "paged_valid_len_sum": int(paged_valid_len_sum),
+            "paged_last_page_tokens_sum": int(paged_last_page_tokens_sum),
+            "paged_prefix_len_sum": int(paged_prefix_len_sum),
+            "flash_prefix_valid_tokens_sum": int(flash_prefix_valid_tokens_sum),
+            "flash_prefix_prefix_tokens_sum": int(flash_prefix_prefix_tokens_sum),
+            "flash_prefix_tail_tokens_sum": int(flash_prefix_tail_tokens_sum),
+            "dense_valid_tokens_sum": int(dense_valid_tokens_sum),
+            "dense_prefix_tokens_sum": int(dense_prefix_tokens_sum),
+            "dense_tail_tokens_sum": int(dense_tail_tokens_sum),
             "total_wall_s": float(total_wall_s),
         }
 
@@ -1808,7 +3579,13 @@ class TransformerEncoderSimple(Module):
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
     ):
-        output = src_step
+        squeeze_seq_dim = bool(
+            self.step_layer_2d_loop
+            and isinstance(src_step, Tensor)
+            and src_step.ndim == 3
+            and int(src_step.shape[0]) == 1
+        )
+        output = src_step.squeeze(0) if squeeze_seq_dim else src_step
         if kv_cache is None:
             kv_cache = [None] * len(self.layers)
         if len(kv_cache) != len(self.layers):
@@ -1852,6 +3629,8 @@ class TransformerEncoderSimple(Module):
 
         if self.norm is not None:
             output = self.norm(output)
+        if squeeze_seq_dim:
+            output = output.unsqueeze(0)
         return output, new_cache
 
     def encode_prefix_to_kv(self, src_prefix: Tensor):
