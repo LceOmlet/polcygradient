@@ -195,6 +195,160 @@ def _sample_action_candidates(rng, action_low, action_high, n_candidates):
     return candidates
 
 
+def _model_supports_policy_step(model):
+    model_ref = model.module if hasattr(model, "module") else model
+    return hasattr(model_ref, "forward_policy_step")
+
+
+def _resolve_validation_sample(value, rng):
+    if isinstance(value, dict):
+        dist = str(value.get("distribution", "")).strip().lower()
+        if dist == "uniform":
+            lo = float(value.get("min", 0.0))
+            hi = float(value.get("max", lo))
+            return float(rng.uniform(lo, hi))
+        if dist == "log_uniform":
+            lo = float(value.get("min", 1e-6))
+            hi = float(value.get("max", lo))
+            if lo <= 0.0 or hi <= 0.0:
+                return float(max(lo, hi, 0.0))
+            return float(np.exp(rng.uniform(np.log(lo), np.log(hi))))
+        if dist in {"uniform_int", "randint"}:
+            lo = float(value.get("min", 0.0))
+            hi = float(value.get("max", lo))
+            return int(round(rng.uniform(lo, hi)))
+    return value
+
+
+def _resolve_validation_policy_hparams(env_cfg, rng):
+    return {
+        # Match the prior semantics: 1 means reward is present, 0 means dropped/missing.
+        "reward_mask_present_value": 1.0,
+        "init_action_std": float(_resolve_validation_sample(env_cfg.get("init_action_std", 0.0), rng)),
+        "action_noise_train_std": float(_resolve_validation_sample(env_cfg.get("action_noise_train_std", 0.0), rng)),
+        "action_noise_eval_std": float(_resolve_validation_sample(env_cfg.get("action_noise_eval_std", 0.0), rng)),
+        "action_transform_mode": str(env_cfg.get("reinforce_action_transform", "rms")).strip().lower(),
+        "action_rms_eps": float(_resolve_validation_sample(env_cfg.get("reinforce_action_rms_eps", 1e-6), rng)),
+        "reward_clip": float(max(0.1, _resolve_validation_sample(env_cfg.get("reward_clip", 10.0), rng))),
+        "reward_transform_mode": str(env_cfg.get("reinforce_reward_transform", "none")).strip().lower(),
+        "reward_transform_rms_eps": float(
+            _resolve_validation_sample(env_cfg.get("reinforce_reward_rms_eps", 1e-6), rng)
+        ),
+        "reward_transform_tanh_c": float(
+            _resolve_validation_sample(env_cfg.get("reinforce_reward_tanh_c", 1.0), rng)
+        ),
+        "reward_transform_tanh_bound": float(
+            _resolve_validation_sample(env_cfg.get("reinforce_reward_tanh_bound", 10.0), rng)
+        ),
+    }
+
+
+def _initialize_validation_policy_state(state, *, env_cfg, device, action_dim):
+    rng = state["rng"]
+    h = _resolve_validation_policy_hparams(env_cfg, rng)
+    init_action_std = float(h["init_action_std"])
+    if init_action_std > 0.0:
+        init_action = rng.normal(size=(1, int(action_dim))).astype(np.float32) * init_action_std
+    else:
+        init_action = np.zeros((1, int(action_dim)), dtype=np.float32)
+    state["policy_hparams"] = h
+    state["policy_action_t"] = torch.from_numpy(init_action).to(device=device, dtype=torch.float32)
+    state["policy_reward_t"] = torch.zeros((1, 1), device=device, dtype=torch.float32)
+    state["policy_reward_mask_t"] = torch.full(
+        (1, 1),
+        float(h["reward_mask_present_value"]),
+        device=device,
+        dtype=torch.float32,
+    )
+    state["policy_terminal_t"] = torch.zeros((1, 1), device=device, dtype=torch.float32)
+    state["policy_cache"] = None
+    state["policy_action_dim"] = int(action_dim)
+
+
+def _transform_validation_reward(reward_raw, *, policy_hparams, device):
+    from ticl.priors.environment_prior import EnvironmentPrior
+
+    reward_t = torch.as_tensor([float(reward_raw)], device=device, dtype=torch.float32)
+    reward_t = torch.clamp(
+        reward_t,
+        min=-float(policy_hparams["reward_clip"]),
+        max=float(policy_hparams["reward_clip"]),
+    )
+    reward_t = EnvironmentPrior._transform_reward_with_params(
+        reward_t,
+        mode=policy_hparams["reward_transform_mode"],
+        rms_eps=policy_hparams["reward_transform_rms_eps"],
+        tanh_c=policy_hparams["reward_transform_tanh_c"],
+        tanh_bound=policy_hparams["reward_transform_tanh_bound"],
+    )
+    return float(reward_t.reshape(()).detach().cpu().item())
+
+
+def _select_policy_action(
+    *,
+    state,
+    policy_step_fn,
+    device,
+    obs_slot_dim,
+    action_slot_dim,
+    terminal_token_enabled,
+):
+    from ticl.priors.environment_prior import EnvironmentPrior
+
+    obs_t = torch.from_numpy(_to_1d_array(state["obs"])).to(device=device, dtype=torch.float32).reshape(1, -1)
+    env_info = {
+        "obs_slot_dim": int(obs_slot_dim),
+        "action_slot_dim": int(action_slot_dim),
+        "action_dim": int(state["policy_action_dim"]),
+        "phase_t": torch.full(
+            (1, 1),
+            float(state["phase_flag"]),
+            device=device,
+            dtype=torch.float32,
+        ),
+    }
+    if bool(terminal_token_enabled):
+        env_info["terminal_t"] = state["policy_terminal_t"]
+    with torch.no_grad():
+        policy_out = policy_step_fn(
+            obs_t,
+            state["policy_action_t"],
+            state["policy_reward_t"],
+            state["policy_reward_mask_t"],
+            state["policy_cache"],
+            int(state["context_len"] + state["current_rollout_len"]),
+            env_info,
+        )
+    if isinstance(policy_out, tuple):
+        action_mean, cache_next = policy_out
+    else:
+        action_mean = policy_out
+        cache_next = state["policy_cache"]
+    if action_mean.ndim == 1:
+        action_mean = action_mean.reshape(1, -1)
+
+    policy_hparams = state["policy_hparams"]
+    action_std = (
+        float(policy_hparams["action_noise_eval_std"])
+        if float(state["phase_flag"]) >= 1.0
+        else float(policy_hparams["action_noise_train_std"])
+    )
+    if action_std > 0.0:
+        action_eps = state["rng"].normal(size=tuple(action_mean.shape)).astype(np.float32)
+        action_pre_tanh = action_mean + torch.from_numpy(action_eps).to(device=device, dtype=action_mean.dtype) * action_std
+    else:
+        action_pre_tanh = action_mean
+    action_env = EnvironmentPrior._transform_reinforce_action(
+        action_pre_tanh,
+        mode=policy_hparams["action_transform_mode"],
+        rms_eps=policy_hparams["action_rms_eps"],
+    )
+    action_np = action_env[0].detach().to(dtype=torch.float32).cpu().numpy()
+    action_np = np.clip(action_np, state["action_low"], state["action_high"]).astype(np.float32)
+    state["policy_cache"] = cache_next
+    return action_np
+
+
 def _reset_validation_rollout(state, preserve_prev=False):
     obs, _ = state["env"].reset(seed=int(state["next_reset_seed"]))
     state["next_reset_seed"] += 1
@@ -202,6 +356,13 @@ def _reset_validation_rollout(state, preserve_prev=False):
     if not bool(preserve_prev):
         state["prev_reward"] = 0.0
         state["prev_terminal"] = 0.0
+        if "policy_hparams" in state:
+            state["policy_reward_t"] = torch.zeros_like(state["policy_reward_t"])
+            state["policy_reward_mask_t"] = torch.full_like(
+                state["policy_reward_mask_t"],
+                float(state["policy_hparams"]["reward_mask_present_value"]),
+            )
+            state["policy_terminal_t"] = torch.zeros_like(state["policy_terminal_t"])
     state["current_rollout_return"] = 0.0
     state["current_rollout_len"] = 0
 
@@ -245,6 +406,11 @@ def _build_validation_episode_states(
     env_name,
     episodes,
     base_seed,
+    env_cfg=None,
+    device="cpu",
+    action_low=None,
+    action_high=None,
+    policy_step_enabled=False,
 ):
     episode_states = []
     for ep in range(int(episodes)):
@@ -267,6 +433,16 @@ def _build_validation_episode_states(
             "explore_rollout_len_mean": None,
             "next_reset_seed": reset_seed,
         }
+        if action_low is not None and action_high is not None:
+            state["action_low"] = np.asarray(action_low, dtype=np.float32).reshape(-1)
+            state["action_high"] = np.asarray(action_high, dtype=np.float32).reshape(-1)
+        if bool(policy_step_enabled):
+            _initialize_validation_policy_state(
+                state,
+                env_cfg=(env_cfg or {}),
+                device=device,
+                action_dim=int(state["action_low"].shape[0]),
+            )
         _reset_validation_rollout(state)
         episode_states.append(state)
     return episode_states
@@ -298,6 +474,22 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     default_num_features = int(obs_slot_dim) + 2 + int(phase_token_enabled) + int(terminal_token_enabled) + int(action_slot_dim)
     num_features = int(config.get("prior", {}).get("num_features", default_num_features))
     device = config.get("device", "cpu")
+    optimizer_cfg = config.get("optimizer", {})
+    policy_step_fn = None
+    use_policy_step_validation = bool(_model_supports_policy_step(model))
+    if bool(use_policy_step_validation):
+        from ticl.train import _build_policy_step_fn
+
+        policy_step_fn = _build_policy_step_fn(
+            model,
+            num_features=num_features,
+            max_cache_len=None,
+            kv_cache_mode=optimizer_cfg.get("pg_kv_cache_mode", "auto"),
+            kv_cache_page_size=optimizer_cfg.get("pg_kv_cache_page_size", None),
+            allow_grad_mutable_cache=False,
+            allow_grad_inplace_paged_cache=False,
+            pg_torch_compile=False,
+        )
 
     was_training = model.training
     model.eval()
@@ -339,6 +531,11 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 env_name=env_name,
                 episodes=episodes,
                 base_seed=base_seed,
+                env_cfg=env_cfg,
+                device=device,
+                action_low=action_low,
+                action_high=action_high,
+                policy_step_enabled=use_policy_step_validation,
             )
             env_states[env_name] = states
             env_action_bounds[env_name] = (action_low, action_high)
@@ -347,85 +544,142 @@ def evaluate_rlpfn_on_gym_envs(model, config):
 
         try:
             while any(not state["done"] for state in all_states):
-                jobs = []
-                job_states = []
-                for env_name in env_names:
-                    states = env_states.get(env_name, None)
-                    if not isinstance(states, list):
-                        continue
-                    action_bounds = env_action_bounds.get(env_name, None)
-                    if action_bounds is None:
-                        continue
-                    action_low, action_high = action_bounds
-                    for state in states:
+                if bool(use_policy_step_validation):
+                    for state in all_states:
                         if bool(state["done"]):
                             continue
                         if int(state["current_rollout_len"]) >= int(max_steps):
                             _finalize_validation_rollout(state, context_lower_bound)
                             continue
-                        candidates = _sample_action_candidates(
-                            rng=state["rng"],
-                            action_low=action_low,
-                            action_high=action_high,
-                            n_candidates=n_candidates,
+                        action = _select_policy_action(
+                            state=state,
+                            policy_step_fn=policy_step_fn,
+                            device=device,
+                            obs_slot_dim=obs_slot_dim,
+                            action_slot_dim=action_slot_dim,
+                            terminal_token_enabled=terminal_token_enabled,
                         )
-                        jobs.append(
-                            {
-                                "x_hist": state["x_hist"],
-                                "y_hist": state["y_hist"],
-                                "obs": state["obs"],
-                                "prev_reward": state["prev_reward"],
-                                "terminal": state["prev_terminal"],
-                                "phase": state["phase_flag"],
-                                "action_candidates": candidates,
-                            }
+                        obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
+                        reward_next = float(reward_next)
+                        done_flag = bool(terminated or truncated)
+                        reward_input = _transform_validation_reward(
+                            reward_next,
+                            policy_hparams=state["policy_hparams"],
+                            device=device,
                         )
-                        job_states.append((state, candidates))
+                        state["obs"] = obs_next
+                        state["prev_reward"] = reward_next
+                        state["prev_terminal"] = 1.0 if done_flag else 0.0
+                        state["policy_action_t"] = torch.from_numpy(action.reshape(1, -1)).to(
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        state["policy_reward_t"] = torch.full(
+                            (1, 1),
+                            float(reward_input),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        state["policy_reward_mask_t"] = torch.full(
+                            (1, 1),
+                            float(state["policy_hparams"]["reward_mask_present_value"]),
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        state["policy_terminal_t"] = torch.full(
+                            (1, 1),
+                            1.0 if done_flag else 0.0,
+                            device=device,
+                            dtype=torch.float32,
+                        )
+                        state["current_rollout_return"] += reward_next
+                        state["current_rollout_len"] += 1
 
-                if jobs:
-                    score_list = _score_candidate_action_jobs(
-                        model=model,
-                        device=device,
-                        jobs=jobs,
-                        obs_slot_dim=obs_slot_dim,
-                        action_slot_dim=action_slot_dim,
-                        num_features=num_features,
-                        terminal_token_enabled=terminal_token_enabled,
-                        max_parallel_columns=max_parallel_columns,
-                    )
+                        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+                            if int(state["current_rollout_len"]) >= int(max_steps):
+                                state["prev_terminal"] = 1.0
+                                state["policy_terminal_t"] = torch.ones_like(state["policy_terminal_t"])
+                            _finalize_validation_rollout(state, context_lower_bound)
                 else:
-                    score_list = []
+                    jobs = []
+                    job_states = []
+                    for env_name in env_names:
+                        states = env_states.get(env_name, None)
+                        if not isinstance(states, list):
+                            continue
+                        action_bounds = env_action_bounds.get(env_name, None)
+                        if action_bounds is None:
+                            continue
+                        action_low, action_high = action_bounds
+                        for state in states:
+                            if bool(state["done"]):
+                                continue
+                            if int(state["current_rollout_len"]) >= int(max_steps):
+                                _finalize_validation_rollout(state, context_lower_bound)
+                                continue
+                            candidates = _sample_action_candidates(
+                                rng=state["rng"],
+                                action_low=action_low,
+                                action_high=action_high,
+                                n_candidates=n_candidates,
+                            )
+                            jobs.append(
+                                {
+                                    "x_hist": state["x_hist"],
+                                    "y_hist": state["y_hist"],
+                                    "obs": state["obs"],
+                                    "prev_reward": state["prev_reward"],
+                                    "terminal": state["prev_terminal"],
+                                    "phase": state["phase_flag"],
+                                    "action_candidates": candidates,
+                                }
+                            )
+                            job_states.append((state, candidates))
 
-                for (state, candidates), scores in zip(job_states, score_list):
-                    action = candidates[int(np.argmax(scores))]
-                    state["x_hist"].append(
-                        _pack_token(
-                            obs=state["obs"],
-                            action=action,
-                            reward=state["prev_reward"],
-                            reward_mask=1.0,
+                    if jobs:
+                        score_list = _score_candidate_action_jobs(
+                            model=model,
+                            device=device,
+                            jobs=jobs,
                             obs_slot_dim=obs_slot_dim,
                             action_slot_dim=action_slot_dim,
                             num_features=num_features,
-                            phase=state["phase_flag"],
-                            terminal=state["prev_terminal"],
                             terminal_token_enabled=terminal_token_enabled,
+                            max_parallel_columns=max_parallel_columns,
                         )
-                    )
-                    obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
-                    reward_next = float(reward_next)
-                    done_flag = bool(terminated or truncated)
-                    state["y_hist"].append(reward_next)
-                    state["obs"] = obs_next
-                    state["prev_reward"] = reward_next
-                    state["prev_terminal"] = 1.0 if done_flag else 0.0
-                    state["current_rollout_return"] += reward_next
-                    state["current_rollout_len"] += 1
+                    else:
+                        score_list = []
 
-                    if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
-                        if int(state["current_rollout_len"]) >= int(max_steps):
-                            state["prev_terminal"] = 1.0
-                        _finalize_validation_rollout(state, context_lower_bound)
+                    for (state, candidates), scores in zip(job_states, score_list):
+                        action = candidates[int(np.argmax(scores))]
+                        state["x_hist"].append(
+                            _pack_token(
+                                obs=state["obs"],
+                                action=action,
+                                reward=state["prev_reward"],
+                                reward_mask=1.0,
+                                obs_slot_dim=obs_slot_dim,
+                                action_slot_dim=action_slot_dim,
+                                num_features=num_features,
+                                phase=state["phase_flag"],
+                                terminal=state["prev_terminal"],
+                                terminal_token_enabled=terminal_token_enabled,
+                            )
+                        )
+                        obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
+                        reward_next = float(reward_next)
+                        done_flag = bool(terminated or truncated)
+                        state["y_hist"].append(reward_next)
+                        state["obs"] = obs_next
+                        state["prev_reward"] = reward_next
+                        state["prev_terminal"] = 1.0 if done_flag else 0.0
+                        state["current_rollout_return"] += reward_next
+                        state["current_rollout_len"] += 1
+
+                        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+                            if int(state["current_rollout_len"]) >= int(max_steps):
+                                state["prev_terminal"] = 1.0
+                            _finalize_validation_rollout(state, context_lower_bound)
 
             for env_name in env_names:
                 states = env_states.get(env_name, None)
@@ -451,7 +705,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 if returns:
                     mean_ret = float(np.mean(returns))
                     mean_len = float(np.mean(lengths))
-                    per_env[env_name] = {
+                    env_summary = {
                         "return_mean": mean_ret,
                         "len_mean": mean_len,
                         "make_failed": 0,
@@ -465,6 +719,10 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                             float(np.mean(explore_rollout_len_means)) if explore_rollout_len_means else float("nan")
                         ),
                     }
+                    if int(len(returns)) == 1:
+                        env_summary["return"] = float(returns[0])
+                        env_summary["len"] = float(lengths[0]) if lengths else float("nan")
+                    per_env[env_name] = env_summary
                     all_env_means.append(mean_ret)
         finally:
             for state in all_states:
