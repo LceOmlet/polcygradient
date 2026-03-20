@@ -7,6 +7,18 @@ import torch
 from ticl.model_configs import get_model_default_config
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
+from ticl.priors.maintained_exact_scm import (
+    coerce_bool,
+    env_input_layout,
+    env_obs_input_dim,
+    env_uses_reference_semantics,
+    resolve_reference_semantics_enabled,
+    resolve_state_full_rms_enabled,
+    resolve_state_input_scale_enabled,
+    resolve_strict_joint_transition_enabled,
+    resolve_terminal_reset_enabled,
+    transition_reference_mode,
+)
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
 from ticl.train import _build_policy_step_fn
@@ -16,6 +28,94 @@ def _seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def _legacy_coerce_bool(value):
+    if torch.is_tensor(value):
+        if value.dtype == torch.bool:
+            return value
+        if value.numel() == 1:
+            return bool(value.item())
+        return value != 0
+    if isinstance(value, str):
+        return value.strip().lower() not in {"0", "false", "no", "off", ""}
+    return bool(value)
+
+
+def _legacy_resolve_strict_joint_transition_enabled(h):
+    enabled = h.get("strict_joint_transition_enabled", False)
+    return bool(_legacy_coerce_bool(enabled))
+
+
+def _legacy_resolve_reference_semantics_enabled(h):
+    return _legacy_resolve_strict_joint_transition_enabled(h)
+
+
+def _legacy_env_uses_reference_semantics(env):
+    enabled = env.get(
+        "reference_semantics_enabled",
+        env.get("strict_joint_transition_enabled", False),
+    )
+    return bool(_legacy_coerce_bool(enabled))
+
+
+def _legacy_transition_reference_mode(family, reference_semantics_enabled, gp_forward_mode=None):
+    family_str = str(family)
+    if family_str == "gp" and bool(reference_semantics_enabled):
+        mode = str(gp_forward_mode or "exact").strip().lower()
+        if mode == "fixed_cost":
+            return "gp_fixed_cost"
+        return "gp_exact"
+    return f"{family_str}_{'exact' if bool(reference_semantics_enabled) else 'legacy'}"
+
+
+def _legacy_env_obs_input_dim(obs_dim, *, reference_semantics_enabled=False):
+    return 0 if bool(reference_semantics_enabled) else int(max(0, int(obs_dim)))
+
+
+def _legacy_env_input_layout(
+    state_dim,
+    obs_dim,
+    action_dim,
+    noise_dim,
+    zero_pad_dim,
+    *,
+    reference_semantics_enabled=False,
+):
+    state_dim = int(max(0, int(state_dim)))
+    obs_dim = int(max(0, int(obs_dim)))
+    action_dim = int(max(0, int(action_dim)))
+    noise_dim = int(max(0, int(noise_dim)))
+    zero_pad_dim = int(max(0, int(zero_pad_dim)))
+    obs_input_dim = _legacy_env_obs_input_dim(
+        obs_dim,
+        reference_semantics_enabled=reference_semantics_enabled,
+    )
+    action_start = state_dim + obs_input_dim
+    noise_start = action_start + action_dim
+    zero_start = noise_start + noise_dim
+    total_dim = zero_start + zero_pad_dim
+    return {
+        "total_dim": int(total_dim),
+        "include_obs": bool(obs_input_dim > 0),
+        "obs_input_dim": int(obs_input_dim),
+        "obs_start": int(state_dim) if obs_input_dim > 0 else None,
+        "action_start": int(action_start),
+        "noise_start": int(noise_start),
+        "zero_start": int(zero_start),
+    }
+
+
+def _legacy_resolve_state_input_scale_enabled(h):
+    return bool(_legacy_coerce_bool(h.get("state_input_scale_enabled", False)))
+
+
+def _legacy_resolve_state_full_rms_enabled(h):
+    return bool(_legacy_coerce_bool(h.get("state_full_rms_enabled", False)))
+
+
+def _legacy_resolve_terminal_reset_enabled(h):
+    return bool(_legacy_coerce_bool(h.get("terminal_reset_enabled", False)))
 
 
 def _small_exact_scm_env_cfg():
@@ -175,6 +275,152 @@ def test_rlpfn_maintained_token_layout_helper_matches_terminal_toggle():
     assert without_terminal["terminal_token_enabled"] is False
     assert without_terminal["x_obs_dim"] == 403
     assert without_terminal["default_num_features"] == 433
+
+
+def test_rlpfn_maintained_exact_scm_helper_contract():
+    h = {
+        "strict_joint_transition_enabled": "true",
+    }
+    env = {
+        "strict_joint_transition_enabled": False,
+        "reference_semantics_enabled": torch.tensor(True),
+    }
+
+    assert resolve_strict_joint_transition_enabled(h) is True
+    assert resolve_reference_semantics_enabled(h) is True
+    assert env_uses_reference_semantics(env) is True
+    assert transition_reference_mode("scm", True) == "scm_exact"
+    assert transition_reference_mode("scm", False) == "scm_legacy"
+    assert transition_reference_mode("gp", True, gp_forward_mode="exact") == "gp_exact"
+    assert transition_reference_mode("gp", True, gp_forward_mode="fixed_cost") == "gp_fixed_cost"
+
+
+def test_rlpfn_maintained_exact_scm_helper_matches_legacy_inline_reference():
+    bool_cases = [
+        False,
+        True,
+        "true",
+        "false",
+        "off",
+        "",
+        0,
+        1,
+        torch.tensor(False),
+        torch.tensor(True),
+        torch.tensor([0, 1, 0], dtype=torch.int64),
+        torch.tensor([True, False, True], dtype=torch.bool),
+    ]
+    for value in bool_cases:
+        actual = coerce_bool(value)
+        expected = _legacy_coerce_bool(value)
+        if torch.is_tensor(expected):
+            assert torch.equal(actual, expected)
+        else:
+            assert actual == expected
+
+    h_cases = [
+        {"strict_joint_transition_enabled": False},
+        {"strict_joint_transition_enabled": "true"},
+        {"strict_joint_transition_enabled": torch.tensor(True)},
+        {"strict_joint_transition_enabled": 0},
+    ]
+    for h in h_cases:
+        assert resolve_strict_joint_transition_enabled(h) == _legacy_resolve_strict_joint_transition_enabled(h)
+        assert resolve_reference_semantics_enabled(h) == _legacy_resolve_reference_semantics_enabled(h)
+
+    env_cases = [
+        {"strict_joint_transition_enabled": False, "reference_semantics_enabled": torch.tensor(True)},
+        {"strict_joint_transition_enabled": "true"},
+        {"strict_joint_transition_enabled": False, "reference_semantics_enabled": False},
+    ]
+    for env in env_cases:
+        assert env_uses_reference_semantics(env) == _legacy_env_uses_reference_semantics(env)
+
+    mode_cases = [
+        ("scm", True, None),
+        ("scm", False, None),
+        ("gp", True, "exact"),
+        ("gp", True, "fixed_cost"),
+        ("gp", False, "exact"),
+    ]
+    for family, enabled, gp_mode in mode_cases:
+        assert transition_reference_mode(
+            family,
+            enabled,
+            gp_forward_mode=gp_mode,
+        ) == _legacy_transition_reference_mode(family, enabled, gp_forward_mode=gp_mode)
+
+
+def test_rlpfn_maintained_exact_scm_layout_and_flag_helpers_match_legacy_inline_reference():
+    layout_cases = [
+        (8, 6, 3, 2, 0, False),
+        (8, 6, 3, 2, 0, True),
+        (0, 4, 1, 0, 2, False),
+        (5, 12, 7, 4, 3, True),
+    ]
+    for state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim, reference_semantics_enabled in layout_cases:
+        assert env_obs_input_dim(
+            obs_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        ) == _legacy_env_obs_input_dim(
+            obs_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+        assert env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        ) == _legacy_env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+        assert EnvironmentPrior._env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        ) == _legacy_env_input_layout(
+            state_dim,
+            obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
+
+    flag_cases = [
+        {
+            "state_input_scale_enabled": False,
+            "state_full_rms_enabled": False,
+            "terminal_reset_enabled": False,
+        },
+        {
+            "state_input_scale_enabled": "true",
+            "state_full_rms_enabled": "false",
+            "terminal_reset_enabled": "1",
+        },
+        {
+            "state_input_scale_enabled": torch.tensor(True),
+            "state_full_rms_enabled": torch.tensor(False),
+            "terminal_reset_enabled": torch.tensor(True),
+        },
+    ]
+    for h in flag_cases:
+        assert resolve_state_input_scale_enabled(h) == _legacy_resolve_state_input_scale_enabled(h)
+        assert resolve_state_full_rms_enabled(h) == _legacy_resolve_state_full_rms_enabled(h)
+        assert resolve_terminal_reset_enabled(h) == _legacy_resolve_terminal_reset_enabled(h)
+        assert EnvironmentPrior._resolve_state_input_scale_enabled(h) == _legacy_resolve_state_input_scale_enabled(h)
+        assert EnvironmentPrior._resolve_state_full_rms_enabled(h) == _legacy_resolve_state_full_rms_enabled(h)
+        assert EnvironmentPrior._resolve_terminal_reset_enabled(h) == _legacy_resolve_terminal_reset_enabled(h)
 
 
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():

@@ -20,6 +20,17 @@ except Exception:  # pragma: no cover - optional CUDA path
     tl_libdevice = None
 
 from ticl.distributions import parse_distributions, sample_distributions
+from ticl.priors.maintained_exact_scm import (
+    env_input_layout as maintained_env_input_layout,
+    env_obs_input_dim as maintained_env_obs_input_dim,
+    env_uses_reference_semantics as maintained_env_uses_reference_semantics,
+    resolve_reference_semantics_enabled as maintained_resolve_reference_semantics_enabled,
+    resolve_state_full_rms_enabled as maintained_resolve_state_full_rms_enabled,
+    resolve_state_input_scale_enabled as maintained_resolve_state_input_scale_enabled,
+    resolve_strict_joint_transition_enabled as maintained_resolve_strict_joint_transition_enabled,
+    resolve_terminal_reset_enabled as maintained_resolve_terminal_reset_enabled,
+    transition_reference_mode as maintained_transition_reference_mode,
+)
 from ticl.utils import default_device
 
 
@@ -4549,32 +4560,19 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_strict_joint_transition_enabled(h):
-        enabled = h.get("strict_joint_transition_enabled", False)
-        if isinstance(enabled, str):
-            enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
-        return bool(enabled)
+        return maintained_resolve_strict_joint_transition_enabled(h)
 
     @staticmethod
     def _resolve_reference_semantics_enabled(h):
-        return EnvironmentPrior._resolve_strict_joint_transition_enabled(h)
+        return maintained_resolve_reference_semantics_enabled(h)
 
     @staticmethod
     def _env_uses_reference_semantics(env):
-        enabled = env.get(
-            "reference_semantics_enabled",
-            env.get("strict_joint_transition_enabled", False),
-        )
-        return bool(EnvironmentPrior._coerce_bool(enabled))
+        return maintained_env_uses_reference_semantics(env)
 
     @staticmethod
     def _transition_reference_mode(family, reference_semantics_enabled, gp_forward_mode=None):
-        family_str = str(family)
-        if family_str == "gp" and bool(reference_semantics_enabled):
-            mode = str(gp_forward_mode or "exact").strip().lower()
-            if mode == "fixed_cost":
-                return "gp_fixed_cost"
-            return "gp_exact"
-        return f"{family_str}_{'exact' if bool(reference_semantics_enabled) else 'legacy'}"
+        return maintained_transition_reference_mode(family, reference_semantics_enabled, gp_forward_mode=gp_forward_mode)
 
     @staticmethod
     def _expand_env_value_to_list(value, batch_size):
@@ -4713,7 +4711,10 @@ class EnvironmentPrior:
 
     @staticmethod
     def _env_obs_input_dim(obs_dim, *, reference_semantics_enabled=False):
-        return 0 if bool(reference_semantics_enabled) else int(max(0, int(obs_dim)))
+        return maintained_env_obs_input_dim(
+            obs_dim,
+            reference_semantics_enabled=reference_semantics_enabled,
+        )
 
     @classmethod
     def _env_input_layout(
@@ -4726,28 +4727,14 @@ class EnvironmentPrior:
         *,
         reference_semantics_enabled=False,
     ):
-        state_dim = int(max(0, int(state_dim)))
-        obs_dim = int(max(0, int(obs_dim)))
-        action_dim = int(max(0, int(action_dim)))
-        noise_dim = int(max(0, int(noise_dim)))
-        zero_pad_dim = int(max(0, int(zero_pad_dim)))
-        obs_input_dim = cls._env_obs_input_dim(
+        return maintained_env_input_layout(
+            state_dim,
             obs_dim,
+            action_dim,
+            noise_dim,
+            zero_pad_dim,
             reference_semantics_enabled=reference_semantics_enabled,
         )
-        action_start = state_dim + obs_input_dim
-        noise_start = action_start + action_dim
-        zero_start = noise_start + noise_dim
-        total_dim = zero_start + zero_pad_dim
-        return {
-            "total_dim": int(total_dim),
-            "include_obs": bool(obs_input_dim > 0),
-            "obs_input_dim": int(obs_input_dim),
-            "obs_start": int(state_dim) if obs_input_dim > 0 else None,
-            "action_start": int(action_start),
-            "noise_start": int(noise_start),
-            "zero_start": int(zero_start),
-        }
 
     def _sample_dims(self, h):
         action_dim = self._clamp_int(h["action_dim"], 1, 30)
@@ -4794,7 +4781,7 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_state_input_scale_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("state_input_scale_enabled", False))
+        return maintained_resolve_state_input_scale_enabled(h)
 
     @staticmethod
     def _resolve_state_input_scale(h):
@@ -4817,7 +4804,7 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_state_full_rms_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("state_full_rms_enabled", False))
+        return maintained_resolve_state_full_rms_enabled(h)
 
     @staticmethod
     def _resolve_state_full_rms_target(h):
@@ -4941,7 +4928,7 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_terminal_reset_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("terminal_reset_enabled", False))
+        return maintained_resolve_terminal_reset_enabled(h)
 
     @staticmethod
     def _resolve_terminal_reset_count_target(h):
