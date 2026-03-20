@@ -24,11 +24,16 @@ from ticl.priors.maintained_exact_scm import (
     env_input_layout as maintained_env_input_layout,
     env_obs_input_dim as maintained_env_obs_input_dim,
     env_uses_reference_semantics as maintained_env_uses_reference_semantics,
+    expand_env_value_to_list as maintained_expand_env_value_to_list,
+    finalize_env_semantics_summary as maintained_finalize_env_semantics_summary,
+    merge_env_semantics_summary as maintained_merge_env_semantics_summary,
+    new_env_semantics_accumulator as maintained_new_env_semantics_accumulator,
     resolve_reference_semantics_enabled as maintained_resolve_reference_semantics_enabled,
     resolve_state_full_rms_enabled as maintained_resolve_state_full_rms_enabled,
     resolve_state_input_scale_enabled as maintained_resolve_state_input_scale_enabled,
     resolve_strict_joint_transition_enabled as maintained_resolve_strict_joint_transition_enabled,
     resolve_terminal_reset_enabled as maintained_resolve_terminal_reset_enabled,
+    summarize_env_semantics as maintained_summarize_env_semantics,
     transition_reference_mode as maintained_transition_reference_mode,
 )
 from ticl.utils import default_device
@@ -4576,138 +4581,23 @@ class EnvironmentPrior:
 
     @staticmethod
     def _expand_env_value_to_list(value, batch_size):
-        batch_size = int(max(1, int(batch_size)))
-        if torch.is_tensor(value):
-            if value.ndim == 0:
-                return [value.item()] * batch_size
-            items = value.detach().cpu().reshape(-1).tolist()
-        elif isinstance(value, np.ndarray):
-            items = value.reshape(-1).tolist()
-        elif isinstance(value, (list, tuple)):
-            items = list(value)
-        else:
-            return [value] * batch_size
-        if not items:
-            return [None] * batch_size
-        if len(items) == batch_size:
-            return items
-        if len(items) == 1:
-            return items * batch_size
-        if len(items) < batch_size:
-            return items + [items[-1]] * (batch_size - len(items))
-        return items[:batch_size]
+        return maintained_expand_env_value_to_list(value, batch_size)
 
     @classmethod
     def _summarize_env_semantics(cls, env, batch_size):
-        batch_size = int(max(1, int(batch_size)))
-        families = cls._expand_env_value_to_list(env.get("family", "unknown"), batch_size)
-        gp_modes = cls._expand_env_value_to_list(env.get("reference_gp_forward_mode", None), batch_size)
-        references = [
-            bool(v)
-            for v in cls._expand_env_value_to_list(
-                env.get("reference_semantics_enabled", env.get("strict_joint_transition_enabled", False)),
-                batch_size,
-            )
-        ]
-        stricts = [
-            bool(v)
-            for v in cls._expand_env_value_to_list(env.get("strict_joint_transition_enabled", False), batch_size)
-        ]
-        exact_scm_count = 0
-        exact_gp_count = 0
-        fixed_gp_count = 0
-        legacy_scm_count = 0
-        legacy_gp_count = 0
-        for family, reference_enabled, gp_mode in zip(families, references, gp_modes):
-            family_str = str(family)
-            if family_str == "scm":
-                if reference_enabled:
-                    exact_scm_count += 1
-                else:
-                    legacy_scm_count += 1
-            elif family_str == "gp":
-                if reference_enabled:
-                    if str(gp_mode).strip().lower() == "fixed_cost":
-                        fixed_gp_count += 1
-                    else:
-                        exact_gp_count += 1
-                else:
-                    legacy_gp_count += 1
-        total = int(batch_size)
-        summary = {
-            "env_count": total,
-            "strict_joint_transition_count": int(sum(1 for flag in stricts if flag)),
-            "reference_semantics_count": int(sum(1 for flag in references if flag)),
-            "exact_scm_count": int(exact_scm_count),
-            "exact_gp_count": int(exact_gp_count),
-            "fixed_gp_count": int(fixed_gp_count),
-            "legacy_scm_count": int(legacy_scm_count),
-            "legacy_gp_count": int(legacy_gp_count),
-        }
-        return cls._finalize_env_semantics_summary(summary)
+        return maintained_summarize_env_semantics(env, batch_size)
 
     @staticmethod
     def _new_env_semantics_accumulator():
-        return {
-            "env_count": 0,
-            "strict_joint_transition_count": 0,
-            "reference_semantics_count": 0,
-            "exact_scm_count": 0,
-            "exact_gp_count": 0,
-            "fixed_gp_count": 0,
-            "legacy_scm_count": 0,
-            "legacy_gp_count": 0,
-        }
+        return maintained_new_env_semantics_accumulator()
 
     @classmethod
     def _merge_env_semantics_summary(cls, acc, summary):
-        if not isinstance(summary, dict):
-            return acc
-        if acc is None:
-            acc = cls._new_env_semantics_accumulator()
-        for key in (
-            "env_count",
-            "strict_joint_transition_count",
-            "reference_semantics_count",
-            "exact_scm_count",
-            "exact_gp_count",
-            "fixed_gp_count",
-            "legacy_scm_count",
-            "legacy_gp_count",
-        ):
-            acc[key] = int(acc.get(key, 0) or 0) + int(summary.get(key, 0) or 0)
-        return acc
+        return maintained_merge_env_semantics_summary(acc, summary)
 
     @classmethod
     def _finalize_env_semantics_summary(cls, acc):
-        if not isinstance(acc, dict):
-            return None
-        total = int(acc.get("env_count", 0) or 0)
-        summary = dict(acc)
-        summary["strict_joint_transition_share"] = float(
-            float(summary.get("strict_joint_transition_count", 0) or 0) / float(max(1, total))
-        )
-        summary["reference_semantics_share"] = float(
-            float(summary.get("reference_semantics_count", 0) or 0) / float(max(1, total))
-        )
-        modes = []
-        if int(summary.get("exact_scm_count", 0) or 0) > 0:
-            modes.append("scm_exact")
-        if int(summary.get("exact_gp_count", 0) or 0) > 0:
-            modes.append("gp_exact")
-        if int(summary.get("fixed_gp_count", 0) or 0) > 0:
-            modes.append("gp_fixed_cost")
-        if int(summary.get("legacy_scm_count", 0) or 0) > 0:
-            modes.append("scm_legacy")
-        if int(summary.get("legacy_gp_count", 0) or 0) > 0:
-            modes.append("gp_legacy")
-        if len(modes) == 1:
-            summary["transition_reference_mode"] = modes[0]
-        elif len(modes) == 0:
-            summary["transition_reference_mode"] = "unknown"
-        else:
-            summary["transition_reference_mode"] = "mixed"
-        return summary
+        return maintained_finalize_env_semantics_summary(acc)
 
     @staticmethod
     def _env_obs_input_dim(obs_dim, *, reference_semantics_enabled=False):

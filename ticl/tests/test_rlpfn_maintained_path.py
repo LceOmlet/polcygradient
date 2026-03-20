@@ -12,11 +12,16 @@ from ticl.priors.maintained_exact_scm import (
     env_input_layout,
     env_obs_input_dim,
     env_uses_reference_semantics,
+    expand_env_value_to_list,
+    finalize_env_semantics_summary,
+    merge_env_semantics_summary,
+    new_env_semantics_accumulator,
     resolve_reference_semantics_enabled,
     resolve_state_full_rms_enabled,
     resolve_state_input_scale_enabled,
     resolve_strict_joint_transition_enabled,
     resolve_terminal_reset_enabled,
+    summarize_env_semantics,
     transition_reference_mode,
 )
 from ticl.priors.environment_prior import EnvironmentPrior
@@ -116,6 +121,140 @@ def _legacy_resolve_state_full_rms_enabled(h):
 
 def _legacy_resolve_terminal_reset_enabled(h):
     return bool(_legacy_coerce_bool(h.get("terminal_reset_enabled", False)))
+
+
+def _legacy_expand_env_value_to_list(value, batch_size):
+    batch_size = int(max(1, int(batch_size)))
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return [value.item()] * batch_size
+        items = value.detach().cpu().reshape(-1).tolist()
+    elif isinstance(value, np.ndarray):
+        items = value.reshape(-1).tolist()
+    elif isinstance(value, (list, tuple)):
+        items = list(value)
+    else:
+        return [value] * batch_size
+    if not items:
+        return [None] * batch_size
+    if len(items) == batch_size:
+        return items
+    if len(items) == 1:
+        return items * batch_size
+    if len(items) < batch_size:
+        return items + [items[-1]] * (batch_size - len(items))
+    return items[:batch_size]
+
+
+def _legacy_new_env_semantics_accumulator():
+    return {
+        "env_count": 0,
+        "strict_joint_transition_count": 0,
+        "reference_semantics_count": 0,
+        "exact_scm_count": 0,
+        "exact_gp_count": 0,
+        "fixed_gp_count": 0,
+        "legacy_scm_count": 0,
+        "legacy_gp_count": 0,
+    }
+
+
+def _legacy_finalize_env_semantics_summary(acc):
+    if not isinstance(acc, dict):
+        return None
+    total = int(acc.get("env_count", 0) or 0)
+    summary = dict(acc)
+    summary["strict_joint_transition_share"] = float(
+        float(summary.get("strict_joint_transition_count", 0) or 0) / float(max(1, total))
+    )
+    summary["reference_semantics_share"] = float(
+        float(summary.get("reference_semantics_count", 0) or 0) / float(max(1, total))
+    )
+    modes = []
+    if int(summary.get("exact_scm_count", 0) or 0) > 0:
+        modes.append("scm_exact")
+    if int(summary.get("exact_gp_count", 0) or 0) > 0:
+        modes.append("gp_exact")
+    if int(summary.get("fixed_gp_count", 0) or 0) > 0:
+        modes.append("gp_fixed_cost")
+    if int(summary.get("legacy_scm_count", 0) or 0) > 0:
+        modes.append("scm_legacy")
+    if int(summary.get("legacy_gp_count", 0) or 0) > 0:
+        modes.append("gp_legacy")
+    if len(modes) == 1:
+        summary["transition_reference_mode"] = modes[0]
+    elif len(modes) == 0:
+        summary["transition_reference_mode"] = "unknown"
+    else:
+        summary["transition_reference_mode"] = "mixed"
+    return summary
+
+
+def _legacy_merge_env_semantics_summary(acc, summary):
+    if not isinstance(summary, dict):
+        return acc
+    if acc is None:
+        acc = _legacy_new_env_semantics_accumulator()
+    for key in (
+        "env_count",
+        "strict_joint_transition_count",
+        "reference_semantics_count",
+        "exact_scm_count",
+        "exact_gp_count",
+        "fixed_gp_count",
+        "legacy_scm_count",
+        "legacy_gp_count",
+    ):
+        acc[key] = int(acc.get(key, 0) or 0) + int(summary.get(key, 0) or 0)
+    return acc
+
+
+def _legacy_summarize_env_semantics(env, batch_size):
+    batch_size = int(max(1, int(batch_size)))
+    families = _legacy_expand_env_value_to_list(env.get("family", "unknown"), batch_size)
+    gp_modes = _legacy_expand_env_value_to_list(env.get("reference_gp_forward_mode", None), batch_size)
+    references = [
+        bool(v)
+        for v in _legacy_expand_env_value_to_list(
+            env.get("reference_semantics_enabled", env.get("strict_joint_transition_enabled", False)),
+            batch_size,
+        )
+    ]
+    stricts = [
+        bool(v)
+        for v in _legacy_expand_env_value_to_list(env.get("strict_joint_transition_enabled", False), batch_size)
+    ]
+    exact_scm_count = 0
+    exact_gp_count = 0
+    fixed_gp_count = 0
+    legacy_scm_count = 0
+    legacy_gp_count = 0
+    for family, reference_enabled, gp_mode in zip(families, references, gp_modes):
+        family_str = str(family)
+        if family_str == "scm":
+            if reference_enabled:
+                exact_scm_count += 1
+            else:
+                legacy_scm_count += 1
+        elif family_str == "gp":
+            if reference_enabled:
+                if str(gp_mode).strip().lower() == "fixed_cost":
+                    fixed_gp_count += 1
+                else:
+                    exact_gp_count += 1
+            else:
+                legacy_gp_count += 1
+    summary = {
+        "env_count": int(batch_size),
+        "strict_joint_transition_count": int(sum(1 for flag in stricts if flag)),
+        "reference_semantics_count": int(sum(1 for flag in references if flag)),
+        "exact_scm_count": int(exact_scm_count),
+        "exact_gp_count": int(exact_gp_count),
+        "fixed_gp_count": int(fixed_gp_count),
+        "legacy_scm_count": int(legacy_scm_count),
+        "legacy_gp_count": int(legacy_gp_count),
+    }
+    return _legacy_finalize_env_semantics_summary(summary)
 
 
 def _small_exact_scm_env_cfg():
@@ -421,6 +560,58 @@ def test_rlpfn_maintained_exact_scm_layout_and_flag_helpers_match_legacy_inline_
         assert EnvironmentPrior._resolve_state_input_scale_enabled(h) == _legacy_resolve_state_input_scale_enabled(h)
         assert EnvironmentPrior._resolve_state_full_rms_enabled(h) == _legacy_resolve_state_full_rms_enabled(h)
         assert EnvironmentPrior._resolve_terminal_reset_enabled(h) == _legacy_resolve_terminal_reset_enabled(h)
+
+
+def test_rlpfn_maintained_exact_scm_env_semantics_helpers_match_legacy_inline_reference():
+    value_cases = [
+        ("scm", 3),
+        (torch.tensor(True), 2),
+        (torch.tensor([1, 0, 1]), 3),
+        (np.array(["exact", "fixed_cost"], dtype=object), 3),
+        ([], 2),
+        ([1], 4),
+        ([1, 2], 4),
+        ([1, 2, 3, 4], 2),
+    ]
+    for value, batch_size in value_cases:
+        assert expand_env_value_to_list(value, batch_size) == _legacy_expand_env_value_to_list(value, batch_size)
+
+    env = {
+        "family": ["scm", "gp", "gp", "scm"],
+        "reference_gp_forward_mode": [None, "exact", "fixed_cost", None],
+        "reference_semantics_enabled": [True, True, True, False],
+        "strict_joint_transition_enabled": [True, True, False, False],
+    }
+    expected_summary = _legacy_summarize_env_semantics(env, 4)
+    assert summarize_env_semantics(env, 4) == expected_summary
+    assert EnvironmentPrior._summarize_env_semantics(env, 4) == expected_summary
+
+    acc_expected = _legacy_new_env_semantics_accumulator()
+    acc_actual = new_env_semantics_accumulator()
+    assert acc_actual == acc_expected
+    assert EnvironmentPrior._new_env_semantics_accumulator() == acc_expected
+
+    part_a = _legacy_summarize_env_semantics(
+        {"family": ["scm", "gp"], "reference_semantics_enabled": [True, False], "strict_joint_transition_enabled": [True, False]},
+        2,
+    )
+    part_b = _legacy_summarize_env_semantics(
+        {"family": ["gp"], "reference_gp_forward_mode": ["fixed_cost"], "reference_semantics_enabled": [True], "strict_joint_transition_enabled": [True]},
+        1,
+    )
+    merged_expected = _legacy_merge_env_semantics_summary(dict(acc_expected), part_a)
+    merged_expected = _legacy_merge_env_semantics_summary(merged_expected, part_b)
+    merged_actual = merge_env_semantics_summary(dict(acc_actual), part_a)
+    merged_actual = merge_env_semantics_summary(merged_actual, part_b)
+    assert merged_actual == merged_expected
+    assert EnvironmentPrior._merge_env_semantics_summary(dict(acc_actual), part_a) == _legacy_merge_env_semantics_summary(
+        dict(acc_expected),
+        part_a,
+    )
+    assert finalize_env_semantics_summary(merged_actual) == _legacy_finalize_env_semantics_summary(merged_expected)
+    assert EnvironmentPrior._finalize_env_semantics_summary(merged_actual) == _legacy_finalize_env_semantics_summary(
+        merged_expected,
+    )
 
 
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():
