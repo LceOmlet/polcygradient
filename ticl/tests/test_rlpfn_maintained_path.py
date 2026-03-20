@@ -626,6 +626,100 @@ def _capture_policy_step_trace():
     }
 
 
+def _capture_alpha_grad_fast_runner_gradient_trace():
+    _seed_everything(20260320)
+    cfg, env_cfg = _small_exact_scm_env_cfg()
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_parallel_workers"] = 1
+    prior = EnvironmentPrior(env_cfg)
+    model = TabPFN(
+        n_out=1,
+        n_features=int(cfg["prior"]["num_features"]),
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=404,
+        x_action_dim=30,
+        single_eval_causal=True,
+    )
+    model.train()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(cfg["prior"]["num_features"]),
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    _seed_everything(515151)
+    sampled = prior._sample_batch_hypers(4)
+    for h in sampled:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.05
+        h["action_noise_eval_std"] = 0.03
+    env_seeds = [17, 29, 43, 59]
+    rollout_seeds = [101, 211, 307, 401]
+
+    model.zero_grad(set_to_none=True)
+    loss, rollout, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=step_fn,
+        batch_size=4,
+        n_samples=12,
+        num_features=int(cfg["prior"]["num_features"]),
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+        h_list_override=[dict(h) for h in sampled],
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="alpha_grad",
+    )
+    loss.backward()
+
+    policy_head_grads = [
+        p.grad.detach()
+        for p in model.policy_action_head.parameters()
+        if p.grad is not None
+    ]
+    policy_head_grad_sum = sum(float(g.abs().sum()) for g in policy_head_grads)
+    policy_head_grad_max = max(float(g.abs().max()) for g in policy_head_grads)
+
+    return {
+        "loss": round(float(loss.detach()), 6),
+        "reward_sum": round(float(rollout["rewards"].detach().sum()), 6),
+        "objective": round(float(stats["objective"].detach()), 6),
+        "alpha_grad_v0_mean": round(float(stats["alpha_grad_v0_mean"].detach()), 6),
+        "alpha_grad_v1_mean": round(float(stats["alpha_grad_v1_mean"].detach()), 6),
+        "alpha_grad_mix_abs_max": round(float(stats["alpha_grad_mix_abs_max"].detach()), 6),
+        "alpha_grad_valid_share": round(float(stats["alpha_grad_valid_share"].detach()), 6),
+        "rollout_transition_group_count": int(stats["rollout_transition_group_count"]),
+        "rollout_transition_family_group_count": int(stats["rollout_transition_family_group_count"]),
+        "rollout_exact_scm_count": int(stats["rollout_exact_scm_count"]),
+        "rollout_transition_reference_mode": stats["rollout_transition_reference_mode"],
+        "reinforce_log_prob_mean": round(float(stats["reinforce_log_prob_mean"].detach()), 6),
+        "policy_head_grad_sum": round(float(policy_head_grad_sum), 6),
+        "policy_head_grad_max": round(float(policy_head_grad_max), 6),
+        "attn_in_proj_grad_sum": round(
+            float(model.transformer_encoder.layers[0].self_attn.in_proj_weight.grad.detach().abs().sum()),
+            6,
+        ),
+        "attn_in_proj_grad_max": round(
+            float(model.transformer_encoder.layers[0].self_attn.in_proj_weight.grad.detach().abs().max()),
+            6,
+        ),
+    }
+
+
 def test_rlpfn_maintained_path_default_contract():
     cfg = get_model_default_config("rlpfn")
     layout = validate_rlpfn_maintained_path_config(cfg)
@@ -1261,3 +1355,26 @@ def test_rlpfn_maintained_path_policy_step_trace_matches_golden():
     }
 
     assert _capture_policy_step_trace() == expected
+
+
+def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden():
+    expected = {
+        "loss": -0.22706,
+        "reward_sum": 1.446079,
+        "objective": 0.22706,
+        "alpha_grad_v0_mean": 0.258765,
+        "alpha_grad_v1_mean": 0.222553,
+        "alpha_grad_mix_abs_max": 0.256863,
+        "alpha_grad_valid_share": 1.0,
+        "rollout_transition_group_count": 0,
+        "rollout_transition_family_group_count": 0,
+        "rollout_exact_scm_count": 4,
+        "rollout_transition_reference_mode": "scm_exact",
+        "reinforce_log_prob_mean": 21.257523,
+        "policy_head_grad_sum": 23.927478,
+        "policy_head_grad_max": 0.262588,
+        "attn_in_proj_grad_sum": 2.479845,
+        "attn_in_proj_grad_max": 0.014586,
+    }
+
+    assert _capture_alpha_grad_fast_runner_gradient_trace() == expected

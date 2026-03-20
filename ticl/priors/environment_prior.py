@@ -66,6 +66,10 @@ from ticl.priors.maintained_policy_rollout import (
     resolve_pg_one_hop_replay_enabled as maintained_resolve_pg_one_hop_replay_enabled,
     resolve_pg_replay_window_depth as maintained_resolve_pg_replay_window_depth,
 )
+from ticl.priors.maintained_fast_runner import (
+    dispatch_policy_rollout as maintained_dispatch_policy_rollout,
+    prepare_policy_rollout_request as maintained_prepare_policy_rollout_request,
+)
 from ticl.utils import default_device
 
 
@@ -19358,45 +19362,39 @@ class EnvironmentPrior:
         policy_action_group_traces = []
         infos = [None] * batch_size
 
-        backend = self._resolve_batch_parallel_backend()
-        strict_rng_match = self._resolve_batch_vectorized_strict_rng_match()
-        grouping_mode = self._resolve_batch_vectorized_grouping()
-        if h_list_override is not None:
-            if len(h_list_override) != batch_size:
-                raise ValueError("h_list_override length must match batch_size")
-            h_list = list(h_list_override)
-        else:
-            h_list = self._sample_batch_hypers(batch_size)
-        if env_seeds_override is not None:
-            if len(env_seeds_override) != batch_size:
-                raise ValueError("env_seeds_override length must match batch_size")
-            env_seeds = [int(s) for s in env_seeds_override]
-        else:
-            env_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
-        if rollout_seeds_override is not None:
-            if len(rollout_seeds_override) != batch_size:
-                raise ValueError("rollout_seeds_override length must match batch_size")
-            rollout_seeds = [int(s) for s in rollout_seeds_override]
-        else:
-            rollout_seeds = self._sample_seed_list(batch_size) if strict_rng_match else None
+        dispatch_request = maintained_prepare_policy_rollout_request(
+            self,
+            batch_size,
+            h_list_override=h_list_override,
+            env_seeds_override=env_seeds_override,
+            rollout_seeds_override=rollout_seeds_override,
+        )
+        backend = dispatch_request["backend"]
+        strict_rng_match = dispatch_request["strict_rng_match"]
+        grouping_mode = dispatch_request["grouping_mode"]
+        h_list = dispatch_request["h_list"]
+        env_seeds = dispatch_request["env_seeds"]
+        rollout_seeds = dispatch_request["rollout_seeds"]
         alpha_grad_outer_tbptt_merge = bool(
             objective_flags.get("alpha_grad", False)
             and tbptt_window_active
             and (tbptt_reward_sink is not None)
             and bool(tbptt_reward_sink_supports_aux)
         )
-        tbptt_alpha_window_buckets = {} if alpha_grad_outer_tbptt_merge else None
-        tbptt_alpha_next_flush = 0
-        tbptt_alpha_expected_group_count = 0
+        alpha_grad_outer_merge_state = {
+            "enabled": bool(alpha_grad_outer_tbptt_merge),
+            "window_buckets": {} if alpha_grad_outer_tbptt_merge else None,
+            "next_flush": 0,
+            "expected_group_count": 0,
+        }
 
         def _make_alpha_grad_tbptt_group_sink(group_indices):
-            if not alpha_grad_outer_tbptt_merge:
+            if not alpha_grad_outer_merge_state["enabled"]:
                 return tbptt_reward_sink
             idx_tuple = tuple(int(i) for i in group_indices)
             local_window_idx = 0
 
             def _sink(payload):
-                nonlocal tbptt_alpha_next_flush
                 nonlocal local_window_idx
                 if (not isinstance(payload, tuple)) or len(payload) != 2:
                     raise RuntimeError("alpha_grad TBPTT outer merge requires payload auxiliary data")
@@ -19412,7 +19410,7 @@ class EnvironmentPrior:
                 log_prob_score_window = reinforce_window.get("log_prob_score", None)
                 if not isinstance(policy_trace_window, dict) or (not torch.is_tensor(policy_trace_window.get("action_mask", None))):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires policy trace in every group payload")
-                if int(tbptt_alpha_expected_group_count) <= 0:
+                if int(alpha_grad_outer_merge_state["expected_group_count"]) <= 0:
                     raise RuntimeError("alpha_grad TBPTT outer merge was not initialized with a valid group count")
                 action_mask_window = policy_trace_window["action_mask"]
                 log_probs_window = reinforce_window["log_probs"]
@@ -19420,7 +19418,7 @@ class EnvironmentPrior:
                 group_roots = policy_trace_window.get("action_mean_roots", None)
                 if (not torch.is_tensor(action_mean_window)) and (not isinstance(group_roots, tuple)):
                     raise RuntimeError("alpha_grad TBPTT outer merge requires action roots or dense action_mean")
-                bucket = tbptt_alpha_window_buckets.get(local_window_idx, None)
+                bucket = alpha_grad_outer_merge_state["window_buckets"].get(local_window_idx, None)
                 if bucket is None:
                     bucket = {
                         "received": 0,
@@ -19461,7 +19459,7 @@ class EnvironmentPrior:
                         "boundary_groups": [],
                         "_tbptt_meta": tbptt_meta,
                     }
-                    tbptt_alpha_window_buckets[local_window_idx] = bucket
+                    alpha_grad_outer_merge_state["window_buckets"][local_window_idx] = bucket
                 elif (
                     tuple(bucket["rewards"].shape) != tuple((int(rewards_window.shape[0]), batch_size))
                     or tuple(bucket["log_probs"].shape) != tuple((int(log_probs_window.shape[0]), batch_size))
@@ -19515,8 +19513,11 @@ class EnvironmentPrior:
                             )
                 bucket["received"] += 1
                 while True:
-                    ready = tbptt_alpha_window_buckets.get(tbptt_alpha_next_flush, None)
-                    if ready is None or int(ready["received"]) < int(tbptt_alpha_expected_group_count):
+                    ready = alpha_grad_outer_merge_state["window_buckets"].get(
+                        alpha_grad_outer_merge_state["next_flush"],
+                        None,
+                    )
+                    if ready is None or int(ready["received"]) < int(alpha_grad_outer_merge_state["expected_group_count"]):
                         break
                     tbptt_reward_sink(
                         (
@@ -19541,784 +19542,45 @@ class EnvironmentPrior:
                             },
                         )
                     )
-                    del tbptt_alpha_window_buckets[tbptt_alpha_next_flush]
-                    tbptt_alpha_next_flush += 1
+                    del alpha_grad_outer_merge_state["window_buckets"][alpha_grad_outer_merge_state["next_flush"]]
+                    alpha_grad_outer_merge_state["next_flush"] += 1
                 local_window_idx += 1
 
             return _sink
 
-        if backend == "torch_vectorized":
-            effective_grouping_mode = str(grouping_mode)
-            # strict_rng_match path is used for semantic A/B tests and keeps the
-            # legacy structural grouping behavior.
-            if strict_rng_match:
-                effective_grouping_mode = "structure"
-            grouped = {}
-            for b, h in enumerate(h_list):
-                sig = self._environment_group_signature(h, effective_grouping_mode)
-                grouped.setdefault(sig, []).append((b, h))
-            if alpha_grad_outer_tbptt_merge:
-                tbptt_alpha_expected_group_count = int(len(grouped))
-            rollout_profile_acc = None
-            rollout_v2_acc = None
-            rollout_v3_acc = None
-            rollout_v4_acc = None
-            rollout_v5_next_acc = None
-            rollout_lipschitz_acc = None
-            rollout_terminal_acc = None
-
-            for group in grouped.values():
-                group_indices = [idx for idx, _ in group]
-                group_h_list = [h for _, h in group]
-                group_env_seeds = (
-                    [env_seeds[idx] for idx in group_indices]
-                    if env_seeds is not None
-                    else None
-                )
-                group_rollout_seeds = (
-                    [rollout_seeds[idx] for idx in group_indices]
-                    if rollout_seeds is not None
-                    else None
-                )
-                group_tbptt_reward_sink = _make_alpha_grad_tbptt_group_sink(group_indices)
-                if effective_grouping_mode == "family":
-                    x_group, y_group, infos_group = self._rollout_family_group_vectorized_with_policy(
-                        h_list=group_h_list,
-                        policy_step_fn=policy_step_fn,
-                        n_samples=n_samples,
-                        num_features=num_features,
-                        single_eval_pos=single_eval_pos,
-                        device=device,
-                        collect_x=collect_x,
-                        collect_runtime_info=collect_runtime_info,
-                        env_rng_seeds=group_env_seeds,
-                        rollout_rng_seeds=group_rollout_seeds,
-                        tbptt_window=tbptt_window,
-                        tbptt_reward_sink=group_tbptt_reward_sink,
-                        tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
-                        store_rewards=store_rewards,
-                        policy_objective_kind=policy_objective_kind,
-                        _policy_collect_log_probs=_policy_collect_log_probs,
-                        _policy_collect_action_trace=_policy_collect_action_trace,
-                        _policy_detach_action_in_env=_policy_detach_action_in_env,
-                    )
-                else:
-                    env_batch = self._sample_environment_batch(
-                        h_list=group_h_list,
-                        device=device,
-                        rng_seeds=group_env_seeds,
-                    )
-                    x_group, y_group, infos_group = self._rollout_distinct_envs_vectorized_with_policy(
-                        env=env_batch,
-                        policy_step_fn=policy_step_fn,
-                        batch_size=len(group_indices),
-                        n_samples=n_samples,
-                        num_features=num_features,
-                        single_eval_pos=single_eval_pos,
-                        device=device,
-                        collect_x=collect_x,
-                        collect_runtime_info=collect_runtime_info,
-                        rng_seeds=group_rollout_seeds,
-                        tbptt_window=tbptt_window,
-                        tbptt_reward_sink=group_tbptt_reward_sink,
-                        tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
-                        store_rewards=store_rewards,
-                        policy_objective_kind=policy_objective_kind,
-                        _policy_collect_log_probs=_policy_collect_log_probs,
-                        _policy_collect_action_trace=_policy_collect_action_trace,
-                        _policy_detach_action_in_env=_policy_detach_action_in_env,
-                    )
-                if collect_x:
-                    x[:, group_indices] = x_group
-                if store_rewards:
-                    rewards[:, group_indices] = y_group
-                if reinforce_log_probs is not None:
-                    group_reinforce = self.last_rollout_reinforce
-                    if isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
-                        reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
-                        group_log_prob_score = group_reinforce.get("log_prob_score", None)
-                        if torch.is_tensor(group_log_prob_score):
-                            if reinforce_log_prob_scores is None:
-                                reinforce_log_prob_scores = torch.empty(
-                                    (int(group_log_prob_score.shape[0]), batch_size, int(group_log_prob_score.shape[-1])),
-                                    device=group_log_prob_score.device,
-                                    dtype=group_log_prob_score.dtype,
-                                )
-                            reinforce_log_prob_scores[:, group_indices] = group_log_prob_score
-                if collect_action_trace:
-                    group_policy_trace = self.last_rollout_policy_trace
-                    if isinstance(group_policy_trace, dict) and torch.is_tensor(group_policy_trace.get("action_mask", None)):
-                        group_action_mean = group_policy_trace.get("action_mean", None)
-                        group_action_mask = group_policy_trace["action_mask"]
-                        if policy_action_mask is None:
-                            action_shape = tuple(group_action_mask.shape)
-                            policy_action_mask = torch.empty(
-                                action_shape[:1] + (batch_size, action_shape[2]),
-                                device=device,
-                                dtype=torch.bool,
-                            )
-                        policy_action_mask[:, group_indices] = group_action_mask
-                        if torch.is_tensor(group_action_mean) and (not alpha_grad_trace_roots_only):
-                            if policy_action_mean is None:
-                                action_shape = tuple(group_action_mean.shape)
-                                policy_action_mean = torch.empty(
-                                    action_shape[:1] + (batch_size, action_shape[2]),
-                                    device=device,
-                                    dtype=group_action_mean.dtype,
-                                )
-                            policy_action_mean[:, group_indices] = group_action_mean
-                        group_action_roots = group_policy_trace.get("action_mean_roots", None)
-                        if isinstance(group_action_roots, tuple):
-                            policy_action_group_traces.append(
-                                {
-                                    "indices": tuple(int(i) for i in group_indices),
-                                    "action_mean_roots": group_action_roots,
-                                    "action_mask": group_action_mask,
-                                }
-                            )
-                            if not alpha_grad_trace_roots_only:
-                                if policy_action_mean_root_steps is None:
-                                    policy_action_mean_root_steps = [
-                                        torch.zeros(
-                                            (batch_size, int(root.shape[-1])),
-                                            device=root.device,
-                                            dtype=root.dtype,
-                                        )
-                                        for root in group_action_roots
-                                    ]
-                                elif len(policy_action_mean_root_steps) != len(group_action_roots):
-                                    raise RuntimeError("alpha_grad action roots time dimension mismatch across rollout groups")
-                                for t_idx, root in enumerate(group_action_roots):
-                                    full_root = policy_action_mean_root_steps[t_idx]
-                                    if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
-                                        raise RuntimeError("alpha_grad action roots width mismatch across rollout groups")
-                                    full_root[group_indices] = root
-                for local_idx, global_idx in enumerate(group_indices):
-                    infos[global_idx] = infos_group[local_idx]
-                group_v2 = self.last_rollout_v2
-                rollout_v2_acc = self._aev2_merge_rollout_summary(
-                    rollout_v2_acc,
-                    group_v2,
-                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                group_v3 = self.last_rollout_v3
-                rollout_v3_acc = self._aev3_merge_rollout_summary(
-                    rollout_v3_acc,
-                    group_v3,
-                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                group_v4 = self.last_rollout_v4
-                rollout_v4_acc = self._aev4_merge_rollout_summary(
-                    rollout_v4_acc,
-                    group_v4,
-                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                group_v5_next = self.last_rollout_v5_next
-                rollout_v5_next_acc = self._aev5_next_merge_rollout_summary(
-                    rollout_v5_next_acc,
-                    group_v5_next,
-                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                rollout_lipschitz_acc = self._merge_lipschitz_audit_summary(
-                    rollout_lipschitz_acc,
-                    self.last_rollout_lipschitz_audit,
-                    device=device,
-                    dtype=torch.float32,
-                )
-                rollout_terminal_acc = self._merge_terminal_count_summary(
-                    rollout_terminal_acc,
-                    self.last_rollout_terminal_stats,
-                    batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                    device=device,
-                    dtype=torch.float32,
-                )
-                group_profile = self.last_rollout_profile
-                if isinstance(group_profile, dict):
-                    if rollout_profile_acc is None:
-                        rollout_profile_acc = {
-                            "policy_cuda_ms": 0.0,
-                            "transition_cuda_ms": 0.0,
-                            "policy_wall_ms": 0.0,
-                            "transition_wall_ms": 0.0,
-                            "transition_y_wall_ms": 0.0,
-                            "transition_x_wall_ms": 0.0,
-                            "transition_group_wall_ms": 0.0,
-                            "transition_group_launch_wall_ms": 0.0,
-                            "transition_group_sync_wall_ms": 0.0,
-                            "transition_env_pack_wall_ms": 0.0,
-                            "transition_state_update_wall_ms": 0.0,
-                            "transition_noise_wall_ms": 0.0,
-                            "transition_fused_wall_ms": 0.0,
-                            "transition_fused_launch_wall_ms": 0.0,
-                            "transition_gp_first_projection_wall_ms": 0.0,
-                            "transition_gp_second_projection_wall_ms": 0.0,
-                            "transition_gp_projection_call_count": 0,
-                            "transition_gp_rff_fused_call_count": 0,
-                            "transition_gp_profile_group_count": 0,
-                            "transition_gp_profile_sync_group_count": 0,
-                            "transition_gp_shared_total_wall_ms": 0.0,
-                            "transition_gp_shared_core_wall_ms": 0.0,
-                            "transition_gp_shared_noise_wall_ms": 0.0,
-                            "transition_gp_shared_checkpoint_wall_ms": 0.0,
-                            "transition_gp_shared_post_wall_ms": 0.0,
-                            "transition_gp_shared_call_count": 0,
-                            "transition_packed_env_input_group_count": 0,
-                            "transition_packed_env_input_call_count": 0,
-                            "transition_only_build_group_count": 0,
-                            "transition_only_skipped_generator_count": 0,
-                            "transition_setup_wall_ms": 0.0,
-                            "transition_family_build_wall_ms": 0.0,
-                            "transition_generator_build_wall_ms": 0.0,
-                            "transition_gp_shared_build_wall_ms": 0.0,
-                            "transition_fused_call_count": 0,
-                            "transition_fused_group_count": 0,
-                            "transition_fused_enabled": 0,
-                            "transition_checkpoint_enabled": 0,
-                            "transition_checkpoint_call_count": 0,
-                            "transition_group_count": 0,
-                            "transition_family_group_count": 0,
-                            "transition_inner_grouping_structure_enabled": 0,
-                            "transition_inner_min_bucket": 0,
-                            "transition_bucket_max_batch": 0,
-                            "transition_work_actual_est": 0.0,
-                            "transition_work_padded_est": 0.0,
-                            "transition_async_enabled": 0,
-                            "noise_mode": None,
-                            "noise_block_size": 0,
-                            "steps": int(n_samples),
-                            "batch_size": int(batch_size),
-                            "env_count": 0,
-                            "strict_joint_transition_count": 0,
-                            "reference_semantics_count": 0,
-                            "exact_scm_count": 0,
-                            "exact_gp_count": 0,
-                            "fixed_gp_count": 0,
-                            "legacy_scm_count": 0,
-                            "legacy_gp_count": 0,
-                        }
-                    rollout_profile_acc["policy_cuda_ms"] += float(group_profile.get("policy_cuda_ms", 0.0))
-                    rollout_profile_acc["transition_cuda_ms"] += float(group_profile.get("transition_cuda_ms", 0.0))
-                    rollout_profile_acc["policy_wall_ms"] += float(group_profile.get("policy_wall_ms", 0.0))
-                    rollout_profile_acc["transition_wall_ms"] += float(group_profile.get("transition_wall_ms", 0.0))
-                    rollout_profile_acc["transition_y_wall_ms"] += float(group_profile.get("transition_y_wall_ms", 0.0))
-                    rollout_profile_acc["transition_x_wall_ms"] += float(group_profile.get("transition_x_wall_ms", 0.0))
-                    rollout_profile_acc["transition_group_wall_ms"] += float(
-                        group_profile.get("transition_group_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_group_launch_wall_ms"] += float(
-                        group_profile.get("transition_group_launch_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_group_sync_wall_ms"] += float(
-                        group_profile.get("transition_group_sync_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_env_pack_wall_ms"] += float(
-                        group_profile.get("transition_env_pack_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_state_update_wall_ms"] += float(
-                        group_profile.get("transition_state_update_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_noise_wall_ms"] += float(
-                        group_profile.get("transition_noise_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_fused_wall_ms"] += float(
-                        group_profile.get("transition_fused_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_fused_launch_wall_ms"] += float(
-                        group_profile.get("transition_fused_launch_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_gp_first_projection_wall_ms"] += float(
-                        group_profile.get("transition_gp_first_projection_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_gp_second_projection_wall_ms"] += float(
-                        group_profile.get("transition_gp_second_projection_wall_ms", 0.0)
-                    )
-                    rollout_profile_acc["transition_gp_projection_call_count"] += int(
-                        group_profile.get("transition_gp_projection_call_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_gp_rff_fused_call_count"] += int(
-                        group_profile.get("transition_gp_rff_fused_call_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_gp_profile_group_count"] += int(
-                        group_profile.get("transition_gp_profile_group_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_gp_profile_sync_group_count"] += int(
-                        group_profile.get("transition_gp_profile_sync_group_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_gp_shared_total_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_total_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_core_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_core_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_noise_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_noise_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_checkpoint_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_checkpoint_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_post_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_post_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_call_count"] += int(
-                        group_profile.get("transition_gp_shared_call_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_packed_env_input_group_count"] += int(
-                        group_profile.get("transition_packed_env_input_group_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_packed_env_input_call_count"] += int(
-                        group_profile.get("transition_packed_env_input_call_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_only_build_group_count"] += int(
-                        group_profile.get("transition_only_build_group_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_only_skipped_generator_count"] += int(
-                        group_profile.get("transition_only_skipped_generator_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_setup_wall_ms"] += float(
-                        group_profile.get("transition_setup_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_family_build_wall_ms"] += float(
-                        group_profile.get("transition_family_build_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_generator_build_wall_ms"] += float(
-                        group_profile.get("transition_generator_build_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_gp_shared_build_wall_ms"] += float(
-                        group_profile.get("transition_gp_shared_build_wall_ms", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_fused_call_count"] += int(
-                        group_profile.get("transition_fused_call_count", 0)
-                    )
-                    rollout_profile_acc["transition_fused_group_count"] += int(
-                        group_profile.get("transition_fused_group_count", 0)
-                    )
-                    rollout_profile_acc["transition_fused_enabled"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_fused_enabled", 0) or 0),
-                            int(group_profile.get("transition_fused_enabled", 0) or 0),
-                        )
-                    )
-                    rollout_profile_acc["transition_checkpoint_enabled"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_checkpoint_enabled", 0) or 0),
-                            int(group_profile.get("transition_checkpoint_enabled", 0) or 0),
-                        )
-                    )
-                    rollout_profile_acc["transition_checkpoint_call_count"] += int(
-                        group_profile.get("transition_checkpoint_call_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_group_count"] += int(group_profile.get("transition_group_count", 0))
-                    rollout_profile_acc["transition_family_group_count"] += int(
-                        group_profile.get("transition_family_group_count", 0) or 0
-                    )
-                    rollout_profile_acc["transition_inner_grouping_structure_enabled"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_inner_grouping_structure_enabled", 0) or 0),
-                            int(group_profile.get("transition_inner_grouping_structure_enabled", 0) or 0),
-                        )
-                    )
-                    rollout_profile_acc["transition_inner_min_bucket"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_inner_min_bucket", 0) or 0),
-                            int(group_profile.get("transition_inner_min_bucket", 0) or 0),
-                        )
-                    )
-                    rollout_profile_acc["transition_bucket_max_batch"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_bucket_max_batch", 0) or 0),
-                            int(group_profile.get("transition_bucket_max_batch", 0) or 0),
-                        )
-                    )
-                    rollout_profile_acc["transition_work_actual_est"] += float(
-                        group_profile.get("transition_work_actual_est", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_work_padded_est"] += float(
-                        group_profile.get("transition_work_padded_est", 0.0) or 0.0
-                    )
-                    rollout_profile_acc["transition_async_enabled"] = int(
-                        max(
-                            int(rollout_profile_acc.get("transition_async_enabled", 0) or 0),
-                            int(group_profile.get("transition_async_enabled", 0) or 0),
-                        )
-                    )
-                    group_noise_mode = group_profile.get("noise_mode", None)
-                    if group_noise_mode is not None:
-                        group_noise_mode = str(group_noise_mode)
-                        current_noise_mode = rollout_profile_acc.get("noise_mode", None)
-                        if current_noise_mode is None:
-                            rollout_profile_acc["noise_mode"] = group_noise_mode
-                        elif str(current_noise_mode) != group_noise_mode:
-                            rollout_profile_acc["noise_mode"] = "mixed"
-                    try:
-                        group_noise_block_size = int(group_profile.get("noise_block_size", 0) or 0)
-                    except Exception:
-                        group_noise_block_size = 0
-                    if group_noise_block_size > int(rollout_profile_acc.get("noise_block_size", 0) or 0):
-                        rollout_profile_acc["noise_block_size"] = group_noise_block_size
-                    for key in (
-                        "env_count",
-                        "strict_joint_transition_count",
-                        "reference_semantics_count",
-                        "exact_scm_count",
-                        "exact_gp_count",
-                        "fixed_gp_count",
-                        "legacy_scm_count",
-                        "legacy_gp_count",
-                    ):
-                        rollout_profile_acc[key] += int(group_profile.get(key, 0) or 0)
-            if rollout_profile_acc is not None:
-                rollout_profile_acc["transition_bucket_mean_batch"] = float(
-                    batch_size / max(1, int(rollout_profile_acc.get("transition_group_count", 0) or 0))
-                )
-                rollout_profile_acc["transition_work_fill_ratio"] = float(
-                    float(rollout_profile_acc.get("transition_work_actual_est", 0.0) or 0.0)
-                    / max(1e-9, float(rollout_profile_acc.get("transition_work_padded_est", 0.0) or 0.0))
-                )
-                rollout_profile_acc = self._finalize_env_semantics_summary(rollout_profile_acc)
-            self.last_rollout_profile = rollout_profile_acc
-            self.last_rollout_env_semantics = (
-                {
-                    key: rollout_profile_acc[key]
-                    for key in (
-                        "env_count",
-                        "strict_joint_transition_count",
-                        "strict_joint_transition_share",
-                        "reference_semantics_count",
-                        "reference_semantics_share",
-                        "exact_scm_count",
-                        "exact_gp_count",
-                        "legacy_scm_count",
-                        "legacy_gp_count",
-                        "transition_reference_mode",
-                    )
-                }
-                if isinstance(rollout_profile_acc, dict)
-                else None
-            )
-            self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
-                rollout_v2_acc,
-                device=device,
-                dtype=torch.float32,
-            )
-            self.last_rollout_v3 = self._aev3_finalize_rollout_summary(
-                rollout_v3_acc,
-                device=device,
-                dtype=torch.float32,
-            )
-            self.last_rollout_v4 = self._aev4_finalize_rollout_summary(
-                rollout_v4_acc,
-                device=device,
-                dtype=torch.float32,
-            )
-            self.last_rollout_v5_next = self._aev5_next_finalize_rollout_summary(
-                rollout_v5_next_acc,
-                device=device,
-                dtype=torch.float32,
-            )
-            self.last_rollout_reinforce = (
-                {
-                    "log_probs": reinforce_log_probs,
-                    "log_prob_score": reinforce_log_prob_scores,
-                }
-                if reinforce_log_probs is not None
-                else None
-            )
-            if policy_action_mean_root_steps is not None:
-                policy_action_mean_roots = tuple(policy_action_mean_root_steps)
-            self.last_rollout_policy_trace = (
-                {
-                    "action_mean": policy_action_mean,
-                    "action_mean_roots": policy_action_mean_roots,
-                    "action_mask": policy_action_mask,
-                    "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
-                }
-                if (
-                    collect_action_trace
-                    and policy_action_mask is not None
-                    and (
-                        (policy_action_mean is not None)
-                        or (policy_action_mean_roots is not None)
-                        or bool(policy_action_group_traces)
-                    )
-                )
-                else None
-            )
-            self.last_rollout_terminal_stats = self._finalize_terminal_count_summary(
-                rollout_terminal_acc,
-                device=device,
-                dtype=torch.float32,
-            )
-            self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
-                rollout_lipschitz_acc
-                if rollout_lipschitz_acc is not None
-                else self._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
-                device=device,
-                dtype=torch.float32,
-            )
-            if alpha_grad_outer_tbptt_merge and tbptt_alpha_window_buckets:
-                raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete window buckets")
-            self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
-            return {
+        return maintained_dispatch_policy_rollout(
+            self,
+            {
+                "policy_step_fn": policy_step_fn,
+                "batch_size": batch_size,
+                "n_samples": n_samples,
+                "num_features": num_features,
+                "single_eval_pos": single_eval_pos,
+                "device": device,
+                "collect_x": collect_x,
+                "collect_runtime_info": collect_runtime_info,
+                "tbptt_window": tbptt_window,
+                "tbptt_reward_sink_supports_aux": tbptt_reward_sink_supports_aux,
+                "store_rewards": store_rewards,
+                "policy_objective_kind": policy_objective_kind,
+                "_policy_collect_log_probs": _policy_collect_log_probs,
+                "_policy_collect_action_trace": _policy_collect_action_trace,
+                "_policy_detach_action_in_env": _policy_detach_action_in_env,
+                "alpha_grad_trace_roots_only": alpha_grad_trace_roots_only,
+                "backend": backend,
+                "strict_rng_match": strict_rng_match,
+                "grouping_mode": grouping_mode,
+                "h_list": h_list,
+                "env_seeds": env_seeds,
+                "rollout_seeds": rollout_seeds,
+                "make_alpha_grad_tbptt_group_sink": _make_alpha_grad_tbptt_group_sink,
+                "alpha_grad_outer_merge_state": alpha_grad_outer_merge_state,
                 "x": x,
                 "rewards": rewards,
-                "info": self.last_runtime_info,
-                "single_eval_pos": single_eval_pos,
-                "rollout_profile": self.last_rollout_profile,
-                "aev2": self.last_rollout_v2,
-                "aev3": self.last_rollout_v3,
-                "aev4": self.last_rollout_v4,
-                "aev5_next": self.last_rollout_v5_next,
-                "reinforce": self.last_rollout_reinforce,
-                "policy_trace": self.last_rollout_policy_trace,
-                "terminal_stats": self.last_rollout_terminal_stats,
-                "lipschitz_audit": self.last_rollout_lipschitz_audit,
-            }
-
-        # Fallback serial baseline for explicit non-vectorized backend.
-        rollout_v2_acc = None
-        rollout_v3_acc = None
-        rollout_v4_acc = None
-        rollout_v5_next_acc = None
-        rollout_lipschitz_acc = None
-        rollout_env_semantics_acc = None
-        rollout_terminal_acc = None
-        if alpha_grad_outer_tbptt_merge:
-            tbptt_alpha_expected_group_count = int(batch_size)
-        for b, h in enumerate(h_list):
-            env = self._sample_environment(
-                h=h,
-                device=device,
-                rng_seed=(env_seeds[b] if env_seeds is not None else None),
-            )
-            x_one, y_one, info = self._rollout_single(
-                env=env,
-                n_samples=n_samples,
-                num_features=num_features,
-                single_eval_pos=single_eval_pos,
-                device=device,
-                policy_step_fn=policy_step_fn,
-                collect_x=collect_x,
-                collect_runtime_info=collect_runtime_info,
-                rng_seed=(rollout_seeds[b] if rollout_seeds is not None else None),
-                tbptt_window=tbptt_window,
-                tbptt_reward_sink=_make_alpha_grad_tbptt_group_sink((b,)),
-                tbptt_reward_sink_supports_aux=tbptt_reward_sink_supports_aux,
-                store_rewards=store_rewards,
-                policy_objective_kind=policy_objective_kind,
-                _policy_collect_log_probs=_policy_collect_log_probs,
-                _policy_collect_action_trace=_policy_collect_action_trace,
-                _policy_detach_action_in_env=_policy_detach_action_in_env,
-            )
-            if collect_x:
-                x[:, b] = x_one
-            if store_rewards:
-                rewards[:, b] = y_one
-            if reinforce_log_probs is not None:
-                rollout_reinforce_one = self.last_rollout_reinforce
-                if isinstance(rollout_reinforce_one, dict) and torch.is_tensor(rollout_reinforce_one.get("log_probs", None)):
-                    reinforce_log_probs[:, b] = rollout_reinforce_one["log_probs"].reshape(n_samples)
-                    rollout_log_prob_score_one = rollout_reinforce_one.get("log_prob_score", None)
-                    if torch.is_tensor(rollout_log_prob_score_one):
-                        if reinforce_log_prob_scores is None:
-                            reinforce_log_prob_scores = torch.empty(
-                                (int(rollout_log_prob_score_one.shape[0]), batch_size, int(rollout_log_prob_score_one.shape[-1])),
-                                device=rollout_log_prob_score_one.device,
-                                dtype=rollout_log_prob_score_one.dtype,
-                            )
-                        reinforce_log_prob_scores[:, b:b + 1] = rollout_log_prob_score_one
-            if collect_action_trace:
-                rollout_policy_one = self.last_rollout_policy_trace
-                if (
-                    isinstance(rollout_policy_one, dict)
-                    and torch.is_tensor(rollout_policy_one.get("action_mean", None))
-                    and torch.is_tensor(rollout_policy_one.get("action_mask", None))
-                ):
-                    if policy_action_mean is None:
-                        action_shape = tuple(rollout_policy_one["action_mean"].shape)
-                        policy_action_mean = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=rollout_policy_one["action_mean"].dtype)
-                        policy_action_mask = torch.empty(action_shape[:1] + (batch_size, action_shape[2]), device=device, dtype=torch.bool)
-                    policy_action_mean[:, b:b + 1] = rollout_policy_one["action_mean"]
-                    policy_action_mask[:, b:b + 1] = rollout_policy_one["action_mask"]
-                    rollout_action_roots = rollout_policy_one.get("action_mean_roots", None)
-                    if isinstance(rollout_action_roots, tuple):
-                        policy_action_group_traces.append(
-                            {
-                                "indices": (int(b),),
-                                "action_mean_roots": rollout_action_roots,
-                                "action_mask": rollout_policy_one["action_mask"],
-                            }
-                        )
-                        if policy_action_mean_root_steps is None:
-                            policy_action_mean_root_steps = [
-                                torch.zeros(
-                                    (batch_size, int(root.shape[-1])),
-                                    device=root.device,
-                                    dtype=root.dtype,
-                                )
-                                for root in rollout_action_roots
-                            ]
-                        elif len(policy_action_mean_root_steps) != len(rollout_action_roots):
-                            raise RuntimeError("alpha_grad action roots time dimension mismatch across serial rollouts")
-                        for t_idx, root in enumerate(rollout_action_roots):
-                            full_root = policy_action_mean_root_steps[t_idx]
-                            if tuple(full_root.shape) != (batch_size, int(root.shape[-1])):
-                                raise RuntimeError("alpha_grad action roots width mismatch across serial rollouts")
-                            full_root[b] = root
-            infos[b] = info
-            rollout_v2_acc = self._aev2_merge_rollout_summary(
-                rollout_v2_acc,
-                self.last_rollout_v2,
-                batch_weight=(1.0 / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v3_acc = self._aev3_merge_rollout_summary(
-                rollout_v3_acc,
-                self.last_rollout_v3,
-                batch_weight=(1.0 / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v4_acc = self._aev4_merge_rollout_summary(
-                rollout_v4_acc,
-                self.last_rollout_v4,
-                batch_weight=(1.0 / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v5_next_acc = self._aev5_next_merge_rollout_summary(
-                rollout_v5_next_acc,
-                self.last_rollout_v5_next,
-                batch_weight=(1.0 / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_lipschitz_acc = self._merge_lipschitz_audit_summary(
-                rollout_lipschitz_acc,
-                self.last_rollout_lipschitz_audit,
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_terminal_acc = self._merge_terminal_count_summary(
-                rollout_terminal_acc,
-                self.last_rollout_terminal_stats,
-                batch_weight=(1.0 / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_env_semantics_acc = self._merge_env_semantics_summary(
-                rollout_env_semantics_acc,
-                self._summarize_env_semantics(env, 1),
-            )
-        self.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
-        self.last_rollout_profile = self._finalize_env_semantics_summary(rollout_env_semantics_acc)
-        if isinstance(self.last_rollout_profile, dict):
-            self.last_rollout_profile["steps"] = int(n_samples)
-            self.last_rollout_profile["batch_size"] = int(batch_size)
-        self.last_rollout_env_semantics = (
-            {
-                key: self.last_rollout_profile[key]
-                for key in (
-                    "env_count",
-                    "strict_joint_transition_count",
-                    "strict_joint_transition_share",
-                    "reference_semantics_count",
-                    "reference_semantics_share",
-                    "exact_scm_count",
-                    "exact_gp_count",
-                    "legacy_scm_count",
-                    "legacy_gp_count",
-                    "transition_reference_mode",
-                )
-            }
-            if isinstance(self.last_rollout_profile, dict)
-            else None
+                "reinforce_log_probs": reinforce_log_probs,
+                "infos": infos,
+            },
         )
-        self.last_rollout_v2 = self._aev2_finalize_rollout_summary(
-            rollout_v2_acc,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.last_rollout_v3 = self._aev3_finalize_rollout_summary(
-            rollout_v3_acc,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.last_rollout_v4 = self._aev4_finalize_rollout_summary(
-            rollout_v4_acc,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.last_rollout_v5_next = self._aev5_next_finalize_rollout_summary(
-            rollout_v5_next_acc,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.last_rollout_reinforce = (
-            {
-                "log_probs": reinforce_log_probs,
-                "log_prob_score": reinforce_log_prob_scores,
-            }
-            if reinforce_log_probs is not None
-            else None
-        )
-        if policy_action_mean_root_steps is not None:
-            policy_action_mean_roots = tuple(policy_action_mean_root_steps)
-        self.last_rollout_policy_trace = (
-            {
-                "action_mean": policy_action_mean,
-                "action_mean_roots": policy_action_mean_roots,
-                "action_mask": policy_action_mask,
-                "group_traces": tuple(policy_action_group_traces) if policy_action_group_traces else None,
-            }
-            if (
-                collect_action_trace
-                and policy_action_mask is not None
-                and (
-                    (policy_action_mean is not None)
-                    or (policy_action_mean_roots is not None)
-                    or bool(policy_action_group_traces)
-                )
-            )
-            else None
-        )
-        self.last_rollout_terminal_stats = self._finalize_terminal_count_summary(
-            rollout_terminal_acc,
-            device=device,
-            dtype=torch.float32,
-        )
-        self.last_rollout_lipschitz_audit = self._finalize_lipschitz_audit_accumulator(
-            rollout_lipschitz_acc
-            if rollout_lipschitz_acc is not None
-            else self._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
-            device=device,
-            dtype=torch.float32,
-        )
-        if alpha_grad_outer_tbptt_merge and tbptt_alpha_window_buckets:
-            raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete serial window buckets")
-        return {
-            "x": x,
-            "rewards": rewards,
-            "info": self.last_runtime_info,
-            "single_eval_pos": single_eval_pos,
-            "rollout_profile": self.last_rollout_profile,
-            "aev2": self.last_rollout_v2,
-            "aev3": self.last_rollout_v3,
-            "aev4": self.last_rollout_v4,
-            "aev5_next": self.last_rollout_v5_next,
-            "reinforce": self.last_rollout_reinforce,
-            "policy_trace": self.last_rollout_policy_trace,
-            "terminal_stats": self.last_rollout_terminal_stats,
-            "lipschitz_audit": self.last_rollout_lipschitz_audit,
-        }
 
     def normalize_rewards(self, rewards, eps=None, clip=None, detach_stats=True, return_stats=False):
         if rewards.ndim != 2:
