@@ -4251,6 +4251,69 @@ def test_environment_prior_strict_joint_transition_builds_single_generator(famil
     assert bool(getattr(env["transition_generator"], "_applies_output_tanh", True)) is False
 
 
+def test_environment_prior_legacy_scm_transition_supports_sin_activation():
+    _seed_everything(20260309)
+    prior = EnvironmentPrior({})
+    h_sin = _manual_sampled_h(
+        family="scm",
+        state_dim=5,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=4,
+        zero_pad_dim=1,
+        num_layers=4,
+    )
+    h_tanh = dict(h_sin)
+    h_sin["prior_mlp_activations"] = "sin"
+    h_sin["noise_std"] = 0.0
+    h_sin["init_std"] = 0.8
+    h_sin["prior_mlp_hidden_dim"] = 32
+    h_tanh["prior_mlp_activations"] = "tanh"
+    h_tanh["noise_std"] = 0.0
+    h_tanh["init_std"] = 0.8
+    h_tanh["prior_mlp_hidden_dim"] = 32
+
+    env_sin = prior._sample_environment(h_sin, device="cpu", rng_seed=321)
+    env_tanh = prior._sample_environment(h_tanh, device="cpu", rng_seed=321)
+
+    in_dim = int(env_sin["env_input_dim"])
+    env_in = torch.linspace(-4.0, 4.0, steps=2 * in_dim, dtype=torch.float32).reshape(2, in_dim)
+    state_sin = env_sin["x_generator"](env_in)
+    reward_sin = env_sin["y_generator"](env_in)
+    state_tanh = env_tanh["x_generator"](env_in)
+    reward_tanh = env_tanh["y_generator"](env_in)
+
+    assert torch.isfinite(state_sin).all()
+    assert torch.isfinite(reward_sin).all()
+    assert not torch.allclose(state_sin, state_tanh)
+    assert not torch.allclose(reward_sin, reward_tanh)
+
+
+def test_environment_prior_prefix_tiled_affine_cpu_fallback_supports_sin_activation():
+    prior = EnvironmentPrior({})
+    x = torch.tensor([[0.20, -0.40, 0.10]], dtype=torch.float32)
+    w = torch.tensor(
+        [[[1.00, -0.50], [0.25, 0.75], [-0.10, 0.30]]],
+        dtype=torch.float32,
+    )
+    b = torch.tensor([[0.10, -0.20]], dtype=torch.float32)
+    in_sizes = torch.tensor([3], dtype=torch.long)
+    out_sizes = torch.tensor([2], dtype=torch.long)
+    activation_codes = torch.tensor([4], dtype=torch.long)
+
+    out = prior._batch_affine_prefix_tiled_input_activated_forward(
+        x,
+        w,
+        b,
+        in_sizes=in_sizes,
+        out_sizes=out_sizes,
+        activation_codes=activation_codes,
+    )
+
+    expected = prior._batch_affine(torch.sin(x), w, b)
+    assert torch.allclose(out, expected, atol=1e-6, rtol=1e-6)
+
+
 def test_environment_prior_strict_reference_scm_joint_transition_matches_reference_builder():
     _seed_everything(20260309)
     prior = EnvironmentPrior({})
@@ -4275,6 +4338,41 @@ def test_environment_prior_strict_reference_scm_joint_transition_matches_referen
     env = prior._sample_environment(h, device="cpu", rng_seed=seed)
     assert bool(env["reference_semantics_enabled"]) is True
 
+    in_dim = int(env["env_input_dim"])
+    env_in = torch.linspace(-1.0, 1.0, steps=3 * in_dim, dtype=torch.float32).reshape(3, in_dim)
+    state_actual, reward_actual = env["transition_generator"](env_in)
+
+    ref_generator = torch.Generator(device="cpu")
+    ref_generator.manual_seed(seed)
+    state_ref, reward_ref = _reference_scm_joint_eval(env_in, h, generator=ref_generator)
+
+    assert torch.allclose(state_actual, state_ref, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(reward_actual, reward_ref, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_strict_reference_scm_joint_transition_matches_reference_builder_with_sin():
+    _seed_everything(20260309)
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=5,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=4,
+        zero_pad_dim=1,
+        num_layers=4,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["scm_standard_linear_init_enabled"] = True
+    h["prior_mlp_activations"] = "sin"
+    h["noise_std"] = 0.0
+    h["pre_sample_weights"] = False
+    h["prior_mlp_dropout_prob"] = 0.0
+    h["block_wise_dropout"] = False
+    h["random_feature_rotation"] = False
+
+    seed = 321
+    env = prior._sample_environment(h, device="cpu", rng_seed=seed)
     in_dim = int(env["env_input_dim"])
     env_in = torch.linspace(-1.0, 1.0, steps=3 * in_dim, dtype=torch.float32).reshape(3, in_dim)
     state_actual, reward_actual = env["transition_generator"](env_in)
@@ -5109,6 +5207,80 @@ def test_environment_prior_strict_reference_scm_family_coarse_batch_matches_refe
         assert torch.allclose(reward_actual[bi: bi + 1], reward_ref, atol=1e-6, rtol=1e-6)
         if state_actual.shape[1] > state_dim:
             assert torch.allclose(state_actual[bi, state_dim:], torch.zeros_like(state_actual[bi, state_dim:]))
+
+
+def test_environment_prior_strict_reference_scm_family_coarse_batch_matches_reference_builder_with_sin():
+    _seed_everything(20260309)
+    prior = EnvironmentPrior({})
+    h_list = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=5,
+            obs_dim=3,
+            action_dim=2,
+            noise_dim=4,
+            zero_pad_dim=1,
+            num_layers=4,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=7,
+            obs_dim=4,
+            action_dim=3,
+            noise_dim=2,
+            zero_pad_dim=0,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=6,
+            obs_dim=5,
+            action_dim=2,
+            noise_dim=3,
+            zero_pad_dim=2,
+            num_layers=5,
+        ),
+    ]
+    activations = ["sin", "relu", "identity"]
+    seeds = [321, 654, 987]
+    for idx, (h, activation) in enumerate(zip(h_list, activations)):
+        h["strict_joint_transition_enabled"] = True
+        h["prior_mlp_activations"] = activation
+        h["noise_std"] = 0.0
+        h["pre_sample_weights"] = False
+        h["prior_mlp_dropout_prob"] = 0.0
+        h["block_wise_dropout"] = False
+        h["random_feature_rotation"] = False
+        h["init_std"] = 0.03 + (0.01 * idx)
+        h["prior_mlp_hidden_dim"] = 10 + (2 * idx)
+
+    env_batch = prior._sample_environment_family_coarse_batch(
+        h_list=h_list,
+        device="cpu",
+        rng_seeds=seeds,
+        build_x_generator=False,
+        build_y_generator=False,
+        build_policy_generator=False,
+    )
+    assert bool(getattr(env_batch["transition_generator"], "_reference_scm_vectorized", False))
+
+    env_in = torch.linspace(
+        -1.25,
+        1.1,
+        steps=len(h_list) * int(env_batch["env_input_dim"]),
+        dtype=torch.float32,
+    ).reshape(len(h_list), int(env_batch["env_input_dim"]))
+    state_actual, reward_actual = env_batch["transition_generator"](env_in)
+
+    for bi, (seed, h) in enumerate(zip(seeds, h_list)):
+        active_idx = _coarse_batch_reference_active_index(env_batch, bi)
+        env_in_compact = env_in[bi: bi + 1].index_select(1, active_idx)
+        ref_generator = torch.Generator(device="cpu")
+        ref_generator.manual_seed(int(seed))
+        state_ref, reward_ref = _reference_scm_joint_eval(env_in_compact, h, generator=ref_generator)
+        state_dim = int(h["state_dim"])
+        assert torch.allclose(state_actual[bi: bi + 1, :state_dim], state_ref, atol=1e-6, rtol=1e-6)
+        assert torch.allclose(reward_actual[bi: bi + 1], reward_ref, atol=1e-6, rtol=1e-6)
 
 
 def test_environment_prior_strict_reference_scm_family_coarse_batch_packed_input_matches_dense():

@@ -1,8 +1,10 @@
+import pytest
 import torch
 
 from ticl.model_configs import get_model_default_config
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
+from ticl.train import _build_policy_step_fn
 
 
 def test_rlpfn_default_config_uses_split_encoder():
@@ -148,6 +150,164 @@ def test_tabpfn_split_obs_action_encoder_forward():
     out = model((x, y), single_eval_pos=5)
     assert out.shape == (2, 3, 1)
     assert torch.isfinite(out).all()
+
+
+def test_tabpfn_policy_step_outputs_action_head_width():
+    emsize = 32
+    model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    x_token = torch.randn(1, 2, 12)
+    y_token = torch.randn(1, 2)
+    out, _ = model.forward_policy_step(
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+    )
+    assert out.shape == (1, 2, 4)
+    assert torch.isfinite(out).all()
+
+
+def test_tabpfn_policy_step_requires_policy_action_head_for_split_encoder():
+    model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    model.policy_action_head = None
+
+    x_token = torch.randn(1, 2, 12)
+    y_token = torch.randn(1, 2)
+
+    with pytest.raises(ValueError, match="policy_action_head"):
+        model.forward_policy_step(
+            x_token,
+            y_token,
+            kv_cache=None,
+            max_cache_len=16,
+            kv_cache_mode="immutable",
+        )
+
+
+def test_build_policy_step_fn_requires_policy_action_head_for_split_encoder():
+    model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    model.policy_action_head = None
+
+    with pytest.raises(ValueError, match="policy_action_head"):
+        _build_policy_step_fn(
+            model,
+            num_features=12,
+            max_cache_len=16,
+            kv_cache_mode="immutable",
+            kv_cache_page_size=None,
+            allow_grad_mutable_cache=False,
+            pg_torch_compile=False,
+        )
+
+
+def test_tabpfn_load_state_dict_bootstraps_policy_action_head_from_legacy_decoder():
+    torch.manual_seed(20260320)
+    emsize = 32
+    source_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    assert source_model.reset_policy_action_head_from_decoder_()
+
+    legacy_state = source_model.state_dict()
+    for key in list(legacy_state.keys()):
+        if key.startswith("policy_action_head."):
+            legacy_state.pop(key)
+
+    restored_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    restored_model.load_state_dict(legacy_state)
+
+    for key, value in source_model.policy_action_head.state_dict().items():
+        restored_value = restored_model.policy_action_head.state_dict()[key]
+        assert torch.allclose(restored_value, value, atol=1e-6, rtol=1e-5)
+
+    x_token = torch.randn(1, 2, 12)
+    y_token = torch.randn(1, 2)
+    out_source, _ = source_model.forward_policy_step(
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+    )
+    out_restored, _ = restored_model.forward_policy_step(
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+    )
+    assert torch.allclose(out_restored, out_source, atol=1e-6, rtol=1e-5)
 
 
 def _assert_nested_tensor_close(a, b, atol=1e-6, rtol=1e-5):

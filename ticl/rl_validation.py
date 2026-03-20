@@ -200,6 +200,13 @@ def _model_supports_policy_step(model):
     return hasattr(model_ref, "forward_policy_step")
 
 
+def _require_validation_policy_action_head(model):
+    model_ref = model.module if hasattr(model, "module") else model
+    require_policy_action_head = getattr(model_ref, "require_policy_action_head", None)
+    if callable(require_policy_action_head):
+        require_policy_action_head()
+
+
 def _resolve_validation_sample(value, rng):
     if isinstance(value, dict):
         dist = str(value.get("distribution", "")).strip().lower()
@@ -478,6 +485,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     policy_step_fn = None
     use_policy_step_validation = bool(_model_supports_policy_step(model))
     if bool(use_policy_step_validation):
+        _require_validation_policy_action_head(model)
         from ticl.train import _build_policy_step_fn
 
         policy_step_fn = _build_policy_step_fn(

@@ -790,6 +790,9 @@ def _build_policy_step_fn(
     model_ref = model.module if hasattr(model, "module") else model
     if not hasattr(model_ref, "forward_policy_step"):
         raise ValueError("RL policy objectives require model.forward_policy_step")
+    require_policy_action_head = getattr(model_ref, "require_policy_action_head", None)
+    if callable(require_policy_action_head):
+        require_policy_action_head()
 
     num_features = int(num_features)
     model_encoder = getattr(model_ref, "encoder", None)

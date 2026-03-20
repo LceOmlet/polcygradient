@@ -1,6 +1,8 @@
 import numpy as np
+import pytest
 import sys
 import types
+import time
 
 import torch
 
@@ -21,6 +23,26 @@ def _build_small_causal_model():
         classification_task=False,
         y_encoder="linear",
         x_encoder_type="single",
+        single_eval_causal=True,
+    )
+    model.eval()
+    return model
+
+
+def _build_small_split_rlpfn_like_model():
+    model = TabPFN(
+        n_out=1,
+        n_features=9,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=1,
         single_eval_causal=True,
     )
     model.eval()
@@ -279,6 +301,116 @@ def test_evaluate_rlpfn_on_gym_envs_policy_step_path_reuses_cache_and_reports_si
     assert model.phase_calls == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
     assert model.terminal_calls == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert model.cache_seen == [False, True, True, True, True, True, True]
+
+
+def test_evaluate_rlpfn_on_gym_envs_small_rlpfn_model_uses_policy_step_validation(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    model = _build_small_split_rlpfn_like_model()
+
+    import ticl.train as train_mod
+    import ticl.rl_validation as rl_validation_mod
+
+    original_builder = train_mod._build_policy_step_fn
+    builder_calls = {"count": 0}
+
+    def _spy_builder(*args, **kwargs):
+        builder_calls["count"] += 1
+        return original_builder(*args, **kwargs)
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("old candidate-scoring validation path should not run for RLPFN policy-step models")
+
+    monkeypatch.setattr(train_mod, "_build_policy_step_fn", _spy_builder)
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vSplit",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    t0 = time.perf_counter()
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+    elapsed_s = time.perf_counter() - t0
+
+    assert builder_calls["count"] == 1
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vSplit"]["return"] == 2.0
+    assert elapsed_s >= 0.0
+
+
+def test_evaluate_rlpfn_on_gym_envs_requires_policy_action_head_for_split_rlpfn(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    model = _build_small_split_rlpfn_like_model()
+    model.policy_action_head = None
+
+    import ticl.rl_validation as rl_validation_mod
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("validation must fail loudly instead of falling back to legacy candidate scoring")
+
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vSplit",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    with pytest.raises(ValueError, match="policy_action_head"):
+        evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
 
 
 def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_threshold(monkeypatch):

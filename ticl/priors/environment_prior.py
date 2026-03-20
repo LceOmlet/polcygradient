@@ -266,6 +266,8 @@ if triton is not None:
             acc = tl_libdevice.tanh(acc)
         elif activation_code == 1:
             acc = tl.maximum(acc, 0.0)
+        elif activation_code == 4:
+            acc = tl_libdevice.sin(acc)
         elif activation_code == 3:
             acc = tl_libdevice.cos(acc)
         out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
@@ -436,6 +438,7 @@ class _TiledRaggedBatchAffineFn(torch.autograd.Function):
             relu_mask = activation_codes == 1
             tanh_mask = activation_codes == 0
             cos_mask = activation_codes == 3
+            sin_mask = activation_codes == 4
             if bool(torch.any(relu_mask)):
                 grad_out_contig = torch.where(
                     relu_mask.unsqueeze(1),
@@ -452,6 +455,12 @@ class _TiledRaggedBatchAffineFn(torch.autograd.Function):
                 grad_out_contig = torch.where(
                     cos_mask.unsqueeze(1),
                     grad_out_contig * (-torch.sin(pre_out)),
+                    grad_out_contig,
+                )
+            if bool(torch.any(sin_mask)):
+                grad_out_contig = torch.where(
+                    sin_mask.unsqueeze(1),
+                    grad_out_contig * torch.cos(pre_out),
                     grad_out_contig,
                 )
             if bool(torch.any(no_activation_mask)):
@@ -549,6 +558,8 @@ if triton is not None:
             acc = tl_libdevice.tanh(acc)
         elif activation_code == 1:
             acc = tl.maximum(acc, 0.0)
+        elif activation_code == 4:
+            acc = tl_libdevice.sin(acc)
         elif activation_code == 3:
             acc = tl_libdevice.cos(acc)
         out_ptrs = out_ptr + pid_b * stride_ob + offs_o * stride_oo
@@ -649,6 +660,8 @@ if triton is not None:
                 x_vals = tl_libdevice.tanh(x_vals)
             elif activation_code == 1:
                 x_vals = tl.maximum(x_vals, 0.0)
+            elif activation_code == 4:
+                x_vals = tl_libdevice.sin(x_vals)
             w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
             w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(w_vals * x_vals[:, None], axis=0)
@@ -716,6 +729,8 @@ if triton is not None:
                 x_vals = tl_libdevice.tanh(x_vals)
             elif activation_code == 1:
                 x_vals = tl.maximum(x_vals, 0.0)
+            elif activation_code == 4:
+                x_vals = tl_libdevice.sin(x_vals)
             w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
             w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
             acc += tl.sum(w_vals * x_vals[:, None], axis=0)
@@ -783,6 +798,8 @@ if triton is not None:
                     x_vals = tl_libdevice.tanh(x_vals)
                 elif activation_code == 1:
                     x_vals = tl.maximum(x_vals, 0.0)
+                elif activation_code == 4:
+                    x_vals = tl_libdevice.sin(x_vals)
                 w_ptrs = w_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
                 w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
                 acc += tl.sum(w_vals * x_vals[:, None], axis=0)
@@ -855,6 +872,8 @@ if triton is not None:
                 acc = acc * (1.0 - tanh_vals * tanh_vals)
             elif activation_code == 1:
                 acc = acc * (z_vals > 0).to(tl.float32)
+            elif activation_code == 4:
+                acc = acc * tl_libdevice.cos(z_vals)
             elif activation_code == 3:
                 acc = acc * (-tl_libdevice.sin(z_vals))
             grad_x_ptrs = grad_x_base + offs_k * stride_gxi
@@ -929,6 +948,8 @@ if triton is not None:
                             x_vals = tl_libdevice.tanh(x_vals)
                         elif activation_code == 1:
                             x_vals = tl.maximum(x_vals, 0.0)
+                        elif activation_code == 4:
+                            x_vals = tl_libdevice.sin(x_vals)
                         w_ptrs = w_layer_base + offs_k[:, None] * stride_wi + offs_o[None, :] * stride_wo
                         w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
                         acc += tl.sum(w_vals * x_vals[:, None], axis=0)
@@ -1036,6 +1057,8 @@ if triton is not None:
                             x_vals = tl_libdevice.tanh(x_vals)
                         elif activation_code == 1:
                             x_vals = tl.maximum(x_vals, 0.0)
+                        elif activation_code == 4:
+                            x_vals = tl_libdevice.sin(x_vals)
                         w_ptrs = w_layer_base + offs_k[:, None] * stride_hwi + offs_o[None, :] * stride_hwo
                         w_vals = tl.load(w_ptrs, mask=k_mask[:, None] & out_mask[None, :], other=0.0).to(tl.float32)
                         acc += tl.sum(w_vals * x_vals[:, None], axis=0)
@@ -1832,6 +1855,8 @@ class EnvironmentPrior:
                 return nn.ReLU()
             if act in {"identity", "linear", "none"}:
                 return nn.Identity()
+            if act == "sin":
+                return torch.sin
             if act == "tanh":
                 return nn.Tanh()
         return nn.Tanh()
@@ -2269,6 +2294,17 @@ class EnvironmentPrior:
         return math.sqrt(2.0 / float(fan_in + fan_out))
 
     @staticmethod
+    def _activation_code(activation_value):
+        activation_name = EnvironmentPrior._activation_name(activation_value)
+        if activation_name == "relu":
+            return 1
+        if activation_name == "identity":
+            return 2
+        if activation_name == "sin":
+            return 4
+        return 0
+
+    @staticmethod
     def _reference_scm_apply_weight_init(
         weight,
         *,
@@ -2618,6 +2654,7 @@ class EnvironmentPrior:
         noise_eps,
         activation_relu_mask,
         activation_identity_mask,
+        activation_sin_mask,
         *,
         activation_mixed=False,
         activation_single=0,
@@ -2626,13 +2663,17 @@ class EnvironmentPrior:
             z_linear = z
             z_tanh = torch.tanh(z_linear)
             z_relu = torch.relu(z_linear)
+            z_sin = torch.sin(z_linear)
             z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
             z_act = torch.where(activation_identity_mask, z_linear, z_act)
+            z_act = torch.where(activation_sin_mask, z_sin, z_act)
         else:
             if int(activation_single) == 1:
                 z_act = torch.relu(z)
             elif int(activation_single) == 2:
                 z_act = z
+            elif int(activation_single) == 4:
+                z_act = torch.sin(z)
             else:
                 z_act = torch.tanh(z)
         active_mask_expanded = active_mask.unsqueeze(1)
@@ -2674,7 +2715,17 @@ class EnvironmentPrior:
         if cached is not None:
             return cached
 
-        def eager_runner(z, active_mask, hidden_mask, w, b, noise_eps, activation_relu_mask, activation_identity_mask):
+        def eager_runner(
+            z,
+            active_mask,
+            hidden_mask,
+            w,
+            b,
+            noise_eps,
+            activation_relu_mask,
+            activation_identity_mask,
+            activation_sin_mask,
+        ):
             return self._reference_scm_layer_step_core(
                 z,
                 active_mask,
@@ -2684,6 +2735,7 @@ class EnvironmentPrior:
                 noise_eps,
                 activation_relu_mask,
                 activation_identity_mask,
+                activation_sin_mask,
                 activation_mixed=bool(activation_mixed),
                 activation_single=int(activation_single),
             )
@@ -3021,12 +3073,7 @@ class EnvironmentPrior:
             random_feature_rotation = bool(h.get("random_feature_rotation", False))
 
             activation_name = self._activation_name(h["prior_mlp_activations"])
-            if activation_name == "relu":
-                activation_codes.append(1)
-            elif activation_name == "identity":
-                activation_codes.append(2)
-            else:
-                activation_codes.append(0)
+            activation_codes.append(self._activation_code(activation_name))
 
             active_idx = torch.nonzero(input_mask_t[bi] > 0, as_tuple=False).squeeze(1)
             if int(active_idx.numel()) != in_i:
@@ -3164,6 +3211,7 @@ class EnvironmentPrior:
         activation_mixed = not bool(torch.all(activation_codes_t == activation_codes_t[0]))
         activation_relu_mask = (activation_codes_t == 1).unsqueeze(1)
         activation_identity_mask = (activation_codes_t == 2).unsqueeze(1)
+        activation_sin_mask = (activation_codes_t == 4).unsqueeze(1)
         activation_single = int(activation_codes_t[0].item())
         hidden_active_masks = [
             (torch.full((batch_size,), layer_idx, device=device, dtype=torch.long) < num_hidden_blocks)
@@ -3203,6 +3251,7 @@ class EnvironmentPrior:
                 "activation_codes_runtime_i32": activation_codes_t.to(device=device_obj, dtype=torch.int32),
                 "activation_relu_mask_runtime": activation_relu_mask.to(device=device_obj),
                 "activation_identity_mask_runtime": activation_identity_mask.to(device=device_obj),
+                "activation_sin_mask_runtime": activation_sin_mask.to(device=device_obj),
                 "hidden_active_masks_runtime": [mask.to(device=device_obj) for mask in hidden_active_masks],
                 "hidden_active_masks_runtime_i32": [mask.to(device=device_obj, dtype=torch.int32).contiguous() for mask in hidden_active_masks],
                 "hidden_prefix_sizes_runtime": [s.to(device=device_obj, dtype=torch.long) for s in hidden_prefix_sizes],
@@ -3327,6 +3376,7 @@ class EnvironmentPrior:
             hidden_mask_runtime = runtime_cached["hidden_mask_runtime"]
             activation_relu_mask_runtime = runtime_cached["activation_relu_mask_runtime"]
             activation_identity_mask_runtime = runtime_cached["activation_identity_mask_runtime"]
+            activation_sin_mask_runtime = runtime_cached["activation_sin_mask_runtime"]
             hidden_active_masks_runtime = runtime_cached["hidden_active_masks_runtime"]
             hidden_active_masks_runtime_i32 = runtime_cached["hidden_active_masks_runtime_i32"]
             hidden_weights_runtime = runtime_cached["hidden_weights_runtime"]
@@ -3514,6 +3564,7 @@ class EnvironmentPrior:
                             noise_eps,
                             activation_relu_mask_runtime,
                             activation_identity_mask_runtime,
+                            activation_sin_mask_runtime,
                         )
                     outputs_layers[:, layer_idx, :] = torch.where(
                         active_mask.unsqueeze(1),
@@ -7846,7 +7897,7 @@ class EnvironmentPrior:
             hidden_dim = int(max(state_dim, int(h["prior_mlp_hidden_dim"])))
             depth = int(max(2, int(h["num_layers"])))
             act_name = self._activation_name(h["prior_mlp_activations"])
-            act_rank = {"identity": 0, "tanh": 1, "relu": 2}.get(act_name, 1)
+            act_rank = {"identity": 0, "tanh": 1, "sin": 2, "relu": 3}.get(act_name, 1)
             return (
                 int(self._bucket_ceil_pow2(hidden_dim)),
                 int(self._bucket_ceil_pow2(in_dim)),
@@ -7958,6 +8009,8 @@ class EnvironmentPrior:
             return "relu"
         if "identity" in name or "linear" in name or name == "none":
             return "identity"
+        if "sin" in name:
+            return "sin"
         return "tanh"
 
     def _environment_group_signature(self, h, grouping_mode):
@@ -8035,12 +8088,7 @@ class EnvironmentPrior:
         standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
-            if name == "relu":
-                activation_codes.append(1)
-            elif name == "identity":
-                activation_codes.append(2)
-            else:
-                activation_codes.append(0)
+            activation_codes.append(self._activation_code(name))
         activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
         activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
         activation_relu_mask = (activation_codes == 1).unsqueeze(1)
@@ -8672,16 +8720,12 @@ class EnvironmentPrior:
         standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
-            if name == "relu":
-                activation_codes.append(1)
-            elif name == "identity":
-                activation_codes.append(2)
-            else:
-                activation_codes.append(0)
+            activation_codes.append(self._activation_code(name))
         activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
         activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
         activation_relu_mask = (activation_codes == 1).unsqueeze(1)
         activation_identity_mask = (activation_codes == 2).unsqueeze(1)
+        activation_sin_mask = (activation_codes == 4).unsqueeze(1)
         activation_single = int(activation_codes[0].item())
 
         state_layers = []
@@ -8830,14 +8874,18 @@ class EnvironmentPrior:
                                 z_act = torch.relu(z)
                             elif activation_single == 2:
                                 z_act = z
+                            elif activation_single == 4:
+                                z_act = torch.sin(z)
                             else:
                                 z_act = torch.tanh(z)
                         else:
                             z_linear = z
                             z_tanh = torch.tanh(z_linear)
                             z_relu = torch.relu(z_linear)
+                            z_sin = torch.sin(z_linear)
                             z_act = torch.where(activation_relu_mask, z_relu, z_tanh)
                             z_act = torch.where(activation_identity_mask, z_linear, z_act)
+                            z_act = torch.where(activation_sin_mask, z_sin, z_act)
                         z = torch.where(activation_mask, z_act, z)
             return z * final_out_mask
 
@@ -9241,16 +9289,12 @@ class EnvironmentPrior:
         standard_init_values = [bool(self._scm_standard_linear_init_enabled(h)) for h in h_list]
         activation_codes = []
         for name in activation_values:
-            if name == "relu":
-                activation_codes.append(1)
-            elif name == "identity":
-                activation_codes.append(2)
-            else:
-                activation_codes.append(0)
+            activation_codes.append(self._activation_code(name))
         activation_codes = torch.tensor(activation_codes, device=device, dtype=torch.long)
         activation_mixed = not bool(torch.all(activation_codes == activation_codes[0]))
         activation_relu_mask = (activation_codes == 1).unsqueeze(1)
         activation_identity_mask = (activation_codes == 2).unsqueeze(1)
+        activation_sin_mask = (activation_codes == 4).unsqueeze(1)
         activation_single = int(activation_codes[0].item())
 
         input_cap = int(input_mask.shape[1]) if input_mask is not None else int(in_dims.max().item())
@@ -9332,6 +9376,7 @@ class EnvironmentPrior:
         packed_activation_mixed = not bool(torch.all(packed_activation_codes == packed_activation_codes[0]))
         packed_activation_relu_mask = (packed_activation_codes == 1).unsqueeze(1)
         packed_activation_identity_mask = (packed_activation_codes == 2).unsqueeze(1)
+        packed_activation_sin_mask = (packed_activation_codes == 4).unsqueeze(1)
         packed_activation_single = int(packed_activation_codes[0].item())
 
         packed_layers = []
@@ -9458,14 +9503,18 @@ class EnvironmentPrior:
                     z_act = torch.relu(z)
                 elif packed_activation_single == 2:
                     z_act = z
+                elif packed_activation_single == 4:
+                    z_act = torch.sin(z)
                 else:
                     z_act = torch.tanh(z)
             else:
                 z_linear = z
                 z_tanh = torch.tanh(z_linear)
                 z_relu = torch.relu(z_linear)
+                z_sin = torch.sin(z_linear)
                 z_act = torch.where(packed_activation_relu_mask, z_relu, z_tanh)
                 z_act = torch.where(packed_activation_identity_mask, z_linear, z_act)
+                z_act = torch.where(packed_activation_sin_mask, z_sin, z_act)
             return torch.where(mask, z_act, z)
 
         def _core_fn(x_state, x_reward):
@@ -11634,12 +11683,16 @@ class EnvironmentPrior:
                 relu_mask = activation_codes == 1
                 tanh_mask = activation_codes == 0
                 cos_mask = activation_codes == 3
+                sin_mask = activation_codes == 4
                 if bool(torch.any(relu_mask)):
                     out = torch.where(relu_mask.unsqueeze(1), torch.relu(out), out)
                 if bool(torch.any(tanh_mask)):
                     out = torch.where(tanh_mask.unsqueeze(1), torch.tanh(out), out)
                 if bool(torch.any(cos_mask)):
                     out = torch.where(cos_mask.unsqueeze(1), torch.cos(out), out)
+                if bool(torch.any(sin_mask)):
+                    out = torch.where(sin_mask.unsqueeze(1), torch.sin(out), out)
+                if bool(torch.any(cos_mask)) or bool(torch.any(sin_mask)):
                     out = out * out_mask
             return out
         return _PrefixTiledBatchAffineFn.apply(
@@ -11701,10 +11754,13 @@ class EnvironmentPrior:
             x_act = x
             relu_mask = activation_codes_t == 1
             tanh_mask = activation_codes_t == 0
+            sin_mask = activation_codes_t == 4
             if bool(torch.any(relu_mask)):
                 x_act = torch.where(relu_mask.unsqueeze(1), torch.relu(x_act), x_act)
             if bool(torch.any(tanh_mask)):
                 x_act = torch.where(tanh_mask.unsqueeze(1), torch.tanh(x), x_act)
+            if bool(torch.any(sin_mask)):
+                x_act = torch.where(sin_mask.unsqueeze(1), torch.sin(x), x_act)
             no_activation_codes = torch.full_like(activation_codes_t, -1)
             in_tile_batch, in_tile_offsets = self._build_active_tile_map(in_sizes.to(device=x.device, dtype=torch.long), 32)
             return self._batch_affine_prefix_tiled(
@@ -12267,13 +12323,16 @@ class EnvironmentPrior:
                 tanh_mask = activation_codes == 0
                 relu_mask = activation_codes == 1
                 cos_mask = activation_codes == 3
+                sin_mask = activation_codes == 4
                 if bool(torch.any(tanh_mask)):
                     out = torch.where(tanh_mask.unsqueeze(1), torch.tanh(out), out)
                 if bool(torch.any(relu_mask)):
                     out = torch.where(relu_mask.unsqueeze(1), torch.relu(out), out)
                 if bool(torch.any(cos_mask)):
                     out = torch.where(cos_mask.unsqueeze(1), torch.cos(out), out)
-                if bool(torch.any(cos_mask)):
+                if bool(torch.any(sin_mask)):
+                    out = torch.where(sin_mask.unsqueeze(1), torch.sin(out), out)
+                if bool(torch.any(cos_mask)) or bool(torch.any(sin_mask)):
                     out_mask = (
                         torch.arange(int(out.shape[1]), device=out.device, dtype=torch.long).unsqueeze(0)
                         < out_sizes.to(device=out.device, dtype=torch.long).unsqueeze(1)

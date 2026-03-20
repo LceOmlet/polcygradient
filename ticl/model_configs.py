@@ -315,7 +315,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         # SCM (aligned with priors/mlp.py names).
         "num_layers": {"distribution": "meta_gamma", "max_alpha": 2, "max_scale": 3, "round": True, "lower_bound": 2},
         "prior_mlp_hidden_dim": {"distribution": "meta_gamma", "max_alpha": 3, "max_scale": 128, "round": True, "lower_bound": 8},
-        "prior_mlp_activations": {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity]},
+        "prior_mlp_activations": {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity, "sin"]},
         "init_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
         "noise_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
         # GP (aligned with priors/fast_gp.py names).

@@ -1,5 +1,6 @@
 import os
 import time
+from collections import OrderedDict
 
 import torch, wandb
 import torch.nn as nn
@@ -79,6 +80,14 @@ class TabPFN(nn.Module):
         else:
             raise ValueError(f"Unknown x_encoder_type: {self.x_encoder_type}")
         self.decoder = decoder(emsize, nhid, n_out) if decoder is not None else nn.Sequential(nn.Linear(emsize, nhid), nn.GELU(), nn.Linear(nhid, n_out))
+        self.policy_action_dim = int(x_action_dim) if x_action_dim is not None else None
+        self.policy_action_head = None
+        if self.policy_action_dim is not None and self.policy_action_dim > 0:
+            self.policy_action_head = (
+                decoder(emsize, nhid, self.policy_action_dim)
+                if decoder is not None
+                else nn.Sequential(nn.Linear(emsize, nhid), nn.GELU(), nn.Linear(nhid, self.policy_action_dim))
+            )
         self.input_ln = SeqBN(emsize) if input_normalization else None
         self.init_method = init_method
         self.efficient_eval_masking = efficient_eval_masking
@@ -127,6 +136,169 @@ class TabPFN(nn.Module):
             "transformer_layer_total_wall_s": 0.0,
         }
         self.init_weights()
+
+    @staticmethod
+    def _repeat_output_rows(tensor, out_rows):
+        if tensor.ndim < 1:
+            raise ValueError("Expected tensor with at least one dimension.")
+        current_rows = int(tensor.shape[0])
+        target_rows = int(out_rows)
+        if current_rows == target_rows:
+            return tensor.clone()
+        if current_rows <= 0:
+            raise ValueError("Cannot expand empty tensor rows.")
+        repeat_rows = (target_rows + current_rows - 1) // current_rows
+        repeat_shape = [repeat_rows] + [1] * (tensor.ndim - 1)
+        return tensor.repeat(*repeat_shape)[:target_rows].clone()
+
+    @staticmethod
+    def _is_default_mlp_head(head):
+        return (
+            isinstance(head, nn.Sequential)
+            and len(head) == 3
+            and isinstance(head[0], nn.Linear)
+            and isinstance(head[1], nn.GELU)
+            and isinstance(head[2], nn.Linear)
+        )
+
+    def has_policy_action_head(self):
+        return isinstance(self.policy_action_head, nn.Module)
+
+    def policy_action_head_required(self):
+        return bool(self.x_encoder_type == "split_obs_action" and self.policy_action_dim is not None and self.policy_action_dim > 0)
+
+    @staticmethod
+    def _infer_head_out_dim(head):
+        if isinstance(head, nn.Linear):
+            return int(head.out_features)
+        if isinstance(head, nn.Sequential):
+            for module in reversed(head):
+                out_features = getattr(module, "out_features", None)
+                if out_features is not None:
+                    return int(out_features)
+        for module in reversed(list(head.modules())):
+            if module is head:
+                continue
+            out_features = getattr(module, "out_features", None)
+            if out_features is not None:
+                return int(out_features)
+        return None
+
+    def has_correct_policy_action_head(self):
+        if not self.policy_action_head_required():
+            return True
+        if not self.has_policy_action_head():
+            return False
+        expected_dim = int(self.policy_action_dim)
+        actual_dim = self._infer_head_out_dim(self.policy_action_head)
+        return actual_dim is None or int(actual_dim) == expected_dim
+
+    def require_policy_action_head(self):
+        if not self.policy_action_head_required():
+            return True
+        if not self.has_policy_action_head():
+            raise ValueError(
+                "split_obs_action policy rollout requires policy_action_head; "
+                "refusing to fall back to the scalar decoder."
+            )
+        expected_dim = int(self.policy_action_dim)
+        actual_dim = self._infer_head_out_dim(self.policy_action_head)
+        if actual_dim is not None and int(actual_dim) != expected_dim:
+            raise ValueError(
+                "split_obs_action policy rollout requires policy_action_head "
+                f"output width {expected_dim}, got {int(actual_dim)}."
+            )
+        return True
+
+    def _decode_policy_action(self, hidden):
+        if self.policy_action_head_required():
+            self.require_policy_action_head()
+            return self.policy_action_head(hidden)
+        return self.decoder(hidden)
+
+    def reset_policy_action_head_from_decoder_(self):
+        if not self.has_policy_action_head():
+            return False
+        if not self._is_default_mlp_head(self.decoder):
+            return False
+        if not self._is_default_mlp_head(self.policy_action_head):
+            return False
+        src_first = self.decoder[0]
+        dst_first = self.policy_action_head[0]
+        src_last = self.decoder[2]
+        dst_last = self.policy_action_head[2]
+        if src_first.weight.shape != dst_first.weight.shape:
+            return False
+        if src_first.bias.shape != dst_first.bias.shape:
+            return False
+        if src_last.weight.shape[1] != dst_last.weight.shape[1]:
+            return False
+        with torch.no_grad():
+            dst_first.weight.copy_(src_first.weight)
+            dst_first.bias.copy_(src_first.bias)
+            dst_last.weight.copy_(self._repeat_output_rows(src_last.weight, dst_last.weight.shape[0]))
+            dst_last.bias.copy_(self._repeat_output_rows(src_last.bias, dst_last.bias.shape[0]))
+        return True
+
+    def _upgrade_legacy_policy_action_head_state_dict(self, state_dict):
+        if not self.has_policy_action_head():
+            return state_dict
+        required_state = self.policy_action_head.state_dict()
+        missing_keys = [
+            f"policy_action_head.{key}"
+            for key in required_state.keys()
+            if f"policy_action_head.{key}" not in state_dict
+        ]
+        if not missing_keys:
+            return state_dict
+
+        upgraded_state = OrderedDict(state_dict)
+        metadata = getattr(state_dict, "_metadata", None)
+        if metadata is not None:
+            upgraded_state._metadata = metadata
+
+        can_bootstrap = (
+            self._is_default_mlp_head(self.decoder)
+            and self._is_default_mlp_head(self.policy_action_head)
+            and "decoder.0.weight" in upgraded_state
+            and "decoder.0.bias" in upgraded_state
+            and "decoder.2.weight" in upgraded_state
+            and "decoder.2.bias" in upgraded_state
+        )
+        if can_bootstrap:
+            src_first_weight = upgraded_state["decoder.0.weight"]
+            src_first_bias = upgraded_state["decoder.0.bias"]
+            src_last_weight = upgraded_state["decoder.2.weight"]
+            src_last_bias = upgraded_state["decoder.2.bias"]
+            dst_first = self.policy_action_head[0]
+            dst_last = self.policy_action_head[2]
+            if (
+                src_first_weight.shape == dst_first.weight.shape
+                and src_first_bias.shape == dst_first.bias.shape
+                and src_last_weight.shape[1] == dst_last.weight.shape[1]
+            ):
+                upgraded_state["policy_action_head.0.weight"] = src_first_weight.clone()
+                upgraded_state["policy_action_head.0.bias"] = src_first_bias.clone()
+                upgraded_state["policy_action_head.2.weight"] = self._repeat_output_rows(
+                    src_last_weight,
+                    dst_last.weight.shape[0],
+                )
+                upgraded_state["policy_action_head.2.bias"] = self._repeat_output_rows(
+                    src_last_bias,
+                    dst_last.bias.shape[0],
+                )
+
+        # Fall back to current initialization only for the new action head keys.
+        current_policy_state = self.policy_action_head.state_dict()
+        for key, value in current_policy_state.items():
+            full_key = f"policy_action_head.{key}"
+            if full_key not in upgraded_state:
+                upgraded_state[full_key] = value.detach().clone()
+        return upgraded_state
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        upgraded_state = self._upgrade_legacy_policy_action_head_state_dict(state_dict)
+        return super().load_state_dict(upgraded_state, strict=strict, assign=assign)
 
     def consume_policy_step_profile(self):
         if not bool(self._policy_step_profile_enabled):
@@ -357,7 +529,7 @@ class TabPFN(nn.Module):
             if callable(consume_tf_profile):
                 transformer_layer_profile = consume_tf_profile()
         decoder_t0 = time.perf_counter() if profile_enabled else None
-        out = self.decoder(hidden)
+        out = self._decode_policy_action(hidden)
         decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
         if total_t0 is not None:
             stats = self._policy_step_profile_stats
@@ -642,7 +814,7 @@ class TabPFN(nn.Module):
             if callable(consume_tf_profile):
                 transformer_layer_profile = consume_tf_profile()
         decoder_t0 = time.perf_counter() if profile_enabled else None
-        out = self.decoder(hidden)
+        out = self._decode_policy_action(hidden)
         decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
         if total_t0 is not None:
             stats = self._policy_step_profile_stats
