@@ -307,7 +307,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
-    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_sample_prob"] == 1.0
+    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_sample_prob"] == 0.5
     assert cfg["prior"]["environment"]["pg_replay_window_depth"] == 1
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
