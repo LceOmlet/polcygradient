@@ -23,7 +23,7 @@ def _percentile(values, q):
 def _build_tabpfn_policy_step(model_cfg, n_features, n_samples, device, pg_torch_compile=False):
     tcfg = model_cfg["transformer"]
     model = TabPFN(
-        n_out=int(tcfg.get("x_action_dim", 30)),
+        n_out=1,
         n_features=int(n_features),
         emsize=int(tcfg["emsize"]),
         nhead=int(tcfg["nhead"]),
@@ -33,6 +33,9 @@ def _build_tabpfn_policy_step(model_cfg, n_features, n_samples, device, pg_torch
         y_encoder_layer=Linear(1, emsize=int(tcfg["emsize"])),
         classification_task=False,
         y_encoder="linear",
+        x_encoder_type=str(tcfg.get("x_encoder_type", "single")),
+        x_obs_dim=tcfg.get("x_obs_dim", None),
+        x_action_dim=tcfg.get("x_action_dim", None),
         single_eval_causal=bool(tcfg.get("single_eval_causal", True)),
     )
     model = model.to(device)

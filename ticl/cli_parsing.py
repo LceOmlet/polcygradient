@@ -272,6 +272,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
         transformer = parser.add_argument_group('transformer')
         transformer.add_argument('-e', '--emsize', type=int, help='embedding size')
         transformer.add_argument('-N', '--nlayers', type=int, help='number of transformer layers')
+        transformer.add_argument('--backbone', type=str, choices=['transformer', 'rwkv7'],
+                                 help='Backbone family for transformer-style models.')
+        transformer.add_argument('--rwkv-head-size', type=int,
+                                 help='RWKV-7 head size. Official maintained path currently requires 64.')
+        transformer.add_argument('--rwkv-ffn-mult', type=int,
+                                 help='RWKV-7 FFN expansion multiplier. Official maintained path currently requires 4.')
         transformer.add_argument('--init-method', help='Weight initialization method.')
         transformer.add_argument('--y-encoder', help='Encoder for labels. "linear", "onehot" or None.')
         transformer.add_argument('--tabpfn-zero-weights', help='Whether to use zeroing of weights from tabpfn code.', type=str2bool)

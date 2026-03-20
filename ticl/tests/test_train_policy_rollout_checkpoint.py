@@ -495,6 +495,39 @@ def test_compute_policy_rollout_chunk_loss_keeps_policy_offload_when_one_hop_ena
     assert seen["one_hop_replay_enabled"] is True
     assert seen["enabled"] is True
 
+
+def test_tbptt_window_offload_respects_policy_default_disabled():
+    class _DummyStep:
+        pass
+
+    step_fn = _DummyStep()
+    step_fn._ticl_saved_tensors_cpu_offload_default_enabled = False
+
+    assert EnvironmentPrior._resolve_tbptt_window_policy_offload_enabled(
+        policy_step_fn=step_fn,
+        tbptt_one_hop_boundary_active=True,
+        one_hop_boundary_roles={"carry_boundary_out": True},
+    ) is False
+
+
+def test_tbptt_window_offload_keeps_carry_only_when_policy_default_enabled():
+    class _DummyStep:
+        pass
+
+    step_fn = _DummyStep()
+    step_fn._ticl_saved_tensors_cpu_offload_default_enabled = True
+
+    assert EnvironmentPrior._resolve_tbptt_window_policy_offload_enabled(
+        policy_step_fn=step_fn,
+        tbptt_one_hop_boundary_active=True,
+        one_hop_boundary_roles={"carry_boundary_out": True},
+    ) is True
+    assert EnvironmentPrior._resolve_tbptt_window_policy_offload_enabled(
+        policy_step_fn=step_fn,
+        tbptt_one_hop_boundary_active=True,
+        one_hop_boundary_roles={"carry_boundary_out": False},
+    ) is False
+
 def test_policy_rollout_compile_matches_baseline_semantics():
     loss_base, stats_base, grads_base = _run_chunk(
         policy_rollout_checkpoint=False,

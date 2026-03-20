@@ -10626,6 +10626,13 @@ class EnvironmentPrior:
             setter(bool(enabled))
 
     @staticmethod
+    def _get_policy_step_saved_tensors_offload_default_enabled(policy_step_fn):
+        try:
+            return bool(getattr(policy_step_fn, "_ticl_saved_tensors_cpu_offload_default_enabled", False))
+        except Exception:
+            return False
+
+    @staticmethod
     def _tbptt_window_one_hop_policy_offload_needed(*, tbptt_one_hop_boundary_active, one_hop_boundary_roles):
         if not bool(tbptt_one_hop_boundary_active):
             return False
@@ -10636,6 +10643,21 @@ class EnvironmentPrior:
         # the baseline fast path once the retained carry graph is already
         # protected.
         return bool(one_hop_boundary_roles.get("carry_boundary_out", False))
+
+    @classmethod
+    def _resolve_tbptt_window_policy_offload_enabled(
+        cls,
+        *,
+        policy_step_fn,
+        tbptt_one_hop_boundary_active,
+        one_hop_boundary_roles,
+    ):
+        if not cls._get_policy_step_saved_tensors_offload_default_enabled(policy_step_fn):
+            return False
+        return cls._tbptt_window_one_hop_policy_offload_needed(
+            tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
+            one_hop_boundary_roles=one_hop_boundary_roles,
+        )
 
     @staticmethod
     def _build_tbptt_boundary_in(
@@ -12973,7 +12995,8 @@ class EnvironmentPrior:
                     ):
                         torch.cuda.set_rng_state(replay_cuda_state, device=device_obj)
 
-                self._set_policy_step_saved_tensors_offload_enabled(policy_step_fn, True)
+                replay_offload_enabled = bool(prev_offload_enabled) if prev_offload_enabled is not None else False
+                self._set_policy_step_saved_tensors_offload_enabled(policy_step_fn, replay_offload_enabled)
 
                 boundary_materialized = _move_tensor_tree_to_device(replay_boundary_cpu, device_obj)
                 state_local = boundary_materialized["state_t"]
@@ -13664,7 +13687,8 @@ class EnvironmentPrior:
                 tbptt_window_one_hop_roles = one_hop_boundary_roles
                 self._set_policy_step_saved_tensors_offload_enabled(
                     policy_step_fn,
-                    self._tbptt_window_one_hop_policy_offload_needed(
+                    self._resolve_tbptt_window_policy_offload_enabled(
+                        policy_step_fn=policy_step_fn,
                         tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
                         one_hop_boundary_roles=one_hop_boundary_roles,
                     ),
@@ -15046,7 +15070,8 @@ class EnvironmentPrior:
                 tbptt_window_one_hop_roles = one_hop_boundary_roles
                 self._set_policy_step_saved_tensors_offload_enabled(
                     policy_step_fn,
-                    self._tbptt_window_one_hop_policy_offload_needed(
+                    self._resolve_tbptt_window_policy_offload_enabled(
+                        policy_step_fn=policy_step_fn,
                         tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
                         one_hop_boundary_roles=one_hop_boundary_roles,
                     ),

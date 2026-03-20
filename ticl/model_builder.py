@@ -10,6 +10,7 @@ from ticl.train import train
 from ticl.model_configs import get_model_default_config
 from ticl.models.mothernet_additive import MotherNetAdditive
 from ticl.models.perceiver import TabPerceiver
+from ticl.models.rwkv7_pfn import RWKV7PFN
 from ticl.models.tabpfn import TabPFN
 from ticl.models.biattention_tabpfn import BiAttentionTabPFN
 from ticl.models.gamformer import GAMformer
@@ -234,31 +235,46 @@ def get_model(
 
     model_type = config['model_type']
     n_features = config['prior']['num_features']
+    transformer_cfg = dict(config.get('transformer', {}))
+    backbone_kind = str(transformer_cfg.pop('backbone', 'transformer')).strip().lower()
+    rwkv_head_size = transformer_cfg.pop('rwkv_head_size', 64)
+    rwkv_ffn_mult = transformer_cfg.pop('rwkv_ffn_mult', 4)
 
     if model_type == "mothernet":
         model = MotherNet(
             n_out=n_out,
-            y_encoder_layer=y_encoder, n_features=n_features, **config['transformer'], **config['mothernet'])
+            y_encoder_layer=y_encoder, n_features=n_features, **transformer_cfg, **config['mothernet'])
     elif model_type == 'perceiver':
         model = TabPerceiver(n_out=n_out, y_encoder_layer=y_encoder, n_features=n_features,
-                             **config['transformer'], **config['mothernet'], **config['perceiver'])
+                             **transformer_cfg, **config['mothernet'], **config['perceiver'])
     elif model_type == "additive":
         model = MotherNetAdditive(
             n_out=n_out, n_features=n_features,
-            y_encoder_layer=y_encoder, **config['transformer'], **config['mothernet'], **config['additive'])
+            y_encoder_layer=y_encoder, **transformer_cfg, **config['mothernet'], **config['additive'])
     elif model_type in ["tabpfn", "rlpfn"]:
-        model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **config['transformer'])
+        if backbone_kind == "rwkv7":
+            model = RWKV7PFN(
+                n_out=n_out,
+                n_features=n_features,
+                y_encoder_layer=y_encoder,
+                backbone=backbone_kind,
+                rwkv_head_size=rwkv_head_size,
+                rwkv_ffn_mult=rwkv_ffn_mult,
+                **transformer_cfg,
+            )
+        else:
+            model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **transformer_cfg)
     elif model_type == "batabpfn":
         # FIXME hack
-        config['transformer']['nhead'] = 4
+        transformer_cfg['nhead'] = 4
         model = BiAttentionTabPFN(
-            n_out=n_out, y_encoder_layer=y_encoder, **config['transformer'], **config['biattention'])
+            n_out=n_out, y_encoder_layer=y_encoder, **transformer_cfg, **config['biattention'])
     elif model_type == "baam":
         # FIXME hack
-        config['transformer']['nhead'] = 4
+        transformer_cfg['nhead'] = 4
         model = GAMformer(
             n_out=n_out, n_features=config['prior']['num_features'],
-            y_encoder_layer=y_encoder, **config['transformer'], **config['mothernet'], **config['additive'])
+            y_encoder_layer=y_encoder, **transformer_cfg, **config['mothernet'], **config['additive'])
     elif model_type in ['tabflex', 'ssm_tabpfn']:
         from ticl.models.tabflex import TabFlex
         config['linear_attention'].pop('causal_mask', None)
@@ -281,6 +297,9 @@ def get_model(
         raise ValueError(f"Unknown model type {model_type}.")
 
     if model_state is not None:
+        prepare_state_dict_for_load = getattr(model, "prepare_state_dict_for_load", None)
+        if callable(prepare_state_dict_for_load):
+            model_state = prepare_state_dict_for_load(model_state, strict=load_model_strict)
         if not load_model_strict:
             for k, v in model.state_dict().items():
                 if k in model_state and model_state[k].shape != v.shape:

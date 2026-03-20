@@ -83,12 +83,12 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_env_replay_steps == 1
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 1024
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 512
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
@@ -160,6 +160,23 @@ def test_rlpfn_parser_accepts_reinforce_objective():
             "--rl-objective", "reinforce",
         ]
     )
+    assert args.optimizer.rl_objective == "reinforce"
+
+
+def test_rlpfn_parser_accepts_rwkv_backbone_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--backbone", "rwkv7",
+            "--rwkv-head-size", "64",
+            "--rwkv-ffn-mult", "4",
+            "--rl-objective", "reinforce",
+        ]
+    )
+    assert args.transformer.backbone == "rwkv7"
+    assert args.transformer.rwkv_head_size == 64
+    assert args.transformer.rwkv_ffn_mult == 4
     assert args.optimizer.rl_objective == "reinforce"
 
 
@@ -307,15 +324,15 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["train_host_rss_limit_gib"] == 32.0
     assert cfg["optimizer"]["train_host_rss_limit_poll_interval_sec"] == 0.02
     assert cfg["optimizer"]["train_host_rss_limit_try_rlimit_as"] is False
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 512
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",

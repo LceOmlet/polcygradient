@@ -6076,7 +6076,14 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         scaler_device_type = torch.device(str(device)).type
     except Exception:
         scaler_device_type = "cuda" if "cuda" in str(device) else "cpu"
-    scaler = GradScaler("cuda") if train_mixed_precision and scaler_device_type == "cuda" else None
+    scaler_autocast_dtype = None
+    if train_mixed_precision and scaler_device_type == "cuda":
+        scaler_autocast_dtype = torch.bfloat16 if torch.cuda.is_bf16_supported() else torch.float16
+    scaler = (
+        GradScaler("cuda")
+        if train_mixed_precision and scaler_device_type == "cuda" and scaler_autocast_dtype == torch.float16
+        else None
+    )
 
     # check that everything uses up-to-date APIs
     utils.check_compatibility(dl)

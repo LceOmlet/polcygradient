@@ -1041,6 +1041,9 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["alpha_grad_one_hop_replay_enabled"] is True
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
     assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
     assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30

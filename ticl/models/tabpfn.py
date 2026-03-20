@@ -240,6 +240,57 @@ class TabPFN(nn.Module):
             dst_last.bias.copy_(self._repeat_output_rows(src_last.bias, dst_last.bias.shape[0]))
         return True
 
+    def _try_bootstrap_policy_action_head_state_dict(self, state_dict, *, overwrite_existing=False):
+        if not self.has_policy_action_head():
+            return state_dict, False
+        if not self._is_default_mlp_head(self.decoder):
+            return state_dict, False
+        if not self._is_default_mlp_head(self.policy_action_head):
+            return state_dict, False
+        required_decoder_keys = (
+            "decoder.0.weight",
+            "decoder.0.bias",
+            "decoder.2.weight",
+            "decoder.2.bias",
+        )
+        if any(key not in state_dict for key in required_decoder_keys):
+            return state_dict, False
+
+        src_first_weight = state_dict["decoder.0.weight"]
+        src_first_bias = state_dict["decoder.0.bias"]
+        src_last_weight = state_dict["decoder.2.weight"]
+        src_last_bias = state_dict["decoder.2.bias"]
+        dst_first = self.policy_action_head[0]
+        dst_last = self.policy_action_head[2]
+        if (
+            src_first_weight.shape != dst_first.weight.shape
+            or src_first_bias.shape != dst_first.bias.shape
+            or src_last_weight.shape[1] != dst_last.weight.shape[1]
+        ):
+            return state_dict, False
+
+        upgraded_state = OrderedDict(state_dict)
+        metadata = getattr(state_dict, "_metadata", None)
+        if metadata is not None:
+            upgraded_state._metadata = metadata
+
+        bootstrap_entries = {
+            "policy_action_head.0.weight": src_first_weight.clone(),
+            "policy_action_head.0.bias": src_first_bias.clone(),
+            "policy_action_head.2.weight": self._repeat_output_rows(
+                src_last_weight,
+                dst_last.weight.shape[0],
+            ),
+            "policy_action_head.2.bias": self._repeat_output_rows(
+                src_last_bias,
+                dst_last.bias.shape[0],
+            ),
+        }
+        for key, value in bootstrap_entries.items():
+            if overwrite_existing or (key not in upgraded_state):
+                upgraded_state[key] = value
+        return upgraded_state, True
+
     def _upgrade_legacy_policy_action_head_state_dict(self, state_dict):
         if not self.has_policy_action_head():
             return state_dict
@@ -257,36 +308,10 @@ class TabPFN(nn.Module):
         if metadata is not None:
             upgraded_state._metadata = metadata
 
-        can_bootstrap = (
-            self._is_default_mlp_head(self.decoder)
-            and self._is_default_mlp_head(self.policy_action_head)
-            and "decoder.0.weight" in upgraded_state
-            and "decoder.0.bias" in upgraded_state
-            and "decoder.2.weight" in upgraded_state
-            and "decoder.2.bias" in upgraded_state
+        upgraded_state, _ = self._try_bootstrap_policy_action_head_state_dict(
+            upgraded_state,
+            overwrite_existing=False,
         )
-        if can_bootstrap:
-            src_first_weight = upgraded_state["decoder.0.weight"]
-            src_first_bias = upgraded_state["decoder.0.bias"]
-            src_last_weight = upgraded_state["decoder.2.weight"]
-            src_last_bias = upgraded_state["decoder.2.bias"]
-            dst_first = self.policy_action_head[0]
-            dst_last = self.policy_action_head[2]
-            if (
-                src_first_weight.shape == dst_first.weight.shape
-                and src_first_bias.shape == dst_first.bias.shape
-                and src_last_weight.shape[1] == dst_last.weight.shape[1]
-            ):
-                upgraded_state["policy_action_head.0.weight"] = src_first_weight.clone()
-                upgraded_state["policy_action_head.0.bias"] = src_first_bias.clone()
-                upgraded_state["policy_action_head.2.weight"] = self._repeat_output_rows(
-                    src_last_weight,
-                    dst_last.weight.shape[0],
-                )
-                upgraded_state["policy_action_head.2.bias"] = self._repeat_output_rows(
-                    src_last_bias,
-                    dst_last.bias.shape[0],
-                )
 
         # Fall back to current initialization only for the new action head keys.
         current_policy_state = self.policy_action_head.state_dict()
@@ -296,8 +321,41 @@ class TabPFN(nn.Module):
                 upgraded_state[full_key] = value.detach().clone()
         return upgraded_state
 
-    def load_state_dict(self, state_dict, strict=True, assign=False):
+    def prepare_state_dict_for_load(self, state_dict, *, strict=True):
         upgraded_state = self._upgrade_legacy_policy_action_head_state_dict(state_dict)
+        if strict or (not self.policy_action_head_required()):
+            return upgraded_state
+
+        current_policy_state = self.policy_action_head.state_dict()
+        mismatched_policy_keys = []
+        for key, value in current_policy_state.items():
+            full_key = f"policy_action_head.{key}"
+            loaded_value = upgraded_state.get(full_key, None)
+            if loaded_value is not None and loaded_value.shape != value.shape:
+                mismatched_policy_keys.append(
+                    (full_key, tuple(loaded_value.shape), tuple(value.shape))
+                )
+        if not mismatched_policy_keys:
+            return upgraded_state
+
+        upgraded_state, bootstrapped = self._try_bootstrap_policy_action_head_state_dict(
+            upgraded_state,
+            overwrite_existing=True,
+        )
+        if bootstrapped:
+            return upgraded_state
+
+        mismatch_desc = ", ".join(
+            f"{key}: checkpoint{src_shape} != model{dst_shape}"
+            for key, src_shape, dst_shape in mismatched_policy_keys
+        )
+        raise ValueError(
+            "Non-strict load cannot ignore split policy_action_head shape mismatches; "
+            f"unable to bootstrap from decoder. Mismatches: {mismatch_desc}"
+        )
+
+    def load_state_dict(self, state_dict, strict=True, assign=False):
+        upgraded_state = self.prepare_state_dict_for_load(state_dict, strict=strict)
         return super().load_state_dict(upgraded_state, strict=strict, assign=assign)
 
     def consume_policy_step_profile(self):

@@ -77,7 +77,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
     assert cfg["optimizer"]["learning_rate"] == 4e-4
-    assert cfg["dataloader"]["batch_size"] == 1024
+    assert cfg["dataloader"]["batch_size"] == 512
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False
@@ -106,12 +106,12 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_env_replay_steps"] == 1
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_oom_fail_fast"] is True
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 512
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
 
 
@@ -460,3 +460,93 @@ def test_tabpfn_forward_with_kv_uses_policy_action_head_for_split_encoder():
     assert tuple(out_full.shape) == (2, 3, 4)
     assert tuple(out_kv.shape) == (2, 3, 4)
     assert torch.allclose(out_full, out_kv, atol=1e-5, rtol=1e-4)
+
+
+def test_tabpfn_non_strict_load_bootstraps_mismatched_policy_action_head_from_decoder():
+    torch.manual_seed(20260321)
+    source_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=2,
+        single_eval_causal=True,
+    )
+    assert source_model.reset_policy_action_head_from_decoder_()
+
+    target_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+    target_model.load_state_dict(source_model.state_dict(), strict=False)
+
+    expected_weight = target_model._repeat_output_rows(
+        source_model.decoder[2].weight.detach(),
+        target_model.policy_action_head[2].weight.shape[0],
+    )
+    expected_bias = target_model._repeat_output_rows(
+        source_model.decoder[2].bias.detach(),
+        target_model.policy_action_head[2].bias.shape[0],
+    )
+    assert torch.allclose(target_model.policy_action_head[0].weight, source_model.decoder[0].weight)
+    assert torch.allclose(target_model.policy_action_head[0].bias, source_model.decoder[0].bias)
+    assert torch.allclose(target_model.policy_action_head[2].weight, expected_weight)
+    assert torch.allclose(target_model.policy_action_head[2].bias, expected_bias)
+
+
+def test_tabpfn_non_strict_load_raises_when_policy_action_head_mismatch_cannot_bootstrap():
+    source_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=3,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=2,
+        single_eval_causal=True,
+    )
+    target_model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+
+    with pytest.raises(ValueError, match="policy_action_head shape mismatches"):
+        target_model.load_state_dict(source_model.state_dict(), strict=False)

@@ -90,7 +90,7 @@ def get_transformer_config():
         "emsize": 256,
         "nlayers": 6,
         "dropout": 0.0,
-        "nhid_factor": 2,
+        "nhid_factor": 1,
         'nhead': 256 // 64,
         'init_method': None,
         'recompute_attn': True,
@@ -102,6 +102,9 @@ def get_transformer_config():
         'single_eval_causal': False,
         'input_normalization': False,
         'tabpfn_zero_weights': True,
+        'backbone': 'transformer',
+        'rwkv_head_size': 64,
+        'rwkv_ffn_mult': 4,
         # x encoder layout:
         # - "single": one linear encoder over full num_features
         # - "split_obs_action": two heads (obs/reward/mask + action)
@@ -464,15 +467,16 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     config['optimizer']['train_kernel_profiler_export_trace'] = True
     config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
-    # Default to policy-only CPU offload: it captures most of the shared
-    # transformer memory reduction while keeping host/RSS and wall-time below
-    # full rollout offload on the maintained risky-load benchmark.
-    config['optimizer']['pg_saved_tensors_cpu_offload'] = True
+    # Keep maintained TBPTT streaming on the baseline device-memory path by
+    # default. Policy-only CPU offload can cap GPU memory, but on the 1024-batch
+    # maintained RL path it shifts retained one-hop/TBPTT state into host RSS
+    # and can trip the hard host guard before a batch completes.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = True
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 16
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 8
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Enable TBPTT by default for memory/throughput tradeoff.
     config['optimizer']['pg_tbptt_window'] = 32
@@ -490,7 +494,7 @@ def get_rlpfn_default_config():
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 64 * 16
+    config['dataloader']['batch_size'] = 64 * 8
     return config
 
 
