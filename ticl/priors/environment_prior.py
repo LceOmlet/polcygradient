@@ -12684,15 +12684,6 @@ class EnvironmentPrior:
         token_action_start = obs_slot_dim + 3 + int(terminal_token_enabled)
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
-        tbptt_boundary_usage = self._tbptt_boundary_usage(
-            num_features=num_features,
-            token_reward_idx=token_reward_idx,
-            token_mask_idx=token_mask_idx,
-            token_terminal_idx=token_terminal_idx,
-            terminal_token_enabled=terminal_token_enabled,
-            token_action_start=token_action_start,
-            token_action_cap=token_action_cap,
-        )
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
         phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
         phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
@@ -12709,46 +12700,6 @@ class EnvironmentPrior:
         env_noise_start = env_layout["noise_start"]
         state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
-            if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
-                window_start_idx = int(t)
-                window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
-                raw_one_hop_boundary_roles = self._tbptt_one_hop_phase_boundary_roles(
-                    window_start_idx=window_start_idx,
-                    window_end_idx=window_end_idx,
-                    next_window_end_idx=min(n_samples, window_end_idx + int(tbptt_window_size)),
-                    n_samples=n_samples,
-                    single_eval_pos=single_eval_pos,
-                    replay_window_depth=tbptt_replay_window_depth,
-                    markov_adjacent_replay=tbptt_markov_adjacent_replay,
-                )
-                one_hop_boundary_roles = self._tbptt_resolve_window_one_hop_roles(
-                    raw_one_hop_boundary_roles,
-                    markov_adjacent_eta_pending=tbptt_markov_adjacent_eta_pending,
-                    markov_adjacent_sample_prob=tbptt_markov_adjacent_sample_prob,
-                )
-                tbptt_window_one_hop_roles = one_hop_boundary_roles
-                self._set_policy_step_saved_tensors_offload_enabled(
-                    policy_step_fn,
-                    self._tbptt_window_one_hop_policy_offload_needed(
-                        tbptt_one_hop_boundary_active=tbptt_one_hop_boundary_active,
-                        one_hop_boundary_roles=one_hop_boundary_roles,
-                    ),
-                )
-                needs_boundary_eta = bool(one_hop_boundary_roles["needs_boundary_eta"])
-                tbptt_boundary_in = None
-                if needs_boundary_eta:
-                    tbptt_boundary_in = self._build_tbptt_boundary_in(
-                        state_t=state_t,
-                        action_t=action_t,
-                        reward_t=reward_t,
-                        reward_mask_t=reward_mask_t,
-                        terminal_t=terminal_t,
-                        cache=cache,
-                        action_replay_dim=tbptt_boundary_usage["action_replay_dim"],
-                        include_reward=tbptt_boundary_usage["include_reward"],
-                        include_reward_mask=tbptt_boundary_usage["include_reward_mask"],
-                        include_terminal=tbptt_boundary_usage["include_terminal"],
-                    )
             obs_t = state_t[:, :obs_dim]
             token_row = x_steps[t]
             token_row.zero_()
