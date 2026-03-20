@@ -42,6 +42,24 @@ from ticl.priors.maintained_exact_scm import (
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
 from ticl.train import _build_policy_step_fn
+from ticl.priors.maintained_policy_rollout import (
+    normalize_policy_objective_kind,
+    policy_rollout_objective_flags,
+    resolve_alpha_grad_local_coordinate_enabled,
+    resolve_alpha_grad_one_hop_replay_enabled,
+    resolve_alpha_grad_unit_grad_delta,
+    resolve_alpha_grad_unit_grad_enabled,
+    resolve_alpha_grad_variance_eps,
+    resolve_batch_parallel_backend,
+    resolve_batch_parallel_workers,
+    resolve_batch_shared_environment,
+    resolve_batch_vectorized_grouping,
+    resolve_batch_vectorized_strict_rng_match,
+    resolve_pg_markov_adjacent_replay_enabled,
+    resolve_pg_markov_adjacent_replay_sample_prob,
+    resolve_pg_one_hop_replay_enabled,
+    resolve_pg_replay_window_depth,
+)
 
 
 def _seed_everything(seed):
@@ -224,6 +242,136 @@ def _legacy_resolve_terminal_bonus_scale_max(h):
     if not math.isfinite(v):
         return 10.0
     return float(v)
+
+
+def _legacy_normalize_policy_objective_kind(policy_objective_kind):
+    objective_kind = str(policy_objective_kind).strip().lower()
+    if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce", "alpha_grad"}:
+        raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
+    return objective_kind
+
+
+def _legacy_policy_rollout_objective_flags(policy_objective_kind):
+    objective_kind = _legacy_normalize_policy_objective_kind(policy_objective_kind)
+    return {
+        "objective_kind": objective_kind,
+        "sample_action": objective_kind in {"first_policy_gradient", "reinforce", "alpha_grad"},
+        "collect_log_probs": objective_kind in {"reinforce", "alpha_grad"},
+        "detach_action_in_env": objective_kind == "reinforce",
+        "first_policy_gradient": objective_kind == "first_policy_gradient",
+        "reinforce": objective_kind == "reinforce",
+        "alpha_grad": objective_kind == "alpha_grad",
+    }
+
+
+def _legacy_resolve_alpha_grad_variance_eps(h):
+    v = _legacy_resolve_scalar(h.get("alpha_grad_variance_eps", 1e-6))
+    return max(float(v), 0.0)
+
+
+def _legacy_resolve_alpha_grad_local_coordinate_enabled(h):
+    return _legacy_coerce_bool(h.get("alpha_grad_local_coordinate_enabled", True))
+
+
+def _legacy_resolve_alpha_grad_unit_grad_enabled(h):
+    return _legacy_coerce_bool(h.get("alpha_grad_unit_grad_enabled", True))
+
+
+def _legacy_resolve_alpha_grad_unit_grad_delta(h):
+    v = _legacy_resolve_scalar(h.get("alpha_grad_unit_grad_delta", 1e-6))
+    if not math.isfinite(v) or v < 0.0:
+        return 1e-6
+    return float(v)
+
+
+def _legacy_resolve_pg_one_hop_replay_enabled(h):
+    if "pg_one_hop_replay_enabled" in h:
+        return _legacy_coerce_bool(h.get("pg_one_hop_replay_enabled", True))
+    return _legacy_coerce_bool(h.get("alpha_grad_one_hop_replay_enabled", True))
+
+
+def _legacy_resolve_pg_replay_window_depth(h):
+    del h
+    return 1
+
+
+def _legacy_resolve_pg_markov_adjacent_replay_enabled(h):
+    return _legacy_coerce_bool(h.get("pg_markov_adjacent_replay_enabled", False))
+
+
+def _legacy_resolve_pg_markov_adjacent_replay_sample_prob(h):
+    v = _legacy_resolve_scalar(h.get("pg_markov_adjacent_replay_sample_prob", 0.125))
+    if not math.isfinite(v):
+        return 0.125
+    return float(min(1.0, max(0.0, v)))
+
+
+def _legacy_resolve_alpha_grad_one_hop_replay_enabled(h):
+    return _legacy_resolve_pg_one_hop_replay_enabled(h)
+
+
+def _legacy_resolve_batch_parallel_workers(config, batch_size):
+    workers_cfg = config.get("batch_parallel_workers", 1)
+    if isinstance(workers_cfg, dict) and "distribution" in workers_cfg:
+        workers = int(sample_distributions({"v": workers_cfg})["v"])
+    else:
+        workers = int(workers_cfg)
+    workers = max(1, workers)
+    return min(int(batch_size), workers)
+
+
+def _legacy_resolve_batch_parallel_backend(config):
+    backend_cfg = config.get("batch_parallel_backend", "python_thread")
+    if isinstance(backend_cfg, dict) and "distribution" in backend_cfg:
+        backend = sample_distributions({"v": backend_cfg})["v"]
+    else:
+        backend = backend_cfg
+    backend = str(backend).strip().lower()
+    if backend not in {"python_thread", "torch_vectorized"}:
+        backend = "python_thread"
+    return backend
+
+
+def _legacy_resolve_batch_shared_environment(config):
+    shared_cfg = config.get("batch_shared_environment", False)
+    if isinstance(shared_cfg, dict) and "distribution" in shared_cfg:
+        shared = sample_distributions({"v": shared_cfg})["v"]
+    else:
+        shared = shared_cfg
+    if isinstance(shared, str):
+        token = shared.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return bool(shared)
+
+
+def _legacy_resolve_batch_vectorized_strict_rng_match(config):
+    strict_cfg = config.get("batch_vectorized_strict_rng_match", False)
+    if isinstance(strict_cfg, dict) and "distribution" in strict_cfg:
+        strict = sample_distributions({"v": strict_cfg})["v"]
+    else:
+        strict = strict_cfg
+    if isinstance(strict, str):
+        token = strict.strip().lower()
+        if token in {"1", "true", "yes", "on"}:
+            return True
+        if token in {"0", "false", "no", "off"}:
+            return False
+    return bool(strict)
+
+
+def _legacy_resolve_batch_vectorized_grouping(config):
+    grouping_cfg = config.get("batch_vectorized_grouping", "structure")
+    if isinstance(grouping_cfg, dict) and "distribution" in grouping_cfg:
+        grouping = sample_distributions({"v": grouping_cfg})["v"]
+    else:
+        grouping = grouping_cfg
+    grouping = str(grouping).strip().lower()
+    if grouping not in {"structure", "family"}:
+        grouping = "structure"
+    return grouping
 
 
 def _legacy_expand_env_value_to_list(value, batch_size):
@@ -891,6 +1039,182 @@ def test_rlpfn_maintained_exact_scm_numeric_resolve_helpers_match_legacy_inline_
         assert EnvironmentPrior._resolve_reinforce_reward_transform(h) == _legacy_resolve_reinforce_reward_transform(h)
         assert resolve_reinforce_action_transform(h) == _legacy_resolve_reinforce_action_transform(h)
         assert EnvironmentPrior._resolve_reinforce_action_transform(h) == _legacy_resolve_reinforce_action_transform(h)
+
+
+def test_rlpfn_maintained_policy_rollout_helpers_match_legacy_inline_reference():
+    objective_cases = ["policy_gradient", "first_policy_gradient", "reinforce", "alpha_grad", "ALPHA_GRAD"]
+    for objective in objective_cases:
+        assert normalize_policy_objective_kind(objective) == _legacy_normalize_policy_objective_kind(objective)
+        assert EnvironmentPrior._normalize_policy_objective_kind(objective) == _legacy_normalize_policy_objective_kind(
+            objective
+        )
+        assert policy_rollout_objective_flags(objective) == _legacy_policy_rollout_objective_flags(objective)
+        assert EnvironmentPrior._policy_rollout_objective_flags(objective) == _legacy_policy_rollout_objective_flags(
+            objective
+        )
+
+    invalid = "bad-objective"
+    try:
+        _legacy_normalize_policy_objective_kind(invalid)
+    except ValueError as expected_error:
+        expected_msg = str(expected_error)
+    else:
+        raise AssertionError("legacy normalize should reject invalid objective")
+    for fn in (normalize_policy_objective_kind, EnvironmentPrior._normalize_policy_objective_kind):
+        try:
+            fn(invalid)
+        except ValueError as actual_error:
+            assert str(actual_error) == expected_msg
+        else:
+            raise AssertionError("normalize should reject invalid objective")
+
+    def _assert_seeded_equal(seed, actual_fn, legacy_fn):
+        _seed_everything(seed)
+        actual = actual_fn()
+        _seed_everything(seed)
+        expected = legacy_fn()
+        if isinstance(actual, float) and isinstance(expected, float):
+            if math.isnan(actual) and math.isnan(expected):
+                return
+        assert actual == expected
+
+    parsed = lambda spec: parse_distributions({"value": spec})["value"]
+    h_cases = [
+        {
+            "alpha_grad_variance_eps": 1e-5,
+            "alpha_grad_local_coordinate_enabled": "true",
+            "alpha_grad_unit_grad_enabled": torch.tensor(False),
+            "alpha_grad_unit_grad_delta": 5e-6,
+            "pg_one_hop_replay_enabled": True,
+            "pg_markov_adjacent_replay_enabled": True,
+            "pg_markov_adjacent_replay_sample_prob": 0.25,
+        },
+        {
+            "alpha_grad_variance_eps": parsed({"distribution": "uniform", "min": 1e-7, "max": 1e-4}),
+            "alpha_grad_local_coordinate_enabled": "false",
+            "alpha_grad_unit_grad_enabled": "true",
+            "alpha_grad_unit_grad_delta": parsed({"distribution": "uniform", "min": 1e-7, "max": 1e-4}),
+            "alpha_grad_one_hop_replay_enabled": True,
+            "pg_markov_adjacent_replay_enabled": False,
+            "pg_markov_adjacent_replay_sample_prob": parsed({"distribution": "uniform", "min": 0.0, "max": 1.0}),
+        },
+    ]
+    for h in h_cases:
+        _assert_seeded_equal(3101, lambda h=h: resolve_alpha_grad_variance_eps(h), lambda h=h: _legacy_resolve_alpha_grad_variance_eps(h))
+        _assert_seeded_equal(
+            3101,
+            lambda h=h: EnvironmentPrior._resolve_alpha_grad_variance_eps(h),
+            lambda h=h: _legacy_resolve_alpha_grad_variance_eps(h),
+        )
+        assert resolve_alpha_grad_local_coordinate_enabled(h) == _legacy_resolve_alpha_grad_local_coordinate_enabled(h)
+        assert EnvironmentPrior._resolve_alpha_grad_local_coordinate_enabled(h) == _legacy_resolve_alpha_grad_local_coordinate_enabled(h)
+        assert resolve_alpha_grad_unit_grad_enabled(h) == _legacy_resolve_alpha_grad_unit_grad_enabled(h)
+        assert EnvironmentPrior._resolve_alpha_grad_unit_grad_enabled(h) == _legacy_resolve_alpha_grad_unit_grad_enabled(h)
+        _assert_seeded_equal(
+            3102,
+            lambda h=h: resolve_alpha_grad_unit_grad_delta(h),
+            lambda h=h: _legacy_resolve_alpha_grad_unit_grad_delta(h),
+        )
+        _assert_seeded_equal(
+            3102,
+            lambda h=h: EnvironmentPrior._resolve_alpha_grad_unit_grad_delta(h),
+            lambda h=h: _legacy_resolve_alpha_grad_unit_grad_delta(h),
+        )
+        assert resolve_pg_one_hop_replay_enabled(h) == _legacy_resolve_pg_one_hop_replay_enabled(h)
+        assert EnvironmentPrior._resolve_pg_one_hop_replay_enabled(h) == _legacy_resolve_pg_one_hop_replay_enabled(h)
+        assert resolve_pg_replay_window_depth(h) == _legacy_resolve_pg_replay_window_depth(h)
+        assert EnvironmentPrior._resolve_pg_replay_window_depth(h) == _legacy_resolve_pg_replay_window_depth(h)
+        assert resolve_pg_markov_adjacent_replay_enabled(h) == _legacy_resolve_pg_markov_adjacent_replay_enabled(h)
+        assert EnvironmentPrior._resolve_pg_markov_adjacent_replay_enabled(h) == _legacy_resolve_pg_markov_adjacent_replay_enabled(h)
+        _assert_seeded_equal(
+            3103,
+            lambda h=h: resolve_pg_markov_adjacent_replay_sample_prob(h),
+            lambda h=h: _legacy_resolve_pg_markov_adjacent_replay_sample_prob(h),
+        )
+        _assert_seeded_equal(
+            3103,
+            lambda h=h: EnvironmentPrior._resolve_pg_markov_adjacent_replay_sample_prob(h),
+            lambda h=h: _legacy_resolve_pg_markov_adjacent_replay_sample_prob(h),
+        )
+        assert resolve_alpha_grad_one_hop_replay_enabled(h) == _legacy_resolve_alpha_grad_one_hop_replay_enabled(h)
+        assert EnvironmentPrior._resolve_alpha_grad_one_hop_replay_enabled(h) == _legacy_resolve_alpha_grad_one_hop_replay_enabled(h)
+
+
+def test_rlpfn_maintained_fast_runner_config_helpers_match_legacy_inline_reference():
+    def _assert_seeded_equal(seed, actual_fn, legacy_fn):
+        _seed_everything(seed)
+        actual = actual_fn()
+        _seed_everything(seed)
+        expected = legacy_fn()
+        assert actual == expected
+
+    config_cases = [
+        {
+            "batch_parallel_workers": 4,
+            "batch_parallel_backend": "torch_vectorized",
+            "batch_shared_environment": "true",
+            "batch_vectorized_strict_rng_match": "false",
+            "batch_vectorized_grouping": "family",
+        },
+        {
+            "batch_parallel_workers": 0,
+            "batch_parallel_backend": "bad-backend",
+            "batch_shared_environment": "off",
+            "batch_vectorized_strict_rng_match": "on",
+            "batch_vectorized_grouping": "bad-grouping",
+        },
+    ]
+    for config in config_cases:
+        _assert_seeded_equal(
+            4101,
+            lambda config=config: resolve_batch_parallel_workers(config, 5),
+            lambda config=config: _legacy_resolve_batch_parallel_workers(config, 5),
+        )
+        _assert_seeded_equal(
+            4101,
+            lambda config=config: EnvironmentPrior(config)._resolve_batch_parallel_workers(5),
+            lambda config=config: _legacy_resolve_batch_parallel_workers(config, 5),
+        )
+        _assert_seeded_equal(
+            4102,
+            lambda config=config: resolve_batch_parallel_backend(config),
+            lambda config=config: _legacy_resolve_batch_parallel_backend(config),
+        )
+        _assert_seeded_equal(
+            4102,
+            lambda config=config: EnvironmentPrior(config)._resolve_batch_parallel_backend(),
+            lambda config=config: _legacy_resolve_batch_parallel_backend(config),
+        )
+        _assert_seeded_equal(
+            4103,
+            lambda config=config: resolve_batch_shared_environment(config),
+            lambda config=config: _legacy_resolve_batch_shared_environment(config),
+        )
+        _assert_seeded_equal(
+            4103,
+            lambda config=config: EnvironmentPrior(config)._resolve_batch_shared_environment(),
+            lambda config=config: _legacy_resolve_batch_shared_environment(config),
+        )
+        _assert_seeded_equal(
+            4104,
+            lambda config=config: resolve_batch_vectorized_strict_rng_match(config),
+            lambda config=config: _legacy_resolve_batch_vectorized_strict_rng_match(config),
+        )
+        _assert_seeded_equal(
+            4104,
+            lambda config=config: EnvironmentPrior(config)._resolve_batch_vectorized_strict_rng_match(),
+            lambda config=config: _legacy_resolve_batch_vectorized_strict_rng_match(config),
+        )
+        _assert_seeded_equal(
+            4105,
+            lambda config=config: resolve_batch_vectorized_grouping(config),
+            lambda config=config: _legacy_resolve_batch_vectorized_grouping(config),
+        )
+        _assert_seeded_equal(
+            4105,
+            lambda config=config: EnvironmentPrior(config)._resolve_batch_vectorized_grouping(),
+            lambda config=config: _legacy_resolve_batch_vectorized_grouping(config),
+        )
 
 
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():

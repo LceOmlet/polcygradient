@@ -48,6 +48,24 @@ from ticl.priors.maintained_exact_scm import (
     summarize_env_semantics as maintained_summarize_env_semantics,
     transition_reference_mode as maintained_transition_reference_mode,
 )
+from ticl.priors.maintained_policy_rollout import (
+    normalize_policy_objective_kind as maintained_normalize_policy_objective_kind,
+    policy_rollout_objective_flags as maintained_policy_rollout_objective_flags,
+    resolve_alpha_grad_local_coordinate_enabled as maintained_resolve_alpha_grad_local_coordinate_enabled,
+    resolve_alpha_grad_one_hop_replay_enabled as maintained_resolve_alpha_grad_one_hop_replay_enabled,
+    resolve_alpha_grad_unit_grad_delta as maintained_resolve_alpha_grad_unit_grad_delta,
+    resolve_alpha_grad_unit_grad_enabled as maintained_resolve_alpha_grad_unit_grad_enabled,
+    resolve_alpha_grad_variance_eps as maintained_resolve_alpha_grad_variance_eps,
+    resolve_batch_parallel_backend as maintained_resolve_batch_parallel_backend,
+    resolve_batch_parallel_workers as maintained_resolve_batch_parallel_workers,
+    resolve_batch_shared_environment as maintained_resolve_batch_shared_environment,
+    resolve_batch_vectorized_grouping as maintained_resolve_batch_vectorized_grouping,
+    resolve_batch_vectorized_strict_rng_match as maintained_resolve_batch_vectorized_strict_rng_match,
+    resolve_pg_markov_adjacent_replay_enabled as maintained_resolve_pg_markov_adjacent_replay_enabled,
+    resolve_pg_markov_adjacent_replay_sample_prob as maintained_resolve_pg_markov_adjacent_replay_sample_prob,
+    resolve_pg_one_hop_replay_enabled as maintained_resolve_pg_one_hop_replay_enabled,
+    resolve_pg_replay_window_depth as maintained_resolve_pg_replay_window_depth,
+)
 from ticl.utils import default_device
 
 
@@ -5444,70 +5462,47 @@ class EnvironmentPrior:
 
     @staticmethod
     def _normalize_policy_objective_kind(policy_objective_kind):
-        objective_kind = str(policy_objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce", "alpha_grad"}:
-            raise ValueError(f"Unknown policy objective kind: {policy_objective_kind}")
-        return objective_kind
+        return maintained_normalize_policy_objective_kind(policy_objective_kind)
 
     @staticmethod
     def _policy_rollout_objective_flags(policy_objective_kind):
-        objective_kind = EnvironmentPrior._normalize_policy_objective_kind(policy_objective_kind)
-        return {
-            "objective_kind": objective_kind,
-            # Future 0th/1th fusion can share this stochastic rollout path.
-            "sample_action": objective_kind in {"first_policy_gradient", "reinforce", "alpha_grad"},
-            "collect_log_probs": objective_kind in {"reinforce", "alpha_grad"},
-            "detach_action_in_env": objective_kind == "reinforce",
-            "first_policy_gradient": objective_kind == "first_policy_gradient",
-            "reinforce": objective_kind == "reinforce",
-            "alpha_grad": objective_kind == "alpha_grad",
-        }
+        return maintained_policy_rollout_objective_flags(policy_objective_kind)
 
     @staticmethod
     def _resolve_alpha_grad_variance_eps(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_variance_eps", 1e-6))
-        return max(float(v), 0.0)
+        return maintained_resolve_alpha_grad_variance_eps(h)
 
     @staticmethod
     def _resolve_alpha_grad_local_coordinate_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_local_coordinate_enabled", True))
+        return maintained_resolve_alpha_grad_local_coordinate_enabled(h)
 
     @staticmethod
     def _resolve_alpha_grad_unit_grad_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_unit_grad_enabled", True))
+        return maintained_resolve_alpha_grad_unit_grad_enabled(h)
 
     @staticmethod
     def _resolve_alpha_grad_unit_grad_delta(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("alpha_grad_unit_grad_delta", 1e-6))
-        if not math.isfinite(v) or v < 0.0:
-            return 1e-6
-        return float(v)
+        return maintained_resolve_alpha_grad_unit_grad_delta(h)
 
     @staticmethod
     def _resolve_pg_one_hop_replay_enabled(h):
-        if "pg_one_hop_replay_enabled" in h:
-            return EnvironmentPrior._coerce_bool(h.get("pg_one_hop_replay_enabled", True))
-        return EnvironmentPrior._coerce_bool(h.get("alpha_grad_one_hop_replay_enabled", True))
+        return maintained_resolve_pg_one_hop_replay_enabled(h)
 
     @staticmethod
     def _resolve_pg_replay_window_depth(h):
-        del h
-        return 1
+        return maintained_resolve_pg_replay_window_depth(h)
 
     @staticmethod
     def _resolve_pg_markov_adjacent_replay_enabled(h):
-        return EnvironmentPrior._coerce_bool(h.get("pg_markov_adjacent_replay_enabled", False))
+        return maintained_resolve_pg_markov_adjacent_replay_enabled(h)
 
     @staticmethod
     def _resolve_pg_markov_adjacent_replay_sample_prob(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("pg_markov_adjacent_replay_sample_prob", 0.125))
-        if not math.isfinite(v):
-            return 0.125
-        return float(min(1.0, max(0.0, v)))
+        return maintained_resolve_pg_markov_adjacent_replay_sample_prob(h)
 
     @staticmethod
     def _resolve_alpha_grad_one_hop_replay_enabled(h):
-        return EnvironmentPrior._resolve_pg_one_hop_replay_enabled(h)
+        return maintained_resolve_alpha_grad_one_hop_replay_enabled(h)
 
     @staticmethod
     def _resolve_state_highway_enabled(h):
@@ -18757,63 +18752,19 @@ class EnvironmentPrior:
         return self._rollout_executor
 
     def _resolve_batch_parallel_workers(self, batch_size):
-        workers_cfg = self.config.get("batch_parallel_workers", 1)
-        if isinstance(workers_cfg, dict) and "distribution" in workers_cfg:
-            workers = int(sample_distributions({"v": workers_cfg})["v"])
-        else:
-            workers = int(workers_cfg)
-        workers = max(1, workers)
-        return min(int(batch_size), workers)
+        return maintained_resolve_batch_parallel_workers(self.config, batch_size)
 
     def _resolve_batch_parallel_backend(self):
-        backend_cfg = self.config.get("batch_parallel_backend", "python_thread")
-        if isinstance(backend_cfg, dict) and "distribution" in backend_cfg:
-            backend = sample_distributions({"v": backend_cfg})["v"]
-        else:
-            backend = backend_cfg
-        backend = str(backend).strip().lower()
-        if backend not in {"python_thread", "torch_vectorized"}:
-            backend = "python_thread"
-        return backend
+        return maintained_resolve_batch_parallel_backend(self.config)
 
     def _resolve_batch_shared_environment(self):
-        shared_cfg = self.config.get("batch_shared_environment", False)
-        if isinstance(shared_cfg, dict) and "distribution" in shared_cfg:
-            shared = sample_distributions({"v": shared_cfg})["v"]
-        else:
-            shared = shared_cfg
-        if isinstance(shared, str):
-            token = shared.strip().lower()
-            if token in {"1", "true", "yes", "on"}:
-                return True
-            if token in {"0", "false", "no", "off"}:
-                return False
-        return bool(shared)
+        return maintained_resolve_batch_shared_environment(self.config)
 
     def _resolve_batch_vectorized_strict_rng_match(self):
-        strict_cfg = self.config.get("batch_vectorized_strict_rng_match", False)
-        if isinstance(strict_cfg, dict) and "distribution" in strict_cfg:
-            strict = sample_distributions({"v": strict_cfg})["v"]
-        else:
-            strict = strict_cfg
-        if isinstance(strict, str):
-            token = strict.strip().lower()
-            if token in {"1", "true", "yes", "on"}:
-                return True
-            if token in {"0", "false", "no", "off"}:
-                return False
-        return bool(strict)
+        return maintained_resolve_batch_vectorized_strict_rng_match(self.config)
 
     def _resolve_batch_vectorized_grouping(self):
-        grouping_cfg = self.config.get("batch_vectorized_grouping", "structure")
-        if isinstance(grouping_cfg, dict) and "distribution" in grouping_cfg:
-            grouping = sample_distributions({"v": grouping_cfg})["v"]
-        else:
-            grouping = grouping_cfg
-        grouping = str(grouping).strip().lower()
-        if grouping not in {"structure", "family"}:
-            grouping = "structure"
-        return grouping
+        return maintained_resolve_batch_vectorized_grouping(self.config)
 
     def _rollout_shared_env_vectorized(
         self,
