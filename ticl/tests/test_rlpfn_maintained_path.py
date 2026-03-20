@@ -8,6 +8,7 @@ from ticl.model_configs import get_model_default_config
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
 from ticl.priors.environment_prior import EnvironmentPrior
+from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
 from ticl.train import _build_policy_step_fn
 
 
@@ -137,6 +138,7 @@ def _capture_policy_step_trace():
 
 def test_rlpfn_maintained_path_default_contract():
     cfg = get_model_default_config("rlpfn")
+    layout = validate_rlpfn_maintained_path_config(cfg)
 
     assert cfg["prior"]["prior_type"] == "environment_only"
     assert cfg["prior"]["num_features"] == 434
@@ -155,6 +157,24 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
+    assert layout["default_num_features"] == 434
+    assert layout["x_obs_dim"] == 404
+    assert layout["x_action_dim"] == 30
+
+
+def test_rlpfn_maintained_token_layout_helper_matches_terminal_toggle():
+    _, env_cfg = _small_exact_scm_env_cfg()
+    with_terminal = resolve_rlpfn_token_layout(env_cfg)
+    assert with_terminal["terminal_token_enabled"] is True
+    assert with_terminal["x_obs_dim"] == 404
+    assert with_terminal["default_num_features"] == 434
+
+    env_cfg_no_terminal = deepcopy(env_cfg)
+    env_cfg_no_terminal["terminal_reset_enabled"] = False
+    without_terminal = resolve_rlpfn_token_layout(env_cfg_no_terminal)
+    assert without_terminal["terminal_token_enabled"] is False
+    assert without_terminal["x_obs_dim"] == 403
+    assert without_terminal["default_num_features"] == 433
 
 
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():

@@ -1,6 +1,7 @@
 import torch
 
 from ticl.config_utils import merge_dicts
+from ticl.rlpfn_maintained_path import apply_rlpfn_maintained_path_defaults
 
 
 def get_optimizer_config():
@@ -475,70 +476,7 @@ def get_rlpfn_default_config():
     config['prior']['n_samples'] = 1024
 
     env_cfg = config['prior']['environment']
-    env_cfg.update({
-        "family": {"distribution": "meta_choice", "choice_values": ["scm"]},
-        "obs_slot_dim": 400,
-        "action_slot_dim": 30,
-        "constrained_dim_sampling_enabled": True,
-        "constrained_dim_sampling_total_budget": 400,
-        "strict_joint_transition_enabled": True,
-        "state_input_scale_enabled": False,
-        "state_input_scale": 1.0,
-        "state_full_rms_enabled": True,
-        "state_full_rms_target": 1.0,
-        "reinforce_reward_transform": "tanh",
-        "reinforce_reward_rms_eps": 1e-6,
-        "reinforce_reward_tanh_c": 10.0,
-        "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
-        "reinforce_action_transform": "rms",
-        "reinforce_action_rms_eps": 1e-6,
-        "first_policy_gradient_state_grad_clip_norm": 4.0,
-        "first_policy_gradient_action_grad_clip_value": 0.0,
-        "first_policy_gradient_action_grad_clip_norm": 1.0,
-        "alpha_grad_local_coordinate_enabled": True,
-        "alpha_grad_unit_grad_enabled": True,
-        "alpha_grad_unit_grad_delta": 1e-6,
-        # Keep replay on the safe TBPTT runner, but make the maintained
-        # alpha-grad default explicitly include one-hop and sampled adjacent
-        # future replay.
-        "pg_one_hop_replay_enabled": True,
-        "alpha_grad_one_hop_replay_enabled": True,
-        "pg_markov_adjacent_replay_enabled": True,
-        "pg_markov_adjacent_replay_sample_prob": 0.125,
-        "pg_replay_window_depth": 1,
-        "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
-        "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
-        "reward_dropout_enabled": True,
-        "reward_dropout_randomize": True,
-        "reward_dropout_ratio_min": 0.1,
-        "reward_dropout_ratio_max": 1.0,
-        "reward_dropout_impute_zero": True,
-        "terminal_reset_enabled": True,
-        "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 20.0},
-        "terminal_bonus_tanh_c": 10.0,
-        "terminal_bonus_scale_min": 1.0,
-        "terminal_bonus_scale_max": 10.0,
-        "batch_parallel_backend": "torch_vectorized",
-        "batch_shared_environment": False,
-        "batch_vectorized_grouping": "family",
-    })
-
-    # Keep a strict fixed feature width for split heads.
-    config['prior']['classification']['num_features_sampler'] = 'fixed'
-    config['prior']['classification']['pad_zeros'] = False
-    config['prior']['classification']['max_num_classes'] = 0
-    config['transformer']['classification_task'] = False
-    config['transformer']['y_encoder'] = 'linear'
-    config['transformer']['x_encoder_type'] = 'split_obs_action'
-    terminal_obs_extra = 1 if bool(env_cfg.get("terminal_reset_enabled", False)) else 0
-    phase_obs_extra = 1
-    config['transformer']['x_obs_dim'] = int(env_cfg["obs_slot_dim"]) + 2 + phase_obs_extra + terminal_obs_extra
-    config['transformer']['x_action_dim'] = int(env_cfg["action_slot_dim"])
-    config['prior']['num_features'] = (
-        int(config['transformer']['x_obs_dim']) + int(config['transformer']['x_action_dim'])
-    )
-    config['transformer']['single_eval_causal'] = True
-    config['optimizer']['rl_objective'] = 'alpha_grad'
+    apply_rlpfn_maintained_path_defaults(config)
     # Policy-gradient rollout chunking over batch columns.
     # None means full-batch rollout chunk (max parallel width).
     config['optimizer']['policy_rollout_chunk_size'] = None

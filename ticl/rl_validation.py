@@ -1,6 +1,8 @@
 import numpy as np
 import torch
 
+from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout
+
 
 RLPFN_DEFAULT_OOP_ENVS = [
     "InvertedPendulum-v5",
@@ -474,12 +476,14 @@ def evaluate_rlpfn_on_gym_envs(model, config):
         max_parallel_columns = max(int(n_candidates), max_parallel_columns)
 
     env_cfg = config.get("prior", {}).get("environment", {})
-    obs_slot_dim = int(env_cfg.get("obs_slot_dim", 400))
-    action_slot_dim = int(env_cfg.get("action_slot_dim", 30))
-    phase_token_enabled = True
-    terminal_token_enabled = bool(env_cfg.get("terminal_reset_enabled", False))
-    default_num_features = int(obs_slot_dim) + 2 + int(phase_token_enabled) + int(terminal_token_enabled) + int(action_slot_dim)
-    num_features = int(config.get("prior", {}).get("num_features", default_num_features))
+    layout = resolve_rlpfn_token_layout(
+        env_cfg,
+        num_features=config.get("prior", {}).get("num_features", None),
+    )
+    obs_slot_dim = int(layout["obs_slot_dim"])
+    action_slot_dim = int(layout["action_slot_dim"])
+    terminal_token_enabled = bool(layout["terminal_token_enabled"])
+    num_features = int(layout["num_features"])
     device = config.get("device", "cpu")
     optimizer_cfg = config.get("optimizer", {})
     policy_step_fn = None
