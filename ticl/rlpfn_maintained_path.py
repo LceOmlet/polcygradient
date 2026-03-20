@@ -27,7 +27,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "pg_one_hop_replay_enabled": True,
     "alpha_grad_one_hop_replay_enabled": True,
     "pg_markov_adjacent_replay_enabled": True,
-    "pg_markov_adjacent_replay_sample_prob": 0.125,
+    "pg_markov_adjacent_replay_sample_prob": 1.0,
     "pg_replay_window_depth": 1,
     "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
     "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
