@@ -374,6 +374,62 @@ def test_evaluate_rlpfn_on_gym_envs_small_rlpfn_model_uses_policy_step_validatio
     assert elapsed_s >= 0.0
 
 
+def test_evaluate_rlpfn_on_gym_envs_paged_policy_step_validation_sets_cache_capacity(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    model = _build_small_split_rlpfn_like_model()
+
+    import ticl.train as train_mod
+
+    original_builder = train_mod._build_policy_step_fn
+    builder_kwargs = {}
+
+    def _spy_builder(*args, **kwargs):
+        builder_kwargs.update(kwargs)
+        return original_builder(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "_build_policy_step_fn", _spy_builder)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "paged",
+            "pg_kv_cache_page_size": 8,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vPaged",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert builder_kwargs["kv_cache_mode"] == "paged"
+    assert builder_kwargs["kv_cache_page_size"] == 8
+    assert builder_kwargs["max_cache_len"] == 17
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vPaged"]["return"] == 2.0
+
+
 def test_evaluate_rlpfn_on_gym_envs_requires_policy_action_head_for_split_rlpfn(monkeypatch):
     _install_fake_gym(
         monkeypatch,

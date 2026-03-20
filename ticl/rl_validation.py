@@ -272,6 +272,30 @@ def _resolve_validation_policy_hparams(env_cfg, rng):
     }
 
 
+def _resolve_validation_policy_cache_config(optimizer_cfg, *, context_lower_bound, max_steps):
+    requested_mode = "auto" if optimizer_cfg.get("pg_kv_cache_mode", "auto") is None else str(
+        optimizer_cfg.get("pg_kv_cache_mode", "auto")
+    ).strip().lower()
+    if requested_mode not in {"auto", "immutable", "static", "paged"}:
+        requested_mode = "auto"
+
+    max_cache_len = None
+    if requested_mode in {"auto", "static", "paged"}:
+        # Validation keeps a single KV history across explore rollouts and the
+        # final exploit rollout. The exploit switch can happen only after an
+        # explore rollout finishes, so the total appended history is bounded by:
+        #   context_before_eval <= context_lower_bound + max_steps
+        #   final_total_len <= context_before_eval + max_steps
+        #                  <= context_lower_bound + 2 * max_steps
+        max_cache_len = max(1, int(max(0, context_lower_bound)) + 2 * int(max(1, max_steps)))
+
+    return {
+        "kv_cache_mode": requested_mode,
+        "kv_cache_page_size": optimizer_cfg.get("pg_kv_cache_page_size", None),
+        "max_cache_len": max_cache_len,
+    }
+
+
 def _initialize_validation_policy_state(state, *, env_cfg, device, action_dim):
     rng = state["rng"]
     h = _resolve_validation_policy_hparams(env_cfg, rng)
@@ -511,13 +535,18 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     if bool(use_policy_step_validation):
         _require_validation_policy_action_head(model)
         from ticl.train import _build_policy_step_fn
+        cache_cfg = _resolve_validation_policy_cache_config(
+            optimizer_cfg,
+            context_lower_bound=context_lower_bound,
+            max_steps=max_steps,
+        )
 
         policy_step_fn = _build_policy_step_fn(
             model,
             num_features=num_features,
-            max_cache_len=None,
-            kv_cache_mode=optimizer_cfg.get("pg_kv_cache_mode", "auto"),
-            kv_cache_page_size=optimizer_cfg.get("pg_kv_cache_page_size", None),
+            max_cache_len=cache_cfg["max_cache_len"],
+            kv_cache_mode=cache_cfg["kv_cache_mode"],
+            kv_cache_page_size=cache_cfg["kv_cache_page_size"],
             allow_grad_mutable_cache=False,
             allow_grad_inplace_paged_cache=False,
             pg_torch_compile=False,
