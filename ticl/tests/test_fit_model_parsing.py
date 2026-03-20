@@ -95,24 +95,6 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.orchestration.rl_validate_context_lower_bound == 2048
     assert args.orchestration.rl_validate_max_parallel_columns == 96
 
-
-def test_rlpfn_parser_accepts_aev5_next_flags():
-    parser = make_model_level_argparser()
-    args = parser.parse_args(
-        [
-            "rlpfn",
-            "--anti-explosion-vanishing-v5-next-enabled", "true",
-            "--anti-explosion-vanishing-v5-next-state-gain-lo", "0.97",
-            "--anti-explosion-vanishing-v5-next-state-gain-hi", "1.02",
-            "--anti-explosion-vanishing-v5-next-step-grad-rms-hi", "0.05",
-        ]
-    )
-    assert args.prior.environment.anti_explosion_vanishing_v5_next_enabled is True
-    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_lo == 0.97
-    assert args.prior.environment.anti_explosion_vanishing_v5_next_state_gain_hi == 1.02
-    assert args.prior.environment.anti_explosion_vanishing_v5_next_step_grad_rms_hi == 0.05
-
-
 def test_rlpfn_parser_refreshes_split_dims_when_terminal_flag_changes():
     parser = make_model_level_argparser()
 

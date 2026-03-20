@@ -113,20 +113,6 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_enabled"] is False
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_enabled"] is False
-    assert cfg["prior"]["environment"]["lipschitz_enforce"] is False
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_gain_lo"] == 0.985
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_gain_hi"] == 1.035
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_rms_lo"] == 4e-3
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_rms_hi"] == 9e-2
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_state_low_boost_cap"] == 1.5
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_loss_scale_hi"] == 4.0
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_grad_rms_lo"] == 1e-4
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_grad_rms_hi"] == 3e-2
-    assert cfg["prior"]["environment"]["anti_explosion_vanishing_v5_next_step_low_boost_cap"] == 4.0
-    assert cfg["prior"]["environment"]["lipschitz_weight_fro_norm_max"] == 1.0
-    assert cfg["prior"]["environment"]["lipschitz_gp_outputscale_max"] == 1.0
 
 
 def test_tabpfn_split_obs_action_encoder_forward():

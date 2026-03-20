@@ -41,7 +41,7 @@ from ticl.priors.maintained_exact_scm import (
 )
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
-from ticl.train import _build_policy_step_fn
+from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
 from ticl.priors.maintained_policy_rollout import (
     normalize_policy_objective_kind,
     policy_rollout_objective_flags,
@@ -59,6 +59,11 @@ from ticl.priors.maintained_policy_rollout import (
     resolve_pg_markov_adjacent_replay_sample_prob,
     resolve_pg_one_hop_replay_enabled,
     resolve_pg_replay_window_depth,
+)
+from ticl.priors.maintained_policy_gradient_loss import (
+    attach_common_rollout_diagnostics,
+    prepare_policy_gradient_loss_request,
+    slice_group_traces_after_eval,
 )
 
 
@@ -372,6 +377,182 @@ def _legacy_resolve_batch_vectorized_grouping(config):
     if grouping not in {"structure", "family"}:
         grouping = "structure"
     return grouping
+
+
+def _legacy_prepare_policy_gradient_loss_request(
+    prior,
+    *,
+    n_samples,
+    tbptt_window,
+    policy_objective_kind="policy_gradient",
+    normalize=None,
+):
+    n_samples = int(n_samples)
+    objective_kind = _legacy_normalize_policy_objective_kind(policy_objective_kind)
+    reinforce_enabled = objective_kind == "reinforce"
+    first_pg_enabled = objective_kind == "first_policy_gradient"
+    alpha_grad_enabled = objective_kind == "alpha_grad"
+    if normalize is None:
+        normalize = bool(prior.config.get("policy_gradient_normalize_rewards", False))
+    tbptt_window_active = False
+    tbptt_window_size = n_samples
+    if tbptt_window is not None:
+        w = int(tbptt_window)
+        if 0 < w < n_samples:
+            tbptt_window_active = True
+            tbptt_window_size = w
+    backend = _legacy_resolve_batch_parallel_backend(prior.config)
+    grouping_mode = _legacy_resolve_batch_vectorized_grouping(prior.config)
+    strict_rng_match = _legacy_resolve_batch_vectorized_strict_rng_match(prior.config)
+    one_hop_replay_enabled = bool(_legacy_resolve_pg_one_hop_replay_enabled(prior.config))
+    markov_adjacent_replay_enabled = bool(_legacy_resolve_pg_markov_adjacent_replay_enabled(prior.config))
+    markov_adjacent_replay_sample_prob = float(
+        _legacy_resolve_pg_markov_adjacent_replay_sample_prob(prior.config)
+    )
+    one_hop_tbptt_active = bool(
+        one_hop_replay_enabled
+        and tbptt_window_active
+        and (reinforce_enabled or alpha_grad_enabled)
+    )
+    return {
+        "n_samples": n_samples,
+        "objective_kind": objective_kind,
+        "reinforce_enabled": reinforce_enabled,
+        "first_pg_enabled": first_pg_enabled,
+        "alpha_grad_enabled": alpha_grad_enabled,
+        "normalize": normalize,
+        "tbptt_window_active": tbptt_window_active,
+        "tbptt_window_size": tbptt_window_size,
+        "backend": backend,
+        "grouping_mode": grouping_mode,
+        "strict_rng_match": strict_rng_match,
+        "one_hop_replay_enabled": one_hop_replay_enabled,
+        "markov_adjacent_replay_enabled": markov_adjacent_replay_enabled,
+        "markov_adjacent_replay_sample_prob": markov_adjacent_replay_sample_prob,
+        "one_hop_tbptt_active": one_hop_tbptt_active,
+    }
+
+
+def _legacy_slice_group_traces_after_eval(group_entries, start_idx):
+    if not isinstance(group_entries, tuple):
+        return group_entries
+    sliced_entries = []
+    for entry in group_entries:
+        if not isinstance(entry, dict):
+            continue
+        roots = entry.get("action_mean_roots", None)
+        mask = entry.get("action_mask", None)
+        if not isinstance(roots, tuple):
+            continue
+        sliced_roots = tuple(roots[int(start_idx):])
+        if len(sliced_roots) <= 0:
+            continue
+        sliced_entry = dict(entry)
+        sliced_entry["action_mean_roots"] = sliced_roots
+        if torch.is_tensor(mask):
+            sliced_entry["action_mask"] = mask[int(start_idx):]
+        sliced_entries.append(sliced_entry)
+    return tuple(sliced_entries)
+
+
+def _legacy_attach_common_rollout_diagnostics(rollout, stats):
+    stats = deepcopy(stats)
+    rewards = rollout["rewards"]
+    rollout_profile = rollout.get("rollout_profile", None)
+    if isinstance(rollout_profile, dict):
+        for key in (
+            "policy_cuda_ms",
+            "transition_cuda_ms",
+            "policy_wall_ms",
+            "transition_wall_ms",
+            "transition_y_wall_ms",
+            "transition_x_wall_ms",
+            "transition_group_wall_ms",
+            "transition_group_launch_wall_ms",
+            "transition_group_sync_wall_ms",
+            "transition_env_pack_wall_ms",
+            "transition_state_update_wall_ms",
+            "transition_noise_wall_ms",
+            "transition_fused_wall_ms",
+            "transition_fused_launch_wall_ms",
+            "transition_gp_first_projection_wall_ms",
+            "transition_gp_second_projection_wall_ms",
+            "transition_work_actual_est",
+            "transition_work_padded_est",
+            "transition_work_fill_ratio",
+        ):
+            stats[f"rollout_{key}"] = float(rollout_profile.get(key, 0.0) or 0.0)
+        for key in (
+            "transition_gp_projection_call_count",
+            "transition_gp_rff_fused_call_count",
+            "transition_gp_profile_group_count",
+            "transition_gp_profile_sync_group_count",
+            "transition_gp_shared_call_count",
+            "transition_packed_env_input_group_count",
+            "transition_packed_env_input_call_count",
+            "transition_only_build_group_count",
+            "transition_only_skipped_generator_count",
+            "transition_fused_call_count",
+            "transition_fused_group_count",
+            "transition_fused_enabled",
+            "transition_checkpoint_enabled",
+            "transition_checkpoint_call_count",
+            "transition_group_count",
+            "transition_family_group_count",
+            "transition_inner_grouping_structure_enabled",
+            "transition_inner_min_bucket",
+            "transition_bucket_max_batch",
+            "transition_async_enabled",
+            "transition_async_commit_in_stream",
+            "noise_block_size",
+            "env_count",
+            "strict_joint_transition_count",
+            "reference_semantics_count",
+            "exact_scm_count",
+            "exact_gp_count",
+            "legacy_scm_count",
+            "legacy_gp_count",
+        ):
+            stats[f"rollout_{key}"] = int(rollout_profile.get(key, 0) or 0)
+        for key in (
+            "transition_gp_shared_total_wall_ms",
+            "transition_gp_shared_core_wall_ms",
+            "transition_gp_shared_noise_wall_ms",
+            "transition_gp_shared_checkpoint_wall_ms",
+            "transition_gp_shared_post_wall_ms",
+            "transition_setup_wall_ms",
+            "transition_family_build_wall_ms",
+            "transition_generator_build_wall_ms",
+            "transition_gp_shared_build_wall_ms",
+            "transition_bucket_mean_batch",
+            "strict_joint_transition_share",
+            "reference_semantics_share",
+        ):
+            stats[f"rollout_{key}"] = float(rollout_profile.get(key, 0.0) or 0.0)
+        stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
+        stats["rollout_transition_reference_mode"] = rollout_profile.get(
+            "transition_reference_mode",
+            None,
+        )
+    terminal_stats = rollout.get("terminal_stats", None)
+    if isinstance(terminal_stats, dict):
+        for key in (
+            "terminal_count_mean",
+            "terminal_count_min",
+            "terminal_count_max",
+            "terminal_count_target_mean",
+            "terminal_count_target_min",
+            "terminal_count_target_max",
+        ):
+            value = terminal_stats.get(key, None)
+            if value is None:
+                continue
+            stats[key] = (
+                value.detach()
+                if torch.is_tensor(value)
+                else torch.as_tensor(value, device=rewards.device, dtype=torch.float32)
+            )
+    return stats
 
 
 def _legacy_expand_env_value_to_list(value, batch_size):
@@ -715,6 +896,129 @@ def _capture_alpha_grad_fast_runner_gradient_trace():
         ),
         "attn_in_proj_grad_max": round(
             float(model.transformer_encoder.layers[0].self_attn.in_proj_weight.grad.detach().abs().max()),
+            6,
+        ),
+    }
+
+
+def _capture_alpha_grad_train_step_trace():
+    _seed_everything(20260320)
+    cfg, env_cfg = _small_exact_scm_env_cfg()
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_parallel_workers"] = 1
+    prior = EnvironmentPrior(env_cfg)
+    model = TabPFN(
+        n_out=1,
+        n_features=int(cfg["prior"]["num_features"]),
+        emsize=32,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=1,
+        y_encoder_layer=Linear(1, emsize=32),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=404,
+        x_action_dim=30,
+        single_eval_causal=True,
+    )
+    model.train()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(cfg["prior"]["num_features"]),
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    _seed_everything(515151)
+    sampled = prior._sample_batch_hypers(4)
+    for h in sampled:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.05
+        h["action_noise_eval_std"] = 0.03
+    env_seeds = [17, 29, 43, 59]
+    rollout_seeds = [101, 211, 307, 401]
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-3,
+        betas=(0.9, 0.999),
+        weight_decay=0.0,
+    )
+    optimizer.zero_grad(set_to_none=True)
+    loss, rollout, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=4,
+        n_samples=12,
+        num_features=int(cfg["prior"]["num_features"]),
+        device="cpu",
+        single_eval_pos=6,
+        collect_x=False,
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=None,
+        h_list_override=[dict(h) for h in sampled],
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        rl_objective="alpha_grad",
+    )
+    params_before = {name: p.detach().clone() for name, p in model.named_parameters()}
+    loss.backward()
+
+    grad_abs_sum = 0.0
+    grad_abs_max = 0.0
+    grad_numel = 0
+    for param in model.parameters():
+        if param.grad is None:
+            continue
+        grad = param.grad.detach()
+        grad_abs_sum += float(grad.abs().sum())
+        grad_abs_max = max(grad_abs_max, float(grad.abs().max()))
+        grad_numel += grad.numel()
+
+    optimizer.step()
+
+    param_delta_abs_sum = 0.0
+    param_delta_abs_max = 0.0
+    policy_head_delta_abs_sum = 0.0
+    for name, param in model.named_parameters():
+        delta = (param.detach() - params_before[name]).abs()
+        param_delta_abs_sum += float(delta.sum())
+        param_delta_abs_max = max(param_delta_abs_max, float(delta.max()))
+        if name.startswith("policy_action_head"):
+            policy_head_delta_abs_sum += float(delta.sum())
+
+    return {
+        "loss": round(float(loss.detach()), 6),
+        "objective": round(float(stats["objective"].detach()), 6),
+        "reward_sum": round(float(rollout["rewards"].detach().sum()), 6),
+        "alpha_grad_v0_mean": round(float(stats["alpha_grad_v0_mean"].detach()), 6),
+        "alpha_grad_v1_mean": round(float(stats["alpha_grad_v1_mean"].detach()), 6),
+        "reinforce_log_prob_mean": round(float(stats["reinforce_log_prob_mean"].detach()), 6),
+        "rollout_transition_reference_mode": stats["rollout_transition_reference_mode"],
+        "rollout_exact_scm_count": int(stats["rollout_exact_scm_count"]),
+        "grad_abs_sum": round(float(grad_abs_sum), 6),
+        "grad_abs_max": round(float(grad_abs_max), 6),
+        "grad_numel": int(grad_numel),
+        "param_delta_abs_sum": round(float(param_delta_abs_sum), 6),
+        "param_delta_abs_max": round(float(param_delta_abs_max), 6),
+        "policy_head_delta_abs_sum": round(float(policy_head_delta_abs_sum), 6),
+        "attn_in_proj_delta_abs_sum": round(
+            float(
+                (
+                    model.transformer_encoder.layers[0].self_attn.in_proj_weight.detach()
+                    - params_before["transformer_encoder.layers.0.self_attn.in_proj_weight"]
+                ).abs().sum()
+            ),
             6,
         ),
     }
@@ -1311,6 +1615,110 @@ def test_rlpfn_maintained_fast_runner_config_helpers_match_legacy_inline_referen
         )
 
 
+def test_rlpfn_maintained_policy_gradient_loss_request_helper_matches_legacy_inline_reference():
+    _, env_cfg = _small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_normalize_rewards"] = True
+    env_cfg["pg_markov_adjacent_replay_enabled"] = True
+    env_cfg["pg_markov_adjacent_replay_sample_prob"] = 0.3
+    prior = EnvironmentPrior(env_cfg)
+
+    cases = [
+        {"n_samples": 12, "tbptt_window": None, "policy_objective_kind": "policy_gradient", "normalize": None},
+        {"n_samples": 12, "tbptt_window": 4, "policy_objective_kind": "reinforce", "normalize": False},
+        {"n_samples": 12, "tbptt_window": 99, "policy_objective_kind": "alpha_grad", "normalize": True},
+    ]
+    for case in cases:
+        expected = _legacy_prepare_policy_gradient_loss_request(prior, **case)
+        actual = prepare_policy_gradient_loss_request(prior, **case)
+        wrapped = prior._prepare_policy_gradient_loss_request(**case)
+        assert actual == expected
+        assert wrapped == expected
+
+
+def test_rlpfn_maintained_policy_gradient_loss_slice_and_diagnostics_helpers_match_legacy_inline_reference():
+    roots = (
+        torch.arange(12, dtype=torch.float32).reshape(3, 4),
+        torch.arange(12, 24, dtype=torch.float32).reshape(3, 4),
+        torch.arange(24, 36, dtype=torch.float32).reshape(3, 4),
+    )
+    mask = torch.tensor(
+        [
+            [[True, False, True, False], [False, True, False, True]],
+            [[True, True, False, False], [False, False, True, True]],
+            [[True, True, True, True], [False, False, False, False]],
+        ],
+        dtype=torch.bool,
+    )
+    group_entries = (
+        {"indices": (0, 1), "action_mean_roots": roots, "action_mask": mask},
+        {"indices": (2,), "action_mean_roots": tuple(root[:1] for root in roots), "action_mask": mask[:1, :1]},
+        "skip-me",
+    )
+    expected_slice = _legacy_slice_group_traces_after_eval(group_entries, 1)
+    actual_slice = slice_group_traces_after_eval(group_entries, 1)
+    wrapped_slice = EnvironmentPrior._slice_group_traces_after_eval(group_entries, 1)
+    assert len(actual_slice) == len(expected_slice)
+    assert len(wrapped_slice) == len(expected_slice)
+    for actual_entry, wrapped_entry, expected_entry in zip(actual_slice, wrapped_slice, expected_slice):
+        assert actual_entry["indices"] == expected_entry["indices"]
+        assert wrapped_entry["indices"] == expected_entry["indices"]
+        assert torch.equal(actual_entry["action_mask"], expected_entry["action_mask"])
+        assert torch.equal(wrapped_entry["action_mask"], expected_entry["action_mask"])
+        for actual_root, wrapped_root, expected_root in zip(
+            actual_entry["action_mean_roots"],
+            wrapped_entry["action_mean_roots"],
+            expected_entry["action_mean_roots"],
+        ):
+            assert torch.equal(actual_root, expected_root)
+            assert torch.equal(wrapped_root, expected_root)
+
+    rollout = {
+        "rewards": torch.tensor([[1.0, -2.0], [3.0, 4.0]], dtype=torch.float32),
+        "rollout_profile": {
+            "policy_cuda_ms": 1.5,
+            "transition_cuda_ms": 2.5,
+            "transition_group_count": 7,
+            "transition_family_group_count": 3,
+            "transition_bucket_mean_batch": 2.25,
+            "transition_async_enabled": 1,
+            "noise_mode": "uniform",
+            "noise_block_size": 8,
+            "env_count": 4,
+            "strict_joint_transition_count": 4,
+            "strict_joint_transition_share": 1.0,
+            "reference_semantics_count": 4,
+            "reference_semantics_share": 1.0,
+            "exact_scm_count": 4,
+            "transition_reference_mode": "scm_exact",
+        },
+        "terminal_stats": {
+            "terminal_count_mean": torch.tensor(2.5),
+            "terminal_count_min": 1.0,
+            "terminal_count_max": 5.0,
+            "terminal_count_target_mean": 3.0,
+            "terminal_count_target_min": 2.0,
+            "terminal_count_target_max": 6.0,
+        },
+    }
+    base_stats = {"objective": torch.tensor(1.25)}
+    expected_stats = _legacy_attach_common_rollout_diagnostics(rollout, base_stats)
+    actual_stats = attach_common_rollout_diagnostics(rollout, deepcopy(base_stats))
+    wrapped_stats = EnvironmentPrior._attach_common_rollout_diagnostics(rollout, deepcopy(base_stats))
+
+    def _assert_stats_equal(actual, expected):
+        assert set(actual.keys()) == set(expected.keys())
+        for key in expected:
+            actual_value = actual[key]
+            expected_value = expected[key]
+            if torch.is_tensor(expected_value):
+                assert torch.equal(actual_value, expected_value), key
+            else:
+                assert actual_value == expected_value, key
+
+    _assert_stats_equal(actual_stats, expected_stats)
+    _assert_stats_equal(wrapped_stats, expected_stats)
+
+
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():
     expected = {
         "x_shape": (12, 2, 434),
@@ -1378,3 +1786,25 @@ def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden()
     }
 
     assert _capture_alpha_grad_fast_runner_gradient_trace() == expected
+
+
+def test_rlpfn_maintained_alpha_grad_train_step_trace_matches_golden():
+    expected = {
+        "loss": -0.22706,
+        "objective": 0.22706,
+        "reward_sum": 1.446079,
+        "alpha_grad_v0_mean": 0.258765,
+        "alpha_grad_v1_mean": 0.222553,
+        "reinforce_log_prob_mean": 21.257523,
+        "rollout_transition_reference_mode": "scm_exact",
+        "rollout_exact_scm_count": 4,
+        "grad_abs_sum": 44.266421,
+        "grad_abs_max": 0.262588,
+        "grad_numel": 26622,
+        "param_delta_abs_sum": 11.284408,
+        "param_delta_abs_max": 0.001,
+        "policy_head_delta_abs_sum": 2.306698,
+        "attn_in_proj_delta_abs_sum": 3.058117,
+    }
+
+    assert _capture_alpha_grad_train_step_trace() == expected

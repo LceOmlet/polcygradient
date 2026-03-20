@@ -177,11 +177,6 @@ def dispatch_policy_rollout(prior, ctx):
         if alpha_grad_outer_merge_state["enabled"]:
             alpha_grad_outer_merge_state["expected_group_count"] = int(len(grouped))
         rollout_profile_acc = None
-        rollout_v2_acc = None
-        rollout_v3_acc = None
-        rollout_v4_acc = None
-        rollout_v5_next_acc = None
-        rollout_lipschitz_acc = None
         rollout_terminal_acc = None
 
         for group in grouped.values():
@@ -304,40 +299,6 @@ def dispatch_policy_rollout(prior, ctx):
                                 full_root[group_indices] = root
             for local_idx, global_idx in enumerate(group_indices):
                 infos[global_idx] = infos_group[local_idx]
-            rollout_v2_acc = prior._aev2_merge_rollout_summary(
-                rollout_v2_acc,
-                prior.last_rollout_v2,
-                batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v3_acc = prior._aev3_merge_rollout_summary(
-                rollout_v3_acc,
-                prior.last_rollout_v3,
-                batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v4_acc = prior._aev4_merge_rollout_summary(
-                rollout_v4_acc,
-                prior.last_rollout_v4,
-                batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_v5_next_acc = prior._aev5_next_merge_rollout_summary(
-                rollout_v5_next_acc,
-                prior.last_rollout_v5_next,
-                batch_weight=(float(len(group_indices)) / float(max(1, batch_size))),
-                device=device,
-                dtype=torch.float32,
-            )
-            rollout_lipschitz_acc = prior._merge_lipschitz_audit_summary(
-                rollout_lipschitz_acc,
-                prior.last_rollout_lipschitz_audit,
-                device=device,
-                dtype=torch.float32,
-            )
             rollout_terminal_acc = prior._merge_terminal_count_summary(
                 rollout_terminal_acc,
                 prior.last_rollout_terminal_stats,
@@ -524,14 +485,6 @@ def dispatch_policy_rollout(prior, ctx):
             rollout_profile_acc = prior._finalize_env_semantics_summary(rollout_profile_acc)
         prior.last_rollout_profile = rollout_profile_acc
         prior.last_rollout_env_semantics = _project_rollout_env_semantics(rollout_profile_acc)
-        prior.last_rollout_v2 = prior._aev2_finalize_rollout_summary(rollout_v2_acc, device=device, dtype=torch.float32)
-        prior.last_rollout_v3 = prior._aev3_finalize_rollout_summary(rollout_v3_acc, device=device, dtype=torch.float32)
-        prior.last_rollout_v4 = prior._aev4_finalize_rollout_summary(rollout_v4_acc, device=device, dtype=torch.float32)
-        prior.last_rollout_v5_next = prior._aev5_next_finalize_rollout_summary(
-            rollout_v5_next_acc,
-            device=device,
-            dtype=torch.float32,
-        )
         prior.last_rollout_reinforce = (
             {"log_probs": reinforce_log_probs, "log_prob_score": reinforce_log_prob_scores}
             if reinforce_log_probs is not None
@@ -562,13 +515,6 @@ def dispatch_policy_rollout(prior, ctx):
             device=device,
             dtype=torch.float32,
         )
-        prior.last_rollout_lipschitz_audit = prior._finalize_lipschitz_audit_accumulator(
-            rollout_lipschitz_acc
-            if rollout_lipschitz_acc is not None
-            else prior._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
-            device=device,
-            dtype=torch.float32,
-        )
         if alpha_grad_outer_merge_state["enabled"] and alpha_grad_outer_merge_state["window_buckets"]:
             raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete window buckets")
         prior.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
@@ -578,21 +524,11 @@ def dispatch_policy_rollout(prior, ctx):
             "info": prior.last_runtime_info,
             "single_eval_pos": single_eval_pos,
             "rollout_profile": prior.last_rollout_profile,
-            "aev2": prior.last_rollout_v2,
-            "aev3": prior.last_rollout_v3,
-            "aev4": prior.last_rollout_v4,
-            "aev5_next": prior.last_rollout_v5_next,
             "reinforce": prior.last_rollout_reinforce,
             "policy_trace": prior.last_rollout_policy_trace,
             "terminal_stats": prior.last_rollout_terminal_stats,
-            "lipschitz_audit": prior.last_rollout_lipschitz_audit,
         }
 
-    rollout_v2_acc = None
-    rollout_v3_acc = None
-    rollout_v4_acc = None
-    rollout_v5_next_acc = None
-    rollout_lipschitz_acc = None
     rollout_env_semantics_acc = None
     rollout_terminal_acc = None
     if alpha_grad_outer_merge_state["enabled"]:
@@ -690,40 +626,6 @@ def dispatch_policy_rollout(prior, ctx):
                             raise RuntimeError("alpha_grad action roots width mismatch across serial rollouts")
                         full_root[b] = root
         infos[b] = info
-        rollout_v2_acc = prior._aev2_merge_rollout_summary(
-            rollout_v2_acc,
-            prior.last_rollout_v2,
-            batch_weight=(1.0 / float(max(1, batch_size))),
-            device=device,
-            dtype=torch.float32,
-        )
-        rollout_v3_acc = prior._aev3_merge_rollout_summary(
-            rollout_v3_acc,
-            prior.last_rollout_v3,
-            batch_weight=(1.0 / float(max(1, batch_size))),
-            device=device,
-            dtype=torch.float32,
-        )
-        rollout_v4_acc = prior._aev4_merge_rollout_summary(
-            rollout_v4_acc,
-            prior.last_rollout_v4,
-            batch_weight=(1.0 / float(max(1, batch_size))),
-            device=device,
-            dtype=torch.float32,
-        )
-        rollout_v5_next_acc = prior._aev5_next_merge_rollout_summary(
-            rollout_v5_next_acc,
-            prior.last_rollout_v5_next,
-            batch_weight=(1.0 / float(max(1, batch_size))),
-            device=device,
-            dtype=torch.float32,
-        )
-        rollout_lipschitz_acc = prior._merge_lipschitz_audit_summary(
-            rollout_lipschitz_acc,
-            prior.last_rollout_lipschitz_audit,
-            device=device,
-            dtype=torch.float32,
-        )
         rollout_terminal_acc = prior._merge_terminal_count_summary(
             rollout_terminal_acc,
             prior.last_rollout_terminal_stats,
@@ -741,14 +643,6 @@ def dispatch_policy_rollout(prior, ctx):
         prior.last_rollout_profile["steps"] = int(n_samples)
         prior.last_rollout_profile["batch_size"] = int(batch_size)
     prior.last_rollout_env_semantics = _project_rollout_env_semantics(prior.last_rollout_profile)
-    prior.last_rollout_v2 = prior._aev2_finalize_rollout_summary(rollout_v2_acc, device=device, dtype=torch.float32)
-    prior.last_rollout_v3 = prior._aev3_finalize_rollout_summary(rollout_v3_acc, device=device, dtype=torch.float32)
-    prior.last_rollout_v4 = prior._aev4_finalize_rollout_summary(rollout_v4_acc, device=device, dtype=torch.float32)
-    prior.last_rollout_v5_next = prior._aev5_next_finalize_rollout_summary(
-        rollout_v5_next_acc,
-        device=device,
-        dtype=torch.float32,
-    )
     prior.last_rollout_reinforce = (
         {"log_probs": reinforce_log_probs, "log_prob_score": reinforce_log_prob_scores}
         if reinforce_log_probs is not None
@@ -779,13 +673,6 @@ def dispatch_policy_rollout(prior, ctx):
         device=device,
         dtype=torch.float32,
     )
-    prior.last_rollout_lipschitz_audit = prior._finalize_lipschitz_audit_accumulator(
-        rollout_lipschitz_acc
-        if rollout_lipschitz_acc is not None
-        else prior._new_lipschitz_audit_accumulator(False, device=device, dtype=torch.float32),
-        device=device,
-        dtype=torch.float32,
-    )
     if alpha_grad_outer_merge_state["enabled"] and alpha_grad_outer_merge_state["window_buckets"]:
         raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete serial window buckets")
     return {
@@ -794,12 +681,7 @@ def dispatch_policy_rollout(prior, ctx):
         "info": prior.last_runtime_info,
         "single_eval_pos": single_eval_pos,
         "rollout_profile": prior.last_rollout_profile,
-        "aev2": prior.last_rollout_v2,
-        "aev3": prior.last_rollout_v3,
-        "aev4": prior.last_rollout_v4,
-        "aev5_next": prior.last_rollout_v5_next,
         "reinforce": prior.last_rollout_reinforce,
         "policy_trace": prior.last_rollout_policy_trace,
         "terminal_stats": prior.last_rollout_terminal_stats,
-        "lipschitz_audit": prior.last_rollout_lipschitz_audit,
     }

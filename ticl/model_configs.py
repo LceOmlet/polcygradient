@@ -241,66 +241,6 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         # Optional state residual highway (default off, no behavior change).
         "state_highway_enabled": False,
         "state_highway_lambda": 0.0,
-        # anti-explosion&vanishing-v2:
-        # two-sided corridor regularization on log gain of consecutive
-        # latent-state increments.
-        "anti_explosion_vanishing_v2_enabled": False,
-        "anti_explosion_vanishing_v2_lambda": 0.05,
-        "anti_explosion_vanishing_v2_gain_lo": 0.85,
-        "anti_explosion_vanishing_v2_gain_hi": 1.15,
-        "anti_explosion_vanishing_v2_huber_delta": 0.05,
-        "anti_explosion_vanishing_v2_eps": 1e-6,
-        "anti_explosion_vanishing_v2_detach_reference": True,
-        # anti-explosion&vanishing-v3:
-        # decoupled drift+tail regularization on per-step log gain of
-        # latent-state increments.
-        "anti_explosion_vanishing_v3_enabled": False,
-        "anti_explosion_vanishing_v3_lambda_drift": 0.02,
-        "anti_explosion_vanishing_v3_lambda_tail": 0.05,
-        "anti_explosion_vanishing_v3_gain_lo": 0.85,
-        "anti_explosion_vanishing_v3_gain_hi": 1.15,
-        "anti_explosion_vanishing_v3_tail_tau": 0.02,
-        "anti_explosion_vanishing_v3_eps": 1e-6,
-        "anti_explosion_vanishing_v3_detach_reference": True,
-        # anti-explosion&vanishing-v4:
-        # controlled highway-subspace update + drift/tail regularization
-        # on per-step update gain (TBPTT-friendly).
-        "anti_explosion_vanishing_v4_enabled": False,
-        "anti_explosion_vanishing_v4_lambda_drift": 0.08,
-        "anti_explosion_vanishing_v4_lambda_tail": 0.25,
-        "anti_explosion_vanishing_v4_gain_lo": 0.97,
-        "anti_explosion_vanishing_v4_gain_hi": 1.03,
-        "anti_explosion_vanishing_v4_tail_tau": 0.010,
-        "anti_explosion_vanishing_v4_eps": 1e-6,
-        "anti_explosion_vanishing_v4_detach_reference": True,
-        "anti_explosion_vanishing_v4_highway_ratio": 0.25,
-        "anti_explosion_vanishing_v4_update_scale": 0.08,
-        "anti_explosion_vanishing_v4_update_clip": 0.0,
-        # anti-explosion&vanishing-v5:
-        # detached reward-signal thermostat that rescales policy-gradient
-        # loss magnitude without changing ascent direction on sum of rewards.
-        "anti_explosion_vanishing_v5_enabled": False,
-        "anti_explosion_vanishing_v5_target_std": 0.25,
-        "anti_explosion_vanishing_v5_scale_lo": 0.5,
-        "anti_explosion_vanishing_v5_scale_hi": 4.0,
-        "anti_explosion_vanishing_v5_eps": 1e-6,
-        "anti_explosion_vanishing_v5_detach_reference": True,
-        "anti_explosion_vanishing_v5_next_enabled": False,
-        "anti_explosion_vanishing_v5_next_state_gain_lo": 0.985,
-        "anti_explosion_vanishing_v5_next_state_gain_hi": 1.035,
-        "anti_explosion_vanishing_v5_next_state_rms_lo": 4e-3,
-        "anti_explosion_vanishing_v5_next_state_rms_hi": 9e-2,
-        "anti_explosion_vanishing_v5_next_state_reward_gate": 0.05,
-        "anti_explosion_vanishing_v5_next_state_low_boost_cap": 1.5,
-        "anti_explosion_vanishing_v5_next_loss_target_std": 0.25,
-        "anti_explosion_vanishing_v5_next_loss_scale_lo": 0.5,
-        "anti_explosion_vanishing_v5_next_loss_scale_hi": 4.0,
-        "anti_explosion_vanishing_v5_next_step_grad_rms_lo": 1e-4,
-        "anti_explosion_vanishing_v5_next_step_grad_rms_hi": 3e-2,
-        "anti_explosion_vanishing_v5_next_step_reward_std_gate": 0.05,
-        "anti_explosion_vanishing_v5_next_step_low_boost_cap": 4.0,
-        "anti_explosion_vanishing_v5_next_eps": 1e-6,
-        "anti_explosion_vanishing_v5_next_detach_reference": True,
         # Policy-gradient stability knobs for differentiable rollout.
         # Train objective default: maximize raw discounted reward mean directly.
         "policy_gradient_normalize_rewards": False,
@@ -308,11 +248,6 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reward_norm_clip": 10.0,
         # Keep Bellman-style undiscounted default unless overridden.
         "discount": 1.0,
-        # Lipschitz safeguards: project sampled generator matrices by
-        # Frobenius norm and cap GP outputscale for bounded transition Jacobians.
-        "lipschitz_enforce": False,
-        "lipschitz_weight_fro_norm_max": 1.0,
-        "lipschitz_gp_outputscale_max": 1.0,
         # SCM (aligned with priors/mlp.py names).
         "num_layers": {"distribution": "meta_gamma", "max_alpha": 2, "max_scale": 3, "round": True, "lower_bound": 2},
         "prior_mlp_hidden_dim": {"distribution": "meta_gamma", "max_alpha": 3, "max_scale": 128, "round": True, "lower_bound": 8},
@@ -556,22 +491,6 @@ def get_rlpfn_default_config():
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
     config['dataloader']['batch_size'] = 64 * 16
-    config['prior']['environment']['anti_explosion_vanishing_v5_enabled'] = False
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_enabled'] = False
-    config['prior']['environment']['lipschitz_enforce'] = False
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_lo'] = 0.985
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_gain_hi'] = 1.035
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_lo'] = 4e-3
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_rms_hi'] = 9e-2
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_reward_gate'] = 0.05
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_state_low_boost_cap'] = 1.5
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_target_std'] = 0.25
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_lo'] = 0.5
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_loss_scale_hi'] = 4.0
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_lo'] = 1e-4
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_grad_rms_hi'] = 3e-2
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_reward_std_gate'] = 0.05
-    config['prior']['environment']['anti_explosion_vanishing_v5_next_step_low_boost_cap'] = 4.0
     return config
 
 
