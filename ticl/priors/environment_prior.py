@@ -29,9 +29,21 @@ from ticl.priors.maintained_exact_scm import (
     merge_env_semantics_summary as maintained_merge_env_semantics_summary,
     new_env_semantics_accumulator as maintained_new_env_semantics_accumulator,
     resolve_reference_semantics_enabled as maintained_resolve_reference_semantics_enabled,
+    resolve_reinforce_action_rms_eps as maintained_resolve_reinforce_action_rms_eps,
+    resolve_reinforce_action_transform as maintained_resolve_reinforce_action_transform,
+    resolve_reinforce_reward_rms_eps as maintained_resolve_reinforce_reward_rms_eps,
+    resolve_reinforce_reward_tanh_bound as maintained_resolve_reinforce_reward_tanh_bound,
+    resolve_reinforce_reward_tanh_c as maintained_resolve_reinforce_reward_tanh_c,
+    resolve_reinforce_reward_transform as maintained_resolve_reinforce_reward_transform,
+    resolve_state_full_rms_target as maintained_resolve_state_full_rms_target,
     resolve_state_full_rms_enabled as maintained_resolve_state_full_rms_enabled,
+    resolve_state_input_scale as maintained_resolve_state_input_scale,
     resolve_state_input_scale_enabled as maintained_resolve_state_input_scale_enabled,
     resolve_strict_joint_transition_enabled as maintained_resolve_strict_joint_transition_enabled,
+    resolve_terminal_bonus_scale_max as maintained_resolve_terminal_bonus_scale_max,
+    resolve_terminal_bonus_scale_min as maintained_resolve_terminal_bonus_scale_min,
+    resolve_terminal_bonus_tanh_c as maintained_resolve_terminal_bonus_tanh_c,
+    resolve_terminal_reset_count_target as maintained_resolve_terminal_reset_count_target,
     resolve_terminal_reset_enabled as maintained_resolve_terminal_reset_enabled,
     summarize_env_semantics as maintained_summarize_env_semantics,
     transition_reference_mode as maintained_transition_reference_mode,
@@ -4675,10 +4687,7 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_state_input_scale(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("state_input_scale", 1.0))
-        if not math.isfinite(v):
-            return 1.0
-        return float(max(1e-6, v))
+        return maintained_resolve_state_input_scale(h)
 
     @staticmethod
     def _scale_state_env_input(state_t, state_input_scale):
@@ -4698,52 +4707,31 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_state_full_rms_target(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("state_full_rms_target", 1.0))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 1.0
-        return float(v)
+        return maintained_resolve_state_full_rms_target(h)
 
     @staticmethod
     def _resolve_reinforce_reward_transform(h):
-        mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
-        if mode not in {"none", "tanh", "rms", "clip"}:
-            mode = "none"
-        return mode
+        return maintained_resolve_reinforce_reward_transform(h)
 
     @staticmethod
     def _resolve_reinforce_reward_rms_eps(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_rms_eps", 1e-6))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 1e-6
-        return float(v)
+        return maintained_resolve_reinforce_reward_rms_eps(h)
 
     @staticmethod
     def _resolve_reinforce_reward_tanh_c(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_c", 1.0))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 1.0
-        return float(v)
+        return maintained_resolve_reinforce_reward_tanh_c(h)
 
     @staticmethod
     def _resolve_reinforce_reward_tanh_bound(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 10.0
-        return float(v)
+        return maintained_resolve_reinforce_reward_tanh_bound(h)
 
     @staticmethod
     def _resolve_reinforce_action_transform(h):
-        mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
-        if mode not in {"tanh", "rms", "none"}:
-            mode = "rms"
-        return mode
+        return maintained_resolve_reinforce_action_transform(h)
 
     @staticmethod
     def _resolve_reinforce_action_rms_eps(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 1e-6
-        return float(v)
+        return maintained_resolve_reinforce_action_rms_eps(h)
 
     @staticmethod
     def _resolve_first_policy_gradient_state_grad_clip_norm(h):
@@ -4822,31 +4810,19 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_terminal_reset_count_target(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("terminal_reset_count_target", 0))
-        if not math.isfinite(v):
-            return 0.0
-        return float(max(0.0, float(v)))
+        return maintained_resolve_terminal_reset_count_target(h)
 
     @staticmethod
     def _resolve_terminal_bonus_tanh_c(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("terminal_bonus_tanh_c", 10.0))
-        if (not math.isfinite(v)) or v <= 0.0:
-            return 10.0
-        return float(v)
+        return maintained_resolve_terminal_bonus_tanh_c(h)
 
     @staticmethod
     def _resolve_terminal_bonus_scale_min(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("terminal_bonus_scale_min", 1.0))
-        if not math.isfinite(v):
-            return 1.0
-        return float(v)
+        return maintained_resolve_terminal_bonus_scale_min(h)
 
     @staticmethod
     def _resolve_terminal_bonus_scale_max(h):
-        v = EnvironmentPrior._resolve_scalar(h.get("terminal_bonus_scale_max", 10.0))
-        if not math.isfinite(v):
-            return 10.0
-        return float(v)
+        return maintained_resolve_terminal_bonus_scale_max(h)
 
     @staticmethod
     def _terminal_reset_prob_from_count(count_target, n_samples):

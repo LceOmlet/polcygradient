@@ -1,5 +1,8 @@
+import math
 import numpy as np
 import torch
+
+from ticl.distributions import sample_distributions
 
 
 def coerce_bool(value):
@@ -12,6 +15,10 @@ def coerce_bool(value):
     if isinstance(value, str):
         return value.strip().lower() not in {"0", "false", "no", "off", ""}
     return bool(value)
+
+
+def resolve_scalar(value):
+    return float(sample_distributions({"value": value})["value"])
 
 
 def resolve_strict_joint_transition_enabled(h):
@@ -82,12 +89,96 @@ def resolve_state_input_scale_enabled(h):
     return bool(coerce_bool(h.get("state_input_scale_enabled", False)))
 
 
+def resolve_state_input_scale(h):
+    v = resolve_scalar(h.get("state_input_scale", 1.0))
+    if not math.isfinite(v):
+        return 1.0
+    return float(max(1e-6, v))
+
+
 def resolve_state_full_rms_enabled(h):
     return bool(coerce_bool(h.get("state_full_rms_enabled", False)))
 
 
+def resolve_state_full_rms_target(h):
+    v = resolve_scalar(h.get("state_full_rms_target", 1.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1.0
+    return float(v)
+
+
+def resolve_reinforce_reward_transform(h):
+    mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
+    if mode not in {"none", "tanh", "rms", "clip"}:
+        mode = "none"
+    return mode
+
+
+def resolve_reinforce_reward_rms_eps(h):
+    v = resolve_scalar(h.get("reinforce_reward_rms_eps", 1e-6))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1e-6
+    return float(v)
+
+
+def resolve_reinforce_reward_tanh_c(h):
+    v = resolve_scalar(h.get("reinforce_reward_tanh_c", 1.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1.0
+    return float(v)
+
+
+def resolve_reinforce_reward_tanh_bound(h):
+    v = resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 10.0
+    return float(v)
+
+
+def resolve_reinforce_action_transform(h):
+    mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
+    if mode not in {"tanh", "rms", "none"}:
+        mode = "rms"
+    return mode
+
+
+def resolve_reinforce_action_rms_eps(h):
+    v = resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1e-6
+    return float(v)
+
+
 def resolve_terminal_reset_enabled(h):
     return bool(coerce_bool(h.get("terminal_reset_enabled", False)))
+
+
+def resolve_terminal_reset_count_target(h):
+    v = resolve_scalar(h.get("terminal_reset_count_target", 0))
+    if not math.isfinite(v):
+        return 0.0
+    return float(max(0.0, float(v)))
+
+
+def resolve_terminal_bonus_tanh_c(h):
+    v = resolve_scalar(h.get("terminal_bonus_tanh_c", 10.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 10.0
+    return float(v)
+
+
+def resolve_terminal_bonus_scale_min(h):
+    v = resolve_scalar(h.get("terminal_bonus_scale_min", 1.0))
+    if not math.isfinite(v):
+        return 1.0
+    return float(v)
+
+
+def resolve_terminal_bonus_scale_max(h):
+    v = resolve_scalar(h.get("terminal_bonus_scale_max", 10.0))
+    if not math.isfinite(v):
+        return 10.0
+    return float(v)
 
 
 def expand_env_value_to_list(value, batch_size):

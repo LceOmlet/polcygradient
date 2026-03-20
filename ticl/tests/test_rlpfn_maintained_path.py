@@ -1,9 +1,11 @@
 from copy import deepcopy
+import math
 import random
 
 import numpy as np
 import torch
 
+from ticl.distributions import parse_distributions, sample_distributions
 from ticl.model_configs import get_model_default_config
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
@@ -17,9 +19,22 @@ from ticl.priors.maintained_exact_scm import (
     merge_env_semantics_summary,
     new_env_semantics_accumulator,
     resolve_reference_semantics_enabled,
+    resolve_reinforce_action_rms_eps,
+    resolve_reinforce_action_transform,
+    resolve_reinforce_reward_rms_eps,
+    resolve_reinforce_reward_tanh_bound,
+    resolve_reinforce_reward_tanh_c,
+    resolve_reinforce_reward_transform,
+    resolve_scalar,
+    resolve_state_full_rms_target,
     resolve_state_full_rms_enabled,
+    resolve_state_input_scale,
     resolve_state_input_scale_enabled,
     resolve_strict_joint_transition_enabled,
+    resolve_terminal_bonus_scale_max,
+    resolve_terminal_bonus_scale_min,
+    resolve_terminal_bonus_tanh_c,
+    resolve_terminal_reset_count_target,
     resolve_terminal_reset_enabled,
     summarize_env_semantics,
     transition_reference_mode,
@@ -121,6 +136,94 @@ def _legacy_resolve_state_full_rms_enabled(h):
 
 def _legacy_resolve_terminal_reset_enabled(h):
     return bool(_legacy_coerce_bool(h.get("terminal_reset_enabled", False)))
+
+
+def _legacy_resolve_scalar(value):
+    return float(sample_distributions({"value": value})["value"])
+
+
+def _legacy_resolve_state_input_scale(h):
+    v = _legacy_resolve_scalar(h.get("state_input_scale", 1.0))
+    if not math.isfinite(v):
+        return 1.0
+    return float(max(1e-6, v))
+
+
+def _legacy_resolve_state_full_rms_target(h):
+    v = _legacy_resolve_scalar(h.get("state_full_rms_target", 1.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1.0
+    return float(v)
+
+
+def _legacy_resolve_reinforce_reward_transform(h):
+    mode = str(h.get("reinforce_reward_transform", "none")).strip().lower()
+    if mode not in {"none", "tanh", "rms", "clip"}:
+        mode = "none"
+    return mode
+
+
+def _legacy_resolve_reinforce_reward_rms_eps(h):
+    v = _legacy_resolve_scalar(h.get("reinforce_reward_rms_eps", 1e-6))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1e-6
+    return float(v)
+
+
+def _legacy_resolve_reinforce_reward_tanh_c(h):
+    v = _legacy_resolve_scalar(h.get("reinforce_reward_tanh_c", 1.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1.0
+    return float(v)
+
+
+def _legacy_resolve_reinforce_reward_tanh_bound(h):
+    v = _legacy_resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 10.0
+    return float(v)
+
+
+def _legacy_resolve_reinforce_action_transform(h):
+    mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
+    if mode not in {"tanh", "rms", "none"}:
+        mode = "rms"
+    return mode
+
+
+def _legacy_resolve_reinforce_action_rms_eps(h):
+    v = _legacy_resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 1e-6
+    return float(v)
+
+
+def _legacy_resolve_terminal_reset_count_target(h):
+    v = _legacy_resolve_scalar(h.get("terminal_reset_count_target", 0))
+    if not math.isfinite(v):
+        return 0.0
+    return float(max(0.0, float(v)))
+
+
+def _legacy_resolve_terminal_bonus_tanh_c(h):
+    v = _legacy_resolve_scalar(h.get("terminal_bonus_tanh_c", 10.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 10.0
+    return float(v)
+
+
+def _legacy_resolve_terminal_bonus_scale_min(h):
+    v = _legacy_resolve_scalar(h.get("terminal_bonus_scale_min", 1.0))
+    if not math.isfinite(v):
+        return 1.0
+    return float(v)
+
+
+def _legacy_resolve_terminal_bonus_scale_max(h):
+    v = _legacy_resolve_scalar(h.get("terminal_bonus_scale_max", 10.0))
+    if not math.isfinite(v):
+        return 10.0
+    return float(v)
 
 
 def _legacy_expand_env_value_to_list(value, batch_size):
@@ -612,6 +715,182 @@ def test_rlpfn_maintained_exact_scm_env_semantics_helpers_match_legacy_inline_re
     assert EnvironmentPrior._finalize_env_semantics_summary(merged_actual) == _legacy_finalize_env_semantics_summary(
         merged_expected,
     )
+
+
+def test_rlpfn_maintained_exact_scm_numeric_resolve_helpers_match_legacy_inline_reference():
+    def _assert_seeded_equal(seed, actual_fn, legacy_fn):
+        _seed_everything(seed)
+        actual = actual_fn()
+        _seed_everything(seed)
+        expected = legacy_fn()
+        if isinstance(actual, float) and isinstance(expected, float):
+            if math.isnan(actual) and math.isnan(expected):
+                return
+        assert actual == expected
+
+    def _parsed_dist(spec):
+        return parse_distributions({"value": spec})["value"]
+
+    scalar_cases = [
+        1.5,
+        float("nan"),
+        -3.0,
+        _parsed_dist({"distribution": "uniform", "min": 0.25, "max": 0.75}),
+    ]
+    for value in scalar_cases:
+        _assert_seeded_equal(1234, lambda value=value: resolve_scalar(value), lambda value=value: _legacy_resolve_scalar(value))
+
+    h_scalar_cases = [
+        {
+            "state_input_scale": 0.5,
+            "state_full_rms_target": 1.2,
+            "reinforce_reward_rms_eps": 1e-5,
+            "reinforce_reward_tanh_c": 2.0,
+            "reinforce_reward_tanh_bound": 7.0,
+            "reinforce_action_rms_eps": 5e-6,
+            "terminal_reset_count_target": 3.0,
+            "terminal_bonus_tanh_c": 8.0,
+            "terminal_bonus_scale_min": 0.5,
+            "terminal_bonus_scale_max": 4.0,
+        },
+        {
+            "state_input_scale": float("nan"),
+            "state_full_rms_target": -1.0,
+            "reinforce_reward_rms_eps": 0.0,
+            "reinforce_reward_tanh_c": -2.0,
+            "reinforce_reward_tanh_bound": float("nan"),
+            "reinforce_action_rms_eps": -1.0,
+            "terminal_reset_count_target": float("nan"),
+            "terminal_bonus_tanh_c": 0.0,
+            "terminal_bonus_scale_min": float("nan"),
+            "terminal_bonus_scale_max": float("nan"),
+        },
+        {
+            "state_input_scale": _parsed_dist({"distribution": "uniform", "min": 0.25, "max": 0.75}),
+            "state_full_rms_target": _parsed_dist({"distribution": "uniform", "min": 0.8, "max": 1.4}),
+            "reinforce_reward_rms_eps": _parsed_dist({"distribution": "uniform", "min": 1e-6, "max": 1e-4}),
+            "reinforce_reward_tanh_c": _parsed_dist({"distribution": "uniform", "min": 0.5, "max": 2.5}),
+            "reinforce_reward_tanh_bound": _parsed_dist({"distribution": "uniform", "min": 5.0, "max": 15.0}),
+            "reinforce_action_rms_eps": _parsed_dist({"distribution": "uniform", "min": 1e-6, "max": 1e-4}),
+            "terminal_reset_count_target": _parsed_dist({"distribution": "uniform", "min": 0.0, "max": 5.0}),
+            "terminal_bonus_tanh_c": _parsed_dist({"distribution": "uniform", "min": 5.0, "max": 15.0}),
+            "terminal_bonus_scale_min": _parsed_dist({"distribution": "uniform", "min": 0.5, "max": 2.0}),
+            "terminal_bonus_scale_max": _parsed_dist({"distribution": "uniform", "min": 2.0, "max": 6.0}),
+        },
+    ]
+    for h in h_scalar_cases:
+        _assert_seeded_equal(
+            2026,
+            lambda h=h: resolve_state_input_scale(h),
+            lambda h=h: _legacy_resolve_state_input_scale(h),
+        )
+        _assert_seeded_equal(
+            2026,
+            lambda h=h: EnvironmentPrior._resolve_state_input_scale(h),
+            lambda h=h: _legacy_resolve_state_input_scale(h),
+        )
+        _assert_seeded_equal(
+            2027,
+            lambda h=h: resolve_state_full_rms_target(h),
+            lambda h=h: _legacy_resolve_state_full_rms_target(h),
+        )
+        _assert_seeded_equal(
+            2027,
+            lambda h=h: EnvironmentPrior._resolve_state_full_rms_target(h),
+            lambda h=h: _legacy_resolve_state_full_rms_target(h),
+        )
+        _assert_seeded_equal(
+            2028,
+            lambda h=h: resolve_reinforce_reward_rms_eps(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_rms_eps(h),
+        )
+        _assert_seeded_equal(
+            2028,
+            lambda h=h: EnvironmentPrior._resolve_reinforce_reward_rms_eps(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_rms_eps(h),
+        )
+        _assert_seeded_equal(
+            2029,
+            lambda h=h: resolve_reinforce_reward_tanh_c(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_tanh_c(h),
+        )
+        _assert_seeded_equal(
+            2029,
+            lambda h=h: EnvironmentPrior._resolve_reinforce_reward_tanh_c(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_tanh_c(h),
+        )
+        _assert_seeded_equal(
+            2030,
+            lambda h=h: resolve_reinforce_reward_tanh_bound(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_tanh_bound(h),
+        )
+        _assert_seeded_equal(
+            2030,
+            lambda h=h: EnvironmentPrior._resolve_reinforce_reward_tanh_bound(h),
+            lambda h=h: _legacy_resolve_reinforce_reward_tanh_bound(h),
+        )
+        _assert_seeded_equal(
+            2031,
+            lambda h=h: resolve_reinforce_action_rms_eps(h),
+            lambda h=h: _legacy_resolve_reinforce_action_rms_eps(h),
+        )
+        _assert_seeded_equal(
+            2031,
+            lambda h=h: EnvironmentPrior._resolve_reinforce_action_rms_eps(h),
+            lambda h=h: _legacy_resolve_reinforce_action_rms_eps(h),
+        )
+        _assert_seeded_equal(
+            2032,
+            lambda h=h: resolve_terminal_reset_count_target(h),
+            lambda h=h: _legacy_resolve_terminal_reset_count_target(h),
+        )
+        _assert_seeded_equal(
+            2032,
+            lambda h=h: EnvironmentPrior._resolve_terminal_reset_count_target(h),
+            lambda h=h: _legacy_resolve_terminal_reset_count_target(h),
+        )
+        _assert_seeded_equal(
+            2033,
+            lambda h=h: resolve_terminal_bonus_tanh_c(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_tanh_c(h),
+        )
+        _assert_seeded_equal(
+            2033,
+            lambda h=h: EnvironmentPrior._resolve_terminal_bonus_tanh_c(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_tanh_c(h),
+        )
+        _assert_seeded_equal(
+            2034,
+            lambda h=h: resolve_terminal_bonus_scale_min(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_scale_min(h),
+        )
+        _assert_seeded_equal(
+            2034,
+            lambda h=h: EnvironmentPrior._resolve_terminal_bonus_scale_min(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_scale_min(h),
+        )
+        _assert_seeded_equal(
+            2035,
+            lambda h=h: resolve_terminal_bonus_scale_max(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_scale_max(h),
+        )
+        _assert_seeded_equal(
+            2035,
+            lambda h=h: EnvironmentPrior._resolve_terminal_bonus_scale_max(h),
+            lambda h=h: _legacy_resolve_terminal_bonus_scale_max(h),
+        )
+
+    transform_cases = [
+        {},
+        {"reinforce_reward_transform": "tanh", "reinforce_action_transform": "none"},
+        {"reinforce_reward_transform": "bad", "reinforce_action_transform": "bad"},
+        {"reinforce_reward_transform": "CLIP", "reinforce_action_transform": "TANH"},
+    ]
+    for h in transform_cases:
+        assert resolve_reinforce_reward_transform(h) == _legacy_resolve_reinforce_reward_transform(h)
+        assert EnvironmentPrior._resolve_reinforce_reward_transform(h) == _legacy_resolve_reinforce_reward_transform(h)
+        assert resolve_reinforce_action_transform(h) == _legacy_resolve_reinforce_action_transform(h)
+        assert EnvironmentPrior._resolve_reinforce_action_transform(h) == _legacy_resolve_reinforce_action_transform(h)
 
 
 def test_rlpfn_maintained_path_exact_scm_get_batch_trace_matches_golden():
