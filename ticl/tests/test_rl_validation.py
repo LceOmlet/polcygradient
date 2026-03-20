@@ -208,6 +208,15 @@ class _PolicyStepRecordingModel(torch.nn.Module):
         return out, {"step": len(self.reward_mask_calls)}
 
 
+class _WrappedPolicyModel(torch.nn.Module):
+    def __init__(self, model):
+        super().__init__()
+        self.model = model
+
+    def forward(self, *args, **kwargs):
+        return self.model(*args, **kwargs)
+
+
 def _install_fake_gym(monkeypatch, env_factory):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
@@ -411,6 +420,55 @@ def test_evaluate_rlpfn_on_gym_envs_requires_policy_action_head_for_split_rlpfn(
 
     with pytest.raises(ValueError, match="policy_action_head"):
         evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+
+def test_evaluate_rlpfn_on_gym_envs_wrapped_split_model_uses_policy_step_validation(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    wrapped_model = _WrappedPolicyModel(_build_small_split_rlpfn_like_model())
+
+    import ticl.rl_validation as rl_validation_mod
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("wrapped split model validation should not fall back to legacy candidate scoring")
+
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vSplit",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=wrapped_model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vSplit"]["return"] == 2.0
 
 
 def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_threshold(monkeypatch):

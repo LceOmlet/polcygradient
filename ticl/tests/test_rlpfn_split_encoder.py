@@ -428,3 +428,35 @@ def test_tabpfn_forward_policy_step_split_matches_materialized_token_with_phase_
 
     assert torch.allclose(out_ref, out_split, atol=1e-6, rtol=1e-5)
     _assert_nested_tensor_close(cache_ref, cache_split, atol=1e-6, rtol=1e-5)
+
+
+def test_tabpfn_forward_with_kv_uses_policy_action_head_for_split_encoder():
+    torch.manual_seed(20260320)
+    emsize = 16
+    model = TabPFN(
+        n_out=1,
+        n_features=12,
+        emsize=emsize,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        dropout=0.0,
+        y_encoder_layer=Linear(1, emsize=emsize),
+        classification_task=False,
+        y_encoder="linear",
+        x_encoder_type="split_obs_action",
+        x_obs_dim=8,
+        x_action_dim=4,
+        single_eval_causal=True,
+    )
+
+    x = torch.randn(7, 3, 12)
+    y = torch.randn(7, 3)
+    single_eval_pos = 5
+
+    out_full = model((x, y), single_eval_pos=single_eval_pos)
+    out_kv = model.forward_with_kv((x, y), single_eval_pos=single_eval_pos)
+
+    assert tuple(out_full.shape) == (2, 3, 4)
+    assert tuple(out_kv.shape) == (2, 3, 4)
+    assert torch.allclose(out_full, out_kv, atol=1e-5, rtol=1e-4)

@@ -197,13 +197,33 @@ def _sample_action_candidates(rng, action_low, action_high, n_candidates):
     return candidates
 
 
+def _resolve_policy_model_ref(model):
+    queue = [model]
+    seen = set()
+    while queue:
+        candidate = queue.pop(0)
+        if candidate is None:
+            continue
+        ident = id(candidate)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if hasattr(candidate, "forward_policy_step"):
+            return candidate
+        for attr in ("module", "model", "_orig_mod"):
+            nested = getattr(candidate, attr, None)
+            if nested is not None and id(nested) not in seen:
+                queue.append(nested)
+    return model
+
+
 def _model_supports_policy_step(model):
-    model_ref = model.module if hasattr(model, "module") else model
+    model_ref = _resolve_policy_model_ref(model)
     return hasattr(model_ref, "forward_policy_step")
 
 
 def _require_validation_policy_action_head(model):
-    model_ref = model.module if hasattr(model, "module") else model
+    model_ref = _resolve_policy_model_ref(model)
     require_policy_action_head = getattr(model_ref, "require_policy_action_head", None)
     if callable(require_policy_action_head):
         require_policy_action_head()

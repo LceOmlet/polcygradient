@@ -408,7 +408,7 @@ class TabPFN(nn.Module):
 
         if self.single_eval_causal:
             hidden_q = self._forward_queries_with_kv_from_encoded(train_x, query_x)
-            return self.decoder(hidden_q)
+            return self._decode_policy_action(hidden_q)
 
         src = torch.cat([train_x, query_x], 0)
         output = self.transformer_encoder(src, src_mask)
@@ -478,7 +478,7 @@ class TabPFN(nn.Module):
         if self.input_ln is not None:
             x_enc = self.input_ln(x_enc)
         hidden = self.transformer_encoder.forward_query(x_enc, kv_cache)
-        return self.decoder(hidden)
+        return self._decode_policy_action(hidden)
 
     def forward_policy_step(
         self,

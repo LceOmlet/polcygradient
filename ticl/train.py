@@ -703,6 +703,26 @@ def _format_compile_counter_delta(counter_delta, max_items=8):
     return ",".join(f"{k}:{int(v):+d}" for k, v in top_items)
 
 
+def _resolve_policy_model_ref(model):
+    queue = [model]
+    seen = set()
+    while queue:
+        candidate = queue.pop(0)
+        if candidate is None:
+            continue
+        ident = id(candidate)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        if hasattr(candidate, "forward_policy_step"):
+            return candidate
+        for attr in ("module", "model", "_orig_mod"):
+            nested = getattr(candidate, attr, None)
+            if nested is not None and id(nested) not in seen:
+                queue.append(nested)
+    return model
+
+
 def _build_policy_step_fn(
     model,
     num_features,
@@ -717,7 +737,7 @@ def _build_policy_step_fn(
     pg_torch_compile_fullgraph=False,
     pg_torch_compile_dynamic=False,
 ):
-    model_ref = model.module if hasattr(model, "module") else model
+    model_ref = _resolve_policy_model_ref(model)
     if not hasattr(model_ref, "forward_policy_step"):
         raise ValueError("RL policy objectives require model.forward_policy_step")
     require_policy_action_head = getattr(model_ref, "require_policy_action_head", None)
