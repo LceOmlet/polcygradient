@@ -18,6 +18,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
     "reinforce_action_transform": "none",
     "reinforce_action_rms_eps": 1e-6,
+    "reinforce_sequence_replay_enabled": True,
     "first_policy_gradient_state_grad_clip_norm": 4.0,
     "first_policy_gradient_action_grad_clip_value": 0.0,
     "first_policy_gradient_action_grad_clip_norm": 1.0,
@@ -83,7 +84,9 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["x_action_dim"] = int(layout["x_action_dim"])
     config["prior"]["num_features"] = int(layout["default_num_features"])
     config["transformer"]["single_eval_causal"] = True
-    config["optimizer"]["rl_objective"] = "alpha_grad"
+    config["transformer"]["backbone"] = "rwkv7"
+    config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
+    config["optimizer"]["rl_objective"] = "reinforce"
     return layout
 
 
@@ -92,8 +95,10 @@ def validate_rlpfn_maintained_path_config(config):
     layout = resolve_rlpfn_token_layout(env_cfg, num_features=config["prior"].get("num_features", None))
     if config["prior"]["prior_type"] != "environment_only":
         raise ValueError("Maintained RLPFN path requires prior_type=environment_only.")
-    if str(config["optimizer"]["rl_objective"]).strip().lower() != "alpha_grad":
-        raise ValueError("Maintained RLPFN path requires optimizer.rl_objective=alpha_grad.")
+    if str(config["optimizer"]["rl_objective"]).strip().lower() != "reinforce":
+        raise ValueError("Maintained RLPFN path requires optimizer.rl_objective=reinforce.")
+    if str(config["transformer"].get("backbone", "transformer")).strip().lower() != "rwkv7":
+        raise ValueError("Maintained RLPFN path requires transformer.backbone=rwkv7.")
     if str(config["transformer"]["x_encoder_type"]).strip().lower() != "split_obs_action":
         raise ValueError("Maintained RLPFN path requires transformer.x_encoder_type=split_obs_action.")
     if not bool(config["transformer"]["single_eval_causal"]):
@@ -106,10 +111,6 @@ def validate_rlpfn_maintained_path_config(config):
         raise ValueError("Maintained RLPFN path requires prior.num_features to match token layout.")
     if not bool(env_cfg.get("strict_joint_transition_enabled", False)):
         raise ValueError("Maintained RLPFN path requires exact-SCM strict_joint_transition_enabled=True.")
-    if not bool(env_cfg.get("pg_one_hop_replay_enabled", False)):
-        raise ValueError("Maintained RLPFN path requires pg_one_hop_replay_enabled=True.")
-    if not bool(env_cfg.get("alpha_grad_one_hop_replay_enabled", False)):
-        raise ValueError("Maintained RLPFN path requires alpha_grad_one_hop_replay_enabled=True.")
-    if not bool(env_cfg.get("pg_markov_adjacent_replay_enabled", False)):
-        raise ValueError("Maintained RLPFN path requires pg_markov_adjacent_replay_enabled=True.")
+    if not bool(env_cfg.get("reinforce_sequence_replay_enabled", False)):
+        raise ValueError("Maintained RLPFN path requires reinforce_sequence_replay_enabled=True.")
     return layout

@@ -4,12 +4,13 @@ import importlib.util
 import sys
 import types
 from pathlib import Path
-from typing import List, Optional, Sequence, Tuple
+from typing import Dict, List, Optional, Sequence, Tuple
 from contextlib import contextmanager
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torch.utils.checkpoint
 import wandb
 
 from ticl.models.encoders import Linear, SplitObsActionEncoder
@@ -163,6 +164,124 @@ def _build_official_rwkv7_args(*, emb_dim: int, nlayers: int, head_size: int):
     )
 
 
+_OFFICIAL_RWKV7_SCRIPT_API = _load_official_rwkv7_demo_rnn()
+_OFFICIAL_RWKV7_TIME_MIXING = _OFFICIAL_RWKV7_SCRIPT_API.time_mixing
+_OFFICIAL_RWKV7_CHANNEL_MIXING = _OFFICIAL_RWKV7_SCRIPT_API.channel_mixing
+
+
+class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
+    z: Dict[str, torch.Tensor]
+    n_embd: int
+    n_layer: int
+    n_head: int
+    head_size: int
+    has_ln0: bool
+
+    def __init__(
+        self,
+        *,
+        z: Dict[str, torch.Tensor],
+        n_embd: int,
+        n_layer: int,
+        n_head: int,
+        head_size: int,
+        has_ln0: bool,
+    ):
+        super().__init__()
+        self.z = torch.jit.Attribute(z, Dict[str, torch.Tensor])
+        self.n_embd = int(n_embd)
+        self.n_layer = int(n_layer)
+        self.n_head = int(n_head)
+        self.head_size = int(head_size)
+        self.has_ln0 = bool(has_ln0)
+        self.eval()
+
+    @torch.jit.script_method
+    def forward(self, x: torch.Tensor, state: List[torch.Tensor]):
+        with torch.no_grad():
+            z = self.z
+            if self.has_ln0:
+                x = F.layer_norm(
+                    x,
+                    (self.n_embd,),
+                    weight=z["blocks.0.ln0.weight"],
+                    bias=z["blocks.0.ln0.bias"],
+                )
+
+            v_first = torch.empty_like(x)
+            for i in range(self.n_layer):
+                bbb = "blocks." + str(i) + "."
+                att = bbb + "att."
+                ffn = bbb + "ffn."
+
+                xx = F.layer_norm(
+                    x,
+                    (self.n_embd,),
+                    weight=z[bbb + "ln1.weight"],
+                    bias=z[bbb + "ln1.bias"],
+                )
+
+                xx, state[i * 3 + 0], state[i * 3 + 1], v_first = _OFFICIAL_RWKV7_TIME_MIXING(
+                    i,
+                    self.n_head,
+                    self.head_size,
+                    xx,
+                    state[i * 3 + 0],
+                    v_first,
+                    state[i * 3 + 1],
+                    z[att + "x_r"],
+                    z[att + "x_w"],
+                    z[att + "x_k"],
+                    z[att + "x_v"],
+                    z[att + "x_a"],
+                    z[att + "x_g"],
+                    z[att + "w0"],
+                    z[att + "w1"],
+                    z[att + "w2"],
+                    z[att + "a0"],
+                    z[att + "a1"],
+                    z[att + "a2"],
+                    z[att + "v0"],
+                    z[att + "v1"],
+                    z[att + "v2"],
+                    z[att + "g1"],
+                    z[att + "g2"],
+                    z[att + "k_k"],
+                    z[att + "k_a"],
+                    z[att + "r_k"],
+                    z[att + "key.weight"],
+                    z[att + "value.weight"],
+                    z[att + "receptance.weight"],
+                    z[att + "output.weight"],
+                    z[att + "ln_x.weight"],
+                    z[att + "ln_x.bias"],
+                )
+                x = x + xx
+
+                xx = F.layer_norm(
+                    x,
+                    (self.n_embd,),
+                    weight=z[bbb + "ln2.weight"],
+                    bias=z[bbb + "ln2.bias"],
+                )
+                xx, state[i * 3 + 2] = _OFFICIAL_RWKV7_CHANNEL_MIXING(
+                    xx,
+                    state[i * 3 + 2],
+                    z[ffn + "x_k"],
+                    z[ffn + "key.weight"],
+                    z[ffn + "value.weight"],
+                )
+                x = x + xx
+
+            x = F.layer_norm(
+                x,
+                (self.n_embd,),
+                weight=z["ln_out.weight"],
+                bias=z["ln_out.bias"],
+            )
+            return x, state
+
+
 class OfficialRWKV7Block(nn.Module):
     def __init__(self, *, emb_dim: int, layer_id: int, num_layers: int, head_size: int):
         super().__init__()
@@ -235,12 +354,6 @@ class OfficialRWKV7Block(nn.Module):
                 self.att.ln_x.bias,
             )
 
-        att_in = self.ln1(x)
-        att_out, att_x_prev_next, att_kv_next, v_first_next = torch.vmap(
-            _single_att_step, in_dims=(0, 0, 0, 0), out_dims=(0, 0, 0, 0)
-        )(att_in, att_x_prev, att_kv, v_first)
-        x = x + att_out
-
         def _single_ffn_step(x_i, x_prev_i):
             return official.channel_mixing__(
                 x_i,
@@ -250,8 +363,67 @@ class OfficialRWKV7Block(nn.Module):
                 self.ffn.value.weight,
             )
 
+        att_in = self.ln1(x)
+        batch_size = int(att_in.shape[0])
+        if batch_size == 1:
+            att_out_i, att_x_prev_next_i, att_kv_next_i, v_first_next_i = official.time_mixing__(
+                int(self.layer_id),
+                int(self.n_head),
+                int(self.head_size),
+                att_in[0],
+                att_x_prev[0],
+                v_first[0],
+                att_kv[0],
+                self.att.x_r.squeeze(0).squeeze(0),
+                self.att.x_w.squeeze(0).squeeze(0),
+                self.att.x_k.squeeze(0).squeeze(0),
+                self.att.x_v.squeeze(0).squeeze(0),
+                self.att.x_a.squeeze(0).squeeze(0),
+                self.att.x_g.squeeze(0).squeeze(0),
+                self.att.w0.squeeze(0).squeeze(0),
+                self.att.w1,
+                self.att.w2,
+                self.att.a0.squeeze(0).squeeze(0),
+                self.att.a1,
+                self.att.a2,
+                self.att.v0.squeeze(0).squeeze(0),
+                self.att.v1,
+                self.att.v2,
+                self.att.g1,
+                self.att.g2,
+                self.att.k_k.squeeze(0).squeeze(0),
+                self.att.k_a.squeeze(0).squeeze(0),
+                self.att.r_k.reshape(-1),
+                self.att.key.weight,
+                self.att.value.weight,
+                self.att.receptance.weight,
+                self.att.output.weight,
+                self.att.ln_x.weight,
+                self.att.ln_x.bias,
+            )
+            att_out = att_out_i.unsqueeze(0)
+            att_x_prev_next = att_x_prev_next_i.unsqueeze(0)
+            att_kv_next = att_kv_next_i.unsqueeze(0)
+            v_first_next = v_first_next_i.unsqueeze(0)
+        else:
+            att_out, att_x_prev_next, att_kv_next, v_first_next = torch.vmap(
+                _single_att_step, in_dims=(0, 0, 0, 0), out_dims=(0, 0, 0, 0)
+            )(att_in, att_x_prev, att_kv, v_first)
+        x = x + att_out
+
         ffn_in = self.ln2(x)
-        ffn_out, ffn_x_prev_next = torch.vmap(_single_ffn_step, in_dims=(0, 0), out_dims=(0, 0))(ffn_in, ffn_x_prev)
+        if batch_size == 1:
+            ffn_out_i, ffn_x_prev_next_i = official.channel_mixing__(
+                ffn_in[0],
+                ffn_x_prev[0],
+                self.ffn.x_k.squeeze(0).squeeze(0),
+                self.ffn.key.weight,
+                self.ffn.value.weight,
+            )
+            ffn_out = ffn_out_i.unsqueeze(0)
+            ffn_x_prev_next = ffn_x_prev_next_i.unsqueeze(0)
+        else:
+            ffn_out, ffn_x_prev_next = torch.vmap(_single_ffn_step, in_dims=(0, 0), out_dims=(0, 0))(ffn_in, ffn_x_prev)
         x = x + ffn_out
         return x, (att_x_prev_next, att_kv_next, ffn_x_prev_next), v_first_next
 
@@ -306,12 +478,21 @@ class OfficialRWKV7Block(nn.Module):
 
 
 class RWKV7Core(nn.Module):
-    def __init__(self, *, emb_dim: int, nlayers: int, head_size: int, ffn_mult: int):
+    def __init__(
+        self,
+        *,
+        emb_dim: int,
+        nlayers: int,
+        head_size: int,
+        ffn_mult: int,
+        sequence_replay_checkpoint: bool = False,
+    ):
         super().__init__()
         self.emb_dim = int(emb_dim)
         self.nlayers = int(nlayers)
         self.head_size = int(head_size)
         self.ffn_mult = int(ffn_mult)
+        self.sequence_replay_checkpoint = bool(sequence_replay_checkpoint)
         if self.head_size != 64:
             raise ValueError(
                 f"Official RWKV-7 maintained path requires rwkv_head_size=64, got {self.head_size}."
@@ -332,6 +513,124 @@ class RWKV7Core(nn.Module):
             ]
         )
         self.ln_out = nn.LayerNorm(self.emb_dim)
+        self._official_eval_core = None
+        self._official_eval_core_device = None
+
+    def train(self, mode: bool = True):
+        self._official_eval_core = None
+        self._official_eval_core_device = None
+        return super().train(mode)
+
+    def load_state_dict(self, state_dict, strict: bool = True):
+        self._official_eval_core = None
+        self._official_eval_core_device = None
+        return super().load_state_dict(state_dict, strict=strict)
+
+    def _flatten_official_eval_state(self, state):
+        flat_state = []
+        for att_x_prev, att_kv, ffn_x_prev in state:
+            flat_state.append(att_x_prev[0].contiguous())
+            flat_state.append(att_kv[0].contiguous())
+            flat_state.append(ffn_x_prev[0].contiguous())
+        return flat_state
+
+    def _is_official_eval_state(self, state) -> bool:
+        if not isinstance(state, list):
+            return False
+        if len(state) != int(self.nlayers) * 3:
+            return False
+        return all(torch.is_tensor(t) for t in state)
+
+    def _init_official_eval_state(self, *, device: torch.device, dtype: torch.dtype):
+        return self._flatten_official_eval_state(self.init_state(1, device=device, dtype=dtype))
+
+    def _build_official_eval_weights(self, *, device: torch.device):
+        def _snapshot(name: str, tensor: torch.Tensor):
+            tensor = tensor.detach().to(device=device)
+            if name.endswith("att.w0"):
+                tensor = tensor.to(dtype=torch.float32)
+            else:
+                tensor = tensor.to(dtype=torch.bfloat16)
+            return tensor.contiguous()
+
+        z: Dict[str, torch.Tensor] = {
+            "ln_out.weight": _snapshot("ln_out.weight", self.ln_out.weight),
+            "ln_out.bias": _snapshot("ln_out.bias", self.ln_out.bias),
+        }
+        for layer_id, block in enumerate(self.blocks):
+            prefix = f"blocks.{layer_id}."
+            if hasattr(block, "ln0"):
+                z[prefix + "ln0.weight"] = _snapshot(prefix + "ln0.weight", block.ln0.weight)
+                z[prefix + "ln0.bias"] = _snapshot(prefix + "ln0.bias", block.ln0.bias)
+            z[prefix + "ln1.weight"] = _snapshot(prefix + "ln1.weight", block.ln1.weight)
+            z[prefix + "ln1.bias"] = _snapshot(prefix + "ln1.bias", block.ln1.bias)
+            z[prefix + "ln2.weight"] = _snapshot(prefix + "ln2.weight", block.ln2.weight)
+            z[prefix + "ln2.bias"] = _snapshot(prefix + "ln2.bias", block.ln2.bias)
+
+            att_prefix = prefix + "att."
+            z[att_prefix + "x_r"] = _snapshot(att_prefix + "x_r", block.att.x_r.squeeze(0).squeeze(0))
+            z[att_prefix + "x_w"] = _snapshot(att_prefix + "x_w", block.att.x_w.squeeze(0).squeeze(0))
+            z[att_prefix + "x_k"] = _snapshot(att_prefix + "x_k", block.att.x_k.squeeze(0).squeeze(0))
+            z[att_prefix + "x_v"] = _snapshot(att_prefix + "x_v", block.att.x_v.squeeze(0).squeeze(0))
+            z[att_prefix + "x_a"] = _snapshot(att_prefix + "x_a", block.att.x_a.squeeze(0).squeeze(0))
+            z[att_prefix + "x_g"] = _snapshot(att_prefix + "x_g", block.att.x_g.squeeze(0).squeeze(0))
+            z[att_prefix + "w0"] = _snapshot(att_prefix + "w0", block.att.w0.squeeze(0).squeeze(0))
+            z[att_prefix + "w1"] = _snapshot(att_prefix + "w1", block.att.w1)
+            z[att_prefix + "w2"] = _snapshot(att_prefix + "w2", block.att.w2)
+            z[att_prefix + "a0"] = _snapshot(att_prefix + "a0", block.att.a0.squeeze(0).squeeze(0))
+            z[att_prefix + "a1"] = _snapshot(att_prefix + "a1", block.att.a1)
+            z[att_prefix + "a2"] = _snapshot(att_prefix + "a2", block.att.a2)
+            z[att_prefix + "v0"] = _snapshot(att_prefix + "v0", block.att.v0.squeeze(0).squeeze(0))
+            z[att_prefix + "v1"] = _snapshot(att_prefix + "v1", block.att.v1)
+            z[att_prefix + "v2"] = _snapshot(att_prefix + "v2", block.att.v2)
+            z[att_prefix + "g1"] = _snapshot(att_prefix + "g1", block.att.g1)
+            z[att_prefix + "g2"] = _snapshot(att_prefix + "g2", block.att.g2)
+            z[att_prefix + "k_k"] = _snapshot(att_prefix + "k_k", block.att.k_k.squeeze(0).squeeze(0))
+            z[att_prefix + "k_a"] = _snapshot(att_prefix + "k_a", block.att.k_a.squeeze(0).squeeze(0))
+            z[att_prefix + "r_k"] = _snapshot(att_prefix + "r_k", block.att.r_k.reshape(-1))
+            z[att_prefix + "key.weight"] = _snapshot(att_prefix + "key.weight", block.att.key.weight)
+            z[att_prefix + "value.weight"] = _snapshot(att_prefix + "value.weight", block.att.value.weight)
+            z[att_prefix + "receptance.weight"] = _snapshot(att_prefix + "receptance.weight", block.att.receptance.weight)
+            z[att_prefix + "output.weight"] = _snapshot(att_prefix + "output.weight", block.att.output.weight)
+            z[att_prefix + "ln_x.weight"] = _snapshot(att_prefix + "ln_x.weight", block.att.ln_x.weight)
+            z[att_prefix + "ln_x.bias"] = _snapshot(att_prefix + "ln_x.bias", block.att.ln_x.bias)
+
+            ffn_prefix = prefix + "ffn."
+            z[ffn_prefix + "x_k"] = _snapshot(ffn_prefix + "x_k", block.ffn.x_k.squeeze(0).squeeze(0))
+            z[ffn_prefix + "key.weight"] = _snapshot(ffn_prefix + "key.weight", block.ffn.key.weight)
+            z[ffn_prefix + "value.weight"] = _snapshot(ffn_prefix + "value.weight", block.ffn.value.weight)
+        return z
+
+    def _get_official_eval_core(self, *, device: torch.device):
+        if self._official_eval_core is not None and self._official_eval_core_device == device:
+            return self._official_eval_core
+        z = self._build_official_eval_weights(device=device)
+        self._official_eval_core = OfficialRWKV7EvalCore(
+            z=z,
+            n_embd=self.emb_dim,
+            n_layer=self.nlayers,
+            n_head=self.emb_dim // self.head_size,
+            head_size=self.head_size,
+            has_ln0=hasattr(self.blocks[0], "ln0"),
+        ).to(device=device)
+        self._official_eval_core_device = device
+        return self._official_eval_core
+
+    def _forward_step_official_eval(self, token: torch.Tensor, state=None):
+        output_dtype = token.dtype
+        token = token.to(dtype=torch.bfloat16)
+        if state is None:
+            flat_state = self._init_official_eval_state(device=token.device, dtype=token.dtype)
+        elif self._is_official_eval_state(state):
+            flat_state = state
+        else:
+            flat_state = self._flatten_official_eval_state(state)
+        compiler_mod = getattr(torch, "compiler", None)
+        if compiler_mod is not None and hasattr(compiler_mod, "cudagraph_mark_step_begin"):
+            compiler_mod.cudagraph_mark_step_begin()
+        eval_core = self._get_official_eval_core(device=token.device)
+        hidden, flat_state = eval_core(token[0], flat_state)
+        return hidden.unsqueeze(0).to(dtype=output_dtype), flat_state
 
     def init_state(self, batch_size: int, *, device: torch.device, dtype: torch.dtype):
         return [block.init_state(batch_size, device=device, dtype=dtype) for block in self.blocks]
@@ -340,15 +639,24 @@ class RWKV7Core(nn.Module):
         if token.ndim != 2:
             raise ValueError(f"RWKV7Core.forward_step expects (B, C), got {tuple(token.shape)}")
         batch_size = int(token.shape[0])
+        if (
+            batch_size == 1
+            and token.is_cuda
+            and (not self.training)
+            and (not torch.is_grad_enabled())
+        ):
+            return self._forward_step_official_eval(token, state)
         if state is None:
             state = self.init_state(batch_size, device=token.device, dtype=token.dtype)
         x = token
         new_state = []
         v_first = None
-        for block, block_state in zip(self.blocks, state):
-            x, block_state_next, v_first = block.forward_step(x, block_state, v_first)
-            new_state.append(block_state_next)
-        x = self.ln_out(x)
+        autocast_enabled = bool(token.is_cuda)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=autocast_enabled):
+            for block, block_state in zip(self.blocks, state):
+                x, block_state_next, v_first = block.forward_step(x, block_state, v_first)
+                new_state.append(block_state_next)
+            x = self.ln_out(x)
         return x, new_state
 
     def forward_tokens(self, tokens: torch.Tensor, state=None):
@@ -390,7 +698,28 @@ class RWKV7Core(nn.Module):
         v_first = None
         with torch.autocast(device_type="cuda", dtype=torch.bfloat16):
             for block in self.blocks:
-                x, v_first = block.forward_sequence(x, v_first)
+                if self.sequence_replay_checkpoint and torch.is_grad_enabled():
+                    if v_first is None:
+                        def _run_block_no_vfirst(x_in, *, _block=block):
+                            return _block.forward_sequence(x_in, None)
+
+                        x, v_first = torch.utils.checkpoint.checkpoint(
+                            _run_block_no_vfirst,
+                            x,
+                            use_reentrant=False,
+                        )
+                    else:
+                        def _run_block_with_vfirst(x_in, v_first_in, *, _block=block):
+                            return _block.forward_sequence(x_in, v_first_in)
+
+                        x, v_first = torch.utils.checkpoint.checkpoint(
+                            _run_block_with_vfirst,
+                            x,
+                            v_first,
+                            use_reentrant=False,
+                        )
+                else:
+                    x, v_first = block.forward_sequence(x, v_first)
             x = self.ln_out(x)
         x = x.transpose(0, 1)
         if pad_len > 0:
@@ -428,6 +757,7 @@ class RWKV7PFN(nn.Module):
         backbone="rwkv7",
         rwkv_head_size=64,
         rwkv_ffn_mult=4,
+        rwkv_sequence_replay_checkpoint=False,
     ):
         del dropout, pre_norm, activation, recompute_attn, all_layers_same_init, y_encoder
         super().__init__()
@@ -438,6 +768,7 @@ class RWKV7PFN(nn.Module):
         self.backbone = str(backbone)
         self.rwkv_head_size = int(rwkv_head_size)
         self.rwkv_ffn_mult = int(rwkv_ffn_mult)
+        self.rwkv_sequence_replay_checkpoint = bool(rwkv_sequence_replay_checkpoint)
 
         if self.x_encoder_type == "single":
             self.encoder = Linear(n_features, self.emsize, replace_nan_by_zero=True)
@@ -464,6 +795,7 @@ class RWKV7PFN(nn.Module):
             nlayers=int(nlayers),
             head_size=self.rwkv_head_size,
             ffn_mult=self.rwkv_ffn_mult,
+            sequence_replay_checkpoint=self.rwkv_sequence_replay_checkpoint,
         )
         backbone_size = sum(p.numel() for p in self.rwkv_core.parameters())
         if wandb.run:
@@ -494,17 +826,10 @@ class RWKV7PFN(nn.Module):
         return next(self.rwkv_core.parameters())
 
     def _ensure_rwkv_core_runtime_dtype(self, device: torch.device):
-        if device.type != "cuda":
-            return
-        core_param = self._rwkv_core_param()
-        if core_param.dtype != torch.bfloat16:
-            self.rwkv_core.to(dtype=torch.bfloat16)
+        del device
+        return
 
     def _cast_token_for_rwkv_core(self, token: torch.Tensor):
-        self._ensure_rwkv_core_runtime_dtype(token.device)
-        core_dtype = self._rwkv_core_param().dtype
-        if token.dtype != core_dtype:
-            token = token.to(dtype=core_dtype)
         return token
 
     def has_policy_action_head(self):
@@ -749,6 +1074,27 @@ class RWKV7PFN(nn.Module):
         token = self._cast_token_for_rwkv_core(token)
         hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
         return self._decode_policy_action(hidden)
+
+    def replay_policy_sequence_tokens(self, x_tokens, y_tokens):
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_sequence_tokens requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_policy_sequence_tokens expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        tokens = self._encode_train_token(x_tokens, y_tokens)
+        tokens = self._cast_token_for_rwkv_core(tokens)
+        hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+        return self._decode_policy_action(hidden_all)
 
     def forward_policy_step(
         self,

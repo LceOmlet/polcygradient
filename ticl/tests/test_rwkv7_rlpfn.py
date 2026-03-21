@@ -68,6 +68,7 @@ def _run_rwkv7_exact_scm_chunk(
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
     reinforce_sequence_replay_enabled=False,
+    rwkv_sequence_replay_checkpoint=None,
 ):
     _ensure_torch_extensions_dir()
     _seed_everything(123)
@@ -76,6 +77,8 @@ def _run_rwkv7_exact_scm_chunk(
     cfg["transformer"]["emsize"] = 64
     cfg["transformer"]["nlayers"] = 2
     cfg["transformer"]["rwkv_head_size"] = 64
+    if rwkv_sequence_replay_checkpoint is not None:
+        cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = bool(rwkv_sequence_replay_checkpoint)
     cfg["optimizer"]["rl_objective"] = "reinforce"
 
     prior = EnvironmentPrior(env_cfg)
@@ -137,6 +140,7 @@ def _run_rwkv7_exact_scm_reinforce_rollout(
     *,
     device="cpu",
     reinforce_sequence_replay_enabled=False,
+    rwkv_sequence_replay_checkpoint=None,
 ):
     _ensure_torch_extensions_dir()
     _seed_everything(123)
@@ -145,6 +149,8 @@ def _run_rwkv7_exact_scm_reinforce_rollout(
     cfg["transformer"]["emsize"] = 64
     cfg["transformer"]["nlayers"] = 2
     cfg["transformer"]["rwkv_head_size"] = 64
+    if rwkv_sequence_replay_checkpoint is not None:
+        cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = bool(rwkv_sequence_replay_checkpoint)
     cfg["optimizer"]["rl_objective"] = "reinforce"
 
     prior = EnvironmentPrior(env_cfg)
@@ -184,6 +190,7 @@ def _run_rwkv7_exact_scm_reinforce_rollout(
         rollout_seeds_override=[101, 211],
         policy_objective_kind="reinforce",
     )
+    replay_meta = getattr(prior, "last_rollout_reinforce", None)
     return {
         "loss": loss.detach().clone(),
         "stats": {
@@ -194,6 +201,13 @@ def _run_rwkv7_exact_scm_reinforce_rollout(
         "rewards": rollout["rewards"].detach().clone(),
         "log_probs": prior.last_rollout_reinforce["log_probs"].detach().clone(),
         "sequence_replay_applied": bool(prior.last_rollout_reinforce.get("sequence_replay_applied", False)),
+        "single_eval_pos": int(rollout.get("single_eval_pos", 0)),
+        "replay_action_steps": (
+            None if not isinstance(replay_meta, dict) else replay_meta.get("sequence_replay_action_steps", None)
+        ),
+        "replay_eval_start": (
+            None if not isinstance(replay_meta, dict) else replay_meta.get("sequence_replay_eval_start", None)
+        ),
     }
 
 
@@ -711,11 +725,41 @@ def test_rwkv7_reinforce_sequence_replay_preserves_rollout_under_fixed_seeds():
 
     assert torch.equal(base["x"], replay["x"])
     assert torch.equal(base["rewards"], replay["rewards"])
-    assert torch.equal(base["log_probs"], replay["log_probs"])
+    eval_start = int(base["single_eval_pos"])
+    assert torch.equal(base["log_probs"][eval_start:], replay["log_probs"][eval_start:])
     for key in ("objective", "reward_mean", "reward_std"):
         assert torch.equal(base["stats"][key], replay["stats"][key]), key
     assert replay["sequence_replay_applied"]
     assert torch.isfinite(replay["log_probs"]).all().item()
+
+
+def test_rwkv7_reinforce_sequence_replay_keeps_only_eval_suffix_aux_tensors():
+    if not torch.cuda.is_available():
+        return
+
+    replay = _run_rwkv7_exact_scm_reinforce_rollout(
+        device="cuda",
+        reinforce_sequence_replay_enabled=True,
+    )
+
+    assert replay["sequence_replay_applied"]
+    assert replay["replay_eval_start"] == replay["single_eval_pos"]
+    assert replay["replay_action_steps"] == int(replay["rewards"].shape[0]) - int(replay["single_eval_pos"])
+
+
+def test_rwkv7_default_config_enables_sequence_replay_checkpoint():
+    cfg = _build_rwkv7_rlpfn_config()
+    assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
+
+
+def test_rwkv7_default_model_enables_sequence_replay_checkpoint():
+    if not torch.cuda.is_available():
+        return
+
+    _ensure_torch_extensions_dir()
+    cfg = _build_rwkv7_rlpfn_config()
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    assert bool(model.rwkv_core.sequence_replay_checkpoint) is True
 
 
 def test_rwkv7_cuda_stepwise_core_matches_official_sequence_core():
@@ -779,6 +823,71 @@ def test_rwkv7_reinforce_sequence_replay_gradients_match_stepwise_reinforce():
     mean_abs_diff /= float(max(1, len(grads_base)))
     assert max_abs_diff <= 2e-3
     assert mean_abs_diff <= 5e-6
+
+
+def test_rwkv7_reinforce_sequence_replay_checkpoint_matches_no_checkpoint():
+    if not torch.cuda.is_available():
+        return
+
+    _ensure_torch_extensions_dir()
+    loss_base, stats_base, grads_base = _run_rwkv7_exact_scm_chunk(
+        device="cuda",
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        reinforce_sequence_replay_enabled=True,
+        rwkv_sequence_replay_checkpoint=False,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_rwkv7_exact_scm_chunk(
+        device="cuda",
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        reinforce_sequence_replay_enabled=True,
+        rwkv_sequence_replay_checkpoint=True,
+    )
+
+    assert torch.equal(loss_base, loss_ckpt)
+    for key in ("objective", "reward_mean", "reward_std"):
+        assert torch.equal(stats_base[key], stats_ckpt[key]), key
+    assert len(grads_base) == len(grads_ckpt)
+
+    max_abs_diff = 0.0
+    mean_abs_diff = 0.0
+    for grad_base, grad_ckpt in zip(grads_base, grads_ckpt):
+        diff = (grad_base - grad_ckpt).abs()
+        max_abs_diff = max(max_abs_diff, float(diff.max()))
+        mean_abs_diff += float(diff.mean())
+    mean_abs_diff /= float(max(1, len(grads_base)))
+    assert max_abs_diff <= 2e-3
+    assert mean_abs_diff <= 5e-6
+
+
+def test_rwkv7_default_sequence_replay_path_invokes_checkpoint(monkeypatch):
+    if not torch.cuda.is_available():
+        return
+
+    call_count = {"n": 0}
+    original_checkpoint = torch.utils.checkpoint.checkpoint
+
+    def _wrapped_checkpoint(function, *args, **kwargs):
+        call_count["n"] += 1
+        return original_checkpoint(function, *args, **kwargs)
+
+    monkeypatch.setattr(torch.utils.checkpoint, "checkpoint", _wrapped_checkpoint)
+    loss, stats, grads = _run_rwkv7_exact_scm_chunk(
+        device="cuda",
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        reinforce_sequence_replay_enabled=True,
+        rwkv_sequence_replay_checkpoint=None,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(stats["objective"]).item()
+    assert grads
+    assert int(call_count["n"]) > 0
 
 
 def test_rwkv7_rlpfn_official_cuda_sequence_forward_runs():

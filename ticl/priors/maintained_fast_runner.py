@@ -171,9 +171,13 @@ def dispatch_policy_rollout(prior, ctx):
     reinforce_sequence_replay_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_fn", None)
     fit_action_dim_fn = getattr(policy_step_fn, "_fit_action_dim_fn", None)
     reinforce_sequence_replay_applied = False
+    reinforce_sequence_replay_eval_start = None
+    reinforce_sequence_replay_action_steps = None
 
     def _maybe_replay_reinforce_log_probs(x_tokens, group_reinforce, group_replay):
         nonlocal reinforce_sequence_replay_applied
+        nonlocal reinforce_sequence_replay_eval_start
+        nonlocal reinforce_sequence_replay_action_steps
         if not policy_collect_reinforce_replay:
             return group_reinforce.get("log_probs", None) if isinstance(group_reinforce, dict) else None
         if not callable(reinforce_sequence_replay_fn):
@@ -187,9 +191,13 @@ def dispatch_policy_rollout(prior, ctx):
         sampled_action = group_replay.get("sampled_action", None)
         action_std = group_replay.get("action_std", None)
         action_mask = group_replay.get("action_mask", None)
+        eval_start = int(group_replay.get("eval_start", 0) or 0)
+        full_length = int(group_replay.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
         if not all(torch.is_tensor(t) for t in (reward_in, action_pre_tanh, sampled_action, action_std, action_mask)):
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
         action_mean_replay = reinforce_sequence_replay_fn(x_tokens, reward_in)
+        if int(action_pre_tanh.shape[0]) != int(action_mean_replay.shape[0]):
+            action_mean_replay = action_mean_replay[eval_start : eval_start + int(action_pre_tanh.shape[0])]
         replay_action_dim = int(action_pre_tanh.shape[-1])
         if callable(fit_action_dim_fn):
             action_mean_replay = fit_action_dim_fn(action_mean_replay.reshape(-1, int(action_mean_replay.shape[-1])), replay_action_dim)
@@ -202,13 +210,24 @@ def dispatch_policy_rollout(prior, ctx):
             action_mean_replay = action_mean_replay[..., :replay_action_dim]
         action_mean_replay = action_mean_replay.to(dtype=action_pre_tanh.dtype)
         reinforce_sequence_replay_applied = True
-        return prior._squashed_gaussian_log_prob(
+        reinforce_sequence_replay_eval_start = int(eval_start)
+        reinforce_sequence_replay_action_steps = int(action_pre_tanh.shape[0])
+        suffix_log_probs = prior._squashed_gaussian_log_prob(
             action_pre_tanh,
             action_mean_replay,
             action_std,
             action=sampled_action,
             mask=action_mask,
         ).to(dtype=torch.float32)
+        if int(action_pre_tanh.shape[0]) == int(full_length) and eval_start == 0:
+            return suffix_log_probs
+        full_log_probs = torch.zeros(
+            (full_length, int(suffix_log_probs.shape[1])),
+            device=suffix_log_probs.device,
+            dtype=suffix_log_probs.dtype,
+        )
+        full_log_probs[eval_start : eval_start + int(suffix_log_probs.shape[0])] = suffix_log_probs
+        return full_log_probs
 
     if policy_collect_reinforce_replay and backend != "torch_vectorized":
         raise RuntimeError("reinforce sequence replay currently requires torch_vectorized rollout backend")
@@ -563,6 +582,16 @@ def dispatch_policy_rollout(prior, ctx):
                 "log_probs": reinforce_log_probs,
                 "log_prob_score": reinforce_log_prob_scores,
                 "sequence_replay_applied": bool(reinforce_sequence_replay_applied),
+                "sequence_replay_eval_start": (
+                    None
+                    if reinforce_sequence_replay_eval_start is None
+                    else int(reinforce_sequence_replay_eval_start)
+                ),
+                "sequence_replay_action_steps": (
+                    None
+                    if reinforce_sequence_replay_action_steps is None
+                    else int(reinforce_sequence_replay_action_steps)
+                ),
             }
             if reinforce_log_probs is not None
             else None
@@ -726,6 +755,16 @@ def dispatch_policy_rollout(prior, ctx):
             "log_probs": reinforce_log_probs,
             "log_prob_score": reinforce_log_prob_scores,
             "sequence_replay_applied": bool(reinforce_sequence_replay_applied),
+            "sequence_replay_eval_start": (
+                None
+                if reinforce_sequence_replay_eval_start is None
+                else int(reinforce_sequence_replay_eval_start)
+            ),
+            "sequence_replay_action_steps": (
+                None
+                if reinforce_sequence_replay_action_steps is None
+                else int(reinforce_sequence_replay_action_steps)
+            ),
         }
         if reinforce_log_probs is not None
         else None

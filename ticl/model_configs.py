@@ -105,6 +105,7 @@ def get_transformer_config():
         'backbone': 'transformer',
         'rwkv_head_size': 64,
         'rwkv_ffn_mult': 4,
+        'rwkv_sequence_replay_checkpoint': False,
         # x encoder layout:
         # - "single": one linear encoder over full num_features
         # - "split_obs_action": two heads (obs/reward/mask + action)
@@ -418,17 +419,13 @@ def get_rlpfn_default_config():
     # Policy-gradient rollout chunking over batch columns.
     # None means full-batch rollout chunk (max parallel width).
     config['optimizer']['policy_rollout_chunk_size'] = None
-    # Recompute rollout forward during backward to reduce peak training memory.
-    # Semantics are preserved (same sampled environments via RNG state restore),
-    # with extra compute overhead.
-    config['optimizer']['policy_rollout_checkpoint'] = True
-    # Use reentrant checkpoint by default for rollout: it avoids building/storing
-    # the full inner autograd graph during forward.
-    config['optimizer']['policy_rollout_checkpoint_reentrant'] = True
-    # Enable grad-mutable KV cache on paged mode (stable default).
-    config['optimizer']['pg_grad_mutable_kv_cache'] = True
-    config['optimizer']['pg_kv_cache_mode'] = "paged"
-    config['optimizer']['pg_kv_cache_page_size'] = 128
+    # RWKV reinforce mainline uses official full-sequence replay, so the
+    # maintained default does not rely on TBPTT or transformer-style paged KV.
+    config['optimizer']['policy_rollout_checkpoint'] = False
+    config['optimizer']['policy_rollout_checkpoint_reentrant'] = False
+    config['optimizer']['pg_grad_mutable_kv_cache'] = False
+    config['optimizer']['pg_kv_cache_mode'] = "immutable"
+    config['optimizer']['pg_kv_cache_page_size'] = None
     # Keep rollout chunk fixed by default.
     config['optimizer']['policy_rollout_chunk_autotune'] = False
     config['optimizer']['policy_rollout_chunk_grow_every'] = 8
@@ -467,18 +464,17 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     config['optimizer']['train_kernel_profiler_export_trace'] = True
     config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
-    # Default to policy-only CPU offload: it captures most of the shared
-    # transformer memory reduction while keeping host/RSS and wall-time below
-    # full rollout offload on the maintained risky-load benchmark.
-    config['optimizer']['pg_saved_tensors_cpu_offload'] = True
+    # Keep host-side tensor offload disabled by default on the maintained RWKV
+    # reinforce mainline to avoid RSS blowups.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 8
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 16
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
-    # Enable TBPTT by default for memory/throughput tradeoff.
-    config['optimizer']['pg_tbptt_window'] = 32
+    # Official RWKV reinforce sequence replay currently requires no-TBPTT.
+    config['optimizer']['pg_tbptt_window'] = None
     # Keep one rollout->update cycle per batch by default for throughput-first
     # benchmarking and simpler PG phase attribution.
     config['optimizer']['pg_env_replay_steps'] = 1
@@ -489,11 +485,12 @@ def get_rlpfn_default_config():
     # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
     config['optimizer']['pg_oom_fail_fast'] = True
-    # Longer TBPTT mainline needs a more conservative default step size.
+    # Keep the maintained RWKV reinforce mainline on the existing optimizer
+    # scale until dedicated skyline tuning lands.
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 64 * 8
+    config['dataloader']['batch_size'] = 64 * 16
     return config
 
 

@@ -239,6 +239,7 @@ def get_model(
     backbone_kind = str(transformer_cfg.pop('backbone', 'transformer')).strip().lower()
     rwkv_head_size = transformer_cfg.pop('rwkv_head_size', 64)
     rwkv_ffn_mult = transformer_cfg.pop('rwkv_ffn_mult', 4)
+    rwkv_sequence_replay_checkpoint = transformer_cfg.pop('rwkv_sequence_replay_checkpoint', False)
 
     if model_type == "mothernet":
         model = MotherNet(
@@ -260,6 +261,7 @@ def get_model(
                 backbone=backbone_kind,
                 rwkv_head_size=rwkv_head_size,
                 rwkv_ffn_mult=rwkv_ffn_mult,
+                rwkv_sequence_replay_checkpoint=rwkv_sequence_replay_checkpoint,
                 **transformer_cfg,
             )
         else:

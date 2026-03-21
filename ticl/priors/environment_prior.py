@@ -12779,23 +12779,25 @@ class EnvironmentPrior:
         )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
+        replay_eval_start = int(max(0, min(int(n_samples), int(single_eval_pos))))
+        replay_eval_steps = int(max(0, int(n_samples) - replay_eval_start))
         replay_reward_in_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_reinforce_replay
             else None
         )
         replay_action_pre_tanh_steps = (
-            torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            torch.empty((replay_eval_steps, batch_size, max_action_dim), device=device, dtype=torch.float32)
             if collect_reinforce_replay
             else None
         )
         replay_sampled_action_steps = (
-            torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            torch.empty((replay_eval_steps, batch_size, max_action_dim), device=device, dtype=torch.float32)
             if collect_reinforce_replay
             else None
         )
         replay_action_std_steps = (
-            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            torch.empty((replay_eval_steps, batch_size), device=device, dtype=torch.float32)
             if collect_reinforce_replay
             else None
         )
@@ -13907,8 +13909,8 @@ class EnvironmentPrior:
                                 action_valid = (action_positions < action_cap) & (action_cols < num_features)
                                 if torch.any(action_valid):
                                     action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
-                                action_src = action_t[:, :action_write_cap].detach()
-                                token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
+                                    action_src = action_t[:, :action_write_cap].detach()
+                                    token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
             if collect_reinforce_replay:
                 replay_reward_in_steps[t] = reward_t.detach()
 
@@ -14022,10 +14024,11 @@ class EnvironmentPrior:
                     rms_eps=action_rms_eps,
                     mask=action_mask,
                 )
-                if collect_reinforce_replay:
-                    replay_action_pre_tanh_steps[t] = action_pre_tanh.detach()
-                    replay_sampled_action_steps[t] = action_next.detach()
-                    replay_action_std_steps[t] = action_std_t.detach()
+                if collect_reinforce_replay and t >= replay_eval_start:
+                    replay_t = int(t - replay_eval_start)
+                    replay_action_pre_tanh_steps[replay_t] = action_pre_tanh.detach()
+                    replay_sampled_action_steps[replay_t] = action_next.detach()
+                    replay_action_std_steps[replay_t] = action_std_t.detach()
                 reinforce_log_prob_t = self._squashed_gaussian_log_prob(
                     action_pre_tanh.detach(),
                     action_mean,
@@ -14896,6 +14899,8 @@ class EnvironmentPrior:
                 "sampled_action": replay_sampled_action_steps,
                 "action_std": replay_action_std_steps,
                 "action_mask": replay_action_mask,
+                "eval_start": int(replay_eval_start),
+                "full_length": int(n_samples),
             }
             if collect_reinforce_replay
             else None

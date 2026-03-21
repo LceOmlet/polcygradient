@@ -109,6 +109,7 @@ def test_environment_prior_clear_rollout_artifacts_resets_all_cached_slots():
     prior.last_rollout_profile = {"policy_wall_ms": 1.0}
     prior.last_rollout_terminal_stats = {"terminal_count_mean": 1.0}
     prior.last_rollout_reinforce = {"log_probs": torch.zeros(1, 1)}
+    prior.last_rollout_reinforce_replay = {"reward_in": torch.zeros(1, 1)}
     prior.last_rollout_policy_trace = {"action_mask": torch.zeros(1, 1, 1, dtype=torch.bool)}
     prior.last_rollout_env_semantics = {"env_count": 1}
 
@@ -118,6 +119,7 @@ def test_environment_prior_clear_rollout_artifacts_resets_all_cached_slots():
     assert prior.last_rollout_profile is None
     assert prior.last_rollout_terminal_stats is None
     assert prior.last_rollout_reinforce is None
+    assert prior.last_rollout_reinforce_replay is None
     assert prior.last_rollout_policy_trace is None
     assert prior.last_rollout_env_semantics is None
 
@@ -7556,6 +7558,182 @@ def test_environment_prior_reinforce_one_hop_supports_immediate_tbptt_backward()
     assert all(torch.isfinite(g).all() for g in grads)
     assert int(stats["pg_one_hop_replay_enabled"]) == 1
     assert int(stats["pg_bridge_replay_count"]) >= 1
+
+
+def test_environment_prior_collect_x_fallback_skips_invalid_action_token_write(monkeypatch):
+    _seed_everything(2085)
+    monkeypatch.setenv("TICL_POLICY_TOKEN_LAYOUT_PREPACK", "0")
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=6,
+        num_features=3,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=True,
+        collect_runtime_info=False,
+        h_list_override=h_list,
+        env_seeds_override=[11, 12, 13, 14],
+        rollout_seeds_override=[21, 22, 23, 24],
+        policy_objective_kind="reinforce",
+    )
+
+    x = rollout["x"]
+    y = rollout["rewards"]
+    infos = rollout["info"]
+    assert tuple(x.shape) == (6, 4, 3)
+    assert tuple(y.shape) == (6, 4)
+    assert len(infos) == 4
+    assert torch.isfinite(x).all()
+    assert torch.isfinite(y).all()
+
+
+@pytest.mark.parametrize("applied_scale", [1.0, 8.0])
+def test_environment_prior_reinforce_markov_adjacent_streaming_eta_matches_buffered_gradients(applied_scale):
+    _seed_everything(2086)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["pg_one_hop_replay_enabled"] = True
+    env_cfg["alpha_grad_one_hop_replay_enabled"] = True
+    env_cfg["pg_markov_adjacent_replay_enabled"] = True
+    env_cfg["pg_markov_adjacent_replay_sample_prob"] = 1.0
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    prior_base = EnvironmentPrior(env_cfg)
+    prior_stream = EnvironmentPrior(dict(env_cfg))
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy_base = TinyPolicy()
+    policy_stream = TinyPolicy()
+    policy_stream.load_state_dict(policy_base.state_dict())
+
+    h_list = prior_base._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.2
+        h["action_noise_eval_std"] = 0.15
+    env_seeds = [101, 102, 103, 104]
+    rollout_seeds = [201, 202, 203, 204]
+
+    loss_base, _, stats_base = prior_base.rollout_policy_gradient_loss(
+        policy_step_fn=policy_base.step,
+        batch_size=4,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="reinforce",
+    )
+    policy_base.zero_grad(set_to_none=True)
+    loss_base.backward()
+    grads_base = [p.grad.detach().clone() for p in policy_base.parameters() if p.grad is not None]
+
+    payload_records = []
+
+    def tbptt_payload_sink(payload):
+        if isinstance(payload, dict):
+            loss_root = payload.get("loss_root", None)
+            retain_graph = bool(payload.get("retain_graph", False))
+            immediate = bool(payload.get("immediate", False))
+        else:
+            loss_root = payload
+            retain_graph = False
+            immediate = False
+        assert torch.is_tensor(loss_root)
+        payload_records.append((retain_graph, immediate, float(loss_root.detach().cpu())))
+        if applied_scale != 1.0:
+            (loss_root * float(applied_scale)).backward(retain_graph=retain_graph)
+            return {"applied_scale": float(applied_scale)}
+        loss_root.backward(retain_graph=retain_graph)
+        return {"applied_scale": 1.0}
+
+    tbptt_payload_sink._ticl_accepts_tbptt_payload = True
+
+    loss_stream, _, stats_stream = prior_stream.rollout_policy_gradient_loss(
+        policy_step_fn=policy_stream.step,
+        batch_size=4,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        tbptt_window=2,
+        tbptt_loss_sink=tbptt_payload_sink,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        policy_objective_kind="reinforce",
+    )
+    grads_stream = [p.grad.detach().clone() for p in policy_stream.parameters() if p.grad is not None]
+    if applied_scale != 1.0:
+        grads_stream = [g / float(applied_scale) for g in grads_stream]
+
+    assert float(loss_stream.detach().cpu()) == 0.0
+    assert torch.equal(stats_base["objective"], stats_stream["objective"])
+    assert torch.equal(stats_base["reward_mean"], stats_stream["reward_mean"])
+    assert torch.equal(stats_base["reward_std"], stats_stream["reward_std"])
+    assert int(stats_base["pg_bridge_replay_count"]) == int(stats_stream["pg_bridge_replay_count"]) == 3
+    assert int(stats_base["pg_markov_adjacent_bridge_sampled_count"]) == int(
+        stats_stream["pg_markov_adjacent_bridge_sampled_count"]
+    ) == 2
+    assert len(grads_base) == len(grads_stream)
+    for grad_base, grad_stream in zip(grads_base, grads_stream):
+        assert torch.allclose(grad_base, grad_stream, atol=1e-7, rtol=1e-7)
+    assert any(retain_graph for retain_graph, _, _ in payload_records)
+    assert any(immediate for _, immediate, _ in payload_records)
 
 
 @pytest.mark.parametrize("objective_kind", ["reinforce", "alpha_grad"])
