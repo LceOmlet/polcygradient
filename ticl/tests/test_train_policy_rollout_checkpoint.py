@@ -5,6 +5,7 @@ import torch
 
 import ticl.train as train_mod
 from ticl.model_configs import get_model_default_config, get_prior_config
+from ticl.model_builder import get_model
 from ticl.models.encoders import Linear
 import ticl.models.layer as layer_mod
 from ticl.models.tabpfn import TabPFN
@@ -226,6 +227,89 @@ def _run_streaming_tbptt_chunk(
         for k, v in stats.items()
     }
     return stats_detached, grads, streamed_roots
+
+
+def _run_maintained_first_pg_long_chunk(
+    *,
+    policy_rollout_checkpoint,
+    policy_rollout_checkpoint_reentrant=True,
+    kv_cache_mode="paged",
+    allow_grad_mutable_cache=True,
+    n_samples=128,
+    single_eval_pos=64,
+    batch_size=2,
+    pg_tbptt_window=32,
+):
+    _seed_everything(20260321)
+    cfg = get_model_default_config("rlpfn")
+    cfg["optimizer"]["rl_objective"] = "first_policy_gradient"
+    cfg["prior"]["n_samples"] = int(n_samples)
+    cfg["dataloader"]["batch_size"] = int(batch_size)
+    cfg["optimizer"]["pg_tbptt_window"] = int(pg_tbptt_window)
+    cfg["optimizer"]["policy_rollout_checkpoint"] = bool(policy_rollout_checkpoint)
+    cfg["optimizer"]["pg_kv_cache_mode"] = str(kv_cache_mode)
+    cfg["optimizer"]["pg_allow_grad_mutable_kv_cache"] = bool(allow_grad_mutable_cache)
+    cfg["optimizer"]["pg_allow_grad_inplace_paged_kv"] = False
+    cfg["transformer"]["backbone"] = "transformer"
+
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.train()
+    prior = EnvironmentPrior(dict(cfg["prior"]["environment"]))
+    step_fn = _build_policy_step_fn(
+        model,
+        cfg["prior"]["num_features"],
+        max_cache_len=int(n_samples),
+        kv_cache_mode=str(kv_cache_mode),
+        allow_grad_mutable_cache=bool(allow_grad_mutable_cache),
+        allow_grad_inplace_paged_cache=False,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+    loss, _, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=int(batch_size),
+        n_samples=int(n_samples),
+        num_features=int(cfg["prior"]["num_features"]),
+        device="cpu",
+        single_eval_pos=int(single_eval_pos),
+        collect_x=False,
+        policy_rollout_checkpoint=bool(policy_rollout_checkpoint),
+        policy_rollout_checkpoint_reentrant=bool(policy_rollout_checkpoint_reentrant),
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=int(pg_tbptt_window),
+        rl_objective="first_policy_gradient",
+    )
+    model.zero_grad(set_to_none=True)
+    loss.backward()
+    grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+    stats_detached = {
+        k: (v.detach().clone() if torch.is_tensor(v) else v)
+        for k, v in stats.items()
+    }
+    return loss.detach().clone(), stats_detached, grads
+
+
+def _assert_exact_stat_and_grad_match(
+    loss_a,
+    stats_a,
+    grads_a,
+    loss_b,
+    stats_b,
+    grads_b,
+    *,
+    stat_keys=("objective", "reward_mean", "reward_std"),
+):
+    assert torch.equal(loss_a, loss_b)
+    for key in stat_keys:
+        assert torch.equal(stats_a[key], stats_b[key]), key
+    assert len(grads_a) == len(grads_b)
+    for grad_a, grad_b in zip(grads_a, grads_b):
+        assert torch.equal(grad_a, grad_b)
 
 
 def test_train_keeps_aggregate_k_gradients_fixed_when_adaptive_batch_size_is_enabled(monkeypatch):
@@ -1697,6 +1781,77 @@ def test_first_policy_gradient_tbptt_matches_full_horizon_loss_and_stats_for_sma
     assert all(torch.isfinite(g).all() for g in grads_tbptt)
 
 
+def test_first_policy_gradient_long_rollout_paged_mutable_auto_matches_immutable_semantics():
+    loss_base, stats_base, grads_base = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+    )
+    loss_paged, stats_paged, grads_paged = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+
+    assert torch.allclose(loss_base, loss_paged, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["objective"], stats_paged["objective"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["reward_mean"], stats_paged["reward_mean"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["reward_std"], stats_paged["reward_std"], atol=1e-6, rtol=1e-5)
+    assert len(grads_base) == len(grads_paged)
+    for g_base, g_paged in zip(grads_base, grads_paged):
+        assert torch.allclose(g_base, g_paged, atol=1e-6, rtol=1e-5)
+
+
+def test_first_policy_gradient_long_rollout_reentrant_checkpoint_paged_mutable_matches_noncheckpoint():
+    loss_base, stats_base, grads_base = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+
+    assert torch.allclose(loss_base, loss_ckpt, atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["objective"], stats_ckpt["objective"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["reward_mean"], stats_ckpt["reward_mean"], atol=1e-6, rtol=1e-5)
+    assert torch.allclose(stats_base["reward_std"], stats_ckpt["reward_std"], atol=1e-6, rtol=1e-5)
+    assert len(grads_base) == len(grads_ckpt)
+    for g_base, g_ckpt in zip(grads_base, grads_ckpt):
+        assert torch.allclose(g_base, g_ckpt, atol=1e-6, rtol=1e-5)
+
+
+def test_first_policy_gradient_current_accel_stack_matches_noaccel_strictly():
+    loss_base, stats_base, grads_base = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+    )
+    loss_paged, stats_paged, grads_paged = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_maintained_first_pg_long_chunk(
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+
+    _assert_exact_stat_and_grad_match(
+        loss_base, stats_base, grads_base,
+        loss_paged, stats_paged, grads_paged,
+    )
+    _assert_exact_stat_and_grad_match(
+        loss_base, stats_base, grads_base,
+        loss_ckpt, stats_ckpt, grads_ckpt,
+    )
+
+
 def test_alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics():
     loss_full, stats_full, grads_full = _run_chunk(
         policy_rollout_checkpoint=False,
@@ -1728,6 +1883,44 @@ def test_alpha_grad_tbptt_window_equal_horizon_matches_full_horizon_semantics():
     assert len(grads_full) == len(grads_tbptt)
     for g_full, g_tbptt in zip(grads_full, grads_tbptt):
         assert torch.allclose(g_full, g_tbptt, atol=1e-6, rtol=1e-5)
+
+
+def test_alpha_grad_current_accel_stack_matches_noaccel_strictly():
+    common = dict(
+        policy_rollout_checkpoint_reentrant=True,
+        batch_size=2,
+        n_samples=12,
+        single_eval_pos=6,
+        pg_tbptt_window=12,
+        rl_objective="alpha_grad",
+    )
+    loss_base, stats_base, grads_base = _run_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+        **common,
+    )
+    loss_paged, stats_paged, grads_paged = _run_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+        **common,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_chunk(
+        policy_rollout_checkpoint=True,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+        **common,
+    )
+
+    _assert_exact_stat_and_grad_match(
+        loss_base, stats_base, grads_base,
+        loss_paged, stats_paged, grads_paged,
+    )
+    _assert_exact_stat_and_grad_match(
+        loss_base, stats_base, grads_base,
+        loss_ckpt, stats_ckpt, grads_ckpt,
+    )
 
 
 def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend_on_real_env_cfg():
@@ -1790,6 +1983,118 @@ def test_first_policy_gradient_tbptt_family_vectorized_matches_structure_backend
     max_grad_diff = max(float((g_s - g_f).abs().max()) for g_s, g_f in zip(grads_structure, grads_family))
     assert max_grad_diff < 1e-4
     assert all(torch.isfinite(g).all() for g in grads_family)
+
+
+def test_first_policy_gradient_tbptt_streaming_matches_buffered_gradients_strictly():
+    _seed_everything(7)
+    full_cfg = get_model_default_config("rlpfn")
+    num_features = int(full_cfg["prior"]["num_features"])
+
+    family_env_cfg = dict(full_cfg["prior"]["environment"])
+    family_env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    family_env_cfg["batch_vectorized_grouping"] = "family"
+    family_env_cfg["batch_vectorized_strict_rng_match"] = True
+
+    sampler_prior = EnvironmentPrior(dict(family_env_cfg))
+    h_list = sampler_prior._sample_batch_hypers(2)
+    env_seeds = sampler_prior._sample_seed_list(2)
+    rollout_seeds = sampler_prior._sample_seed_list(2)
+
+    _seed_everything(20260311)
+    model_buffered = _build_policy_model_for_num_features(num_features=num_features, recompute_attn=False)
+    prior_buffered = EnvironmentPrior(dict(family_env_cfg))
+    step_fn_buffered = _build_policy_step_fn(
+        model_buffered,
+        num_features=int(num_features),
+        max_cache_len=16,
+        kv_cache_mode="paged",
+        kv_cache_page_size=128,
+        allow_grad_mutable_cache=True,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+    model_buffered.zero_grad(set_to_none=True)
+    loss_buffered, _, buffered_stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior_buffered,
+        policy_step_fn=step_fn_buffered,
+        batch_size=2,
+        n_samples=16,
+        num_features=int(num_features),
+        device="cpu",
+        single_eval_pos=7,
+        collect_x=False,
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=8,
+        tbptt_loss_sink=None,
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        rl_objective="first_policy_gradient",
+    )
+    loss_buffered.backward()
+    buffered_grads = [p.grad.detach().clone() for p in model_buffered.parameters() if p.grad is not None]
+    buffered_stats = {
+        k: (v.detach().clone() if torch.is_tensor(v) else v)
+        for k, v in buffered_stats.items()
+    }
+
+    _seed_everything(20260311)
+    model = _build_policy_model_for_num_features(num_features=num_features, recompute_attn=False)
+    prior = EnvironmentPrior(dict(family_env_cfg))
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(num_features),
+        max_cache_len=16,
+        kv_cache_mode="paged",
+        kv_cache_page_size=128,
+        allow_grad_mutable_cache=True,
+        pg_torch_compile=False,
+        pg_torch_compile_backend="eager",
+        pg_torch_compile_mode="reduce-overhead",
+        pg_torch_compile_fullgraph=False,
+        pg_torch_compile_dynamic=False,
+    )
+    model.zero_grad(set_to_none=True)
+    streamed_roots = []
+    _, _, streamed_stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=2,
+        n_samples=16,
+        num_features=int(num_features),
+        device="cpu",
+        single_eval_pos=7,
+        collect_x=False,
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=8,
+        tbptt_loss_sink=lambda loss_root: (streamed_roots.append(float(loss_root.detach())), loss_root.backward()),
+        h_list_override=h_list,
+        env_seeds_override=env_seeds,
+        rollout_seeds_override=rollout_seeds,
+        rl_objective="first_policy_gradient",
+    )
+    streamed_grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+    streamed_stats = {
+        k: (v.detach().clone() if torch.is_tensor(v) else v)
+        for k, v in streamed_stats.items()
+    }
+
+    assert len(streamed_roots) > 1
+    assert torch.equal(buffered_stats["objective"], streamed_stats["objective"])
+    assert torch.equal(buffered_stats["reward_mean"], streamed_stats["reward_mean"])
+    assert torch.equal(buffered_stats["reward_std"], streamed_stats["reward_std"])
+    assert len(buffered_grads) == len(streamed_grads)
+    max_grad_diff = max(float((g_buf - g_stream).abs().max()) for g_buf, g_stream in zip(buffered_grads, streamed_grads))
+    assert max_grad_diff < 1e-10
 
 
 def test_alpha_grad_tbptt_family_vectorized_handles_nonfinal_window_case():

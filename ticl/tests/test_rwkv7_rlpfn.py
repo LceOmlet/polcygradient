@@ -10,7 +10,7 @@ from ticl.model_builder import get_model
 from ticl.model_configs import get_model_default_config
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
-from ticl.train import _build_policy_step_fn
+from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
 
 
 def _seed_everything(seed: int):
@@ -44,6 +44,77 @@ def _build_small_exact_scm_env_cfg():
         }
     )
     return cfg, env_cfg
+
+
+def _run_rwkv7_exact_scm_chunk(
+    *,
+    policy_rollout_checkpoint=False,
+    policy_rollout_checkpoint_reentrant=True,
+    kv_cache_mode="immutable",
+    allow_grad_mutable_cache=False,
+    n_samples=8,
+    single_eval_pos=4,
+    pg_tbptt_window=None,
+    tbptt_loss_sink=None,
+):
+    _seed_everything(123)
+    cfg, env_cfg = _build_small_exact_scm_env_cfg()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    cfg["optimizer"]["rl_objective"] = "reinforce"
+
+    prior = EnvironmentPrior(env_cfg)
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.train()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(cfg["prior"]["num_features"]),
+        max_cache_len=int(n_samples),
+        kv_cache_mode=kv_cache_mode,
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=bool(allow_grad_mutable_cache),
+        pg_torch_compile=False,
+    )
+
+    _seed_everything(515151)
+    h_list = prior._sample_batch_hypers(2)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.05
+        h["action_noise_eval_std"] = 0.03
+
+    model.zero_grad(set_to_none=True)
+    loss, _, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=2,
+        n_samples=int(n_samples),
+        num_features=int(cfg["prior"]["num_features"]),
+        device="cpu",
+        single_eval_pos=int(single_eval_pos),
+        collect_x=False,
+        policy_rollout_checkpoint=bool(policy_rollout_checkpoint),
+        policy_rollout_checkpoint_reentrant=bool(policy_rollout_checkpoint_reentrant),
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=pg_tbptt_window,
+        tbptt_loss_sink=tbptt_loss_sink,
+        h_list_override=[dict(h) for h in h_list],
+        env_seeds_override=[17, 29],
+        rollout_seeds_override=[101, 211],
+        rl_objective="reinforce",
+    )
+    if tbptt_loss_sink is None:
+        loss.backward()
+    grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+    stats = {
+        k: (v.detach().clone() if torch.is_tensor(v) else v)
+        for k, v in stats.items()
+    }
+    return loss.detach().clone(), stats, grads
 
 
 class _FakeBox:
@@ -409,3 +480,62 @@ def test_rwkv7_rlpfn_validation_uses_split_policy_step_state_cache(monkeypatch):
     assert split_calls["count"] > 0
     assert split_cache_seen[0] is False
     assert any(split_cache_seen[1:])
+
+
+def test_rwkv7_reinforce_current_accel_stack_matches_noaccel_strictly():
+    loss_base, stats_base, grads_base = _run_rwkv7_exact_scm_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="immutable",
+        allow_grad_mutable_cache=False,
+    )
+    loss_paged, stats_paged, grads_paged = _run_rwkv7_exact_scm_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+    loss_ckpt, stats_ckpt, grads_ckpt = _run_rwkv7_exact_scm_chunk(
+        policy_rollout_checkpoint=True,
+        policy_rollout_checkpoint_reentrant=True,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+    )
+
+    assert torch.equal(loss_base, loss_paged)
+    assert torch.equal(loss_base, loss_ckpt)
+    for key in ("objective", "reward_mean", "reward_std"):
+        assert torch.equal(stats_base[key], stats_paged[key]), key
+        assert torch.equal(stats_base[key], stats_ckpt[key]), key
+    assert len(grads_base) == len(grads_paged) == len(grads_ckpt)
+    assert all(torch.equal(g_base, g_paged) for g_base, g_paged in zip(grads_base, grads_paged))
+    assert all(torch.equal(g_base, g_ckpt) for g_base, g_ckpt in zip(grads_base, grads_ckpt))
+
+
+def test_rwkv7_reinforce_tbptt_streaming_matches_buffered_gradients():
+    loss_buffered, stats_buffered, grads_buffered = _run_rwkv7_exact_scm_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+        n_samples=12,
+        single_eval_pos=4,
+        pg_tbptt_window=4,
+        tbptt_loss_sink=None,
+    )
+
+    streamed_roots = []
+    _, stats_streamed, grads_streamed = _run_rwkv7_exact_scm_chunk(
+        policy_rollout_checkpoint=False,
+        kv_cache_mode="paged",
+        allow_grad_mutable_cache=True,
+        n_samples=12,
+        single_eval_pos=4,
+        pg_tbptt_window=4,
+        tbptt_loss_sink=lambda loss_root: (streamed_roots.append(float(loss_root.detach())), loss_root.backward()),
+    )
+
+    assert torch.isfinite(loss_buffered)
+    assert len(streamed_roots) > 1
+    for key in ("objective", "reward_mean", "reward_std"):
+        assert torch.equal(stats_buffered[key], stats_streamed[key]), key
+    assert len(grads_buffered) == len(grads_streamed)
+    max_grad_diff = max(float((g_buf - g_stream).abs().max()) for g_buf, g_stream in zip(grads_buffered, grads_streamed))
+    assert max_grad_diff < 1e-7
