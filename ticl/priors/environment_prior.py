@@ -3,7 +3,7 @@ import inspect
 import os
 import threading
 import time
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from concurrent.futures import ThreadPoolExecutor
 import numpy as np
 import torch
@@ -1539,6 +1539,7 @@ class EnvironmentPrior:
         self.last_rollout_profile = None
         self.last_rollout_terminal_stats = None
         self.last_rollout_reinforce = None
+        self.last_rollout_reinforce_replay = None
         self.last_rollout_policy_trace = None
         self.last_rollout_env_semantics = None
         self._rollout_executor = None
@@ -1809,6 +1810,7 @@ class EnvironmentPrior:
         self.last_rollout_profile = None
         self.last_rollout_terminal_stats = None
         self.last_rollout_reinforce = None
+        self.last_rollout_reinforce_replay = None
         self.last_rollout_policy_trace = None
         self.last_rollout_env_semantics = None
 
@@ -4389,6 +4391,10 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_reinforce_action_rms_eps(h):
         return maintained_resolve_reinforce_action_rms_eps(h)
+
+    @staticmethod
+    def _resolve_reinforce_sequence_replay_enabled(h):
+        return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_sequence_replay_enabled", False)))
 
     @staticmethod
     def _resolve_first_policy_gradient_state_grad_clip_norm(h):
@@ -10887,6 +10893,55 @@ class EnvironmentPrior:
         return tuple(eta_groups)
 
     @staticmethod
+    def _alpha_tbptt_boundary_eta_from_boundary_groups_after_backward(boundary_groups, *, applied_scale=1.0):
+        if not isinstance(boundary_groups, (tuple, list)):
+            return tuple()
+        scale = float(applied_scale)
+        if (not math.isfinite(scale)) or abs(scale) <= 0.0:
+            scale = 1.0
+        inv_scale = float(1.0 / scale)
+        eta_groups = []
+        for group_idx, boundary_group in enumerate(boundary_groups):
+            if not isinstance(boundary_group, dict):
+                continue
+            boundary_in = boundary_group.get("boundary_in", None)
+            if not isinstance(boundary_in, dict):
+                continue
+            cache_grad_targets = tuple(boundary_in.get("cache_grad_targets", tuple()) or tuple())
+            boundary_specs = EnvironmentPrior._iter_tbptt_boundary_grad_specs(boundary_in)
+            if len(boundary_specs) == 0 and len(cache_grad_targets) == 0:
+                continue
+            eta = {}
+            for name, target, replay_dim in boundary_specs:
+                grad_part = target.grad
+                eta_t = EnvironmentPrior._tbptt_detached_boundary_grad(
+                    grad_part,
+                    target,
+                    replay_dim,
+                )
+                if inv_scale != 1.0:
+                    eta_t = eta_t * inv_scale
+                eta[name] = eta_t
+                target.grad = None
+            cache_grads = []
+            for cache_target in cache_grad_targets:
+                grad_part = cache_target.grad
+                cache_grad = grad_part.detach() if grad_part is not None else torch.zeros_like(cache_target)
+                if inv_scale != 1.0:
+                    cache_grad = cache_grad * inv_scale
+                cache_grads.append(cache_grad)
+                cache_target.grad = None
+            eta["cache_leaves"] = tuple(cache_grads)
+            eta_groups.append(
+                {
+                    "indices": tuple(int(i) for i in boundary_group.get("indices", tuple()) or tuple()),
+                    "group_idx": int(boundary_group.get("group_idx", group_idx) or group_idx),
+                    "eta": eta,
+                }
+            )
+        return tuple(eta_groups)
+
+    @staticmethod
     def _alpha_tbptt_bridge_loss_from_eta(boundary_out, boundary_eta):
         if boundary_eta is None:
             return None
@@ -11034,6 +11089,8 @@ class EnvironmentPrior:
         _policy_collect_log_probs=False,
         _policy_collect_action_trace=False,
         _policy_detach_action_in_env=None,
+        _policy_disable_log_probs=False,
+        _policy_force_no_grad=False,
     ):
         n_samples = int(n_samples)
         batch_size = int(batch_size)
@@ -11140,7 +11197,10 @@ class EnvironmentPrior:
             if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
-        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_probs = (
+            (bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs))
+            and (not bool(_policy_disable_log_probs))
+        )
         collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
@@ -11580,25 +11640,28 @@ class EnvironmentPrior:
             else:
                 env.pop("terminal_t", None)
             env["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
+            policy_step_grad_ctx = torch.no_grad if bool(_policy_force_no_grad) else nullcontext
             if policy_accepts_reward_mask:
-                policy_out = policy_step_fn(
-                    obs_t,
-                    action_t,
-                    reward_t.reshape(batch_size, 1),
-                    reward_mask_t.reshape(batch_size, 1),
-                    cache,
-                    t,
-                    env,
-                )
+                with policy_step_grad_ctx():
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        reward_mask_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env,
+                    )
             else:
-                policy_out = policy_step_fn(
-                    obs_t,
-                    action_t,
-                    reward_t.reshape(batch_size, 1),
-                    cache,
-                    t,
-                    env,
-                )
+                with policy_step_grad_ctx():
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env,
+                    )
             if policy_cuda_start is not None:
                 policy_cuda_end = torch.cuda.Event(enable_timing=True)
                 policy_cuda_end.record()
@@ -12053,6 +12116,17 @@ class EnvironmentPrior:
             if (collect_log_probs and log_prob_steps is not None)
             else None
         )
+        self.last_rollout_reinforce_replay = (
+            {
+                "reward_in": replay_reward_in_steps,
+                "action_pre_tanh": replay_action_pre_tanh_steps,
+                "sampled_action": replay_sampled_action_steps,
+                "action_std": replay_action_std_steps,
+                "action_mask": replay_action_mask,
+            }
+            if collect_reinforce_replay
+            else None
+        )
         self.last_rollout_policy_trace = None
         if collect_action_trace and isinstance(action_mean_steps, list) and isinstance(action_mask_steps, list):
             self.last_rollout_policy_trace = {
@@ -12083,7 +12157,10 @@ class EnvironmentPrior:
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
         _policy_collect_action_trace=False,
+        _policy_collect_reinforce_replay=False,
         _policy_detach_action_in_env=None,
+        _policy_disable_log_probs=False,
+        _policy_force_no_grad=False,
     ):
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
@@ -12669,9 +12746,18 @@ class EnvironmentPrior:
             if str(policy_objective_kind).strip().lower() in {"first_policy_gradient", "alpha_grad"}
             else 0.0
         )
-        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_probs = (
+            (bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs))
+            and (not bool(_policy_disable_log_probs))
+        )
         collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
+        collect_reinforce_replay = bool(
+            _policy_collect_reinforce_replay
+            and reinforce_enabled
+            and sample_action
+            and (not tbptt_window_active)
+        )
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
             if _policy_detach_action_in_env is None
@@ -12679,6 +12765,8 @@ class EnvironmentPrior:
         )
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
+        if collect_reinforce_replay and x_steps is None:
+            raise RuntimeError("reinforce sequence replay requires collect_x=True to record rollout tokens")
         log_prob_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_log_probs and (not tbptt_window_active)
@@ -12691,6 +12779,27 @@ class EnvironmentPrior:
         )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
+        replay_reward_in_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_reinforce_replay
+            else None
+        )
+        replay_action_pre_tanh_steps = (
+            torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            if collect_reinforce_replay
+            else None
+        )
+        replay_sampled_action_steps = (
+            torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            if collect_reinforce_replay
+            else None
+        )
+        replay_action_std_steps = (
+            torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
+            if collect_reinforce_replay
+            else None
+        )
+        replay_action_mask = action_mask.to(device=device, dtype=torch.bool) if collect_reinforce_replay else None
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -13589,6 +13698,8 @@ class EnvironmentPrior:
         token_reward_cols = None
         token_mask_rows = None
         token_mask_cols = None
+        token_phase_rows = None
+        token_phase_cols = None
         token_terminal_rows = None
         token_terminal_cols = None
         token_action_write_cap = 0
@@ -13609,7 +13720,10 @@ class EnvironmentPrior:
             token_mask_cols = obs_slot_dims + 1
             token_mask_rows = torch.nonzero(token_mask_cols < num_features, as_tuple=False).squeeze(1)
 
-            token_terminal_cols = obs_slot_dims + 2
+            token_phase_cols = obs_slot_dims + 2
+            token_phase_rows = torch.nonzero(token_phase_cols < num_features, as_tuple=False).squeeze(1)
+
+            token_terminal_cols = obs_slot_dims + 3
             token_terminal_rows = torch.nonzero(
                 terminal_reset_enabled & (token_terminal_cols < num_features),
                 as_tuple=False,
@@ -13618,7 +13732,7 @@ class EnvironmentPrior:
             token_action_write_cap = int(min(max_action_dim, num_features))
             if token_action_write_cap > 0:
                 action_positions = torch.arange(token_action_write_cap, device=device, dtype=torch.long).unsqueeze(0)
-                action_start = (obs_slot_dims + 2 + terminal_token_offset).unsqueeze(1)
+                action_start = (obs_slot_dims + 3 + terminal_token_offset).unsqueeze(1)
                 action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
                 token_action_cols = action_start + action_positions
                 token_action_valid = (action_positions < action_cap) & (token_action_cols < num_features)
@@ -13730,6 +13844,14 @@ class EnvironmentPrior:
                                     reward_mask_t[token_mask_rows].detach()
                                 )
 
+                            if token_phase_rows is not None and token_phase_rows.numel() > 0:
+                                phase_scalar = (
+                                    phase_eval_t.reshape(-1) if t >= single_eval_pos else phase_train_t.reshape(-1)
+                                )
+                                token_row[token_phase_rows, token_phase_cols[token_phase_rows]] = (
+                                    phase_scalar[token_phase_rows]
+                                )
+
                             if token_terminal_rows is not None and token_terminal_rows.numel() > 0:
                                 token_row[token_terminal_rows, token_terminal_cols[token_terminal_rows]] = (
                                     terminal_t[token_terminal_rows].detach()
@@ -13759,7 +13881,16 @@ class EnvironmentPrior:
                             if mask_rows.numel() > 0:
                                 token_row[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
 
-                            terminal_cols = obs_slot_dims + 2
+                            phase_cols = obs_slot_dims + 2
+                            phase_rows = torch.nonzero(phase_cols < num_features, as_tuple=False).squeeze(1)
+                            if phase_rows.numel() > 0:
+                                token_row[phase_rows, phase_cols[phase_rows]] = (
+                                    phase_eval_t.reshape(-1)[phase_rows]
+                                    if t >= single_eval_pos
+                                    else phase_train_t.reshape(-1)[phase_rows]
+                                )
+
+                            terminal_cols = obs_slot_dims + 3
                             terminal_rows = torch.nonzero(
                                 terminal_reset_enabled & (terminal_cols < num_features),
                                 as_tuple=False,
@@ -13770,48 +13901,54 @@ class EnvironmentPrior:
                             action_write_cap = min(max_action_dim, num_features)
                             if action_write_cap > 0:
                                 action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
-                                action_start = (obs_slot_dims + 2 + terminal_token_offset).unsqueeze(1)
+                                action_start = (obs_slot_dims + 3 + terminal_token_offset).unsqueeze(1)
                                 action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
                                 action_cols = action_start + action_positions
                                 action_valid = (action_positions < action_cap) & (action_cols < num_features)
                                 if torch.any(action_valid):
                                     action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
-                                    action_src = action_t[:, :action_write_cap].detach()
-                                    token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
+                                action_src = action_t[:, :action_write_cap].detach()
+                                token_row[action_rows[action_valid], action_cols[action_valid]] = action_src[action_valid]
+            if collect_reinforce_replay:
+                replay_reward_in_steps[t] = reward_t.detach()
 
             if terminal_token_enabled:
                 env_info["terminal_t"] = terminal_t.reshape(batch_size, 1)
             else:
                 env_info.pop("terminal_t", None)
+            env_info["phase_t"] = phase_eval_t if t >= single_eval_pos else phase_train_t
+            policy_step_grad_ctx = torch.no_grad if bool(_policy_force_no_grad) else nullcontext
             if policy_accepts_reward_mask:
                 policy_cuda_start = None
                 policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
                     policy_cuda_start = torch.cuda.Event(enable_timing=True)
                     policy_cuda_start.record()
-                policy_out = policy_step_fn(
-                    obs_t,
-                    action_t,
-                    reward_t.reshape(batch_size, 1),
-                    reward_mask_t.reshape(batch_size, 1),
-                    cache,
-                    t,
-                    env_info,
-                )
+                with policy_step_grad_ctx():
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        reward_mask_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env_info,
+                    )
             else:
                 policy_cuda_start = None
                 policy_wall_t0 = time.perf_counter() if profile_rollout_timing else None
                 if profile_rollout_breakdown_cuda:
                     policy_cuda_start = torch.cuda.Event(enable_timing=True)
                     policy_cuda_start.record()
-                policy_out = policy_step_fn(
-                    obs_t,
-                    action_t,
-                    reward_t.reshape(batch_size, 1),
-                    cache,
-                    t,
-                    env_info,
-                )
+                with policy_step_grad_ctx():
+                    policy_out = policy_step_fn(
+                        obs_t,
+                        action_t,
+                        reward_t.reshape(batch_size, 1),
+                        cache,
+                        t,
+                        env_info,
+                    )
             if profile_rollout_timing and policy_wall_t0 is not None:
                 policy_wall_s += (time.perf_counter() - policy_wall_t0)
             if policy_cuda_start is not None:
@@ -13885,6 +14022,10 @@ class EnvironmentPrior:
                     rms_eps=action_rms_eps,
                     mask=action_mask,
                 )
+                if collect_reinforce_replay:
+                    replay_action_pre_tanh_steps[t] = action_pre_tanh.detach()
+                    replay_sampled_action_steps[t] = action_next.detach()
+                    replay_action_std_steps[t] = action_std_t.detach()
                 reinforce_log_prob_t = self._squashed_gaussian_log_prob(
                     action_pre_tanh.detach(),
                     action_mean,
@@ -14746,6 +14887,17 @@ class EnvironmentPrior:
                 "log_prob_score": log_prob_score_steps,
             }
             if (collect_log_probs and log_prob_steps is not None)
+            else None
+        )
+        self.last_rollout_reinforce_replay = (
+            {
+                "reward_in": replay_reward_in_steps,
+                "action_pre_tanh": replay_action_pre_tanh_steps,
+                "sampled_action": replay_sampled_action_steps,
+                "action_std": replay_action_std_steps,
+                "action_mask": replay_action_mask,
+            }
+            if collect_reinforce_replay
             else None
         )
         self.last_rollout_policy_trace = None
@@ -16229,7 +16381,10 @@ class EnvironmentPrior:
         policy_objective_kind="policy_gradient",
         _policy_collect_log_probs=False,
         _policy_collect_action_trace=False,
+        _policy_collect_reinforce_replay=False,
         _policy_detach_action_in_env=None,
+        _policy_disable_log_probs=False,
+        _policy_force_no_grad=False,
     ):
         """
         Differentiable rollout for policy optimization.
@@ -16251,7 +16406,10 @@ class EnvironmentPrior:
         objective_flags = self._policy_rollout_objective_flags(policy_objective_kind)
         sample_action = bool(objective_flags["sample_action"])
         alpha_grad_trace_roots_only = bool(objective_flags.get("alpha_grad", False))
-        collect_log_probs = bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs)
+        collect_log_probs = (
+            (bool(objective_flags["collect_log_probs"]) or bool(_policy_collect_log_probs))
+            and (not bool(_policy_disable_log_probs))
+        )
         collect_action_trace = bool(_policy_collect_action_trace)
         if collect_log_probs and (not sample_action):
             raise ValueError("log-prob collection requires stochastic action sampling")
@@ -16483,7 +16641,10 @@ class EnvironmentPrior:
                 "policy_objective_kind": policy_objective_kind,
                 "_policy_collect_log_probs": _policy_collect_log_probs,
                 "_policy_collect_action_trace": _policy_collect_action_trace,
+                "_policy_collect_reinforce_replay": _policy_collect_reinforce_replay,
                 "_policy_detach_action_in_env": _policy_detach_action_in_env,
+                "_policy_disable_log_probs": _policy_disable_log_probs,
+                "_policy_force_no_grad": _policy_force_no_grad,
                 "alpha_grad_trace_roots_only": alpha_grad_trace_roots_only,
                 "backend": backend,
                 "strict_rng_match": strict_rng_match,
@@ -18956,6 +19117,26 @@ class EnvironmentPrior:
         markov_adjacent_replay_enabled = bool(request["markov_adjacent_replay_enabled"])
         markov_adjacent_replay_sample_prob = float(request["markov_adjacent_replay_sample_prob"])
         one_hop_tbptt_active = bool(request["one_hop_tbptt_active"])
+        reinforce_sequence_replay_enabled = bool(
+            reinforce_enabled and self._resolve_reinforce_sequence_replay_enabled(self.config)
+        )
+        if reinforce_sequence_replay_enabled:
+            if tbptt_window_active:
+                raise RuntimeError("reinforce sequence replay is currently implemented only for no-TBPTT rollouts")
+            replay_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_fn", None)
+            if not callable(replay_fn):
+                raise RuntimeError(
+                    "reinforce sequence replay was enabled, but policy_step_fn does not expose an official sequence replay helper"
+                )
+            device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+            if device_obj.type != "cuda":
+                raise RuntimeError("reinforce sequence replay currently requires CUDA")
+            if str(backend).strip().lower() != "torch_vectorized":
+                raise RuntimeError("reinforce sequence replay currently requires torch_vectorized rollout backend")
+            if strict_rng_match or str(grouping_mode).strip().lower() != "family":
+                raise RuntimeError(
+                    "reinforce sequence replay currently requires family grouping without strict RNG remapping"
+                )
         if not tbptt_window_active:
             rollout = self.rollout_with_policy(
                 policy_step_fn=policy_step_fn,
@@ -18965,7 +19146,7 @@ class EnvironmentPrior:
                 device=device,
                 epoch=epoch,
                 single_eval_pos=single_eval_pos,
-                collect_x=collect_x,
+                collect_x=bool(collect_x or reinforce_sequence_replay_enabled),
                 collect_runtime_info=False,
                 tbptt_reward_sink_supports_aux=bool(reinforce_enabled or alpha_grad_enabled),
                 h_list_override=h_list_override,
@@ -18973,7 +19154,12 @@ class EnvironmentPrior:
                 rollout_seeds_override=rollout_seeds_override,
                 policy_objective_kind=objective_kind,
                 _policy_collect_action_trace=bool(alpha_grad_enabled),
+                _policy_collect_reinforce_replay=bool(reinforce_sequence_replay_enabled),
+                _policy_disable_log_probs=bool(reinforce_sequence_replay_enabled),
+                _policy_force_no_grad=bool(reinforce_sequence_replay_enabled),
             )
+            if reinforce_sequence_replay_enabled and (not collect_x):
+                rollout["x"] = None
             effective_single_eval_pos = int(rollout.get("single_eval_pos", single_eval_pos or 0))
             effective_single_eval_pos = int(max(0, min(int(rollout["rewards"].shape[0]), effective_single_eval_pos)))
             rewards_eval = rollout["rewards"][effective_single_eval_pos:]
@@ -18981,6 +19167,8 @@ class EnvironmentPrior:
                 reinforce_rollout = rollout.get("reinforce", None)
                 if not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
                     raise RuntimeError("reinforce rollout did not return log_probs")
+                if reinforce_sequence_replay_enabled and (not bool(reinforce_rollout.get("sequence_replay_applied", False))):
+                    raise RuntimeError("reinforce sequence replay was enabled, but rollout did not apply replayed log_probs")
                 loss, stats = self.reinforce_loss_from_rewards(
                     rewards=rewards_eval,
                     log_probs=reinforce_rollout["log_probs"][effective_single_eval_pos:],
@@ -18988,6 +19176,8 @@ class EnvironmentPrior:
                     baseline_mode="leave_one_out",
                 )
                 stats["reinforce_enabled"] = 1
+                if reinforce_rollout.get("sequence_replay_applied", False):
+                    stats["reinforce_sequence_replay_applied"] = 1
             elif first_pg_enabled:
                 loss, stats = self.first_policy_gradient_loss_from_rewards(
                     rewards=rewards_eval,
@@ -19069,16 +19259,22 @@ class EnvironmentPrior:
         markov_adjacent_bridge_sampled_count = 0
         replay_window_depth = 1
         pending_one_hop_window = None
+        streaming_boundary_eta_active = bool(
+            one_hop_tbptt_active
+            and tbptt_loss_sink is not None
+            and bool(getattr(tbptt_loss_sink, "_ticl_accepts_tbptt_payload", False))
+        )
 
         def _emit_tbptt_window_loss(loss_root):
             if loss_root is None:
-                return
-            if torch.is_tensor(loss_root) and (not bool(loss_root.requires_grad)):
-                return
+                return None
             if tbptt_loss_sink is None:
                 weighted_losses.append(loss_root)
+                return None
             else:
-                tbptt_loss_sink(loss_root)
+                if torch.is_tensor(loss_root) and (not bool(loss_root.requires_grad)):
+                    return None
+                return tbptt_loss_sink(loss_root)
 
         def _flush_pending_one_hop_window(*, bridge_loss=None, addon_loss=None):
             nonlocal pending_one_hop_window
@@ -19239,10 +19435,30 @@ class EnvironmentPrior:
                     and len(boundary_groups) > 0
                 ):
                     if weighted_loss is not None:
-                        boundary_eta_groups = self._alpha_tbptt_boundary_eta_from_boundary_groups(
-                            weighted_loss,
-                            boundary_groups,
-                        )
+                        if streaming_boundary_eta_active:
+                            sink_result = _emit_tbptt_window_loss(
+                                {
+                                    "loss_root": weighted_loss,
+                                    "retain_graph": True,
+                                    "immediate": True,
+                                }
+                            )
+                            applied_scale = 1.0
+                            if isinstance(sink_result, dict):
+                                try:
+                                    applied_scale = float(sink_result.get("applied_scale", 1.0))
+                                except Exception:
+                                    applied_scale = 1.0
+                            boundary_eta_groups = self._alpha_tbptt_boundary_eta_from_boundary_groups_after_backward(
+                                boundary_groups,
+                                applied_scale=applied_scale,
+                            )
+                            weighted_loss = None
+                        else:
+                            boundary_eta_groups = self._alpha_tbptt_boundary_eta_from_boundary_groups(
+                                weighted_loss,
+                                boundary_groups,
+                            )
                         self._drop_tbptt_boundary_inputs(boundary_groups)
                         if boundary_eta_groups:
                             bridge_loss = self._alpha_tbptt_bridge_loss_from_boundary_groups(

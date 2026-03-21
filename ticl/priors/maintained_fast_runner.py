@@ -142,7 +142,10 @@ def dispatch_policy_rollout(prior, ctx):
     policy_objective_kind = ctx["policy_objective_kind"]
     policy_collect_log_probs = bool(ctx["_policy_collect_log_probs"])
     policy_collect_action_trace = bool(ctx["_policy_collect_action_trace"])
+    policy_collect_reinforce_replay = bool(ctx.get("_policy_collect_reinforce_replay", False))
     policy_detach_action_in_env = ctx["_policy_detach_action_in_env"]
+    policy_disable_log_probs = bool(ctx.get("_policy_disable_log_probs", False))
+    policy_force_no_grad = bool(ctx.get("_policy_force_no_grad", False))
     alpha_grad_trace_roots_only = bool(ctx["alpha_grad_trace_roots_only"])
     backend = ctx["backend"]
     strict_rng_match = bool(ctx["strict_rng_match"])
@@ -165,11 +168,59 @@ def dispatch_policy_rollout(prior, ctx):
     infos = ctx["infos"]
 
     collect_action_trace = bool(policy_collect_action_trace)
+    reinforce_sequence_replay_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_fn", None)
+    fit_action_dim_fn = getattr(policy_step_fn, "_fit_action_dim_fn", None)
+    reinforce_sequence_replay_applied = False
+
+    def _maybe_replay_reinforce_log_probs(x_tokens, group_reinforce, group_replay):
+        nonlocal reinforce_sequence_replay_applied
+        if not policy_collect_reinforce_replay:
+            return group_reinforce.get("log_probs", None) if isinstance(group_reinforce, dict) else None
+        if not callable(reinforce_sequence_replay_fn):
+            raise RuntimeError("reinforce sequence replay was requested but policy_step_fn has no replay helper")
+        if x_tokens is None:
+            raise RuntimeError("reinforce sequence replay requires collected rollout x tokens")
+        if not isinstance(group_replay, dict):
+            raise RuntimeError("reinforce sequence replay requested but rollout did not record replay tensors")
+        reward_in = group_replay.get("reward_in", None)
+        action_pre_tanh = group_replay.get("action_pre_tanh", None)
+        sampled_action = group_replay.get("sampled_action", None)
+        action_std = group_replay.get("action_std", None)
+        action_mask = group_replay.get("action_mask", None)
+        if not all(torch.is_tensor(t) for t in (reward_in, action_pre_tanh, sampled_action, action_std, action_mask)):
+            raise RuntimeError("reinforce sequence replay tensors are incomplete")
+        action_mean_replay = reinforce_sequence_replay_fn(x_tokens, reward_in)
+        replay_action_dim = int(action_pre_tanh.shape[-1])
+        if callable(fit_action_dim_fn):
+            action_mean_replay = fit_action_dim_fn(action_mean_replay.reshape(-1, int(action_mean_replay.shape[-1])), replay_action_dim)
+            action_mean_replay = action_mean_replay.reshape(
+                int(action_pre_tanh.shape[0]),
+                int(action_pre_tanh.shape[1]),
+                replay_action_dim,
+            )
+        elif int(action_mean_replay.shape[-1]) != replay_action_dim:
+            action_mean_replay = action_mean_replay[..., :replay_action_dim]
+        action_mean_replay = action_mean_replay.to(dtype=action_pre_tanh.dtype)
+        reinforce_sequence_replay_applied = True
+        return prior._squashed_gaussian_log_prob(
+            action_pre_tanh,
+            action_mean_replay,
+            action_std,
+            action=sampled_action,
+            mask=action_mask,
+        ).to(dtype=torch.float32)
+
+    if policy_collect_reinforce_replay and backend != "torch_vectorized":
+        raise RuntimeError("reinforce sequence replay currently requires torch_vectorized rollout backend")
 
     if backend == "torch_vectorized":
         effective_grouping_mode = str(grouping_mode)
         if strict_rng_match:
             effective_grouping_mode = "structure"
+        if policy_collect_reinforce_replay and effective_grouping_mode != "family":
+            raise RuntimeError(
+                "reinforce sequence replay currently requires torch_vectorized family grouping without strict RNG remapping"
+            )
         grouped = {}
         for b, h in enumerate(h_list):
             sig = prior._environment_group_signature(h, effective_grouping_mode)
@@ -204,7 +255,10 @@ def dispatch_policy_rollout(prior, ctx):
                     policy_objective_kind=policy_objective_kind,
                     _policy_collect_log_probs=policy_collect_log_probs,
                     _policy_collect_action_trace=policy_collect_action_trace,
+                    _policy_collect_reinforce_replay=policy_collect_reinforce_replay,
                     _policy_detach_action_in_env=policy_detach_action_in_env,
+                    _policy_disable_log_probs=policy_disable_log_probs,
+                    _policy_force_no_grad=policy_force_no_grad,
                 )
             else:
                 env_batch = prior._sample_environment_batch(
@@ -231,24 +285,42 @@ def dispatch_policy_rollout(prior, ctx):
                     _policy_collect_log_probs=policy_collect_log_probs,
                     _policy_collect_action_trace=policy_collect_action_trace,
                     _policy_detach_action_in_env=policy_detach_action_in_env,
+                    _policy_disable_log_probs=policy_disable_log_probs,
+                    _policy_force_no_grad=policy_force_no_grad,
                 )
             if collect_x:
                 x[:, group_indices] = x_group
             if store_rewards:
                 rewards[:, group_indices] = y_group
-            if reinforce_log_probs is not None:
-                group_reinforce = prior.last_rollout_reinforce
-                if isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
-                    reinforce_log_probs[:, group_indices] = group_reinforce["log_probs"]
-                    group_log_prob_score = group_reinforce.get("log_prob_score", None)
-                    if torch.is_tensor(group_log_prob_score):
-                        if reinforce_log_prob_scores is None:
-                            reinforce_log_prob_scores = torch.empty(
-                                (int(group_log_prob_score.shape[0]), batch_size, int(group_log_prob_score.shape[-1])),
-                                device=group_log_prob_score.device,
-                                dtype=group_log_prob_score.dtype,
-                            )
-                        reinforce_log_prob_scores[:, group_indices] = group_log_prob_score
+            group_reinforce = prior.last_rollout_reinforce
+            group_replay = getattr(prior, "last_rollout_reinforce_replay", None)
+            group_log_probs = None
+            if policy_collect_reinforce_replay:
+                group_log_probs = _maybe_replay_reinforce_log_probs(
+                    x_group,
+                    group_reinforce,
+                    group_replay,
+                )
+            elif isinstance(group_reinforce, dict) and torch.is_tensor(group_reinforce.get("log_probs", None)):
+                group_log_probs = group_reinforce["log_probs"]
+            if torch.is_tensor(group_log_probs):
+                if reinforce_log_probs is None:
+                    reinforce_log_probs = torch.empty(
+                        (int(group_log_probs.shape[0]), batch_size),
+                        device=group_log_probs.device,
+                        dtype=group_log_probs.dtype,
+                    )
+                reinforce_log_probs[:, group_indices] = group_log_probs
+            if isinstance(group_reinforce, dict):
+                group_log_prob_score = group_reinforce.get("log_prob_score", None)
+                if torch.is_tensor(group_log_prob_score):
+                    if reinforce_log_prob_scores is None:
+                        reinforce_log_prob_scores = torch.empty(
+                            (int(group_log_prob_score.shape[0]), batch_size, int(group_log_prob_score.shape[-1])),
+                            device=group_log_prob_score.device,
+                            dtype=group_log_prob_score.dtype,
+                        )
+                    reinforce_log_prob_scores[:, group_indices] = group_log_prob_score
             if collect_action_trace:
                 group_policy_trace = prior.last_rollout_policy_trace
                 if isinstance(group_policy_trace, dict) and torch.is_tensor(group_policy_trace.get("action_mask", None)):
@@ -485,8 +557,13 @@ def dispatch_policy_rollout(prior, ctx):
             rollout_profile_acc = prior._finalize_env_semantics_summary(rollout_profile_acc)
         prior.last_rollout_profile = rollout_profile_acc
         prior.last_rollout_env_semantics = _project_rollout_env_semantics(rollout_profile_acc)
+        prior.last_rollout_reinforce_replay = None
         prior.last_rollout_reinforce = (
-            {"log_probs": reinforce_log_probs, "log_prob_score": reinforce_log_prob_scores}
+            {
+                "log_probs": reinforce_log_probs,
+                "log_prob_score": reinforce_log_prob_scores,
+                "sequence_replay_applied": bool(reinforce_sequence_replay_applied),
+            }
             if reinforce_log_probs is not None
             else None
         )
@@ -643,8 +720,13 @@ def dispatch_policy_rollout(prior, ctx):
         prior.last_rollout_profile["steps"] = int(n_samples)
         prior.last_rollout_profile["batch_size"] = int(batch_size)
     prior.last_rollout_env_semantics = _project_rollout_env_semantics(prior.last_rollout_profile)
+    prior.last_rollout_reinforce_replay = None
     prior.last_rollout_reinforce = (
-        {"log_probs": reinforce_log_probs, "log_prob_score": reinforce_log_prob_scores}
+        {
+            "log_probs": reinforce_log_probs,
+            "log_prob_score": reinforce_log_prob_scores,
+            "sequence_replay_applied": bool(reinforce_sequence_replay_applied),
+        }
         if reinforce_log_probs is not None
         else None
     )
