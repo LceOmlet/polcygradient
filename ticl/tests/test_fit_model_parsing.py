@@ -83,7 +83,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_env_replay_steps == 1
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload is False
+    assert args.optimizer.pg_saved_tensors_cpu_offload is True
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is False
@@ -315,7 +315,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
         "min": 0.0,
         "max": 10.0,
     }
-    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "rms"
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
@@ -324,7 +324,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["train_host_rss_limit_gib"] == 32.0

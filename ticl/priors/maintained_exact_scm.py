@@ -136,9 +136,9 @@ def resolve_reinforce_reward_tanh_bound(h):
 
 
 def resolve_reinforce_action_transform(h):
-    mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
+    mode = str(h.get("reinforce_action_transform", "none")).strip().lower()
     if mode not in {"tanh", "rms", "none"}:
-        mode = "rms"
+        mode = "none"
     return mode
 
 

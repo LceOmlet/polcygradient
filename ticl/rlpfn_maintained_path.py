@@ -16,7 +16,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reinforce_reward_rms_eps": 1e-6,
     "reinforce_reward_tanh_c": 10.0,
     "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 10.0},
-    "reinforce_action_transform": "rms",
+    "reinforce_action_transform": "none",
     "reinforce_action_rms_eps": 1e-6,
     "first_policy_gradient_state_grad_clip_norm": 4.0,
     "first_policy_gradient_action_grad_clip_value": 0.0,

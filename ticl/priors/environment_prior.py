@@ -1474,7 +1474,7 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
         cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 10.0})
-        cfg.setdefault("reinforce_action_transform", "rms")
+        cfg.setdefault("reinforce_action_transform", "none")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
         cfg.setdefault("first_policy_gradient_action_grad_clip_value", 0.0)

@@ -208,9 +208,9 @@ def _legacy_resolve_reinforce_reward_tanh_bound(h):
 
 
 def _legacy_resolve_reinforce_action_transform(h):
-    mode = str(h.get("reinforce_action_transform", "rms")).strip().lower()
+    mode = str(h.get("reinforce_action_transform", "none")).strip().lower()
     if mode not in {"tanh", "rms", "none"}:
-        mode = "rms"
+        mode = "none"
     return mode
 
 
@@ -1041,7 +1041,7 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["alpha_grad_one_hop_replay_enabled"] is True
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
     assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
@@ -1770,22 +1770,22 @@ def test_rlpfn_maintained_path_policy_step_trace_matches_golden():
 
 def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden():
     expected = {
-        "loss": -0.22706,
-        "reward_sum": 1.446079,
-        "objective": 0.22706,
+        "loss": -0.226237,
+        "reward_sum": 1.433664,
+        "objective": 0.226237,
         "alpha_grad_v0_mean": 0.258765,
-        "alpha_grad_v1_mean": 0.222553,
-        "alpha_grad_mix_abs_max": 0.256863,
+        "alpha_grad_v1_mean": 0.167426,
+        "alpha_grad_mix_abs_max": 0.244521,
         "alpha_grad_valid_share": 1.0,
         "rollout_transition_group_count": 0,
         "rollout_transition_family_group_count": 0,
         "rollout_exact_scm_count": 4,
         "rollout_transition_reference_mode": "scm_exact",
-        "reinforce_log_prob_mean": 21.257523,
-        "policy_head_grad_sum": 23.927478,
-        "policy_head_grad_max": 0.262588,
-        "attn_in_proj_grad_sum": 2.479845,
-        "attn_in_proj_grad_max": 0.014586,
+        "reinforce_log_prob_mean": 6.192621,
+        "policy_head_grad_sum": 22.067406,
+        "policy_head_grad_max": 0.27335,
+        "attn_in_proj_grad_sum": 2.429768,
+        "attn_in_proj_grad_max": 0.011334,
     }
 
     assert _capture_alpha_grad_fast_runner_gradient_trace() == expected
@@ -1793,21 +1793,21 @@ def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden()
 
 def test_rlpfn_maintained_alpha_grad_train_step_trace_matches_golden():
     expected = {
-        "loss": -0.22706,
-        "objective": 0.22706,
-        "reward_sum": 1.446079,
+        "loss": -0.226237,
+        "objective": 0.226237,
+        "reward_sum": 1.433664,
         "alpha_grad_v0_mean": 0.258765,
-        "alpha_grad_v1_mean": 0.222553,
-        "reinforce_log_prob_mean": 21.257523,
+        "alpha_grad_v1_mean": 0.167426,
+        "reinforce_log_prob_mean": 6.192621,
         "rollout_transition_reference_mode": "scm_exact",
         "rollout_exact_scm_count": 4,
-        "grad_abs_sum": 44.266421,
-        "grad_abs_max": 0.262588,
+        "grad_abs_sum": 40.443638,
+        "grad_abs_max": 0.27335,
         "grad_numel": 26622,
-        "param_delta_abs_sum": 11.284408,
+        "param_delta_abs_sum": 11.250804,
         "param_delta_abs_max": 0.001,
-        "policy_head_delta_abs_sum": 2.306698,
-        "attn_in_proj_delta_abs_sum": 3.058117,
+        "policy_head_delta_abs_sum": 2.306941,
+        "attn_in_proj_delta_abs_sum": 3.024241,
     }
 
     assert _capture_alpha_grad_train_step_trace() == expected
