@@ -1030,6 +1030,12 @@ def _build_policy_step_fn(
 
     policy_step_fn._compile_active = bool(compile_active or split_compile_active)
     policy_step_fn._clear_buffers = _clear_policy_step_buffers
+    policy_step_fn._model_ref = model_ref
+    reinforce_sequence_replay_fn = getattr(model_ref, "replay_policy_sequence_tokens", None)
+    policy_step_fn._reinforce_sequence_replay_fn = (
+        reinforce_sequence_replay_fn if callable(reinforce_sequence_replay_fn) else None
+    )
+    policy_step_fn._fit_action_dim_fn = _fit_action_dim
     return policy_step_fn
 
 
