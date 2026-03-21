@@ -249,14 +249,21 @@ def _resolve_validation_sample(value, rng):
     return value
 
 
-def _resolve_validation_policy_hparams(env_cfg, rng):
+def _resolve_validation_policy_hparams(env_cfg, rng, *, orch_cfg=None):
+    orch_cfg = {} if orch_cfg is None else orch_cfg
+    # Real Gym validation should execute the model's raw environment action
+    # (plus any stochastic exploration noise), not the synthetic-prior-only
+    # RMS normalization that keeps generated environments numerically stable.
+    action_transform_mode = str(orch_cfg.get("rl_validate_action_transform", "none")).strip().lower()
+    if action_transform_mode not in {"none", "tanh", "rms"}:
+        action_transform_mode = "none"
     return {
         # Match the prior semantics: 1 means reward is present, 0 means dropped/missing.
         "reward_mask_present_value": 1.0,
         "init_action_std": float(_resolve_validation_sample(env_cfg.get("init_action_std", 0.0), rng)),
         "action_noise_train_std": float(_resolve_validation_sample(env_cfg.get("action_noise_train_std", 0.0), rng)),
         "action_noise_eval_std": float(_resolve_validation_sample(env_cfg.get("action_noise_eval_std", 0.0), rng)),
-        "action_transform_mode": str(env_cfg.get("reinforce_action_transform", "rms")).strip().lower(),
+        "action_transform_mode": action_transform_mode,
         "action_rms_eps": float(_resolve_validation_sample(env_cfg.get("reinforce_action_rms_eps", 1e-6), rng)),
         "reward_clip": float(max(0.1, _resolve_validation_sample(env_cfg.get("reward_clip", 10.0), rng))),
         "reward_transform_mode": str(env_cfg.get("reinforce_reward_transform", "none")).strip().lower(),
@@ -296,9 +303,9 @@ def _resolve_validation_policy_cache_config(optimizer_cfg, *, context_lower_boun
     }
 
 
-def _initialize_validation_policy_state(state, *, env_cfg, device, action_dim):
+def _initialize_validation_policy_state(state, *, env_cfg, orch_cfg, device, action_dim):
     rng = state["rng"]
-    h = _resolve_validation_policy_hparams(env_cfg, rng)
+    h = _resolve_validation_policy_hparams(env_cfg, rng, orch_cfg=orch_cfg)
     init_action_std = float(h["init_action_std"])
     if init_action_std > 0.0:
         init_action = rng.normal(size=(1, int(action_dim))).astype(np.float32) * init_action_std
@@ -460,6 +467,7 @@ def _build_validation_episode_states(
     episodes,
     base_seed,
     env_cfg=None,
+    orch_cfg=None,
     device="cpu",
     action_low=None,
     action_high=None,
@@ -493,6 +501,7 @@ def _build_validation_episode_states(
             _initialize_validation_policy_state(
                 state,
                 env_cfg=(env_cfg or {}),
+                orch_cfg=(orch_cfg or {}),
                 device=device,
                 action_dim=int(state["action_low"].shape[0]),
             )
@@ -586,13 +595,13 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 probe_env.close()
             except Exception:
                 pass
-
             states = _build_validation_episode_states(
                 gym=gym,
                 env_name=env_name,
                 episodes=episodes,
                 base_seed=base_seed,
                 env_cfg=env_cfg,
+                orch_cfg=orch,
                 device=device,
                 action_low=action_low,
                 action_high=action_high,

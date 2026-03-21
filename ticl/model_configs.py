@@ -411,7 +411,7 @@ def get_rlpfn_default_config():
     config['prior']['prior_type'] = 'environment_only'
     config['prior']['num_features'] = 432
     # RLPFN default rollout horizon.
-    config['prior']['n_samples'] = 1024
+    config['prior']['n_samples'] = 1024 * 4
 
     env_cfg = config['prior']['environment']
     apply_rlpfn_maintained_path_defaults(config)
@@ -467,11 +467,10 @@ def get_rlpfn_default_config():
     config['optimizer']['train_kernel_profiler_log_every_batches'] = 0
     config['optimizer']['train_kernel_profiler_export_trace'] = True
     config['optimizer']['train_kernel_profiler_summary_top_k'] = 20
-    # Keep maintained TBPTT streaming on the baseline device-memory path by
-    # default. Policy-only CPU offload can cap GPU memory, but on the 1024-batch
-    # maintained RL path it shifts retained one-hop/TBPTT state into host RSS
-    # and can trip the hard host guard before a batch completes.
-    config['optimizer']['pg_saved_tensors_cpu_offload'] = False
+    # Default to policy-only CPU offload: it captures most of the shared
+    # transformer memory reduction while keeping host/RSS and wall-time below
+    # full rollout offload on the maintained risky-load benchmark.
+    config['optimizer']['pg_saved_tensors_cpu_offload'] = True
     config['optimizer']['pg_saved_tensors_cpu_offload_scope'] = "policy"
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False

@@ -118,6 +118,16 @@ class _ScriptedEnv:
         return None
 
 
+class _ActionRecordingEnv(_ScriptedEnv):
+    def __init__(self, rollout_lengths, rollout_rewards, action_log, obs_dim=4, action_dim=1):
+        super().__init__(rollout_lengths, rollout_rewards, obs_dim=obs_dim, action_dim=action_dim)
+        self._action_log = action_log
+
+    def step(self, action):
+        self._action_log.append(float(np.asarray(action, dtype=np.float32).reshape(-1)[0]))
+        return super().step(action)
+
+
 class _PhaseRecordingModel:
     def __init__(self, phase_idx, terminal_idx):
         self.training = False
@@ -217,6 +227,71 @@ class _WrappedPolicyModel(torch.nn.Module):
         return self.model(*args, **kwargs)
 
 
+class _FixedActionPolicyModel(torch.nn.Module):
+    def __init__(self, obs_total_dim, action_dim=1, action_value=0.25):
+        super().__init__()
+        self.x_encoder_type = "split_obs_action"
+        self.encoder = types.SimpleNamespace(obs_dim=int(obs_total_dim), action_dim=int(action_dim))
+        self.action_dim = int(action_dim)
+        self.action_value = float(action_value)
+
+    def forward_policy_step(
+        self,
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        del x_token
+        del y_token
+        del max_cache_len
+        del kv_cache_mode
+        del kv_cache_page_size
+        del allow_grad_mutable_cache
+        del allow_grad_inplace_paged_cache
+        batch_size = int(x_token.shape[1])
+        out = torch.full((1, batch_size, self.action_dim), self.action_value, dtype=x_token.dtype, device=x_token.device)
+        return out, {"step": 1 if kv_cache is None else int(kv_cache.get("step", 0)) + 1}
+
+    def forward_policy_step_split(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        del obs_t
+        del action_t
+        del reward_t
+        del phase_t
+        del terminal_t
+        del max_cache_len
+        del kv_cache_mode
+        del kv_cache_page_size
+        del allow_grad_mutable_cache
+        del allow_grad_inplace_paged_cache
+        batch_size = int(reward_mask_t.shape[0])
+        out = torch.full(
+            (1, batch_size, self.action_dim),
+            self.action_value,
+            dtype=reward_mask_t.dtype,
+            device=reward_mask_t.device,
+        )
+        return out, {"step": 1 if kv_cache is None else int(kv_cache.get("step", 0)) + 1}
+
+
 def _install_fake_gym(monkeypatch, env_factory):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
@@ -310,6 +385,51 @@ def test_evaluate_rlpfn_on_gym_envs_policy_step_path_reuses_cache_and_reports_si
     assert model.phase_calls == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
     assert model.terminal_calls == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert model.cache_seen == [False, True, True, True, True, True, True]
+
+
+def test_evaluate_rlpfn_on_gym_envs_does_not_apply_prior_rms_action_transform_to_real_env(monkeypatch):
+    action_log = []
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ActionRecordingEnv([1, 1], [0.0, 0.0], action_log, obs_dim=4, action_dim=1),
+    )
+    model = _FixedActionPolicyModel(obs_total_dim=8, action_dim=1, action_value=0.25)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                # Validation should ignore this synthetic-prior-only transform.
+                "reinforce_action_transform": "rms",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vAction",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vAction"]["return"] == 0.0
+    assert len(action_log) == 2
+    assert action_log == pytest.approx([0.25, 0.25], abs=1e-6)
 
 
 def test_evaluate_rlpfn_on_gym_envs_small_rlpfn_model_uses_policy_step_validation(monkeypatch):

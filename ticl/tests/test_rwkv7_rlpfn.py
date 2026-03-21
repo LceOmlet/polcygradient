@@ -1,5 +1,7 @@
 from copy import deepcopy
 import random
+import sys
+import types
 
 import numpy as np
 import torch
@@ -7,6 +9,7 @@ import torch
 from ticl.model_builder import get_model
 from ticl.model_configs import get_model_default_config
 from ticl.priors.environment_prior import EnvironmentPrior
+from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
 from ticl.train import _build_policy_step_fn
 
 
@@ -41,6 +44,57 @@ def _build_small_exact_scm_env_cfg():
         }
     )
     return cfg, env_cfg
+
+
+class _FakeBox:
+    def __init__(self, low, high):
+        self.low = np.asarray(low, dtype=np.float32)
+        self.high = np.asarray(high, dtype=np.float32)
+
+
+class _ScriptedEnv:
+    def __init__(self, rollout_lengths, rollout_rewards, obs_dim=400, action_dim=30):
+        self._rollout_lengths = [int(x) for x in rollout_lengths]
+        self._rollout_rewards = [float(x) for x in rollout_rewards]
+        self._obs_dim = int(obs_dim)
+        self._rollout_idx = -1
+        self._step_idx = 0
+        self.action_space = _FakeBox(
+            low=-np.ones((int(action_dim),), dtype=np.float32),
+            high=np.ones((int(action_dim),), dtype=np.float32),
+        )
+
+    def reset(self, seed=None):
+        del seed
+        self._rollout_idx += 1
+        self._step_idx = 0
+        obs = np.full((self._obs_dim,), float(self._rollout_idx), dtype=np.float32)
+        return obs, {}
+
+    def step(self, action):
+        del action
+        reward = self._rollout_rewards[self._rollout_idx]
+        self._step_idx += 1
+        terminated = bool(self._step_idx >= self._rollout_lengths[self._rollout_idx])
+        obs = np.full(
+            (self._obs_dim,),
+            float(self._rollout_idx) + 0.1 * float(self._step_idx),
+            dtype=np.float32,
+        )
+        return obs, reward, terminated, False, {}
+
+    def close(self):
+        return None
+
+
+def _install_fake_gym(monkeypatch, env_factory):
+    gym_mod = types.ModuleType("gymnasium")
+    spaces_mod = types.ModuleType("gymnasium.spaces")
+    spaces_mod.Box = _FakeBox
+    gym_mod.spaces = spaces_mod
+    gym_mod.make = lambda env_name: env_factory(env_name)
+    monkeypatch.setitem(sys.modules, "gymnasium", gym_mod)
+    monkeypatch.setitem(sys.modules, "gymnasium.spaces", spaces_mod)
 
 
 def _assemble_split_token(obs_t, action_t, reward_t, reward_mask_t, phase_t, terminal_t, *, obs_dim: int, action_dim: int):
@@ -245,3 +299,113 @@ def test_rwkv7_rlpfn_official_cuda_sequence_forward_runs():
     out = model((x, y), single_eval_pos=7)
     assert out.is_cuda
     assert tuple(out.shape) == (seq_len - 7, batch_size, int(model.policy_action_dim))
+
+
+def test_rwkv7_rlpfn_validation_uses_split_policy_step_state_cache(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
+    )
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    import ticl.rl_validation as rl_validation_mod
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("RWKV validation must not fall back to legacy candidate scoring")
+
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    split_calls = {"count": 0}
+    split_cache_seen = []
+
+    original_split = model.forward_policy_step_split
+
+    def _wrapped_split(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        split_calls["count"] += 1
+        split_cache_seen.append(kv_cache is not None)
+        return original_split(
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=phase_t,
+            terminal_t=terminal_t,
+            kv_cache=kv_cache,
+            max_cache_len=max_cache_len,
+            kv_cache_mode=kv_cache_mode,
+            kv_cache_page_size=kv_cache_page_size,
+            allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+        )
+
+    def _forbid_generic(
+        self,
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        raise AssertionError("RWKV validation should use split policy-step fastpath, not generic policy_step")
+
+    monkeypatch.setattr(model, "forward_policy_step_split", types.MethodType(_wrapped_split, model))
+    monkeypatch.setattr(model, "forward_policy_step", types.MethodType(_forbid_generic, model))
+
+    val_cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": int(cfg["prior"]["num_features"]),
+            "environment": {
+                "obs_slot_dim": 400,
+                "action_slot_dim": 30,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vRWKV",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=val_cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vRWKV"]["return"] == 2.0
+    assert split_calls["count"] > 0
+    assert split_cache_seen[0] is False
+    assert any(split_cache_seen[1:])

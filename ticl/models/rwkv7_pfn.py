@@ -613,6 +613,90 @@ class RWKV7PFN(nn.Module):
             x_enc = self.input_ln(x_enc)
         return x_enc
 
+    def _encode_split_train_token(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+    ):
+        if self.x_encoder_type != "split_obs_action" or (not isinstance(self.encoder, SplitObsActionEncoder)):
+            raise ValueError("_encode_split_train_token requires split_obs_action encoder.")
+        if obs_t.ndim != 2 or action_t.ndim != 2:
+            raise ValueError(
+                f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
+            )
+        batch_size = int(obs_t.shape[0])
+        if int(action_t.shape[0]) != batch_size:
+            raise ValueError("obs_t and action_t batch size mismatch")
+
+        obs_dtype = obs_t.dtype
+        obs_device = obs_t.device
+        reward_scalar = reward_t.reshape(batch_size).to(dtype=obs_dtype, device=obs_device)
+        reward_mask_scalar = reward_mask_t.reshape(batch_size).to(dtype=obs_dtype, device=obs_device)
+        phase_scalar = None if phase_t is None else phase_t.reshape(batch_size).to(dtype=obs_dtype, device=obs_device)
+        terminal_scalar = None if terminal_t is None else terminal_t.reshape(batch_size).to(dtype=obs_dtype, device=obs_device)
+
+        obs_dim = int(self.encoder.obs_dim)
+        action_dim = int(self.encoder.action_dim)
+        extra_scalar_slots = int(max(0, obs_dim - int(obs_t.shape[-1]) - 2))
+        phase_token_enabled = bool(phase_scalar is not None)
+        terminal_token_enabled = bool(terminal_scalar is not None)
+        remaining_scalar_slots = int(max(0, extra_scalar_slots - int(phase_token_enabled) - int(terminal_token_enabled)))
+        if remaining_scalar_slots > 0 and phase_scalar is None:
+            phase_scalar = torch.zeros((batch_size,), device=obs_device, dtype=obs_dtype)
+            phase_token_enabled = True
+            remaining_scalar_slots -= 1
+        if remaining_scalar_slots > 0 and terminal_scalar is None:
+            terminal_scalar = torch.zeros((batch_size,), device=obs_device, dtype=obs_dtype)
+            terminal_token_enabled = True
+            remaining_scalar_slots -= 1
+        obs_slot_dim = int(max(0, obs_dim - (2 + int(phase_token_enabled) + int(terminal_token_enabled))))
+
+        obs_features = torch.zeros((batch_size, obs_dim), device=obs_device, dtype=obs_dtype)
+        obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
+        if obs_copy > 0:
+            obs_src = (
+                torch.nan_to_num(obs_t, nan=0.0)
+                if bool(getattr(self.encoder.obs_encoder, "replace_nan_by_zero", False))
+                else obs_t
+            )
+            obs_features[:, :obs_copy] = obs_src[:, :obs_copy]
+        reward_idx = obs_slot_dim
+        mask_idx = obs_slot_dim + 1
+        if reward_idx < obs_dim:
+            obs_features[:, reward_idx] = reward_scalar
+        if mask_idx < obs_dim:
+            obs_features[:, mask_idx] = reward_mask_scalar
+        phase_idx = obs_slot_dim + 2
+        if phase_token_enabled and phase_idx < obs_dim:
+            obs_features[:, phase_idx] = phase_scalar
+        terminal_idx = obs_slot_dim + 2 + int(phase_token_enabled)
+        if terminal_token_enabled and terminal_idx < obs_dim:
+            obs_features[:, terminal_idx] = terminal_scalar
+
+        action_features = torch.zeros((batch_size, action_dim), device=obs_device, dtype=obs_dtype)
+        action_copy = int(min(int(action_t.shape[-1]), action_dim))
+        if action_copy > 0:
+            action_src = (
+                torch.nan_to_num(action_t, nan=0.0)
+                if bool(getattr(self.encoder.action_encoder, "replace_nan_by_zero", False))
+                else action_t
+            )
+            action_features[:, :action_copy] = action_src[:, :action_copy]
+
+        x_enc = self.encoder.obs_encoder(obs_features) + self.encoder.action_encoder(action_features)
+        if self.y_encoder is None:
+            y_enc = torch.zeros_like(x_enc)
+        else:
+            y_enc = self.y_encoder(reward_scalar.reshape(batch_size, 1))
+        token = x_enc + y_enc
+        if self.input_ln is not None:
+            token = self.input_ln(token)
+        return token
+
     def forward(self, src, single_eval_pos=None):
         assert isinstance(src, tuple), "inputs (src) have to be given as (x,y) or (style,x,y) tuple"
         if single_eval_pos is None:
@@ -708,68 +792,18 @@ class RWKV7PFN(nn.Module):
             raise ValueError("forward_policy_step_split requires single_eval_causal=True.")
         if self.x_encoder_type != "split_obs_action" or (not isinstance(self.encoder, SplitObsActionEncoder)):
             raise ValueError("forward_policy_step_split requires split_obs_action encoder.")
-        if obs_t.ndim != 2 or action_t.ndim != 2:
-            raise ValueError(
-                f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
-            )
-
-        batch_size = int(obs_t.shape[0])
-        if int(action_t.shape[0]) != batch_size:
-            raise ValueError("obs_t and action_t batch size mismatch")
-
-        reward_scalar = reward_t.reshape(batch_size).to(dtype=obs_t.dtype, device=obs_t.device)
-        reward_mask_scalar = reward_mask_t.reshape(batch_size).to(dtype=obs_t.dtype, device=obs_t.device)
-        phase_scalar = None if phase_t is None else phase_t.reshape(batch_size).to(dtype=obs_t.dtype, device=obs_t.device)
-        terminal_scalar = None if terminal_t is None else terminal_t.reshape(batch_size).to(dtype=obs_t.dtype, device=obs_t.device)
-
-        obs_dim = int(self.encoder.obs_dim)
-        action_dim = int(self.encoder.action_dim)
-        extra_scalar_slots = int(max(0, obs_dim - int(obs_t.shape[-1]) - 2))
-        phase_token_enabled = bool(phase_scalar is not None)
-        terminal_token_enabled = bool(terminal_scalar is not None)
-        remaining_scalar_slots = int(max(0, extra_scalar_slots - int(phase_token_enabled) - int(terminal_token_enabled)))
-        if remaining_scalar_slots > 0 and phase_scalar is None:
-            phase_scalar = torch.zeros((batch_size,), device=obs_t.device, dtype=obs_t.dtype)
-            phase_token_enabled = True
-            remaining_scalar_slots -= 1
-        if remaining_scalar_slots > 0 and terminal_scalar is None:
-            terminal_scalar = torch.zeros((batch_size,), device=obs_t.device, dtype=obs_t.dtype)
-            terminal_token_enabled = True
-            remaining_scalar_slots -= 1
-        obs_slot_dim = int(max(0, obs_dim - (2 + int(phase_token_enabled) + int(terminal_token_enabled))))
-        num_features = int(obs_dim + action_dim)
-
-        x_token = torch.zeros((1, batch_size, num_features), device=obs_t.device, dtype=obs_t.dtype)
-        x_row = x_token[0]
-        obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
-        if obs_copy > 0:
-            obs_src = torch.nan_to_num(obs_t, nan=0.0) if bool(getattr(self.encoder.obs_encoder, "replace_nan_by_zero", False)) else obs_t
-            x_row[:, :obs_copy] = obs_src[:, :obs_copy]
-        reward_idx = obs_slot_dim
-        mask_idx = obs_slot_dim + 1
-        if reward_idx < obs_dim:
-            x_row[:, reward_idx] = reward_scalar
-        if mask_idx < obs_dim:
-            x_row[:, mask_idx] = reward_mask_scalar
-        phase_idx = obs_slot_dim + 2
-        if phase_token_enabled and phase_idx < obs_dim:
-            x_row[:, phase_idx] = phase_scalar
-        terminal_idx = obs_slot_dim + 2 + int(phase_token_enabled)
-        if terminal_token_enabled and terminal_idx < obs_dim:
-            x_row[:, terminal_idx] = terminal_scalar
-        action_write_start = obs_slot_dim + 2 + int(phase_token_enabled) + int(terminal_token_enabled)
-        if action_write_start < num_features:
-            action_copy = int(min(int(action_t.shape[-1]), action_dim, num_features - action_write_start))
-            if action_copy > 0:
-                action_src = torch.nan_to_num(action_t, nan=0.0) if bool(getattr(self.encoder.action_encoder, "replace_nan_by_zero", False)) else action_t
-                x_row[:, action_write_start: action_write_start + action_copy] = action_src[:, :action_copy]
-
-        y_token = reward_scalar.reshape(1, batch_size)
-        return self.forward_policy_step(
-            x_token,
-            y_token,
-            kv_cache=kv_cache,
+        token = self._encode_split_train_token(
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=phase_t,
+            terminal_t=terminal_t,
         )
+        token = self._cast_token_for_rwkv_core(token)
+        hidden, kv_cache = self.rwkv_core.forward_step(token, kv_cache)
+        out = self._decode_policy_action(hidden.unsqueeze(0))
+        return out, kv_cache
 
     def forward_with_kv(self, src, single_eval_pos=None):
         assert isinstance(src, tuple), "inputs (src) have to be given as (x,y) or (style,x,y) tuple"
