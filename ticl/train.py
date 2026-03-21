@@ -891,6 +891,22 @@ def _build_policy_step_fn(
             and action_slot_dim == int(split_action_slot_dim)
         )
 
+        step_kv_cache_mode = kv_cache_mode
+        step_allow_grad_mutable_cache = allow_grad_mutable_cache
+        step_allow_grad_inplace_paged_cache = allow_grad_inplace_paged_cache
+        if (
+            (not torch.is_grad_enabled())
+            and bool(allow_grad_mutable_cache)
+            and str(kv_cache_mode).strip().lower() == "paged"
+        ):
+            # Reentrant rollout checkpoint executes the first forward pass under
+            # no-grad. The paged+mutable cache path is numerically unstable in
+            # that mode after a prior paged backward, while immutable cache is
+            # semantically equivalent for the no-grad replay pass.
+            step_kv_cache_mode = "immutable"
+            step_allow_grad_mutable_cache = False
+            step_allow_grad_inplace_paged_cache = False
+
         def _call_split_forward_step():
             return split_policy_forward_step(
                 obs_t,
@@ -901,10 +917,10 @@ def _build_policy_step_fn(
                 terminal_t=(terminal_scalar.reshape(batch_size, 1) if terminal_token_enabled else None),
                 kv_cache=cache,
                 max_cache_len=max_cache_len,
-                kv_cache_mode=kv_cache_mode,
+                kv_cache_mode=step_kv_cache_mode,
                 kv_cache_page_size=kv_cache_page_size,
-                allow_grad_mutable_cache=allow_grad_mutable_cache,
-                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+                allow_grad_mutable_cache=step_allow_grad_mutable_cache,
+                allow_grad_inplace_paged_cache=step_allow_grad_inplace_paged_cache,
             )
 
         if use_split_fastpath:
@@ -998,10 +1014,10 @@ def _build_policy_step_fn(
                 y_token,
                 kv_cache=cache,
                 max_cache_len=max_cache_len,
-                kv_cache_mode=kv_cache_mode,
+                kv_cache_mode=step_kv_cache_mode,
                 kv_cache_page_size=kv_cache_page_size,
-                allow_grad_mutable_cache=allow_grad_mutable_cache,
-                allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+                allow_grad_mutable_cache=step_allow_grad_mutable_cache,
+                allow_grad_inplace_paged_cache=step_allow_grad_inplace_paged_cache,
             )
 
         if compile_active:
@@ -1105,6 +1121,7 @@ def _compute_policy_rollout_chunk_loss(
     pg_saved_tensors_cpu_offload_auto_max_n_samples=1024,
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
+    reinforce_replay_loss_sink=None,
     h_list_override=None,
     env_seeds_override=None,
     rollout_seeds_override=None,
@@ -1158,6 +1175,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=tbptt_loss_sink,
+                reinforce_replay_loss_sink=reinforce_replay_loss_sink,
                 policy_objective_kind=rl_objective,
                 **rollout_kwargs,
             )
@@ -1177,6 +1195,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=None,
+                reinforce_replay_loss_sink=reinforce_replay_loss_sink,
                 policy_objective_kind=rl_objective,
                 **rollout_kwargs,
             )
@@ -1201,6 +1220,7 @@ def _compute_policy_rollout_chunk_loss(
                 collect_x=collect_x,
                 tbptt_window=pg_tbptt_window,
                 tbptt_loss_sink=None,
+                reinforce_replay_loss_sink=reinforce_replay_loss_sink,
                 policy_objective_kind=rl_objective,
                 **rollout_kwargs,
             )
@@ -2442,8 +2462,10 @@ def train_epoch_policy_gradient(
                             else None
                         )
     
+                        backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
+                        reinforce_replay_backward_called = False
+
                         if tbptt_stream_backward_active:
-                            backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
                             tbptt_merge_guard_active = bool(
                                 (tbptt_pending_window_losses is not None)
                                 and tbptt_merge_guard_enabled
@@ -2474,7 +2496,7 @@ def train_epoch_policy_gradient(
                                     )
                                 )
 
-                            def _tbptt_backward_from_losses(window_losses_scaled):
+                            def _tbptt_backward_from_losses(window_losses_scaled, *, retain_graph=False):
                                 nonlocal tbptt_window_backward_called, batch_backward_wall, batch_backward_calls
                                 nonlocal backward_t_start_unix, backward_t_end_unix
                                 nonlocal batch_tbptt_stream_backward_launches, batch_tbptt_stream_backward_roots
@@ -2522,17 +2544,25 @@ def train_epoch_policy_gradient(
                                     if (kernel_profiler is not None and kernel_profiler.enabled())
                                     else nullcontext()
                                 ):
+                                    applied_scale = 1.0
                                     if scaler is None:
                                         if num_roots == 1:
-                                            window_losses_scaled[0].backward()
+                                            window_losses_scaled[0].backward(retain_graph=bool(retain_graph))
                                         else:
-                                            torch.autograd.backward(window_losses_scaled)
+                                            torch.autograd.backward(
+                                                window_losses_scaled,
+                                                retain_graph=bool(retain_graph),
+                                            )
                                     else:
+                                        applied_scale = float(scaler.get_scale())
                                         scaled_losses = [scaler.scale(loss_root) for loss_root in window_losses_scaled]
                                         if num_roots == 1:
-                                            scaled_losses[0].backward()
+                                            scaled_losses[0].backward(retain_graph=bool(retain_graph))
                                         else:
-                                            torch.autograd.backward(scaled_losses)
+                                            torch.autograd.backward(
+                                                scaled_losses,
+                                                retain_graph=bool(retain_graph),
+                                            )
                                 if backward_cuda_start is not None:
                                     backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_end.record()
@@ -2546,6 +2576,7 @@ def train_epoch_policy_gradient(
                                     backward_t_start_unix = backward_t0_unix
                                 backward_t_end_unix = backward_t1_unix
                                 tbptt_window_backward_called = True
+                                return float(applied_scale)
 
                             def _tbptt_flush_pending_windows():
                                 if tbptt_pending_window_losses is None or (len(tbptt_pending_window_losses) == 0):
@@ -2556,7 +2587,27 @@ def train_epoch_policy_gradient(
 
                             def _tbptt_chunk_loss_sink(weighted_window_loss):
                                 nonlocal batch_tbptt_stream_merge_guard_flushes
-                                window_loss_scaled = weighted_window_loss * backward_scale
+                                payload = None
+                                loss_root = weighted_window_loss
+                                retain_graph = False
+                                immediate = False
+                                if isinstance(weighted_window_loss, dict):
+                                    payload = weighted_window_loss
+                                    loss_root = weighted_window_loss.get("loss_root", None)
+                                    retain_graph = bool(weighted_window_loss.get("retain_graph", False))
+                                    immediate = bool(weighted_window_loss.get("immediate", False))
+                                if (not torch.is_tensor(loss_root)) or (not bool(loss_root.requires_grad)):
+                                    return None
+                                window_loss_scaled = loss_root * backward_scale
+                                if immediate:
+                                    _tbptt_flush_pending_windows()
+                                    applied_scale = _tbptt_backward_from_losses(
+                                        [window_loss_scaled],
+                                        retain_graph=bool(retain_graph),
+                                    )
+                                    if isinstance(payload, dict):
+                                        return {"applied_scale": float(applied_scale)}
+                                    return None
                                 if tbptt_pending_window_losses is not None:
                                     if _tbptt_merge_guard_should_flush_pending():
                                         batch_tbptt_stream_merge_guard_flushes += 1
@@ -2565,11 +2616,51 @@ def train_epoch_policy_gradient(
                                     if len(tbptt_pending_window_losses) < int(tbptt_stream_merge_windows):
                                         return
                                     _tbptt_flush_pending_windows()
-                                    return
+                                    return None
                                 _tbptt_backward_from_losses([window_loss_scaled])
+                                return None
+                            _tbptt_chunk_loss_sink._ticl_accepts_tbptt_payload = True
                         else:
                             _tbptt_chunk_loss_sink = None
                             _tbptt_flush_pending_windows = None
+
+                        if (not tbptt_stream_backward_active) and (current_tbptt_window is None):
+                            def _reinforce_replay_loss_sink(loss_root):
+                                nonlocal reinforce_replay_backward_called
+                                nonlocal batch_backward_wall, batch_backward_calls
+                                nonlocal backward_t_start_unix, backward_t_end_unix
+                                if (not torch.is_tensor(loss_root)) or (not bool(loss_root.requires_grad)):
+                                    return None
+                                reinforce_replay_backward_called = True
+                                scaled_loss = loss_root * backward_scale
+                                backward_t0_unix = time.time()
+                                backward_t0 = time.perf_counter()
+                                backward_cuda_start = None
+                                if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                                    backward_cuda_start = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_start.record()
+                                with (
+                                    kernel_profiler.phase("pg.backward")
+                                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                                    else nullcontext()
+                                ):
+                                    if scaler is None:
+                                        scaled_loss.backward()
+                                    else:
+                                        scaler.scale(scaled_loss).backward()
+                                if backward_cuda_start is not None:
+                                    backward_cuda_end = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_end.record()
+                                    backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
+                                batch_backward_wall += (time.perf_counter() - backward_t0)
+                                batch_backward_calls += 1
+                                backward_t1_unix = time.time()
+                                if backward_t_start_unix is None:
+                                    backward_t_start_unix = backward_t0_unix
+                                backward_t_end_unix = backward_t1_unix
+                                return None
+                        else:
+                            _reinforce_replay_loss_sink = None
     
                         try:
                             rollout_t0_unix = time.time()
@@ -2613,6 +2704,7 @@ def train_epoch_policy_gradient(
                                         pg_saved_tensors_cpu_offload_auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
                                         pg_tbptt_window=current_tbptt_window,
                                         tbptt_loss_sink=_tbptt_chunk_loss_sink,
+                                        reinforce_replay_loss_sink=_reinforce_replay_loss_sink,
                                         rl_objective=rl_objective,
                                         **rollout_override_kwargs,
                                     )
@@ -2620,6 +2712,8 @@ def train_epoch_policy_gradient(
                                     weighted_pg_loss = pg_loss_chunk * chunk_weight
                                     loss = weighted_pg_loss / aggregate_k_gradients
                                     if tbptt_stream_backward_active and tbptt_window_backward_called:
+                                        loss = loss.detach()
+                                    if reinforce_replay_backward_called:
                                         loss = loss.detach()
                                     metric_loss = loss.detach().mean()
                                     if tbptt_stream_backward_active and tbptt_window_backward_called:

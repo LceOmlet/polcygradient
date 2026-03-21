@@ -12161,6 +12161,7 @@ class EnvironmentPrior:
         _policy_detach_action_in_env=None,
         _policy_disable_log_probs=False,
         _policy_force_no_grad=False,
+        _policy_defer_reinforce_replay=False,
     ):
         n_samples = int(n_samples)
         batch_size = int(len(h_list))
@@ -16390,6 +16391,7 @@ class EnvironmentPrior:
         _policy_detach_action_in_env=None,
         _policy_disable_log_probs=False,
         _policy_force_no_grad=False,
+        _policy_defer_reinforce_replay=False,
     ):
         """
         Differentiable rollout for policy optimization.
@@ -16650,6 +16652,7 @@ class EnvironmentPrior:
                 "_policy_detach_action_in_env": _policy_detach_action_in_env,
                 "_policy_disable_log_probs": _policy_disable_log_probs,
                 "_policy_force_no_grad": _policy_force_no_grad,
+                "_policy_defer_reinforce_replay": _policy_defer_reinforce_replay,
                 "alpha_grad_trace_roots_only": alpha_grad_trace_roots_only,
                 "backend": backend,
                 "strict_rng_match": strict_rng_match,
@@ -16848,6 +16851,132 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": float(reward_transform_stats["tanh_bound"]),
         }
         return loss, stats
+
+    def reinforce_sequence_replay_loss_from_rollout(
+        self,
+        *,
+        policy_step_fn,
+        x_tokens,
+        rewards,
+        replay_payload,
+        single_eval_pos,
+        discount=None,
+        baseline_mode="leave_one_out",
+        fit_action_dim_fn=None,
+        loss_sink=None,
+    ):
+        if not callable(getattr(policy_step_fn, "_reinforce_sequence_replay_fn", None)):
+            raise RuntimeError("reinforce sequence replay helper is missing from policy_step_fn")
+        if not torch.is_tensor(x_tokens) or x_tokens.ndim != 3:
+            raise ValueError("reinforce sequence replay requires rollout x tokens with shape (T, B, F)")
+        if not torch.is_tensor(rewards) or rewards.ndim != 2:
+            raise ValueError("reinforce sequence replay requires rollout rewards with shape (T, B)")
+        if not isinstance(replay_payload, dict):
+            raise ValueError("reinforce sequence replay requires recorded replay payload tensors")
+
+        replay_fn = policy_step_fn._reinforce_sequence_replay_fn
+        reward_in = replay_payload.get("reward_in", None)
+        action_pre_tanh = replay_payload.get("action_pre_tanh", None)
+        sampled_action = replay_payload.get("sampled_action", None)
+        action_std = replay_payload.get("action_std", None)
+        action_mask = replay_payload.get("action_mask", None)
+        eval_start = int(replay_payload.get("eval_start", int(single_eval_pos) or 0) or 0)
+        full_length = int(replay_payload.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
+        if not all(torch.is_tensor(t) for t in (reward_in, action_pre_tanh, sampled_action, action_std, action_mask)):
+            raise RuntimeError("reinforce sequence replay tensors are incomplete")
+
+        rewards_eval = rewards[eval_start:]
+        if tuple(rewards_eval.shape) != tuple(action_std.shape):
+            raise RuntimeError(
+                "reinforce sequence replay reward/action_std shape mismatch: "
+                f"{tuple(rewards_eval.shape)} vs {tuple(action_std.shape)}"
+            )
+        if discount is None:
+            discount = self._resolve_scalar(self.config.get("discount", 1.0))
+        discount = float(max(0.0, min(1.0, discount)))
+        returns = self._returns_to_go(rewards_eval, discount=discount)
+        baseline_mode = str(baseline_mode).strip().lower()
+        if baseline_mode in {"loo", "leave_one_out", "leave-one-out"}:
+            baseline = self._leave_one_out_baseline(returns)
+            baseline_mode = "leave_one_out"
+        elif baseline_mode in {"zero", "none", ""}:
+            baseline = torch.zeros_like(returns)
+            baseline_mode = "zero"
+        else:
+            raise ValueError(f"Unknown REINFORCE baseline mode: {baseline_mode}")
+        advantages = (returns - baseline).detach()
+        batch_size = int(x_tokens.shape[1])
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is not None and hasattr(model_ref, "resolve_replay_batch_chunk_size"):
+            replay_batch_chunk = int(
+                model_ref.resolve_replay_batch_chunk_size(
+                    seq_len=int(full_length),
+                    total_batch=batch_size,
+                )
+            )
+        else:
+            replay_batch_chunk = int(batch_size)
+        replay_batch_chunk = int(max(1, min(batch_size, replay_batch_chunk)))
+        replay_chunk_count = int((batch_size + replay_batch_chunk - 1) // replay_batch_chunk)
+        total_elements = float(max(1, rewards_eval.numel()))
+        full_log_probs = torch.empty_like(rewards_eval, dtype=torch.float32)
+        loss_total = torch.zeros((), device=rewards_eval.device, dtype=torch.float32)
+
+        for start in range(0, batch_size, replay_batch_chunk):
+            end = min(batch_size, start + replay_batch_chunk)
+            action_mean_replay = replay_fn(
+                x_tokens[:, start:end],
+                reward_in[:, start:end],
+                eval_start=eval_start,
+            )
+            if int(action_pre_tanh.shape[0]) != int(action_mean_replay.shape[0]):
+                action_mean_replay = action_mean_replay[eval_start : eval_start + int(action_pre_tanh.shape[0])]
+            replay_action_dim = int(action_pre_tanh.shape[-1])
+            if callable(fit_action_dim_fn):
+                action_mean_replay = fit_action_dim_fn(
+                    action_mean_replay.reshape(-1, int(action_mean_replay.shape[-1])),
+                    replay_action_dim,
+                ).reshape(
+                    int(action_pre_tanh.shape[0]),
+                    int(end - start),
+                    replay_action_dim,
+                )
+            elif int(action_mean_replay.shape[-1]) != replay_action_dim:
+                action_mean_replay = action_mean_replay[..., :replay_action_dim]
+            action_mean_replay = action_mean_replay.to(dtype=action_pre_tanh.dtype)
+            log_probs_chunk = self._squashed_gaussian_log_prob(
+                action_pre_tanh[:, start:end],
+                action_mean_replay,
+                action_std[:, start:end],
+                action=sampled_action[:, start:end],
+                mask=action_mask[start:end],
+            ).to(dtype=torch.float32)
+            full_log_probs[:, start:end] = log_probs_chunk.detach()
+            chunk_loss = -(
+                advantages[:, start:end] * log_probs_chunk
+            ).sum() / total_elements
+            if callable(loss_sink):
+                loss_sink(chunk_loss)
+            else:
+                loss_total = loss_total + chunk_loss
+
+        stats_loss, stats = self.reinforce_loss_from_rewards(
+            rewards=rewards_eval,
+            log_probs=full_log_probs,
+            discount=discount,
+            baseline_mode=baseline_mode,
+        )
+        del stats_loss
+        stats["reinforce_sequence_replay_applied"] = 1
+        stats["reinforce_sequence_replay_batch_chunk"] = int(replay_batch_chunk)
+        stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
+        stats["reinforce_sequence_replay_full_length"] = int(full_length)
+        stats["reinforce_sequence_replay_eval_steps"] = int(action_pre_tanh.shape[0])
+        if callable(loss_sink):
+            loss_total = -(
+                advantages * full_log_probs
+            ).mean().detach()
+        return loss_total, stats, full_log_probs
 
     def policy_gradient_loss_signature(
         self,
@@ -19095,6 +19224,7 @@ class EnvironmentPrior:
         collect_x=False,
         tbptt_window=None,
         tbptt_loss_sink=None,
+        reinforce_replay_loss_sink=None,
         h_list_override=None,
         env_seeds_override=None,
         rollout_seeds_override=None,
@@ -19162,27 +19292,51 @@ class EnvironmentPrior:
                 _policy_collect_reinforce_replay=bool(reinforce_sequence_replay_enabled),
                 _policy_disable_log_probs=bool(reinforce_sequence_replay_enabled),
                 _policy_force_no_grad=bool(reinforce_sequence_replay_enabled),
+                _policy_defer_reinforce_replay=bool(reinforce_sequence_replay_enabled and callable(reinforce_replay_loss_sink)),
             )
-            if reinforce_sequence_replay_enabled and (not collect_x):
-                rollout["x"] = None
             effective_single_eval_pos = int(rollout.get("single_eval_pos", single_eval_pos or 0))
             effective_single_eval_pos = int(max(0, min(int(rollout["rewards"].shape[0]), effective_single_eval_pos)))
             rewards_eval = rollout["rewards"][effective_single_eval_pos:]
             if reinforce_enabled:
                 reinforce_rollout = rollout.get("reinforce", None)
-                if not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
+                if reinforce_sequence_replay_enabled and callable(reinforce_replay_loss_sink):
+                    replay_payload = getattr(self, "last_rollout_reinforce_replay", None)
+                    loss, stats, replay_log_probs = self.reinforce_sequence_replay_loss_from_rollout(
+                        policy_step_fn=policy_step_fn,
+                        x_tokens=rollout["x"],
+                        rewards=rollout["rewards"],
+                        replay_payload=replay_payload,
+                        single_eval_pos=effective_single_eval_pos,
+                        discount=discount,
+                        baseline_mode="leave_one_out",
+                        fit_action_dim_fn=getattr(policy_step_fn, "_fit_action_dim_fn", None),
+                        loss_sink=reinforce_replay_loss_sink,
+                    )
+                    self.last_rollout_reinforce = {
+                        "log_probs": replay_log_probs,
+                        "log_prob_score": None,
+                        "sequence_replay_applied": True,
+                        "sequence_replay_eval_start": int(effective_single_eval_pos),
+                        "sequence_replay_action_steps": int(replay_log_probs.shape[0]),
+                    }
+                    rollout["reinforce"] = self.last_rollout_reinforce
+                elif not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
                     raise RuntimeError("reinforce rollout did not return log_probs")
-                if reinforce_sequence_replay_enabled and (not bool(reinforce_rollout.get("sequence_replay_applied", False))):
+                elif reinforce_sequence_replay_enabled and (not bool(reinforce_rollout.get("sequence_replay_applied", False))):
                     raise RuntimeError("reinforce sequence replay was enabled, but rollout did not apply replayed log_probs")
-                loss, stats = self.reinforce_loss_from_rewards(
-                    rewards=rewards_eval,
-                    log_probs=reinforce_rollout["log_probs"][effective_single_eval_pos:],
-                    discount=discount,
-                    baseline_mode="leave_one_out",
-                )
+                else:
+                    loss, stats = self.reinforce_loss_from_rewards(
+                        rewards=rewards_eval,
+                        log_probs=reinforce_rollout["log_probs"][effective_single_eval_pos:],
+                        discount=discount,
+                        baseline_mode="leave_one_out",
+                    )
+                    stats["reinforce_enabled"] = 1
+                    if reinforce_rollout.get("sequence_replay_applied", False):
+                        stats["reinforce_sequence_replay_applied"] = 1
+                if reinforce_sequence_replay_enabled and (not collect_x):
+                    rollout["x"] = None
                 stats["reinforce_enabled"] = 1
-                if reinforce_rollout.get("sequence_replay_applied", False):
-                    stats["reinforce_sequence_replay_applied"] = 1
             elif first_pg_enabled:
                 loss, stats = self.first_policy_gradient_loss_from_rewards(
                     rewards=rewards_eval,

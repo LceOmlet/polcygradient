@@ -197,6 +197,40 @@ def _sample_action_candidates(rng, action_low, action_high, n_candidates):
     return candidates
 
 
+def _resolve_validation_action_bounds(action_space, *, fallback_abs_bound=10.0):
+    fallback_abs_bound = float(max(0.1, fallback_abs_bound))
+
+    action_shape = getattr(action_space, "shape", None)
+    action_dim = None
+    if isinstance(action_shape, tuple) and len(action_shape) > 0:
+        try:
+            action_dim = int(np.prod(action_shape))
+        except Exception:
+            action_dim = None
+
+    low = getattr(action_space, "low", None)
+    high = getattr(action_space, "high", None)
+    if low is not None and high is not None:
+        try:
+            low_arr = np.asarray(low, dtype=np.float32).reshape(-1)
+            high_arr = np.asarray(high, dtype=np.float32).reshape(-1)
+        except Exception:
+            low_arr = None
+            high_arr = None
+        if low_arr is not None and high_arr is not None and low_arr.shape == high_arr.shape and low_arr.size > 0:
+            if bool(np.all(np.isfinite(low_arr))) and bool(np.all(np.isfinite(high_arr))):
+                return low_arr, high_arr, False
+            if action_dim is None:
+                action_dim = int(low_arr.size)
+
+    if action_dim is None or action_dim <= 0:
+        raise ValueError("validation action space does not expose usable low/high bounds or a vector shape")
+
+    low_fallback = np.full((action_dim,), -fallback_abs_bound, dtype=np.float32)
+    high_fallback = np.full((action_dim,), fallback_abs_bound, dtype=np.float32)
+    return low_fallback, high_fallback, True
+
+
 def _resolve_policy_model_ref(model):
     queue = [model]
     seen = set()
@@ -513,7 +547,6 @@ def _build_validation_episode_states(
 def evaluate_rlpfn_on_gym_envs(model, config):
     try:
         import gymnasium as gym
-        from gymnasium.spaces import Box
     except Exception as exc:
         return float("nan"), {"__error__": f"gymnasium_import_failed: {exc}"}
 
@@ -577,7 +610,11 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 per_env[env_name] = {"return_mean": float("nan"), "len_mean": float("nan"), "make_failed": 1}
                 continue
 
-            if not isinstance(probe_env.action_space, Box):
+            try:
+                action_low, action_high, used_fallback_bounds = _resolve_validation_action_bounds(
+                    probe_env.action_space
+                )
+            except Exception:
                 per_env[env_name] = {
                     "return_mean": float("nan"),
                     "len_mean": float("nan"),
@@ -589,8 +626,6 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     pass
                 continue
 
-            action_low = np.asarray(probe_env.action_space.low, dtype=np.float32).reshape(-1)
-            action_high = np.asarray(probe_env.action_space.high, dtype=np.float32).reshape(-1)
             try:
                 probe_env.close()
             except Exception:
@@ -609,6 +644,8 @@ def evaluate_rlpfn_on_gym_envs(model, config):
             )
             env_states[env_name] = states
             env_action_bounds[env_name] = (action_low, action_high)
+            if bool(used_fallback_bounds):
+                per_env.setdefault(env_name, {})["fallback_action_bounds"] = 1
 
         all_states = [state for states in env_states.values() for state in states]
 
@@ -775,6 +812,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 if returns:
                     mean_ret = float(np.mean(returns))
                     mean_len = float(np.mean(lengths))
+                    existing_summary = dict(per_env.get(env_name, {}))
                     env_summary = {
                         "return_mean": mean_ret,
                         "len_mean": mean_len,
@@ -792,7 +830,8 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     if int(len(returns)) == 1:
                         env_summary["return"] = float(returns[0])
                         env_summary["len"] = float(lengths[0]) if lengths else float("nan")
-                    per_env[env_name] = env_summary
+                    existing_summary.update(env_summary)
+                    per_env[env_name] = existing_summary
                     all_env_means.append(mean_ret)
         finally:
             for state in all_states:

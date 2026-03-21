@@ -1082,6 +1082,43 @@ class TransformerEncoderLayer(Module):
         # This is important for no-grad/inference runs where we keep one large
         # page and avoid the per-page python loop entirely.
         if len(k_pages) == 1:
+            if (prefix_k is not None) and (prefix_v is not None):
+                prefix_len = int(prefix_k.shape[2])
+                if (
+                    torch.is_grad_enabled()
+                    and attn_dropout <= 0.0
+                    and train_mode == "flash_prefix"
+                    and (not bool(clone_kv_for_grad))
+                ):
+                    if stats is not None:
+                        stats["paged_path_flash_prefix"] += 1
+                    return self._forward_step_attn_ff_paged_flash_prefix(
+                        src_step,
+                        q_bhld,
+                        k_pages,
+                        v_pages,
+                        valid_len,
+                        prefix_k=prefix_k,
+                        prefix_v=prefix_v,
+                        clone_kv_for_grad=bool(clone_kv_for_grad),
+                        clone_prefix_for_grad=bool(clone_kv_for_grad) and bool(self.inplace_clone_prefix),
+                    )
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+                if bool(clone_kv_for_grad) and torch.is_grad_enabled():
+                    k_all = k_all.clone()
+                    v_all = v_all.clone()
+                if stats is not None:
+                    stats["paged_path_dense"] += 1
+                    stats["dense_valid_tokens_sum"] += int(valid_len)
+                    stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                    stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+                return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
             if (
                 bool(self.force_flash_single_page)
                 and
@@ -1117,6 +1154,29 @@ class TransformerEncoderLayer(Module):
         # Training throughput route: dispatch fused SDPA on dense/flash views.
         # This removes many tiny per-page kernels in the grad-enabled hot path.
         if torch.is_grad_enabled():
+            if (
+                attn_dropout <= 0.0
+                and train_mode == "flash_merge"
+                and (prefix_k is not None)
+                and (prefix_v is not None)
+            ):
+                prefix_len = int(prefix_k.shape[2])
+                k_all, v_all = self._combine_prefix_with_paged_tail(
+                    prefix_k,
+                    prefix_v,
+                    k_pages,
+                    v_pages,
+                    valid_len,
+                )
+                if bool(clone_kv_for_grad):
+                    k_all = k_all.clone()
+                    v_all = v_all.clone()
+                if stats is not None:
+                    stats["paged_path_dense"] += 1
+                    stats["dense_valid_tokens_sum"] += int(valid_len)
+                    stats["dense_prefix_tokens_sum"] += int(prefix_len)
+                    stats["dense_tail_tokens_sum"] += int(max(0, int(valid_len) - int(prefix_len)))
+                return self._forward_step_attn_ff(src_step, q_bhld, k_all, v_all)
             if (
                 attn_dropout <= 0.0
                 and train_mode == "flash_prefix"
@@ -1949,10 +2009,14 @@ class TransformerEncoderLayer(Module):
                     v_pages = None
                     valid_len = int(k_all.shape[2])
 
+        resolved_paged_train_mode = None
+        if cache_mode == "paged":
+            resolved_paged_train_mode = self._resolve_paged_attn_train_mode(q_bhld)
+
         if (
             cache_mode == "paged"
             and torch.is_grad_enabled()
-            and self.paged_attn_train_mode in {"flash_prefix", "dense"}
+            and resolved_paged_train_mode in {"flash_prefix", "dense"}
             and (k_pages is not None)
             and (v_pages is not None)
         ):

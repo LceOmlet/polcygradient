@@ -83,6 +83,11 @@ class _FakeBox:
         self.high = np.asarray(high, dtype=np.float32)
 
 
+class _ShapeOnlyActionSpace:
+    def __init__(self, shape):
+        self.shape = tuple(shape)
+
+
 class _ScriptedEnv:
     def __init__(self, rollout_lengths, rollout_rewards, obs_dim=4, action_dim=1):
         self._rollout_lengths = [int(x) for x in rollout_lengths]
@@ -126,6 +131,12 @@ class _ActionRecordingEnv(_ScriptedEnv):
     def step(self, action):
         self._action_log.append(float(np.asarray(action, dtype=np.float32).reshape(-1)[0]))
         return super().step(action)
+
+
+class _FallbackBoundsEnv(_ActionRecordingEnv):
+    def __init__(self, rollout_lengths, rollout_rewards, action_log, obs_dim=4, action_dim=1):
+        super().__init__(rollout_lengths, rollout_rewards, action_log, obs_dim=obs_dim, action_dim=action_dim)
+        self.action_space = _ShapeOnlyActionSpace((int(action_dim),))
 
 
 class _PhaseRecordingModel:
@@ -430,6 +441,51 @@ def test_evaluate_rlpfn_on_gym_envs_does_not_apply_prior_rms_action_transform_to
     assert per_env["DummyEnv-vAction"]["return"] == 0.0
     assert len(action_log) == 2
     assert action_log == pytest.approx([0.25, 0.25], abs=1e-6)
+
+
+def test_evaluate_rlpfn_on_gym_envs_falls_back_to_clip_bounds_when_env_has_no_low_high(monkeypatch):
+    action_log = []
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _FallbackBoundsEnv([1, 1], [0.0, 0.0], action_log, obs_dim=4, action_dim=1),
+    )
+    model = _FixedActionPolicyModel(obs_total_dim=8, action_dim=1, action_value=25.0)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vFallbackBounds",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vFallbackBounds"]["return"] == 0.0
+    assert per_env["DummyEnv-vFallbackBounds"]["fallback_action_bounds"] == 1
+    assert len(action_log) == 2
+    assert action_log == pytest.approx([10.0, 10.0], abs=1e-6)
 
 
 def test_evaluate_rlpfn_on_gym_envs_small_rlpfn_model_uses_policy_step_validation(monkeypatch):

@@ -86,6 +86,8 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["single_eval_causal"] = True
     config["transformer"]["backbone"] = "rwkv7"
     config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
+    config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = 64
+    config["transformer"]["rwkv_sequence_replay_token_budget"] = 262144
     config["optimizer"]["rl_objective"] = "reinforce"
     return layout
 

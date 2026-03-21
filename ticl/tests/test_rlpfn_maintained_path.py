@@ -1037,13 +1037,17 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
     assert cfg["prior"]["environment"]["batch_parallel_backend"] == "torch_vectorized"
     assert cfg["prior"]["environment"]["batch_vectorized_grouping"] == "family"
-    assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
-    assert cfg["prior"]["environment"]["alpha_grad_one_hop_replay_enabled"] is True
-    assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
-    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_enabled"] is True
+    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["pg_tbptt_window"] is None
+    assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
+    assert cfg["transformer"]["backbone"] == "rwkv7"
+    assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
+    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
+    assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
     assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30
@@ -1770,22 +1774,22 @@ def test_rlpfn_maintained_path_policy_step_trace_matches_golden():
 
 def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden():
     expected = {
-        "loss": -0.226237,
-        "reward_sum": 1.433664,
-        "objective": 0.226237,
+        "loss": -0.226233,
+        "reward_sum": 1.433646,
+        "objective": 0.226233,
         "alpha_grad_v0_mean": 0.258765,
-        "alpha_grad_v1_mean": 0.167426,
-        "alpha_grad_mix_abs_max": 0.244521,
+        "alpha_grad_v1_mean": 0.167517,
+        "alpha_grad_mix_abs_max": 0.244621,
         "alpha_grad_valid_share": 1.0,
         "rollout_transition_group_count": 0,
         "rollout_transition_family_group_count": 0,
         "rollout_exact_scm_count": 4,
         "rollout_transition_reference_mode": "scm_exact",
-        "reinforce_log_prob_mean": 6.192621,
-        "policy_head_grad_sum": 22.067406,
-        "policy_head_grad_max": 0.27335,
-        "attn_in_proj_grad_sum": 2.429768,
-        "attn_in_proj_grad_max": 0.011334,
+        "reinforce_log_prob_mean": 6.196776,
+        "policy_head_grad_sum": 22.163615,
+        "policy_head_grad_max": 0.27963,
+        "attn_in_proj_grad_sum": 2.410962,
+        "attn_in_proj_grad_max": 0.011078,
     }
 
     assert _capture_alpha_grad_fast_runner_gradient_trace() == expected
@@ -1793,21 +1797,21 @@ def test_rlpfn_maintained_alpha_grad_fast_runner_gradient_trace_matches_golden()
 
 def test_rlpfn_maintained_alpha_grad_train_step_trace_matches_golden():
     expected = {
-        "loss": -0.226237,
-        "objective": 0.226237,
-        "reward_sum": 1.433664,
+        "loss": -0.226233,
+        "objective": 0.226233,
+        "reward_sum": 1.433646,
         "alpha_grad_v0_mean": 0.258765,
-        "alpha_grad_v1_mean": 0.167426,
-        "reinforce_log_prob_mean": 6.192621,
+        "alpha_grad_v1_mean": 0.167517,
+        "reinforce_log_prob_mean": 6.196776,
         "rollout_transition_reference_mode": "scm_exact",
         "rollout_exact_scm_count": 4,
-        "grad_abs_sum": 40.443638,
-        "grad_abs_max": 0.27335,
+        "grad_abs_sum": 40.616607,
+        "grad_abs_max": 0.27963,
         "grad_numel": 26622,
-        "param_delta_abs_sum": 11.250804,
+        "param_delta_abs_sum": 11.283599,
         "param_delta_abs_max": 0.001,
-        "policy_head_delta_abs_sum": 2.306941,
-        "attn_in_proj_delta_abs_sum": 3.024241,
+        "policy_head_delta_abs_sum": 2.306956,
+        "attn_in_proj_delta_abs_sum": 3.025408,
     }
 
     assert _capture_alpha_grad_train_step_trace() == expected

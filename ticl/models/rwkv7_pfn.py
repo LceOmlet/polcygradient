@@ -309,8 +309,95 @@ class OfficialRWKV7Block(nn.Module):
         ffn_x_prev = torch.zeros((batch_size, self.emb_dim), device=device, dtype=dtype)
         return att_x_prev, att_kv, ffn_x_prev
 
+    def _forward_step_batched_no_grad(
+        self,
+        x: torch.Tensor,
+        state,
+        v_first: Optional[torch.Tensor],
+    ):
+        if hasattr(self, "ln0"):
+            x = self.ln0(x)
+        if v_first is None:
+            v_first = torch.zeros_like(x)
+        att_x_prev, att_kv, ffn_x_prev = state
+
+        att_in = self.ln1(x)
+        xx = att_x_prev - att_in
+
+        x_r = self.att.x_r.squeeze(0).squeeze(0)
+        x_w = self.att.x_w.squeeze(0).squeeze(0)
+        x_k = self.att.x_k.squeeze(0).squeeze(0)
+        x_v = self.att.x_v.squeeze(0).squeeze(0)
+        x_a = self.att.x_a.squeeze(0).squeeze(0)
+        x_g = self.att.x_g.squeeze(0).squeeze(0)
+        w0 = self.att.w0.squeeze(0).squeeze(0)
+        a0 = self.att.a0.squeeze(0).squeeze(0)
+        v0 = self.att.v0.squeeze(0).squeeze(0)
+        k_k = self.att.k_k.squeeze(0).squeeze(0)
+        k_a = self.att.k_a.squeeze(0).squeeze(0)
+        r_k = self.att.r_k.reshape(1, self.n_head, self.head_size)
+
+        xr = att_in + xx * x_r
+        xw = att_in + xx * x_w
+        xk = att_in + xx * x_k
+        xv = att_in + xx * x_v
+        xa = att_in + xx * x_a
+        xg = att_in + xx * x_g
+
+        r = F.linear(xr, self.att.receptance.weight)
+        w = torch.tanh(xw @ self.att.w1) @ self.att.w2
+        k = F.linear(xk, self.att.key.weight)
+        v = F.linear(xv, self.att.value.weight)
+        a = torch.sigmoid(a0 + (xa @ self.att.a1) @ self.att.a2)
+        g = torch.sigmoid(xg @ self.att.g1) @ self.att.g2
+
+        kk = k * k_k
+        kk = F.normalize(kk.view(-1, self.n_head, self.head_size), dim=-1, p=2.0)
+        k = k.view(-1, self.n_head, self.head_size) * (
+            1 + (a.view(-1, self.n_head, self.head_size) - 1) * k_a.view(1, self.n_head, self.head_size)
+        )
+        v_heads = v.view(-1, self.n_head, self.head_size)
+
+        if self.layer_id == 0:
+            v_first_next = v
+        else:
+            v = v + (v_first - v) * torch.sigmoid(v0 + (xv @ self.att.v1) @ self.att.v2)
+            v_heads = v.view(-1, self.n_head, self.head_size)
+            v_first_next = v_first
+
+        w = w0 + w.float()
+        w = torch.exp(-0.606531 * torch.sigmoid(w)).view(-1, self.n_head, self.head_size)
+
+        vk = v_heads.unsqueeze(-1) @ k.unsqueeze(-2)
+        ab = (-kk).unsqueeze(-1) @ (kk * a.view(-1, self.n_head, self.head_size)).unsqueeze(-2)
+        att_kv_next = att_kv * w.unsqueeze(-2) + (att_kv @ ab.float()) + vk.float()
+        out = (att_kv_next.to(dtype=att_in.dtype) @ r.view(-1, self.n_head, self.head_size, 1)).view(-1, self.emb_dim)
+        out = F.group_norm(
+            out,
+            num_groups=self.n_head,
+            weight=self.att.ln_x.weight,
+            bias=self.att.ln_x.bias,
+            eps=64e-5,
+        )
+        out = out + ((r.view(-1, self.n_head, self.head_size) * k * r_k).sum(dim=-1, keepdim=True) * v_heads).view(
+            -1, self.emb_dim
+        )
+        att_out = F.linear(out * g, self.att.output.weight)
+        x = x + att_out
+
+        ffn_in = self.ln2(x)
+        ffn_xx = ffn_x_prev - ffn_in
+        ffn_k = ffn_in + ffn_xx * self.ffn.x_k.squeeze(0).squeeze(0)
+        ffn_k = torch.relu(F.linear(ffn_k, self.ffn.key.weight)) ** 2
+        ffn_out = F.linear(ffn_k, self.ffn.value.weight)
+        x = x + ffn_out
+        return x, (att_in, att_kv_next, ffn_in), v_first_next
+
     def forward_step(self, x: torch.Tensor, state, v_first: Optional[torch.Tensor]):
         official = _load_official_rwkv7_demo_rnn()
+        batch_size = int(x.shape[0])
+        if batch_size > 1 and (not torch.is_grad_enabled()):
+            return self._forward_step_batched_no_grad(x, state, v_first)
         if hasattr(self, "ln0"):
             x = self.ln0(x)
         if v_first is None:
@@ -364,7 +451,6 @@ class OfficialRWKV7Block(nn.Module):
             )
 
         att_in = self.ln1(x)
-        batch_size = int(att_in.shape[0])
         if batch_size == 1:
             att_out_i, att_x_prev_next_i, att_kv_next_i, v_first_next_i = official.time_mixing__(
                 int(self.layer_id),
@@ -758,6 +844,8 @@ class RWKV7PFN(nn.Module):
         rwkv_head_size=64,
         rwkv_ffn_mult=4,
         rwkv_sequence_replay_checkpoint=False,
+        rwkv_sequence_replay_batch_chunk_size=None,
+        rwkv_sequence_replay_token_budget=None,
     ):
         del dropout, pre_norm, activation, recompute_attn, all_layers_same_init, y_encoder
         super().__init__()
@@ -769,6 +857,14 @@ class RWKV7PFN(nn.Module):
         self.rwkv_head_size = int(rwkv_head_size)
         self.rwkv_ffn_mult = int(rwkv_ffn_mult)
         self.rwkv_sequence_replay_checkpoint = bool(rwkv_sequence_replay_checkpoint)
+        self.rwkv_sequence_replay_batch_chunk_size = (
+            None if rwkv_sequence_replay_batch_chunk_size in (None, 0, False)
+            else int(rwkv_sequence_replay_batch_chunk_size)
+        )
+        self.rwkv_sequence_replay_token_budget = (
+            None if rwkv_sequence_replay_token_budget in (None, 0, False)
+            else int(rwkv_sequence_replay_token_budget)
+        )
 
         if self.x_encoder_type == "single":
             self.encoder = Linear(n_features, self.emsize, replace_nan_by_zero=True)
@@ -1075,7 +1171,7 @@ class RWKV7PFN(nn.Module):
         hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
         return self._decode_policy_action(hidden)
 
-    def replay_policy_sequence_tokens(self, x_tokens, y_tokens):
+    def replay_policy_sequence_tokens(self, x_tokens, y_tokens, *, eval_start: int = 0):
         if not self.single_eval_causal:
             raise ValueError("replay_policy_sequence_tokens requires single_eval_causal=True.")
         if x_tokens.ndim != 3:
@@ -1091,10 +1187,44 @@ class RWKV7PFN(nn.Module):
                 "replay_policy_sequence_tokens expects matching leading dims, "
                 f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
             )
-        tokens = self._encode_train_token(x_tokens, y_tokens)
-        tokens = self._cast_token_for_rwkv_core(tokens)
-        hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
-        return self._decode_policy_action(hidden_all)
+        eval_start = int(max(0, min(int(x_tokens.shape[0]), int(eval_start))))
+        total_batch = int(x_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=int(x_tokens.shape[0]),
+            total_batch=total_batch,
+        )
+        if batch_chunk_size >= total_batch:
+            tokens = self._encode_train_token(x_tokens, y_tokens)
+            tokens = self._cast_token_for_rwkv_core(tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+            return self._decode_policy_action(hidden_all[eval_start:])
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+        decoded_chunks = []
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            tokens_chunk = self._encode_train_token(
+                x_tokens[:, start:end],
+                y_tokens[:, start:end],
+            )
+            tokens_chunk = self._cast_token_for_rwkv_core(tokens_chunk)
+            hidden_chunk = self.rwkv_core.forward_tokens_sequence_only(tokens_chunk)
+            decoded_chunks.append(self._decode_policy_action(hidden_chunk[eval_start:]))
+        return torch.cat(decoded_chunks, dim=1)
+
+    def resolve_replay_batch_chunk_size(self, *, seq_len: int, total_batch: int):
+        seq_len = int(max(1, seq_len))
+        total_batch = int(max(1, total_batch))
+        effective_chunk = total_batch
+        if self.rwkv_sequence_replay_batch_chunk_size is not None:
+            effective_chunk = min(effective_chunk, int(max(1, self.rwkv_sequence_replay_batch_chunk_size)))
+        if self.rwkv_sequence_replay_token_budget is not None:
+            token_budget = int(max(1, self.rwkv_sequence_replay_token_budget))
+            effective_chunk = min(effective_chunk, int(max(1, token_budget // seq_len)))
+        return int(max(1, effective_chunk))
 
     def forward_policy_step(
         self,

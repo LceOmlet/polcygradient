@@ -146,6 +146,7 @@ def dispatch_policy_rollout(prior, ctx):
     policy_detach_action_in_env = ctx["_policy_detach_action_in_env"]
     policy_disable_log_probs = bool(ctx.get("_policy_disable_log_probs", False))
     policy_force_no_grad = bool(ctx.get("_policy_force_no_grad", False))
+    policy_defer_reinforce_replay = bool(ctx.get("_policy_defer_reinforce_replay", False))
     alpha_grad_trace_roots_only = bool(ctx["alpha_grad_trace_roots_only"])
     backend = ctx["backend"]
     strict_rng_match = bool(ctx["strict_rng_match"])
@@ -173,6 +174,7 @@ def dispatch_policy_rollout(prior, ctx):
     reinforce_sequence_replay_applied = False
     reinforce_sequence_replay_eval_start = None
     reinforce_sequence_replay_action_steps = None
+    reinforce_replay_payload = None
 
     def _maybe_replay_reinforce_log_probs(x_tokens, group_reinforce, group_replay):
         nonlocal reinforce_sequence_replay_applied
@@ -313,8 +315,71 @@ def dispatch_policy_rollout(prior, ctx):
                 rewards[:, group_indices] = y_group
             group_reinforce = prior.last_rollout_reinforce
             group_replay = getattr(prior, "last_rollout_reinforce_replay", None)
+            if policy_collect_reinforce_replay and isinstance(group_replay, dict):
+                reward_in_group = group_replay.get("reward_in", None)
+                action_pre_tanh_group = group_replay.get("action_pre_tanh", None)
+                sampled_action_group = group_replay.get("sampled_action", None)
+                action_std_group = group_replay.get("action_std", None)
+                action_mask_group = group_replay.get("action_mask", None)
+                eval_start_group = int(group_replay.get("eval_start", 0) or 0)
+                full_length_group = int(group_replay.get("full_length", int(n_samples)) or int(n_samples))
+                if all(
+                    torch.is_tensor(t)
+                    for t in (
+                        reward_in_group,
+                        action_pre_tanh_group,
+                        sampled_action_group,
+                        action_std_group,
+                        action_mask_group,
+                    )
+                ):
+                    replay_steps = int(action_pre_tanh_group.shape[0])
+                    action_dim_group = int(action_pre_tanh_group.shape[-1])
+                    if reinforce_replay_payload is None:
+                        reinforce_replay_payload = {
+                            "reward_in": torch.empty(
+                                (full_length_group, batch_size),
+                                device=reward_in_group.device,
+                                dtype=reward_in_group.dtype,
+                            ),
+                            "action_pre_tanh": torch.empty(
+                                (replay_steps, batch_size, action_dim_group),
+                                device=action_pre_tanh_group.device,
+                                dtype=action_pre_tanh_group.dtype,
+                            ),
+                            "sampled_action": torch.empty(
+                                (replay_steps, batch_size, action_dim_group),
+                                device=sampled_action_group.device,
+                                dtype=sampled_action_group.dtype,
+                            ),
+                            "action_std": torch.empty(
+                                (replay_steps, batch_size),
+                                device=action_std_group.device,
+                                dtype=action_std_group.dtype,
+                            ),
+                            "action_mask": torch.empty(
+                                (batch_size, int(action_mask_group.shape[-1])),
+                                device=action_mask_group.device,
+                                dtype=action_mask_group.dtype,
+                            ),
+                            "eval_start": int(eval_start_group),
+                            "full_length": int(full_length_group),
+                        }
+                    else:
+                        if (
+                            int(reinforce_replay_payload["eval_start"]) != int(eval_start_group)
+                            or int(reinforce_replay_payload["full_length"]) != int(full_length_group)
+                            or tuple(reinforce_replay_payload["action_pre_tanh"].shape[:1] + reinforce_replay_payload["action_pre_tanh"].shape[2:])
+                            != (replay_steps, action_dim_group)
+                        ):
+                            raise RuntimeError("reinforce replay payload shapes were inconsistent across rollout groups")
+                    reinforce_replay_payload["reward_in"][:, group_indices] = reward_in_group
+                    reinforce_replay_payload["action_pre_tanh"][:, group_indices] = action_pre_tanh_group
+                    reinforce_replay_payload["sampled_action"][:, group_indices] = sampled_action_group
+                    reinforce_replay_payload["action_std"][:, group_indices] = action_std_group
+                    reinforce_replay_payload["action_mask"][group_indices] = action_mask_group
             group_log_probs = None
-            if policy_collect_reinforce_replay:
+            if policy_collect_reinforce_replay and (not policy_defer_reinforce_replay):
                 group_log_probs = _maybe_replay_reinforce_log_probs(
                     x_group,
                     group_reinforce,
@@ -576,7 +641,7 @@ def dispatch_policy_rollout(prior, ctx):
             rollout_profile_acc = prior._finalize_env_semantics_summary(rollout_profile_acc)
         prior.last_rollout_profile = rollout_profile_acc
         prior.last_rollout_env_semantics = _project_rollout_env_semantics(rollout_profile_acc)
-        prior.last_rollout_reinforce_replay = None
+        prior.last_rollout_reinforce_replay = reinforce_replay_payload
         prior.last_rollout_reinforce = (
             {
                 "log_probs": reinforce_log_probs,
@@ -749,7 +814,7 @@ def dispatch_policy_rollout(prior, ctx):
         prior.last_rollout_profile["steps"] = int(n_samples)
         prior.last_rollout_profile["batch_size"] = int(batch_size)
     prior.last_rollout_env_semantics = _project_rollout_env_semantics(prior.last_rollout_profile)
-    prior.last_rollout_reinforce_replay = None
+    prior.last_rollout_reinforce_replay = reinforce_replay_payload
     prior.last_rollout_reinforce = (
         {
             "log_probs": reinforce_log_probs,

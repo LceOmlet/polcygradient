@@ -106,6 +106,8 @@ def get_transformer_config():
         'rwkv_head_size': 64,
         'rwkv_ffn_mult': 4,
         'rwkv_sequence_replay_checkpoint': False,
+        'rwkv_sequence_replay_batch_chunk_size': None,
+        'rwkv_sequence_replay_token_budget': None,
         # x encoder layout:
         # - "single": one linear encoder over full num_features
         # - "split_obs_action": two heads (obs/reward/mask + action)

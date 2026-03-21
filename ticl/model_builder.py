@@ -240,6 +240,8 @@ def get_model(
     rwkv_head_size = transformer_cfg.pop('rwkv_head_size', 64)
     rwkv_ffn_mult = transformer_cfg.pop('rwkv_ffn_mult', 4)
     rwkv_sequence_replay_checkpoint = transformer_cfg.pop('rwkv_sequence_replay_checkpoint', False)
+    rwkv_sequence_replay_batch_chunk_size = transformer_cfg.pop('rwkv_sequence_replay_batch_chunk_size', None)
+    rwkv_sequence_replay_token_budget = transformer_cfg.pop('rwkv_sequence_replay_token_budget', None)
 
     if model_type == "mothernet":
         model = MotherNet(
@@ -262,6 +264,8 @@ def get_model(
                 rwkv_head_size=rwkv_head_size,
                 rwkv_ffn_mult=rwkv_ffn_mult,
                 rwkv_sequence_replay_checkpoint=rwkv_sequence_replay_checkpoint,
+                rwkv_sequence_replay_batch_chunk_size=rwkv_sequence_replay_batch_chunk_size,
+                rwkv_sequence_replay_token_budget=rwkv_sequence_replay_token_budget,
                 **transformer_cfg,
             )
         else:

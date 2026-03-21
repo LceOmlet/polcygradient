@@ -18,8 +18,12 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
+    assert cfg["transformer"]["backbone"] == "rwkv7"
+    assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
+    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
+    assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
-    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
+    assert cfg["optimizer"]["rl_objective"] == "reinforce"
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],
@@ -41,6 +45,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_enabled"] is True
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
@@ -69,10 +74,11 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["terminal_bonus_scale_min"] == 1.0
     assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 10.0
     assert cfg["optimizer"]["policy_rollout_chunk_size"] is None
-    assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is True
-    assert cfg["optimizer"]["pg_grad_mutable_kv_cache"] is True
-    assert cfg["optimizer"]["pg_kv_cache_mode"] == "paged"
-    assert cfg["optimizer"]["pg_kv_cache_page_size"] == 128
+    assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
+    assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is False
+    assert cfg["optimizer"]["pg_grad_mutable_kv_cache"] is False
+    assert cfg["optimizer"]["pg_kv_cache_mode"] == "immutable"
+    assert cfg["optimizer"]["pg_kv_cache_page_size"] is None
     assert cfg["optimizer"]["policy_rollout_chunk_autotune"] is False
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
@@ -102,11 +108,11 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["train_kernel_profiler_with_stack"] is False
     assert cfg["optimizer"]["train_kernel_profiler_with_flops"] is False
     assert cfg["optimizer"]["train_kernel_profiler_log_every_batches"] == 0
-    assert cfg["optimizer"]["pg_tbptt_window"] == 32
+    assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["pg_env_replay_steps"] == 1
     assert cfg["optimizer"]["pg_oom_debug_raise"] is False
     assert cfg["optimizer"]["pg_oom_fail_fast"] is True
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False

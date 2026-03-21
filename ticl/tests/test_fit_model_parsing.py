@@ -35,6 +35,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     )
 
     assert args.transformer.single_eval_causal is False
+    assert args.transformer.backbone == "rwkv7"
     assert args.prior.environment.family == "gp"
     assert args.prior.environment.state_dim == 12
     assert args.prior.environment.reward_norm_eps == 1e-5
@@ -48,10 +49,10 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.policy_rollout_chunk_autotune is False
     assert args.optimizer.policy_rollout_chunk_grow_every == 8
     assert args.optimizer.policy_rollout_chunk_grow_factor == 2.0
-    assert args.optimizer.policy_rollout_checkpoint_reentrant is True
-    assert args.optimizer.pg_grad_mutable_kv_cache is True
-    assert args.optimizer.pg_kv_cache_mode == "paged"
-    assert args.optimizer.pg_kv_cache_page_size == 128
+    assert args.optimizer.policy_rollout_checkpoint_reentrant is False
+    assert args.optimizer.pg_grad_mutable_kv_cache is False
+    assert args.optimizer.pg_kv_cache_mode == "immutable"
+    assert args.optimizer.pg_kv_cache_page_size is None
     assert args.optimizer.pg_torch_compile is False
     assert args.optimizer.adamw_fused is True
     assert args.optimizer.train_profiler_enabled is False
@@ -79,16 +80,16 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.train_kernel_profiler_with_stack is False
     assert args.optimizer.train_kernel_profiler_with_flops is False
     assert args.optimizer.train_kernel_profiler_log_every_batches == 0
-    assert args.optimizer.pg_tbptt_window == 32
+    assert args.optimizer.pg_tbptt_window is None
     assert args.optimizer.pg_env_replay_steps == 1
     assert args.optimizer.pg_oom_reduce_tbptt_first is True
     assert args.optimizer.pg_oom_debug_raise is False
-    assert args.optimizer.pg_saved_tensors_cpu_offload is True
+    assert args.optimizer.pg_saved_tensors_cpu_offload is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_scope == "policy"
     assert args.optimizer.pg_saved_tensors_pin_memory is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 512
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 1024
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
@@ -292,7 +293,11 @@ def test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options():
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
-    assert cfg["optimizer"]["rl_objective"] == "alpha_grad"
+    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["transformer"]["backbone"] == "rwkv7"
+    assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
+    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
+    assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],
@@ -317,6 +322,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_enabled"] is True
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_norm"] == 1.0
@@ -324,7 +330,13 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_enabled"] is True
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is True
+    assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
+    assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is False
+    assert cfg["optimizer"]["pg_grad_mutable_kv_cache"] is False
+    assert cfg["optimizer"]["pg_kv_cache_mode"] == "immutable"
+    assert cfg["optimizer"]["pg_kv_cache_page_size"] is None
+    assert cfg["optimizer"]["pg_tbptt_window"] is None
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_scope"] == "policy"
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["train_host_rss_limit_gib"] == 32.0
@@ -332,7 +344,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["optimizer"]["train_host_rss_limit_try_rlimit_as"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 512
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
     assert cfg["prior"]["environment"]["action_noise_train_std"] == {
         "distribution": "log_uniform",
