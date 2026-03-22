@@ -11749,15 +11749,14 @@ class EnvironmentPrior:
                     rms_eps=action_rms_eps,
                 )
                 if collect_log_probs:
-                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                        action_pre_tanh.detach(),
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_next.detach(),
                         action_mean,
                         action_std_t,
-                        action=action_next.detach(),
                     )
                     if collect_log_prob_score:
                         reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_pre_tanh.detach(),
+                            action_next.detach(),
                             action_mean.detach(),
                             action_std_t,
                         ).detach().to(dtype=torch.float32)
@@ -12119,7 +12118,6 @@ class EnvironmentPrior:
         self.last_rollout_reinforce_replay = (
             {
                 "reward_in": replay_reward_in_steps,
-                "action_pre_tanh": replay_action_pre_tanh_steps,
                 "sampled_action": replay_sampled_action_steps,
                 "action_std": replay_action_std_steps,
                 "action_mask": replay_action_mask,
@@ -12787,11 +12785,6 @@ class EnvironmentPrior:
             if collect_reinforce_replay
             else None
         )
-        replay_action_pre_tanh_steps = (
-            torch.empty((replay_eval_steps, batch_size, max_action_dim), device=device, dtype=torch.float32)
-            if collect_reinforce_replay
-            else None
-        )
         replay_sampled_action_steps = (
             torch.empty((replay_eval_steps, batch_size, max_action_dim), device=device, dtype=torch.float32)
             if collect_reinforce_replay
@@ -13293,16 +13286,15 @@ class EnvironmentPrior:
                         rms_eps=env_info.get("reinforce_action_rms_eps", 1e-6),
                         mask=action_mask,
                     )
-                    reinforce_log_prob_t_replay = self._squashed_gaussian_log_prob(
-                        action_pre_tanh_replay.detach(),
+                    reinforce_log_prob_t_replay = self._gaussian_log_prob(
+                        action_next_replay.detach(),
                         action_mean_replay,
                         action_std_t_replay,
-                        action=action_next_replay.detach(),
                         mask=action_mask,
                     )
                     if collect_log_prob_score:
                         reinforce_log_prob_score_t_replay = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_pre_tanh_replay.detach(),
+                            action_next_replay.detach(),
                             action_mean_replay.detach(),
                             action_std_t_replay,
                             mask=action_mask,
@@ -14027,19 +14019,17 @@ class EnvironmentPrior:
                 )
                 if collect_reinforce_replay and t >= replay_eval_start:
                     replay_t = int(t - replay_eval_start)
-                    replay_action_pre_tanh_steps[replay_t] = action_pre_tanh.detach()
                     replay_sampled_action_steps[replay_t] = action_next.detach()
                     replay_action_std_steps[replay_t] = action_std_t.detach()
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
+                reinforce_log_prob_t = self._gaussian_log_prob(
+                    action_next.detach(),
                     action_mean,
                     action_std_t,
-                    action=action_next.detach(),
                     mask=action_mask,
                 )
                 if collect_log_prob_score:
                     reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                        action_pre_tanh.detach(),
+                        action_next.detach(),
                         action_mean.detach(),
                         action_std_t,
                         mask=action_mask,
@@ -14896,7 +14886,6 @@ class EnvironmentPrior:
         self.last_rollout_reinforce_replay = (
             {
                 "reward_in": replay_reward_in_steps,
-                "action_pre_tanh": replay_action_pre_tanh_steps,
                 "sampled_action": replay_sampled_action_steps,
                 "action_std": replay_action_std_steps,
                 "action_mask": replay_action_mask,
@@ -15403,15 +15392,14 @@ class EnvironmentPrior:
                     rms_eps=action_rms_eps,
                 )
                 if collect_log_probs:
-                    reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                        action_pre_tanh.detach(),
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_next.detach(),
                         action_mean,
                         float(action_noise_std),
-                        action=action_next.detach(),
                     )
                     if collect_log_prob_score:
                         reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_pre_tanh.detach(),
+                            action_next.detach(),
                             action_mean.detach(),
                             float(action_noise_std),
                         ).detach().to(dtype=torch.float32)
@@ -16696,54 +16684,49 @@ class EnvironmentPrior:
         return normalized
 
     @staticmethod
-    def _squashed_gaussian_log_prob(pre_tanh_action, action_mean, action_std, *, action=None, mask=None, eps=1e-6):
-        if pre_tanh_action.shape != action_mean.shape:
+    def _gaussian_log_prob(action, action_mean, action_std, *, mask=None, eps=1e-6):
+        if action.shape != action_mean.shape:
             raise ValueError(
-                "pre_tanh_action and action_mean must have identical shape, "
-                f"got {tuple(pre_tanh_action.shape)} and {tuple(action_mean.shape)}"
+                "action and action_mean must have identical shape, "
+                f"got {tuple(action.shape)} and {tuple(action_mean.shape)}"
             )
-        if action is None:
-            action = torch.tanh(pre_tanh_action)
         std = action_std
         if not torch.is_tensor(std):
-            std = torch.as_tensor(std, device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
-        std = std.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
-        while std.ndim < pre_tanh_action.ndim:
+            std = torch.as_tensor(std, device=action.device, dtype=action.dtype)
+        std = std.to(device=action.device, dtype=action.dtype)
+        while std.ndim < action.ndim:
             std = std.unsqueeze(-1)
-        std = std.expand_as(pre_tanh_action).clamp_min(float(max(1e-12, eps)))
+        std = std.expand_as(action).clamp_min(float(max(1e-12, eps)))
         log_std = torch.log(std)
-        centered = (pre_tanh_action - action_mean) / std
+        centered = (action - action_mean) / std
         gaussian_log_prob = -0.5 * (
             centered.square() + (2.0 * log_std) + math.log(2.0 * math.pi)
         )
-        squash_logdet = torch.log(
-            torch.clamp(1.0 - action.square(), min=float(max(1e-12, eps)))
-        )
-        log_prob_per_dim = gaussian_log_prob - squash_logdet
+        log_prob_per_dim = gaussian_log_prob
         if mask is not None:
-            mask_t = mask.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+            mask_t = mask.to(device=action.device, dtype=action.dtype)
             while mask_t.ndim < log_prob_per_dim.ndim:
                 mask_t = mask_t.unsqueeze(0)
             log_prob_per_dim = log_prob_per_dim * mask_t
         return log_prob_per_dim.sum(dim=-1)
 
     @staticmethod
-    def _reinforce_log_prob_score_wrt_action_mean(pre_tanh_action, action_mean, action_std, *, mask=None, eps=1e-6):
-        if pre_tanh_action.shape != action_mean.shape:
+    def _reinforce_log_prob_score_wrt_action_mean(action, action_mean, action_std, *, mask=None, eps=1e-6):
+        if action.shape != action_mean.shape:
             raise ValueError(
-                "pre_tanh_action and action_mean must have identical shape, "
-                f"got {tuple(pre_tanh_action.shape)} and {tuple(action_mean.shape)}"
+                "action and action_mean must have identical shape, "
+                f"got {tuple(action.shape)} and {tuple(action_mean.shape)}"
             )
         std = action_std
         if not torch.is_tensor(std):
-            std = torch.as_tensor(std, device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
-        std = std.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
-        while std.ndim < pre_tanh_action.ndim:
+            std = torch.as_tensor(std, device=action.device, dtype=action.dtype)
+        std = std.to(device=action.device, dtype=action.dtype)
+        while std.ndim < action.ndim:
             std = std.unsqueeze(-1)
-        std = std.expand_as(pre_tanh_action).clamp_min(float(max(1e-12, eps)))
-        score = (pre_tanh_action - action_mean) / std.square()
+        std = std.expand_as(action).clamp_min(float(max(1e-12, eps)))
+        score = (action - action_mean) / std.square()
         if mask is not None:
-            mask_t = mask.to(device=pre_tanh_action.device, dtype=pre_tanh_action.dtype)
+            mask_t = mask.to(device=action.device, dtype=action.dtype)
             while mask_t.ndim < score.ndim:
                 mask_t = mask_t.unsqueeze(0)
             score = score * mask_t
@@ -16876,13 +16859,12 @@ class EnvironmentPrior:
 
         replay_fn = policy_step_fn._reinforce_sequence_replay_fn
         reward_in = replay_payload.get("reward_in", None)
-        action_pre_tanh = replay_payload.get("action_pre_tanh", None)
         sampled_action = replay_payload.get("sampled_action", None)
         action_std = replay_payload.get("action_std", None)
         action_mask = replay_payload.get("action_mask", None)
         eval_start = int(replay_payload.get("eval_start", int(single_eval_pos) or 0) or 0)
         full_length = int(replay_payload.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
-        if not all(torch.is_tensor(t) for t in (reward_in, action_pre_tanh, sampled_action, action_std, action_mask)):
+        if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_std, action_mask)):
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
 
         rewards_eval = rewards[eval_start:]
@@ -16929,26 +16911,25 @@ class EnvironmentPrior:
                 reward_in[:, start:end],
                 eval_start=eval_start,
             )
-            if int(action_pre_tanh.shape[0]) != int(action_mean_replay.shape[0]):
-                action_mean_replay = action_mean_replay[eval_start : eval_start + int(action_pre_tanh.shape[0])]
-            replay_action_dim = int(action_pre_tanh.shape[-1])
+            if int(sampled_action.shape[0]) != int(action_mean_replay.shape[0]):
+                action_mean_replay = action_mean_replay[eval_start : eval_start + int(sampled_action.shape[0])]
+            replay_action_dim = int(sampled_action.shape[-1])
             if callable(fit_action_dim_fn):
                 action_mean_replay = fit_action_dim_fn(
                     action_mean_replay.reshape(-1, int(action_mean_replay.shape[-1])),
                     replay_action_dim,
                 ).reshape(
-                    int(action_pre_tanh.shape[0]),
+                    int(sampled_action.shape[0]),
                     int(end - start),
                     replay_action_dim,
                 )
             elif int(action_mean_replay.shape[-1]) != replay_action_dim:
                 action_mean_replay = action_mean_replay[..., :replay_action_dim]
-            action_mean_replay = action_mean_replay.to(dtype=action_pre_tanh.dtype)
-            log_probs_chunk = self._squashed_gaussian_log_prob(
-                action_pre_tanh[:, start:end],
+            action_mean_replay = action_mean_replay.to(dtype=sampled_action.dtype)
+            log_probs_chunk = self._gaussian_log_prob(
+                sampled_action[:, start:end],
                 action_mean_replay,
                 action_std[:, start:end],
-                action=sampled_action[:, start:end],
                 mask=action_mask[start:end],
             ).to(dtype=torch.float32)
             full_log_probs[:, start:end] = log_probs_chunk.detach()
@@ -16971,7 +16952,7 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_batch_chunk"] = int(replay_batch_chunk)
         stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
         stats["reinforce_sequence_replay_full_length"] = int(full_length)
-        stats["reinforce_sequence_replay_eval_steps"] = int(action_pre_tanh.shape[0])
+        stats["reinforce_sequence_replay_eval_steps"] = int(sampled_action.shape[0])
         if callable(loss_sink):
             loss_total = -(
                 advantages * full_log_probs
@@ -18485,17 +18466,16 @@ class EnvironmentPrior:
                     rms_eps=action_rms_eps,
                     mask=action_mask,
                 )
-                reinforce_log_prob_t = self._squashed_gaussian_log_prob(
-                    action_pre_tanh.detach(),
+                reinforce_log_prob_t = self._gaussian_log_prob(
+                    action_next.detach(),
                     action_mean,
                     action_std_t,
-                    action=action_next.detach(),
                     mask=action_mask,
                 )
                 reinforce_log_prob_score_t = None
                 if alpha_grad_enabled:
                     reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                        action_pre_tanh.detach(),
+                        action_next.detach(),
                         action_mean.detach(),
                         action_std_t,
                         mask=action_mask,

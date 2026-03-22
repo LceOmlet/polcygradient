@@ -189,39 +189,37 @@ def dispatch_policy_rollout(prior, ctx):
         if not isinstance(group_replay, dict):
             raise RuntimeError("reinforce sequence replay requested but rollout did not record replay tensors")
         reward_in = group_replay.get("reward_in", None)
-        action_pre_tanh = group_replay.get("action_pre_tanh", None)
         sampled_action = group_replay.get("sampled_action", None)
         action_std = group_replay.get("action_std", None)
         action_mask = group_replay.get("action_mask", None)
         eval_start = int(group_replay.get("eval_start", 0) or 0)
         full_length = int(group_replay.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
-        if not all(torch.is_tensor(t) for t in (reward_in, action_pre_tanh, sampled_action, action_std, action_mask)):
+        if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_std, action_mask)):
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
         action_mean_replay = reinforce_sequence_replay_fn(x_tokens, reward_in)
-        if int(action_pre_tanh.shape[0]) != int(action_mean_replay.shape[0]):
-            action_mean_replay = action_mean_replay[eval_start : eval_start + int(action_pre_tanh.shape[0])]
-        replay_action_dim = int(action_pre_tanh.shape[-1])
+        if int(sampled_action.shape[0]) != int(action_mean_replay.shape[0]):
+            action_mean_replay = action_mean_replay[eval_start : eval_start + int(sampled_action.shape[0])]
+        replay_action_dim = int(sampled_action.shape[-1])
         if callable(fit_action_dim_fn):
             action_mean_replay = fit_action_dim_fn(action_mean_replay.reshape(-1, int(action_mean_replay.shape[-1])), replay_action_dim)
             action_mean_replay = action_mean_replay.reshape(
-                int(action_pre_tanh.shape[0]),
-                int(action_pre_tanh.shape[1]),
+                int(sampled_action.shape[0]),
+                int(sampled_action.shape[1]),
                 replay_action_dim,
             )
         elif int(action_mean_replay.shape[-1]) != replay_action_dim:
             action_mean_replay = action_mean_replay[..., :replay_action_dim]
-        action_mean_replay = action_mean_replay.to(dtype=action_pre_tanh.dtype)
+        action_mean_replay = action_mean_replay.to(dtype=sampled_action.dtype)
         reinforce_sequence_replay_applied = True
         reinforce_sequence_replay_eval_start = int(eval_start)
-        reinforce_sequence_replay_action_steps = int(action_pre_tanh.shape[0])
-        suffix_log_probs = prior._squashed_gaussian_log_prob(
-            action_pre_tanh,
+        reinforce_sequence_replay_action_steps = int(sampled_action.shape[0])
+        suffix_log_probs = prior._gaussian_log_prob(
+            sampled_action,
             action_mean_replay,
             action_std,
-            action=sampled_action,
             mask=action_mask,
         ).to(dtype=torch.float32)
-        if int(action_pre_tanh.shape[0]) == int(full_length) and eval_start == 0:
+        if int(sampled_action.shape[0]) == int(full_length) and eval_start == 0:
             return suffix_log_probs
         full_log_probs = torch.zeros(
             (full_length, int(suffix_log_probs.shape[1])),
@@ -317,7 +315,6 @@ def dispatch_policy_rollout(prior, ctx):
             group_replay = getattr(prior, "last_rollout_reinforce_replay", None)
             if policy_collect_reinforce_replay and isinstance(group_replay, dict):
                 reward_in_group = group_replay.get("reward_in", None)
-                action_pre_tanh_group = group_replay.get("action_pre_tanh", None)
                 sampled_action_group = group_replay.get("sampled_action", None)
                 action_std_group = group_replay.get("action_std", None)
                 action_mask_group = group_replay.get("action_mask", None)
@@ -327,25 +324,19 @@ def dispatch_policy_rollout(prior, ctx):
                     torch.is_tensor(t)
                     for t in (
                         reward_in_group,
-                        action_pre_tanh_group,
                         sampled_action_group,
                         action_std_group,
                         action_mask_group,
                     )
                 ):
-                    replay_steps = int(action_pre_tanh_group.shape[0])
-                    action_dim_group = int(action_pre_tanh_group.shape[-1])
+                    replay_steps = int(sampled_action_group.shape[0])
+                    action_dim_group = int(sampled_action_group.shape[-1])
                     if reinforce_replay_payload is None:
                         reinforce_replay_payload = {
                             "reward_in": torch.empty(
                                 (full_length_group, batch_size),
                                 device=reward_in_group.device,
                                 dtype=reward_in_group.dtype,
-                            ),
-                            "action_pre_tanh": torch.empty(
-                                (replay_steps, batch_size, action_dim_group),
-                                device=action_pre_tanh_group.device,
-                                dtype=action_pre_tanh_group.dtype,
                             ),
                             "sampled_action": torch.empty(
                                 (replay_steps, batch_size, action_dim_group),
@@ -369,12 +360,11 @@ def dispatch_policy_rollout(prior, ctx):
                         if (
                             int(reinforce_replay_payload["eval_start"]) != int(eval_start_group)
                             or int(reinforce_replay_payload["full_length"]) != int(full_length_group)
-                            or tuple(reinforce_replay_payload["action_pre_tanh"].shape[:1] + reinforce_replay_payload["action_pre_tanh"].shape[2:])
+                            or tuple(reinforce_replay_payload["sampled_action"].shape[:1] + reinforce_replay_payload["sampled_action"].shape[2:])
                             != (replay_steps, action_dim_group)
                         ):
                             raise RuntimeError("reinforce replay payload shapes were inconsistent across rollout groups")
                     reinforce_replay_payload["reward_in"][:, group_indices] = reward_in_group
-                    reinforce_replay_payload["action_pre_tanh"][:, group_indices] = action_pre_tanh_group
                     reinforce_replay_payload["sampled_action"][:, group_indices] = sampled_action_group
                     reinforce_replay_payload["action_std"][:, group_indices] = action_std_group
                     reinforce_replay_payload["action_mask"][group_indices] = action_mask_group

@@ -2009,16 +2009,14 @@ def test_environment_prior_alpha_grad_log_prob_score_matches_autograd_g0_path():
         ],
         dtype=torch.float32,
     )
-    pre_tanh_action = action_mean + (eps * action_std.unsqueeze(-1))
-    action = torch.tanh(pre_tanh_action)
+    action = action_mean + (eps * action_std.unsqueeze(-1))
     rewards = (1.5 * action_mean[..., 0]) - (0.25 * action_mean[..., 1])
     log_probs = torch.stack(
         [
-            EnvironmentPrior._squashed_gaussian_log_prob(
-                pre_tanh_action[t].detach(),
+            EnvironmentPrior._gaussian_log_prob(
+                action[t].detach(),
                 action_mean[t],
                 action_std[t],
-                action=action[t].detach(),
                 mask=action_mask[t],
             )
             for t in range(action_mean.shape[0])
@@ -2026,7 +2024,7 @@ def test_environment_prior_alpha_grad_log_prob_score_matches_autograd_g0_path():
         dim=0,
     )
     log_prob_score = EnvironmentPrior._reinforce_log_prob_score_wrt_action_mean(
-        pre_tanh_action.detach(),
+        action.detach(),
         action_mean.detach(),
         action_std.unsqueeze(-1),
         mask=action_mask,
@@ -2783,21 +2781,19 @@ def test_environment_prior_state_full_rms_only_downscales_active_dims():
     assert torch.allclose(transformed[1, 2], state_next[1, 2])
 
 
-def test_environment_prior_squashed_gaussian_log_prob_matches_clean_score_function_gradient():
+def test_environment_prior_gaussian_log_prob_matches_clean_score_function_gradient():
     action_mean = torch.tensor([0.3], dtype=torch.float32, requires_grad=True)
     action_std = 0.7
     eps = torch.tensor([0.5], dtype=torch.float32)
-    pre_tanh_action = action_mean + (eps * action_std)
-    action = torch.tanh(pre_tanh_action)
+    action = action_mean + (eps * action_std)
 
-    log_prob = EnvironmentPrior._squashed_gaussian_log_prob(
-        pre_tanh_action.detach(),
+    log_prob = EnvironmentPrior._gaussian_log_prob(
+        action.detach(),
         action_mean,
         action_std,
-        action=action.detach(),
     )
     (grad_mean,) = torch.autograd.grad(log_prob, action_mean)
-    expected = (pre_tanh_action.detach() - action_mean.detach()) / (action_std ** 2)
+    expected = (action.detach() - action_mean.detach()) / (action_std ** 2)
     assert torch.allclose(grad_mean, expected, atol=1e-6, rtol=1e-6)
 
 
@@ -2806,19 +2802,17 @@ def test_environment_prior_reinforce_log_prob_score_matches_autograd_gradient():
     action_std = torch.tensor([0.7], dtype=torch.float32)
     eps = torch.tensor([[0.5, -0.25]], dtype=torch.float32)
     mask = torch.tensor([[True, False]], dtype=torch.bool)
-    pre_tanh_action = action_mean + (eps * action_std.unsqueeze(-1))
-    action = torch.tanh(pre_tanh_action)
+    action = action_mean + (eps * action_std.unsqueeze(-1))
 
-    log_prob = EnvironmentPrior._squashed_gaussian_log_prob(
-        pre_tanh_action.detach(),
+    log_prob = EnvironmentPrior._gaussian_log_prob(
+        action.detach(),
         action_mean,
         action_std,
-        action=action.detach(),
         mask=mask,
     )
     (grad_mean,) = torch.autograd.grad(log_prob, action_mean)
     score = EnvironmentPrior._reinforce_log_prob_score_wrt_action_mean(
-        pre_tanh_action.detach(),
+        action.detach(),
         action_mean.detach(),
         action_std,
         mask=mask,
