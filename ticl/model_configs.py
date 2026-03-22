@@ -252,6 +252,11 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "policy_gradient_normalize_rewards": False,
         "reward_norm_eps": 1e-6,
         "reward_norm_clip": 10.0,
+        # REINFORCE-specific loss-side advantage normalization.
+        # This does not change the reward tokens fed back into the model.
+        "reinforce_normalize_advantages": False,
+        "reinforce_advantage_norm_eps": 1e-6,
+        "reinforce_advantage_norm_clip": 10.0,
         # Keep Bellman-style undiscounted default unless overridden.
         "discount": 1.0,
         # SCM (aligned with priors/mlp.py names).

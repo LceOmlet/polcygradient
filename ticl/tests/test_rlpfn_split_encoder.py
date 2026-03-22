@@ -45,6 +45,9 @@ def test_rlpfn_default_config_uses_split_encoder():
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_normalize_advantages"] is True
+    assert cfg["prior"]["environment"]["reinforce_advantage_norm_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_advantage_norm_clip"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_enabled"] is True
     assert cfg["prior"]["environment"]["first_policy_gradient_state_grad_clip_norm"] == 4.0
     assert cfg["prior"]["environment"]["first_policy_gradient_action_grad_clip_value"] == 0.0

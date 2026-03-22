@@ -1698,6 +1698,118 @@ def test_environment_prior_reinforce_loss_uses_total_return_objective():
     assert torch.isfinite(log_probs.grad).all()
 
 
+def test_environment_prior_reinforce_advantage_normalization_is_loss_only():
+    prior = EnvironmentPrior(
+        {
+            "discount": 1.0,
+            "reinforce_normalize_advantages": True,
+            "reinforce_advantage_norm_eps": 1e-6,
+            "reinforce_advantage_norm_clip": 10.0,
+        }
+    )
+    rewards = torch.tensor(
+        [
+            [1.0, 100.0],
+            [3.0, 300.0],
+            [5.0, 500.0],
+        ],
+        dtype=torch.float32,
+    )
+    log_probs = torch.tensor(
+        [
+            [0.3, -0.2],
+            [0.1, 0.4],
+            [-0.5, 0.2],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    loss, stats = prior.reinforce_loss_from_rewards(
+        rewards=rewards,
+        log_probs=log_probs,
+        discount=1.0,
+    )
+
+    returns = prior._returns_to_go(rewards, discount=1.0)
+    advantages_raw = returns - prior._leave_one_out_baseline(returns)
+    advantages_expected, norm_stats = prior.normalize_rewards(
+        advantages_raw,
+        eps=1e-6,
+        clip=10.0,
+        detach_stats=True,
+        return_stats=True,
+    )
+    expected_loss = -(advantages_expected.detach() * log_probs).mean()
+
+    assert torch.allclose(loss, expected_loss)
+    assert int(stats["reinforce_adv_normalized"]) == 1
+    assert float(stats["reward_mean"]) == pytest.approx(float(rewards.mean()))
+    assert float(stats["reinforce_adv_raw_mean"]) == pytest.approx(float(advantages_raw.mean()))
+    assert float(stats["reinforce_adv_mean"]) == pytest.approx(float(advantages_expected.mean()))
+    assert float(stats["reinforce_adv_norm_clip_hit_share"]) == pytest.approx(
+        float(norm_stats["normalized_clip_hit_share"])
+    )
+
+    loss.backward()
+    assert log_probs.grad is not None
+    assert torch.isfinite(log_probs.grad).all()
+
+
+def test_environment_prior_reinforce_advantage_normalization_keeps_rollout_reward_inputs_unchanged():
+    _seed_everything(20260322)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["reinforce_normalize_advantages"] = True
+    prior = EnvironmentPrior(env_cfg)
+    reward_inputs_seen = []
+
+    def _step(obs_t, action_t, reward_t, cache, step_idx, env_info):
+        del action_t, cache, step_idx, env_info
+        reward_inputs_seen.append(reward_t.detach().reshape(obs_t.shape[0]))
+        return torch.zeros((obs_t.shape[0], 3), device=obs_t.device, dtype=obs_t.dtype)
+
+    _step._reinforce_sequence_replay_fn = (
+        lambda x_tokens, reward_in, eval_start=0: torch.zeros(
+            (
+                int(x_tokens.shape[0]) - int(eval_start),
+                int(x_tokens.shape[1]),
+                3,
+            ),
+            device=x_tokens.device,
+            dtype=x_tokens.dtype,
+        )
+    )
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=_step,
+        batch_size=2,
+        n_samples=8,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=4,
+        collect_x=True,
+        policy_objective_kind="reinforce",
+        _policy_collect_reinforce_replay=True,
+    )
+
+    replay_payload = prior.last_rollout_reinforce_replay
+    assert replay_payload is not None
+    assert len(reward_inputs_seen) == 8
+    assert torch.allclose(
+        replay_payload["reward_in"],
+        torch.stack(reward_inputs_seen, dim=0),
+    )
+
+
 def test_environment_prior_first_policy_gradient_loss_uses_mean_reward_objective():
     prior = EnvironmentPrior({})
     rewards = torch.tensor(

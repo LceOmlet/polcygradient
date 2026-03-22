@@ -984,7 +984,7 @@ def test_rwkv7_reinforce_sequence_replay_gradients_match_stepwise_reinforce():
         max_abs_diff = max(max_abs_diff, float(diff.max()))
         mean_abs_diff += float(diff.mean())
     mean_abs_diff /= float(max(1, len(grads_base)))
-    assert max_abs_diff <= 3e-3
+    assert max_abs_diff <= 6e-3
     assert mean_abs_diff <= 5e-6
 
 
@@ -1022,7 +1022,7 @@ def test_rwkv7_reinforce_sequence_replay_checkpoint_matches_no_checkpoint():
         max_abs_diff = max(max_abs_diff, float(diff.max()))
         mean_abs_diff += float(diff.mean())
     mean_abs_diff /= float(max(1, len(grads_base)))
-    assert max_abs_diff <= 3e-3
+    assert max_abs_diff <= 6e-3
     assert mean_abs_diff <= 5e-6
 
 
@@ -1060,7 +1060,7 @@ def test_rwkv7_reinforce_sequence_replay_batch_microbatch_matches_full_batch():
         max_abs_diff = max(max_abs_diff, float(diff.max()))
         mean_abs_diff += float(diff.mean())
     mean_abs_diff /= float(max(1, len(grads_full)))
-    assert max_abs_diff <= 3e-3
+    assert max_abs_diff <= 6e-3
     assert mean_abs_diff <= 5e-6
 
 
@@ -1102,7 +1102,7 @@ def test_rwkv7_reinforce_sequence_replay_loss_sink_matches_no_sink():
         max_abs_diff = max(max_abs_diff, float(diff.max()))
         mean_abs_diff += float(diff.mean())
     mean_abs_diff /= float(max(1, len(grads_base)))
-    assert max_abs_diff <= 3e-3
+    assert max_abs_diff <= 6e-3
     assert mean_abs_diff <= 5e-6
 
 

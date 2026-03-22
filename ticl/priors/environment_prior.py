@@ -1508,6 +1508,9 @@ class EnvironmentPrior:
         cfg.setdefault("policy_gradient_normalize_rewards", False)
         cfg.setdefault("reward_norm_eps", 1e-6)
         cfg.setdefault("reward_norm_clip", 10.0)
+        cfg.setdefault("reinforce_normalize_advantages", False)
+        cfg.setdefault("reinforce_advantage_norm_eps", 1e-6)
+        cfg.setdefault("reinforce_advantage_norm_clip", 10.0)
         cfg.setdefault("discount", 1.0)
 
         # SCM-style knobs (aligned with names in priors/mlp.py).
@@ -16754,33 +16757,21 @@ class EnvironmentPrior:
         batch_sum = values.sum(dim=1, keepdim=True)
         return (batch_sum - values) / float(batch_size - 1)
 
-    def reinforce_loss_from_rewards(
+    def _prepare_reinforce_advantages(
         self,
         rewards,
-        log_probs,
+        *,
         discount=None,
         baseline_mode="leave_one_out",
         detach_baseline=True,
+        normalize_advantages=None,
     ):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
-        if log_probs.ndim != 2:
-            raise ValueError(f"log_probs must have shape (T, B), got {tuple(log_probs.shape)}")
-        if tuple(rewards.shape) != tuple(log_probs.shape):
-            raise ValueError(
-                "rewards and log_probs must share shape, "
-                f"got {tuple(rewards.shape)} and {tuple(log_probs.shape)}"
-            )
         if discount is None:
             discount = self._resolve_scalar(self.config.get("discount", 1.0))
         discount = float(max(0.0, min(1.0, discount)))
-        rewards_used = rewards
-        reward_transform_stats = {
-            "mode": self._resolve_reinforce_reward_transform(self.config),
-            "tanh_c": float(self._resolve_reinforce_reward_tanh_c(self.config)),
-            "tanh_bound": float(self._resolve_reinforce_reward_tanh_bound(self.config)),
-        }
-        returns = self._returns_to_go(rewards_used, discount=discount)
+        returns = self._returns_to_go(rewards, discount=discount)
         baseline_mode = str(baseline_mode).strip().lower()
         if baseline_mode in {"loo", "leave_one_out", "leave-one-out"}:
             baseline = self._leave_one_out_baseline(returns)
@@ -16792,7 +16783,76 @@ class EnvironmentPrior:
             raise ValueError(f"Unknown REINFORCE baseline mode: {baseline_mode}")
         if detach_baseline:
             baseline = baseline.detach()
-        advantages = returns - baseline
+        advantages_raw = returns - baseline
+        normalize_advantages_enabled = (
+            bool(self.config.get("reinforce_normalize_advantages", False))
+            if normalize_advantages is None
+            else bool(normalize_advantages)
+        )
+        advantages_used = advantages_raw
+        advantage_norm_clip_hit_share = torch.zeros((), device=rewards.device, dtype=torch.float32)
+        advantage_norm_eps = float(self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6)))
+        advantage_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
+        if normalize_advantages_enabled:
+            advantages_used, norm_stats = self.normalize_rewards(
+                advantages_raw,
+                eps=advantage_norm_eps,
+                clip=advantage_norm_clip,
+                detach_stats=True,
+                return_stats=True,
+            )
+            advantage_norm_clip_hit_share = norm_stats["normalized_clip_hit_share"].detach()
+        return {
+            "discount": discount,
+            "returns": returns,
+            "baseline_mode": baseline_mode,
+            "advantages_raw": advantages_raw,
+            "advantages": advantages_used,
+            "normalize_advantages": normalize_advantages_enabled,
+            "advantage_norm_eps": float(advantage_norm_eps),
+            "advantage_norm_clip": (
+                float(advantage_norm_clip)
+                if advantage_norm_clip is not None
+                else None
+            ),
+            "advantage_norm_clip_hit_share": advantage_norm_clip_hit_share,
+        }
+
+    def reinforce_loss_from_rewards(
+        self,
+        rewards,
+        log_probs,
+        discount=None,
+        baseline_mode="leave_one_out",
+        detach_baseline=True,
+        normalize_advantages=None,
+    ):
+        if rewards.ndim != 2:
+            raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+        if log_probs.ndim != 2:
+            raise ValueError(f"log_probs must have shape (T, B), got {tuple(log_probs.shape)}")
+        if tuple(rewards.shape) != tuple(log_probs.shape):
+            raise ValueError(
+                "rewards and log_probs must share shape, "
+                f"got {tuple(rewards.shape)} and {tuple(log_probs.shape)}"
+            )
+        rewards_used = rewards
+        reward_transform_stats = {
+            "mode": self._resolve_reinforce_reward_transform(self.config),
+            "tanh_c": float(self._resolve_reinforce_reward_tanh_c(self.config)),
+            "tanh_bound": float(self._resolve_reinforce_reward_tanh_bound(self.config)),
+        }
+        reinforce_terms = self._prepare_reinforce_advantages(
+            rewards_used,
+            discount=discount,
+            baseline_mode=baseline_mode,
+            detach_baseline=detach_baseline,
+            normalize_advantages=normalize_advantages,
+        )
+        returns = reinforce_terms["returns"]
+        baseline_mode = reinforce_terms["baseline_mode"]
+        advantages_raw = reinforce_terms["advantages_raw"]
+        advantages = reinforce_terms["advantages"]
         loss = -(advantages.detach() * log_probs).mean()
 
         def _share(mask):
@@ -16820,9 +16880,19 @@ class EnvironmentPrior:
             "reinforce_return_inf_share": _share(torch.isinf(returns)),
             "reinforce_adv_mean": advantages.mean().detach(),
             "reinforce_adv_std": advantages.std(unbiased=False).detach(),
+            "reinforce_adv_raw_mean": advantages_raw.mean().detach(),
+            "reinforce_adv_raw_std": advantages_raw.std(unbiased=False).detach(),
             "reinforce_adv_nonfinite_share": _share(~torch.isfinite(advantages)),
             "reinforce_adv_nan_share": _share(torch.isnan(advantages)),
             "reinforce_adv_inf_share": _share(torch.isinf(advantages)),
+            "reinforce_adv_normalized": int(reinforce_terms["normalize_advantages"]),
+            "reinforce_adv_norm_eps": float(reinforce_terms["advantage_norm_eps"]),
+            "reinforce_adv_norm_clip": (
+                float(reinforce_terms["advantage_norm_clip"])
+                if reinforce_terms["advantage_norm_clip"] is not None
+                else 0.0
+            ),
+            "reinforce_adv_norm_clip_hit_share": reinforce_terms["advantage_norm_clip_hit_share"],
             "reinforce_log_prob_mean": log_probs.mean().detach(),
             "reinforce_log_prob_std": log_probs.std(unbiased=False).detach(),
             "reinforce_log_prob_nonfinite_share": _share(~torch.isfinite(log_probs)),
@@ -16873,20 +16943,16 @@ class EnvironmentPrior:
                 "reinforce sequence replay reward/action_std shape mismatch: "
                 f"{tuple(rewards_eval.shape)} vs {tuple(action_std.shape)}"
             )
-        if discount is None:
-            discount = self._resolve_scalar(self.config.get("discount", 1.0))
-        discount = float(max(0.0, min(1.0, discount)))
-        returns = self._returns_to_go(rewards_eval, discount=discount)
-        baseline_mode = str(baseline_mode).strip().lower()
-        if baseline_mode in {"loo", "leave_one_out", "leave-one-out"}:
-            baseline = self._leave_one_out_baseline(returns)
-            baseline_mode = "leave_one_out"
-        elif baseline_mode in {"zero", "none", ""}:
-            baseline = torch.zeros_like(returns)
-            baseline_mode = "zero"
-        else:
-            raise ValueError(f"Unknown REINFORCE baseline mode: {baseline_mode}")
-        advantages = (returns - baseline).detach()
+        reinforce_terms = self._prepare_reinforce_advantages(
+            rewards_eval,
+            discount=discount,
+            baseline_mode=baseline_mode,
+            detach_baseline=True,
+            normalize_advantages=None,
+        )
+        discount = reinforce_terms["discount"]
+        baseline_mode = reinforce_terms["baseline_mode"]
+        advantages = reinforce_terms["advantages"].detach()
         batch_size = int(x_tokens.shape[1])
         model_ref = getattr(policy_step_fn, "_model_ref", None)
         if model_ref is not None and hasattr(model_ref, "resolve_replay_batch_chunk_size"):
@@ -16987,6 +17053,9 @@ class EnvironmentPrior:
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(self.config)
         reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+        reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
+        reinforce_adv_norm_eps = self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6))
+        reinforce_adv_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
         objective_kind = str(objective_kind).strip().lower()
         if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
             objective_kind = "policy_gradient"
@@ -17003,6 +17072,9 @@ class EnvironmentPrior:
             f"|rrtx={reinforce_reward_transform}"
             f"|rrtc={_fmt_float(reinforce_reward_tanh_c)}"
             f"|rrtb={_fmt_float(reinforce_reward_tanh_bound)}"
+            f"|anorm={int(reinforce_adv_normalized)}"
+            f"|aneps={_fmt_float(reinforce_adv_norm_eps)}"
+            f"|anclip={_fmt_float(reinforce_adv_norm_clip)}"
         )
 
     def policy_gradient_loss_from_rewards(
@@ -17247,6 +17319,7 @@ class EnvironmentPrior:
             log_probs=log_probs,
             discount=discount,
             baseline_mode="leave_one_out",
+            normalize_advantages=False,
         )
 
         def _grad_parts_or_zeros(loss_value, grad_inputs):
