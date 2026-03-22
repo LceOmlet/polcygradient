@@ -1082,6 +1082,17 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
+            "reinforce_action_std_mean": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_min": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_max": torch.as_tensor(5e-2, device=device),
+            "reinforce_logprob_log_std_mean": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_min": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_max": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_z2_mean": torch.as_tensor(1.25, device=device),
+            "reinforce_logprob_z2_max": torch.as_tensor(4.5, device=device),
         }
         return anchor, None, stats
 
@@ -1183,6 +1194,17 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch(rl_object
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
+            "reinforce_action_std_mean": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_min": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_max": torch.as_tensor(5e-2, device=device),
+            "reinforce_logprob_log_std_mean": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_min": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_max": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_z2_mean": torch.as_tensor(1.25, device=device),
+            "reinforce_logprob_z2_max": torch.as_tensor(4.5, device=device),
         }
         return anchor, None, stats
 
@@ -1289,6 +1311,17 @@ def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
+            "reinforce_action_std_mean": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_min": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_max": torch.as_tensor(5e-2, device=device),
+            "reinforce_logprob_log_std_mean": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_min": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_max": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_z2_mean": torch.as_tensor(1.25, device=device),
+            "reinforce_logprob_z2_max": torch.as_tensor(4.5, device=device),
         }
         return anchor, None, stats
 
@@ -2256,6 +2289,17 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
+            "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
+            "reinforce_action_std_mean": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_min": torch.as_tensor(5e-2, device=device),
+            "reinforce_action_std_max": torch.as_tensor(5e-2, device=device),
+            "reinforce_logprob_log_std_mean": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_min": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_log_std_max": torch.as_tensor(-2.995732, device=device),
+            "reinforce_logprob_z2_mean": torch.as_tensor(1.25, device=device),
+            "reinforce_logprob_z2_max": torch.as_tensor(4.5, device=device),
         }
         return anchor, None, stats
 
@@ -2292,3 +2336,7 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
     assert len(finish_lines) == 1
     assert "status=start" in start_lines[0]
     assert "status=ok" in finish_lines[0]
+    assert "actdim_mean=3.000" in finish_lines[0]
+    assert "policy_std_mean=5.000e-02" in finish_lines[0]
+    assert "logstd_mean=-2.996e+00" in finish_lines[0]
+    assert "z2_mean=1.250e+00" in finish_lines[0]

@@ -139,6 +139,16 @@ class _FallbackBoundsEnv(_ActionRecordingEnv):
         self.action_space = _ShapeOnlyActionSpace((int(action_dim),))
 
 
+class _RewardInfoEnv(_ScriptedEnv):
+    def __init__(self, rollout_lengths, rollout_rewards, rollout_infos, obs_dim=4, action_dim=1):
+        super().__init__(rollout_lengths, rollout_rewards, obs_dim=obs_dim, action_dim=action_dim)
+        self._rollout_infos = [dict(info) for info in rollout_infos]
+
+    def step(self, action):
+        obs, reward, terminated, truncated, _ = super().step(action)
+        return obs, reward, terminated, truncated, dict(self._rollout_infos[self._rollout_idx])
+
+
 class _PhaseRecordingModel:
     def __init__(self, phase_idx, terminal_idx):
         self.training = False
@@ -396,6 +406,102 @@ def test_evaluate_rlpfn_on_gym_envs_policy_step_path_reuses_cache_and_reports_si
     assert model.phase_calls == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
     assert model.terminal_calls == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
     assert model.cache_seen == [False, True, True, True, True, True, True]
+
+
+def test_evaluate_rlpfn_on_gym_envs_reports_reward_term_breakdown_for_candidate_path(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _RewardInfoEnv(
+            [2, 3],
+            [1.0, 2.0],
+            [
+                {"reward_forward": 0.25, "reward_ctrl": -0.10, "x_position": 1.0},
+                {"reward_forward": 0.50, "reward_ctrl": -0.20, "x_position": 2.0},
+            ],
+        ),
+    )
+    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+            },
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vRewardTerms",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 32,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 3,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert mean_ret == 6.0
+    assert per_env["DummyEnv-vRewardTerms"]["return"] == 6.0
+    assert per_env["DummyEnv-vRewardTerms"]["reward_forward"] == pytest.approx(1.5)
+    assert per_env["DummyEnv-vRewardTerms"]["reward_forward_mean"] == pytest.approx(1.5)
+    assert per_env["DummyEnv-vRewardTerms"]["reward_ctrl"] == pytest.approx(-0.6)
+    assert per_env["DummyEnv-vRewardTerms"]["reward_ctrl_mean"] == pytest.approx(-0.6)
+    assert "x_position_mean" not in per_env["DummyEnv-vRewardTerms"]
+
+
+def test_evaluate_rlpfn_on_gym_envs_reports_reward_term_breakdown_for_policy_step_path(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _RewardInfoEnv(
+            [2, 3],
+            [1.0, 2.0],
+            [
+                {"reward_forward": 0.25, "reward_ctrl": -0.10},
+                {"reward_forward": 0.50, "reward_ctrl": -0.20},
+            ],
+        ),
+    )
+    model = _PolicyStepRecordingModel(obs_total_dim=8, action_dim=1)
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vRewardTermsPolicy",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 32,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 3,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert mean_ret == 6.0
+    assert per_env["DummyEnv-vRewardTermsPolicy"]["return"] == 6.0
+    assert per_env["DummyEnv-vRewardTermsPolicy"]["reward_forward"] == pytest.approx(1.5)
+    assert per_env["DummyEnv-vRewardTermsPolicy"]["reward_forward_mean"] == pytest.approx(1.5)
+    assert per_env["DummyEnv-vRewardTermsPolicy"]["reward_ctrl"] == pytest.approx(-0.6)
+    assert per_env["DummyEnv-vRewardTermsPolicy"]["reward_ctrl_mean"] == pytest.approx(-0.6)
 
 
 def test_evaluate_rlpfn_on_gym_envs_does_not_apply_prior_rms_action_transform_to_real_env(monkeypatch):

@@ -378,6 +378,46 @@ def _transform_validation_reward(reward_raw, *, policy_hparams, device):
     return float(reward_t.reshape(()).detach().cpu().item())
 
 
+def _extract_validation_reward_term_scalars(info):
+    if not isinstance(info, dict):
+        return {}
+    reward_terms = {}
+    for key, value in info.items():
+        key_str = str(key).strip()
+        key_lower = key_str.lower()
+        if not key_str:
+            continue
+        if not (
+            key_lower.startswith("reward_")
+            or key_lower.endswith("_reward")
+            or key_lower.startswith("cost_")
+            or key_lower.endswith("_cost")
+        ):
+            continue
+        if key_lower == "reward":
+            continue
+        try:
+            value_arr = np.asarray(value, dtype=np.float64).reshape(-1)
+        except Exception:
+            continue
+        if int(value_arr.size) != 1:
+            continue
+        value_scalar = float(value_arr[0])
+        if not np.isfinite(value_scalar):
+            continue
+        reward_terms[key_str] = value_scalar
+    return reward_terms
+
+
+def _accumulate_validation_reward_terms(state, info):
+    reward_terms = _extract_validation_reward_term_scalars(info)
+    if not reward_terms:
+        return
+    rollout_terms = state.setdefault("current_rollout_reward_terms", {})
+    for key, value in reward_terms.items():
+        rollout_terms[key] = float(rollout_terms.get(key, 0.0)) + float(value)
+
+
 def _select_policy_action(
     *,
     state,
@@ -447,6 +487,7 @@ def _reset_validation_rollout(state, preserve_prev=False):
     obs, _ = state["env"].reset(seed=int(state["next_reset_seed"]))
     state["next_reset_seed"] += 1
     state["obs"] = obs
+    state["current_rollout_reward_terms"] = {}
     if not bool(preserve_prev):
         state["prev_reward"] = 0.0
         state["prev_terminal"] = 0.0
@@ -469,6 +510,7 @@ def _finalize_validation_rollout(state, context_lower_bound):
     if bool(state["phase_flag"] >= 1.0):
         state["reported_return"] = rollout_return
         state["reported_len"] = float(rollout_len)
+        state["reported_reward_terms"] = dict(state.get("current_rollout_reward_terms", {}))
         state["context_len_before_eval"] = float(state["context_len"] - rollout_len)
         state["explore_rollout_count"] = float(len(state["explore_rollout_lengths"]))
         state["explore_rollout_len_mean"] = (
@@ -523,6 +565,7 @@ def _build_validation_episode_states(
             "done": False,
             "reported_return": None,
             "reported_len": None,
+            "reported_reward_terms": None,
             "context_len_before_eval": None,
             "explore_rollout_count": None,
             "explore_rollout_len_mean": None,
@@ -666,9 +709,10 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                             action_slot_dim=action_slot_dim,
                             terminal_token_enabled=terminal_token_enabled,
                         )
-                        obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
+                        obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
                         reward_next = float(reward_next)
                         done_flag = bool(terminated or truncated)
+                        _accumulate_validation_reward_terms(state, info)
                         reward_input = _transform_validation_reward(
                             reward_next,
                             policy_hparams=state["policy_hparams"],
@@ -773,9 +817,10 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                                 terminal_token_enabled=terminal_token_enabled,
                             )
                         )
-                        obs_next, reward_next, terminated, truncated, _ = state["env"].step(action.astype(np.float32))
+                        obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
                         reward_next = float(reward_next)
                         done_flag = bool(terminated or truncated)
+                        _accumulate_validation_reward_terms(state, info)
                         state["y_hist"].append(reward_next)
                         state["obs"] = obs_next
                         state["prev_reward"] = reward_next
@@ -809,6 +854,13 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     for state in states
                     if state["explore_rollout_len_mean"] is not None
                 ]
+                reward_term_values = {}
+                for state in states:
+                    reported_reward_terms = state.get("reported_reward_terms", None)
+                    if not isinstance(reported_reward_terms, dict):
+                        continue
+                    for key, value in reported_reward_terms.items():
+                        reward_term_values.setdefault(str(key), []).append(float(value))
                 if returns:
                     mean_ret = float(np.mean(returns))
                     mean_len = float(np.mean(lengths))
@@ -830,6 +882,10 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     if int(len(returns)) == 1:
                         env_summary["return"] = float(returns[0])
                         env_summary["len"] = float(lengths[0]) if lengths else float("nan")
+                    for key, values in reward_term_values.items():
+                        env_summary[f"{key}_mean"] = float(np.mean(np.asarray(values, dtype=np.float64)))
+                        if int(len(values)) == 1:
+                            env_summary[key] = float(values[0])
                     existing_summary.update(env_summary)
                     per_env[env_name] = existing_summary
                     all_env_means.append(mean_ret)

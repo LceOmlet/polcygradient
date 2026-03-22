@@ -16714,6 +16714,63 @@ class EnvironmentPrior:
         return log_prob_per_dim.sum(dim=-1)
 
     @staticmethod
+    def _gaussian_log_prob_decomposition_stats(action, action_mean, action_std, *, mask=None, eps=1e-6):
+        if action.shape != action_mean.shape:
+            raise ValueError(
+                "action and action_mean must have identical shape, "
+                f"got {tuple(action.shape)} and {tuple(action_mean.shape)}"
+            )
+        std = action_std
+        if not torch.is_tensor(std):
+            std = torch.as_tensor(std, device=action.device, dtype=action.dtype)
+        std = std.to(device=action.device, dtype=action.dtype)
+        while std.ndim < action.ndim:
+            std = std.unsqueeze(-1)
+        std = std.expand_as(action).clamp_min(float(max(1e-12, eps)))
+        centered_sq = ((action - action_mean) / std).square()
+        log_std = torch.log(std)
+
+        if mask is None:
+            mask_t = torch.ones_like(action, dtype=torch.bool)
+        else:
+            mask_t = mask.to(device=action.device, dtype=torch.bool)
+            while mask_t.ndim < action.ndim:
+                mask_t = mask_t.unsqueeze(0)
+            mask_t = mask_t.expand_as(action)
+
+        active_counts = mask_t.to(dtype=torch.float32).sum(dim=-1)
+        active_count_total = int(mask_t.sum().item())
+
+        def _safe_mean(values):
+            if active_count_total <= 0:
+                return torch.zeros((), device=action.device, dtype=torch.float32)
+            return values.masked_select(mask_t).to(dtype=torch.float32).mean().detach()
+
+        def _safe_max(values):
+            if active_count_total <= 0:
+                return torch.zeros((), device=action.device, dtype=torch.float32)
+            return values.masked_select(mask_t).to(dtype=torch.float32).max().detach()
+
+        def _safe_min(values):
+            if active_count_total <= 0:
+                return torch.zeros((), device=action.device, dtype=torch.float32)
+            return values.masked_select(mask_t).to(dtype=torch.float32).min().detach()
+
+        return {
+            "reinforce_action_dim_mean": active_counts.mean().detach(),
+            "reinforce_action_dim_min": active_counts.min().detach(),
+            "reinforce_action_dim_max": active_counts.max().detach(),
+            "reinforce_action_std_mean": _safe_mean(std),
+            "reinforce_action_std_min": _safe_min(std),
+            "reinforce_action_std_max": _safe_max(std),
+            "reinforce_logprob_log_std_mean": _safe_mean(log_std),
+            "reinforce_logprob_log_std_min": _safe_min(log_std),
+            "reinforce_logprob_log_std_max": _safe_max(log_std),
+            "reinforce_logprob_z2_mean": _safe_mean(centered_sq),
+            "reinforce_logprob_z2_max": _safe_max(centered_sq),
+        }
+
+    @staticmethod
     def _reinforce_log_prob_score_wrt_action_mean(action, action_mean, action_std, *, mask=None, eps=1e-6):
         if action.shape != action_mean.shape:
             raise ValueError(
@@ -16969,6 +17026,24 @@ class EnvironmentPrior:
         total_elements = float(max(1, rewards_eval.numel()))
         full_log_probs = torch.empty_like(rewards_eval, dtype=torch.float32)
         loss_total = torch.zeros((), device=rewards_eval.device, dtype=torch.float32)
+        replay_decomp_accum = {
+            "reinforce_action_dim_mean": 0.0,
+            "reinforce_action_std_mean": 0.0,
+            "reinforce_logprob_log_std_mean": 0.0,
+            "reinforce_logprob_z2_mean": 0.0,
+        }
+        replay_decomp_count = 0.0
+        replay_decomp_min = {
+            "reinforce_action_dim_min": float("inf"),
+            "reinforce_action_std_min": float("inf"),
+            "reinforce_logprob_log_std_min": float("inf"),
+        }
+        replay_decomp_max = {
+            "reinforce_action_dim_max": float("-inf"),
+            "reinforce_action_std_max": float("-inf"),
+            "reinforce_logprob_log_std_max": float("-inf"),
+            "reinforce_logprob_z2_max": float("-inf"),
+        }
 
         for start in range(0, batch_size, replay_batch_chunk):
             end = min(batch_size, start + replay_batch_chunk)
@@ -16998,6 +17073,20 @@ class EnvironmentPrior:
                 action_std[:, start:end],
                 mask=action_mask[start:end],
             ).to(dtype=torch.float32)
+            decomp_stats_chunk = self._gaussian_log_prob_decomposition_stats(
+                sampled_action[:, start:end],
+                action_mean_replay,
+                action_std[:, start:end],
+                mask=action_mask[start:end],
+            )
+            chunk_weight = float(end - start)
+            replay_decomp_count += chunk_weight
+            for key in replay_decomp_accum:
+                replay_decomp_accum[key] += float(decomp_stats_chunk[key].detach().cpu()) * chunk_weight
+            for key in replay_decomp_min:
+                replay_decomp_min[key] = min(replay_decomp_min[key], float(decomp_stats_chunk[key].detach().cpu()))
+            for key in replay_decomp_max:
+                replay_decomp_max[key] = max(replay_decomp_max[key], float(decomp_stats_chunk[key].detach().cpu()))
             full_log_probs[:, start:end] = log_probs_chunk.detach()
             chunk_loss = -(
                 advantages[:, start:end] * log_probs_chunk
@@ -17019,6 +17108,31 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
         stats["reinforce_sequence_replay_full_length"] = int(full_length)
         stats["reinforce_sequence_replay_eval_steps"] = int(sampled_action.shape[0])
+        if replay_decomp_count > 0.0:
+            stats["reinforce_action_dim_mean"] = torch.as_tensor(
+                replay_decomp_accum["reinforce_action_dim_mean"] / replay_decomp_count,
+                device=rewards_eval.device,
+                dtype=torch.float32,
+            )
+            stats["reinforce_action_std_mean"] = torch.as_tensor(
+                replay_decomp_accum["reinforce_action_std_mean"] / replay_decomp_count,
+                device=rewards_eval.device,
+                dtype=torch.float32,
+            )
+            stats["reinforce_logprob_log_std_mean"] = torch.as_tensor(
+                replay_decomp_accum["reinforce_logprob_log_std_mean"] / replay_decomp_count,
+                device=rewards_eval.device,
+                dtype=torch.float32,
+            )
+            stats["reinforce_logprob_z2_mean"] = torch.as_tensor(
+                replay_decomp_accum["reinforce_logprob_z2_mean"] / replay_decomp_count,
+                device=rewards_eval.device,
+                dtype=torch.float32,
+            )
+            for key, value in replay_decomp_min.items():
+                stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
+            for key, value in replay_decomp_max.items():
+                stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
         if callable(loss_sink):
             loss_total = -(
                 advantages * full_log_probs
@@ -19387,6 +19501,22 @@ class EnvironmentPrior:
                     stats["reinforce_enabled"] = 1
                     if reinforce_rollout.get("sequence_replay_applied", False):
                         stats["reinforce_sequence_replay_applied"] = 1
+                    for key in (
+                        "reinforce_action_dim_mean",
+                        "reinforce_action_dim_min",
+                        "reinforce_action_dim_max",
+                        "reinforce_action_std_mean",
+                        "reinforce_action_std_min",
+                        "reinforce_action_std_max",
+                        "reinforce_logprob_log_std_mean",
+                        "reinforce_logprob_log_std_min",
+                        "reinforce_logprob_log_std_max",
+                        "reinforce_logprob_z2_mean",
+                        "reinforce_logprob_z2_max",
+                    ):
+                        value = reinforce_rollout.get(key, None)
+                        if value is not None:
+                            stats[key] = value
                 if reinforce_sequence_replay_enabled and (not collect_x):
                     rollout["x"] = None
                 stats["reinforce_enabled"] = 1

@@ -856,6 +856,21 @@ def test_rwkv7_reinforce_sequence_replay_backward_is_finite():
     assert grads_replay
     assert all(torch.isfinite(g).all().item() for g in grads_replay)
     assert any(float(g.abs().sum()) > 0.0 for g in grads_replay)
+    for key in (
+        "reinforce_action_dim_mean",
+        "reinforce_action_dim_min",
+        "reinforce_action_dim_max",
+        "reinforce_action_std_mean",
+        "reinforce_action_std_min",
+        "reinforce_action_std_max",
+        "reinforce_logprob_log_std_mean",
+        "reinforce_logprob_log_std_min",
+        "reinforce_logprob_log_std_max",
+        "reinforce_logprob_z2_mean",
+        "reinforce_logprob_z2_max",
+    ):
+        assert key in stats_replay, key
+        assert torch.isfinite(torch.as_tensor(stats_replay[key])).item(), key
 
 
 def test_rwkv7_reinforce_sequence_replay_preserves_rollout_under_fixed_seeds():

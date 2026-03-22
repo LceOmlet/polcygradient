@@ -2131,6 +2131,17 @@ def train_epoch_policy_gradient(
                     batch_reinforce_adv_nonfinite_share = 0.0
                     batch_reinforce_log_prob_mean_value = None
                     batch_reinforce_log_prob_std_value = None
+                    batch_reinforce_action_dim_mean_value = None
+                    batch_reinforce_action_dim_min_value = float("inf")
+                    batch_reinforce_action_dim_max_value = float("-inf")
+                    batch_reinforce_action_std_mean_value = None
+                    batch_reinforce_action_std_min_value = float("inf")
+                    batch_reinforce_action_std_max_value = float("-inf")
+                    batch_reinforce_logprob_log_std_mean_value = None
+                    batch_reinforce_logprob_log_std_min_value = float("inf")
+                    batch_reinforce_logprob_log_std_max_value = float("-inf")
+                    batch_reinforce_logprob_z2_mean_value = None
+                    batch_reinforce_logprob_z2_max_value = float("-inf")
                     batch_state_abs_max_value = 0.0
                     batch_action_std_min_value = float("inf")
                     batch_action_std_max_value = float("-inf")
@@ -3087,6 +3098,109 @@ def train_epoch_policy_gradient(
                                     batch_reinforce_log_prob_std_value = contrib
                                 else:
                                     batch_reinforce_log_prob_std_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_dim_mean = pg_stats_chunk.get("reinforce_action_dim_mean", None)
+                        if chunk_reinforce_action_dim_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reinforce_action_dim_mean).detach().cpu()) * chunk_weight
+                                if batch_reinforce_action_dim_mean_value is None:
+                                    batch_reinforce_action_dim_mean_value = contrib
+                                else:
+                                    batch_reinforce_action_dim_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_dim_min = pg_stats_chunk.get("reinforce_action_dim_min", None)
+                        if chunk_reinforce_action_dim_min is not None:
+                            try:
+                                batch_reinforce_action_dim_min_value = min(
+                                    batch_reinforce_action_dim_min_value,
+                                    float(torch.as_tensor(chunk_reinforce_action_dim_min).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_dim_max = pg_stats_chunk.get("reinforce_action_dim_max", None)
+                        if chunk_reinforce_action_dim_max is not None:
+                            try:
+                                batch_reinforce_action_dim_max_value = max(
+                                    batch_reinforce_action_dim_max_value,
+                                    float(torch.as_tensor(chunk_reinforce_action_dim_max).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_std_mean = pg_stats_chunk.get("reinforce_action_std_mean", None)
+                        if chunk_reinforce_action_std_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reinforce_action_std_mean).detach().cpu()) * chunk_weight
+                                if batch_reinforce_action_std_mean_value is None:
+                                    batch_reinforce_action_std_mean_value = contrib
+                                else:
+                                    batch_reinforce_action_std_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_std_min = pg_stats_chunk.get("reinforce_action_std_min", None)
+                        if chunk_reinforce_action_std_min is not None:
+                            try:
+                                batch_reinforce_action_std_min_value = min(
+                                    batch_reinforce_action_std_min_value,
+                                    float(torch.as_tensor(chunk_reinforce_action_std_min).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_action_std_max = pg_stats_chunk.get("reinforce_action_std_max", None)
+                        if chunk_reinforce_action_std_max is not None:
+                            try:
+                                batch_reinforce_action_std_max_value = max(
+                                    batch_reinforce_action_std_max_value,
+                                    float(torch.as_tensor(chunk_reinforce_action_std_max).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_logprob_log_std_mean = pg_stats_chunk.get("reinforce_logprob_log_std_mean", None)
+                        if chunk_reinforce_logprob_log_std_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reinforce_logprob_log_std_mean).detach().cpu()) * chunk_weight
+                                if batch_reinforce_logprob_log_std_mean_value is None:
+                                    batch_reinforce_logprob_log_std_mean_value = contrib
+                                else:
+                                    batch_reinforce_logprob_log_std_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_logprob_log_std_min = pg_stats_chunk.get("reinforce_logprob_log_std_min", None)
+                        if chunk_reinforce_logprob_log_std_min is not None:
+                            try:
+                                batch_reinforce_logprob_log_std_min_value = min(
+                                    batch_reinforce_logprob_log_std_min_value,
+                                    float(torch.as_tensor(chunk_reinforce_logprob_log_std_min).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_logprob_log_std_max = pg_stats_chunk.get("reinforce_logprob_log_std_max", None)
+                        if chunk_reinforce_logprob_log_std_max is not None:
+                            try:
+                                batch_reinforce_logprob_log_std_max_value = max(
+                                    batch_reinforce_logprob_log_std_max_value,
+                                    float(torch.as_tensor(chunk_reinforce_logprob_log_std_max).detach().cpu()),
+                                )
+                            except Exception:
+                                pass
+                        chunk_reinforce_logprob_z2_mean = pg_stats_chunk.get("reinforce_logprob_z2_mean", None)
+                        if chunk_reinforce_logprob_z2_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reinforce_logprob_z2_mean).detach().cpu()) * chunk_weight
+                                if batch_reinforce_logprob_z2_mean_value is None:
+                                    batch_reinforce_logprob_z2_mean_value = contrib
+                                else:
+                                    batch_reinforce_logprob_z2_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_logprob_z2_max = pg_stats_chunk.get("reinforce_logprob_z2_max", None)
+                        if chunk_reinforce_logprob_z2_max is not None:
+                            try:
+                                batch_reinforce_logprob_z2_max_value = max(
+                                    batch_reinforce_logprob_z2_max_value,
+                                    float(torch.as_tensor(chunk_reinforce_logprob_z2_max).detach().cpu()),
+                                )
                             except Exception:
                                 pass
                         chunk_state_abs_max = pg_stats_chunk.get("state_abs_max", None)
@@ -4255,6 +4369,28 @@ def train_epoch_policy_gradient(
                     rollout_breakdown_suffix += f" logprob_mean={float(batch_reinforce_log_prob_mean_value):+.3e}"
                 if batch_reinforce_log_prob_std_value is not None and math.isfinite(float(batch_reinforce_log_prob_std_value)):
                     rollout_breakdown_suffix += f" logprob_std={float(batch_reinforce_log_prob_std_value):.3e}"
+                if batch_reinforce_action_dim_mean_value is not None and math.isfinite(float(batch_reinforce_action_dim_mean_value)):
+                    rollout_breakdown_suffix += f" actdim_mean={float(batch_reinforce_action_dim_mean_value):.3f}"
+                if math.isfinite(float(batch_reinforce_action_dim_min_value)):
+                    rollout_breakdown_suffix += f" actdim_min={float(batch_reinforce_action_dim_min_value):.0f}"
+                if math.isfinite(float(batch_reinforce_action_dim_max_value)):
+                    rollout_breakdown_suffix += f" actdim_max={float(batch_reinforce_action_dim_max_value):.0f}"
+                if batch_reinforce_action_std_mean_value is not None and math.isfinite(float(batch_reinforce_action_std_mean_value)):
+                    rollout_breakdown_suffix += f" policy_std_mean={float(batch_reinforce_action_std_mean_value):.3e}"
+                if math.isfinite(float(batch_reinforce_action_std_min_value)):
+                    rollout_breakdown_suffix += f" policy_std_min={float(batch_reinforce_action_std_min_value):.3e}"
+                if math.isfinite(float(batch_reinforce_action_std_max_value)):
+                    rollout_breakdown_suffix += f" policy_std_max={float(batch_reinforce_action_std_max_value):.3e}"
+                if batch_reinforce_logprob_log_std_mean_value is not None and math.isfinite(float(batch_reinforce_logprob_log_std_mean_value)):
+                    rollout_breakdown_suffix += f" logstd_mean={float(batch_reinforce_logprob_log_std_mean_value):+.3e}"
+                if math.isfinite(float(batch_reinforce_logprob_log_std_min_value)):
+                    rollout_breakdown_suffix += f" logstd_min={float(batch_reinforce_logprob_log_std_min_value):+.3e}"
+                if math.isfinite(float(batch_reinforce_logprob_log_std_max_value)):
+                    rollout_breakdown_suffix += f" logstd_max={float(batch_reinforce_logprob_log_std_max_value):+.3e}"
+                if batch_reinforce_logprob_z2_mean_value is not None and math.isfinite(float(batch_reinforce_logprob_z2_mean_value)):
+                    rollout_breakdown_suffix += f" z2_mean={float(batch_reinforce_logprob_z2_mean_value):.3e}"
+                if math.isfinite(float(batch_reinforce_logprob_z2_max_value)):
+                    rollout_breakdown_suffix += f" z2_max={float(batch_reinforce_logprob_z2_max_value):.3e}"
                 if math.isfinite(float(batch_action_std_min_value)):
                     rollout_breakdown_suffix += f" action_std_min={float(batch_action_std_min_value):.3e}"
                 if math.isfinite(float(batch_action_std_max_value)):

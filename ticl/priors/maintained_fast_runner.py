@@ -175,11 +175,30 @@ def dispatch_policy_rollout(prior, ctx):
     reinforce_sequence_replay_eval_start = None
     reinforce_sequence_replay_action_steps = None
     reinforce_replay_payload = None
+    reinforce_decomp_accum = {
+        "reinforce_action_dim_mean": 0.0,
+        "reinforce_action_std_mean": 0.0,
+        "reinforce_logprob_log_std_mean": 0.0,
+        "reinforce_logprob_z2_mean": 0.0,
+    }
+    reinforce_decomp_count = 0.0
+    reinforce_decomp_min = {
+        "reinforce_action_dim_min": float("inf"),
+        "reinforce_action_std_min": float("inf"),
+        "reinforce_logprob_log_std_min": float("inf"),
+    }
+    reinforce_decomp_max = {
+        "reinforce_action_dim_max": float("-inf"),
+        "reinforce_action_std_max": float("-inf"),
+        "reinforce_logprob_log_std_max": float("-inf"),
+        "reinforce_logprob_z2_max": float("-inf"),
+    }
 
     def _maybe_replay_reinforce_log_probs(x_tokens, group_reinforce, group_replay):
         nonlocal reinforce_sequence_replay_applied
         nonlocal reinforce_sequence_replay_eval_start
         nonlocal reinforce_sequence_replay_action_steps
+        nonlocal reinforce_decomp_count
         if not policy_collect_reinforce_replay:
             return group_reinforce.get("log_probs", None) if isinstance(group_reinforce, dict) else None
         if not callable(reinforce_sequence_replay_fn):
@@ -219,6 +238,26 @@ def dispatch_policy_rollout(prior, ctx):
             action_std,
             mask=action_mask,
         ).to(dtype=torch.float32)
+        decomp_stats = prior._gaussian_log_prob_decomposition_stats(
+            sampled_action,
+            action_mean_replay,
+            action_std,
+            mask=action_mask,
+        )
+        group_weight = float(max(1, int(sampled_action.shape[1])))
+        reinforce_decomp_count += group_weight
+        for key in reinforce_decomp_accum:
+            reinforce_decomp_accum[key] += float(torch.as_tensor(decomp_stats[key]).detach().cpu()) * group_weight
+        for key in reinforce_decomp_min:
+            reinforce_decomp_min[key] = min(
+                reinforce_decomp_min[key],
+                float(torch.as_tensor(decomp_stats[key]).detach().cpu()),
+            )
+        for key in reinforce_decomp_max:
+            reinforce_decomp_max[key] = max(
+                reinforce_decomp_max[key],
+                float(torch.as_tensor(decomp_stats[key]).detach().cpu()),
+            )
         if int(sampled_action.shape[0]) == int(full_length) and eval_start == 0:
             return suffix_log_probs
         full_log_probs = torch.zeros(
@@ -632,6 +671,34 @@ def dispatch_policy_rollout(prior, ctx):
         prior.last_rollout_profile = rollout_profile_acc
         prior.last_rollout_env_semantics = _project_rollout_env_semantics(rollout_profile_acc)
         prior.last_rollout_reinforce_replay = reinforce_replay_payload
+        reinforce_meta = {}
+        if reinforce_decomp_count > 0.0:
+            reinforce_meta = {
+                "reinforce_action_dim_mean": torch.as_tensor(
+                    reinforce_decomp_accum["reinforce_action_dim_mean"] / reinforce_decomp_count,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                "reinforce_action_std_mean": torch.as_tensor(
+                    reinforce_decomp_accum["reinforce_action_std_mean"] / reinforce_decomp_count,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                "reinforce_logprob_log_std_mean": torch.as_tensor(
+                    reinforce_decomp_accum["reinforce_logprob_log_std_mean"] / reinforce_decomp_count,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+                "reinforce_logprob_z2_mean": torch.as_tensor(
+                    reinforce_decomp_accum["reinforce_logprob_z2_mean"] / reinforce_decomp_count,
+                    device=device,
+                    dtype=torch.float32,
+                ),
+            }
+            for key, value in reinforce_decomp_min.items():
+                reinforce_meta[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
+            for key, value in reinforce_decomp_max.items():
+                reinforce_meta[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
         prior.last_rollout_reinforce = (
             {
                 "log_probs": reinforce_log_probs,
@@ -647,6 +714,7 @@ def dispatch_policy_rollout(prior, ctx):
                     if reinforce_sequence_replay_action_steps is None
                     else int(reinforce_sequence_replay_action_steps)
                 ),
+                **reinforce_meta,
             }
             if reinforce_log_probs is not None
             else None
@@ -805,6 +873,34 @@ def dispatch_policy_rollout(prior, ctx):
         prior.last_rollout_profile["batch_size"] = int(batch_size)
     prior.last_rollout_env_semantics = _project_rollout_env_semantics(prior.last_rollout_profile)
     prior.last_rollout_reinforce_replay = reinforce_replay_payload
+    reinforce_meta = {}
+    if reinforce_decomp_count > 0.0:
+        reinforce_meta = {
+            "reinforce_action_dim_mean": torch.as_tensor(
+                reinforce_decomp_accum["reinforce_action_dim_mean"] / reinforce_decomp_count,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "reinforce_action_std_mean": torch.as_tensor(
+                reinforce_decomp_accum["reinforce_action_std_mean"] / reinforce_decomp_count,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "reinforce_logprob_log_std_mean": torch.as_tensor(
+                reinforce_decomp_accum["reinforce_logprob_log_std_mean"] / reinforce_decomp_count,
+                device=device,
+                dtype=torch.float32,
+            ),
+            "reinforce_logprob_z2_mean": torch.as_tensor(
+                reinforce_decomp_accum["reinforce_logprob_z2_mean"] / reinforce_decomp_count,
+                device=device,
+                dtype=torch.float32,
+            ),
+        }
+        for key, value in reinforce_decomp_min.items():
+            reinforce_meta[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
+        for key, value in reinforce_decomp_max.items():
+            reinforce_meta[key] = torch.as_tensor(value, device=device, dtype=torch.float32)
     prior.last_rollout_reinforce = (
         {
             "log_probs": reinforce_log_probs,
@@ -820,6 +916,7 @@ def dispatch_policy_rollout(prior, ctx):
                 if reinforce_sequence_replay_action_steps is None
                 else int(reinforce_sequence_replay_action_steps)
             ),
+            **reinforce_meta,
         }
         if reinforce_log_probs is not None
         else None
