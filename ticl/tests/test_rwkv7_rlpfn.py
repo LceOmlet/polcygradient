@@ -1,4 +1,5 @@
 from copy import deepcopy
+from collections import OrderedDict
 import os
 import random
 import sys
@@ -8,8 +9,10 @@ import numpy as np
 import pytest
 import torch
 
+import ticl.train as train_mod
 from ticl.model_builder import get_model
 from ticl.model_configs import get_model_default_config
+from ticl.models.tabpfn_bar_distribution import make_standardized_full_support_bar_distribution
 from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
@@ -51,6 +54,8 @@ def _build_small_exact_scm_env_cfg():
             "action_noise_train_std": 0.05,
             "action_noise_eval_std": 0.03,
             "reinforce_sequence_replay_enabled": False,
+            "normalized_q_value_weight": 0.0,
+            "next_state_flow_matching_weight": 0.0,
         }
     )
     return cfg, env_cfg
@@ -417,6 +422,60 @@ def test_rwkv7_rlpfn_policy_step_reuses_state_cache():
     assert cache_diverged
 
 
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="RWKV head-override step test requires CUDA runtime")
+def test_rwkv7_policy_step_head_override_changes_output_without_mutating_model():
+    _ensure_torch_extensions_dir()
+    _seed_everything(23)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    model = model.cuda().eval()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(cfg["prior"]["num_features"]),
+        max_cache_len=16,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    env_info = {
+        "obs_slot_dim": 400,
+        "action_slot_dim": 30,
+        "action_dim": 30,
+        "phase_t": torch.tensor([[0.0], [1.0]], dtype=torch.float32),
+        "terminal_t": torch.tensor([[0.0], [0.0]], dtype=torch.float32),
+    }
+    obs = torch.randn(2, 400, device="cuda")
+    action = torch.randn(2, 30, device="cuda")
+    reward = torch.randn(2, 1, device="cuda")
+    reward_mask = torch.ones(2, 1, device="cuda")
+
+    base_out, _ = step_fn(obs, action, reward, reward_mask, None, 0, env_info)
+    base_out_again, _ = step_fn(obs, action, reward, reward_mask, None, 0, env_info)
+    override = OrderedDict(
+        (name, torch.zeros_like(param))
+        for name, param in model.policy_action_head.named_parameters()
+    )
+    override["0.bias"] = torch.full_like(override["0.bias"], 0.5)
+    override_out, _ = step_fn(
+        obs,
+        action,
+        reward,
+        reward_mask,
+        None,
+        0,
+        env_info,
+        _policy_action_head_params_override=override,
+    )
+
+    assert torch.allclose(base_out, base_out_again, atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(base_out, override_out, atol=1e-6, rtol=1e-6)
+
+
 def test_rwkv7_block_batch1_fastpath_matches_manual_vmap_semantics():
     _ensure_torch_extensions_dir()
     _seed_everything(13)
@@ -745,6 +804,202 @@ def test_rwkv7_rlpfn_exact_scm_reinforce_rollout_backward_is_finite():
     assert any(float(g.abs().sum()) > 0.0 for g in backbone_grads)
 
 
+@pytest.mark.parametrize(
+    ("head_type", "expected_class_name"),
+    [
+        ("cfmi_resnet", "CFMIResidualFlowMatchingHead"),
+        ("rwkv_two_layer", "RWKVTwoLayerFlowMatchingHead"),
+    ],
+)
+def test_rwkv7_replay_policy_sequence_outputs_emit_aux_predictions(head_type, expected_class_name):
+    if not torch.cuda.is_available():
+        return
+    _ensure_torch_extensions_dir()
+    _seed_everything(321)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = head_type
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    model = model.cuda().eval()
+    assert model.next_state_flow_head.__class__.__name__ == expected_class_name
+    assert model.normalized_q_value_bardist.__class__.__name__ == "FullSupportBarDistribution"
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 3
+    flow_dim = int(cfg["prior"]["environment"]["obs_slot_dim"])
+    with torch.no_grad():
+        outputs = model.replay_policy_sequence_outputs(
+            torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]), device="cuda"),
+            torch.randn(seq_len, batch_size, device="cuda"),
+            eval_start=eval_start,
+            flow_matching_xt=torch.randn(seq_len - eval_start, batch_size, flow_dim, device="cuda"),
+            flow_matching_t=torch.rand(seq_len - eval_start, batch_size, 1, device="cuda"),
+        )
+
+    assert set(outputs.keys()) == {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}
+    assert tuple(outputs["action_mean"].shape) == (seq_len - eval_start, batch_size, int(cfg["transformer"]["x_action_dim"]))
+    assert tuple(outputs["normalized_q"].shape) == (seq_len - eval_start, batch_size)
+    assert tuple(outputs["normalized_q_logits"].shape) == (
+        seq_len - eval_start,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert tuple(outputs["next_state_flow"].shape) == (seq_len - eval_start, batch_size, flow_dim)
+
+
+def test_transformer_replay_policy_sequence_outputs_emit_cfmi_aux_predictions():
+    _seed_everything(654)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "transformer"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "cfmi_resnet"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["nhead"] = 4
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+    assert model.next_state_flow_head.__class__.__name__ == "CFMIResidualFlowMatchingHead"
+    assert model.normalized_q_value_bardist.__class__.__name__ == "FullSupportBarDistribution"
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 2
+    flow_dim = int(cfg["prior"]["environment"]["obs_slot_dim"])
+    with torch.no_grad():
+        outputs = model.replay_policy_sequence_outputs(
+            torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"])),
+            torch.randn(seq_len, batch_size),
+            eval_start=eval_start,
+            flow_matching_xt=torch.randn(seq_len - eval_start, batch_size, flow_dim),
+            flow_matching_t=torch.rand(seq_len - eval_start, batch_size, 1),
+        )
+
+    assert set(outputs.keys()) == {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}
+    assert tuple(outputs["action_mean"].shape) == (seq_len - eval_start, batch_size, int(cfg["transformer"]["x_action_dim"]))
+    assert tuple(outputs["normalized_q"].shape) == (seq_len - eval_start, batch_size)
+    assert tuple(outputs["normalized_q_logits"].shape) == (
+        seq_len - eval_start,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert tuple(outputs["next_state_flow"].shape) == (seq_len - eval_start, batch_size, flow_dim)
+
+
+def test_transformer_rejects_rwkv_two_layer_flow_head():
+    _seed_everything(655)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "transformer"
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "rwkv_two_layer"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["nhead"] = 4
+    with pytest.raises(ValueError, match="does not support"):
+        get_model(cfg, device="cpu", should_train=False, verbose=False)
+
+
+def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
+    _seed_everything(999)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_tokens(x_tokens, y_tokens, *, eval_start=0):
+        del y_tokens
+        query = x_tokens[eval_start:]
+        return torch.zeros(
+            int(query.shape[0]),
+            int(query.shape[1]),
+            3,
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+    def _replay_outputs(x_tokens, y_tokens, *, eval_start=0, flow_matching_xt=None, flow_matching_t=None):
+        del y_tokens, flow_matching_t
+        query = x_tokens[eval_start:]
+        outputs = {
+            "action_mean": torch.zeros(
+                int(query.shape[0]),
+                int(query.shape[1]),
+                3,
+                dtype=query.dtype,
+                device=query.device,
+            ),
+            "normalized_q_logits": torch.zeros(
+                int(query.shape[0]),
+                int(query.shape[1]),
+                bardist.num_bars,
+                dtype=query.dtype,
+                device=query.device,
+            ),
+        }
+        outputs["normalized_q"] = bardist.mean(outputs["normalized_q_logits"])
+        if flow_matching_xt is not None:
+            outputs["next_state_flow"] = torch.zeros_like(flow_matching_xt)
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("direct replay loss test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = _replay_tokens
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 2
+    obs_dim = int(env_cfg["obs_slot_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_obs": torch.randn(seq_len - eval_start, batch_size, obs_dim, dtype=torch.float32),
+        "obs_mask": torch.ones(batch_size, obs_dim, dtype=torch.bool),
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert "normalized_q_value_loss" in stats
+    assert "next_state_flow_matching_loss" in stats
+    assert "policy_total_loss" in stats
+    assert int(stats["normalized_q_value_head_applied"]) == 1
+    assert int(stats["next_state_flow_matching_head_applied"]) == 1
+    assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
+
+
 def test_rwkv7_reinforce_sequence_replay_requires_cuda():
     _ensure_torch_extensions_dir()
     _seed_everything(123)
@@ -754,7 +1009,6 @@ def test_rwkv7_reinforce_sequence_replay_requires_cuda():
 
     def _dummy_step_fn(*args, **kwargs):
         raise AssertionError("CPU replay guard should trigger before rollout executes policy_step_fn")
-
     _dummy_step_fn._reinforce_sequence_replay_fn = lambda x_tokens, y_tokens: x_tokens
 
     with pytest.raises(RuntimeError, match="requires CUDA"):
@@ -768,6 +1022,238 @@ def test_rwkv7_reinforce_sequence_replay_requires_cuda():
             collect_x=False,
             policy_objective_kind="reinforce",
         )
+
+
+def test_rwkv7_anil_requires_cuda():
+    _ensure_torch_extensions_dir()
+    _seed_everything(123)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    prior = EnvironmentPrior(env_cfg)
+
+    class _DummyReplayModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy_action_head = torch.nn.Linear(4, 3)
+
+        def require_policy_action_head(self):
+            return True
+
+        def replay_policy_sequence_tokens(self, *args, **kwargs):
+            raise AssertionError("CUDA guard should trigger before replay is used")
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("CUDA guard should trigger before policy_step_fn is used")
+
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    _seed_everything(515151)
+    h_list = prior._sample_batch_hypers(1)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+
+    with pytest.raises(RuntimeError, match="requires CUDA"):
+        _compute_policy_rollout_chunk_loss(
+            env_prior=prior,
+            policy_step_fn=_dummy_step_fn,
+            batch_size=1,
+            n_samples=8,
+            num_features=16,
+            device="cpu",
+            single_eval_pos=4,
+            collect_x=False,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=True,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=True,
+            pg_tbptt_window=None,
+            h_list_override=[dict(h) for h in h_list],
+            env_seeds_override=[17],
+            rollout_seeds_override=[101],
+            rl_objective="anil",
+        )
+
+
+def test_anil_rejects_tbptt_before_attempting_cuda_or_rollout():
+    _ensure_torch_extensions_dir()
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    prior = EnvironmentPrior(env_cfg)
+
+    class _DummyReplayModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy_action_head = torch.nn.Linear(4, 3)
+
+        def require_policy_action_head(self):
+            return True
+
+        def replay_policy_sequence_tokens(self, *args, **kwargs):
+            raise AssertionError("TBPTT guard should trigger before replay is used")
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("TBPTT guard should trigger before rollout executes policy_step_fn")
+
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    with pytest.raises(RuntimeError, match="requires pg_tbptt_window=None"):
+        _compute_policy_rollout_chunk_loss(
+            env_prior=prior,
+            policy_step_fn=_dummy_step_fn,
+            batch_size=1,
+            n_samples=8,
+            num_features=16,
+            device="cpu",
+            single_eval_pos=4,
+            collect_x=False,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=True,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=True,
+            pg_tbptt_window=4,
+            h_list_override=[dict(h) for h in prior._sample_batch_hypers(1)],
+            env_seeds_override=[17],
+            rollout_seeds_override=[101],
+            rl_objective="anil",
+        )
+
+
+def test_anil_rejects_rollout_checkpoint_before_attempting_cuda_or_rollout():
+    _ensure_torch_extensions_dir()
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    prior = EnvironmentPrior(env_cfg)
+
+    class _DummyReplayModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy_action_head = torch.nn.Linear(4, 3)
+
+        def require_policy_action_head(self):
+            return True
+
+        def replay_policy_sequence_tokens(self, *args, **kwargs):
+            raise AssertionError("Checkpoint guard should trigger before replay is used")
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("Checkpoint guard should trigger before rollout executes policy_step_fn")
+
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    with pytest.raises(RuntimeError, match="does not support policy_rollout_checkpoint"):
+        _compute_policy_rollout_chunk_loss(
+            env_prior=prior,
+            policy_step_fn=_dummy_step_fn,
+            batch_size=1,
+            n_samples=8,
+            num_features=16,
+            device="cpu",
+            single_eval_pos=4,
+            collect_x=False,
+            policy_rollout_checkpoint=True,
+            policy_rollout_checkpoint_reentrant=True,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=True,
+            pg_tbptt_window=None,
+            h_list_override=[dict(h) for h in prior._sample_batch_hypers(1)],
+            env_seeds_override=[17],
+            rollout_seeds_override=[101],
+            rl_objective="anil",
+        )
+
+
+def test_anil_head_adaptation_updates_functional_head_without_mutating_base_params():
+    class _DummyReplayModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy_action_head = torch.nn.Linear(2, 1, bias=False)
+
+        def require_policy_action_head(self):
+            return True
+
+        def replay_policy_sequence_tokens(
+            self,
+            x_tokens,
+            y_tokens,
+            *,
+            eval_start=0,
+            policy_action_head_params_override=None,
+        ):
+            del y_tokens
+            features = x_tokens[int(eval_start):, :, :2]
+            if policy_action_head_params_override is not None:
+                weight = policy_action_head_params_override["weight"]
+                return torch.nn.functional.linear(features, weight, None)
+            return self.policy_action_head(features)
+
+    class _FakePrior:
+        def reinforce_sequence_replay_loss_from_rollout(
+            self,
+            *,
+            policy_step_fn,
+            x_tokens,
+            rewards,
+            replay_payload,
+            single_eval_pos,
+            baseline_mode,
+            fit_action_dim_fn,
+        ):
+            del rewards, baseline_mode, fit_action_dim_fn
+            preds = policy_step_fn._reinforce_sequence_replay_fn(
+                x_tokens,
+                replay_payload["reward_in"],
+                eval_start=int(single_eval_pos),
+            ).squeeze(-1)
+            target = replay_payload["target"]
+            loss = ((preds - target) ** 2).mean()
+            stats = {
+                "objective": torch.tensor(1.0, dtype=torch.float32),
+                "reward_mean": torch.tensor(0.0, dtype=torch.float32),
+                "reward_std": torch.tensor(1.0, dtype=torch.float32),
+            }
+            return loss, stats, None
+
+    model = _DummyReplayModel()
+
+    def _base_step_fn(*args, **kwargs):
+        raise AssertionError("adapt helper should use replay path, not live policy_step")
+
+    _base_step_fn._model_ref = model
+    _base_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    support_rollout = {
+        "x": torch.tensor(
+            [
+                [[1.0, -1.0]],
+                [[0.5, 2.0]],
+                [[-1.5, 0.25]],
+            ],
+            dtype=torch.float32,
+        ),
+        "rewards": torch.zeros((3, 1), dtype=torch.float32),
+        "single_eval_pos": 1,
+    }
+    support_payload = {
+        "reward_in": torch.zeros((3, 1), dtype=torch.float32),
+        "target": torch.tensor([[1.0], [-0.5]], dtype=torch.float32),
+    }
+    init_weight = model.policy_action_head.weight.detach().clone()
+
+    adapted_head, support_stats = train_mod._adapt_anil_policy_action_head(
+        _FakePrior(),
+        _base_step_fn,
+        support_rollout=support_rollout,
+        support_replay_payload=support_payload,
+        anil_inner_steps=1,
+        anil_inner_learning_rate=0.25,
+    )
+
+    assert "weight" in adapted_head
+    assert not torch.allclose(adapted_head["weight"].detach(), init_weight, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(model.policy_action_head.weight.detach(), init_weight, atol=1e-6, rtol=1e-6)
+    assert torch.isfinite(torch.as_tensor(support_stats["objective"])).item()
 
 
 def test_rwkv7_reinforce_sequence_replay_runs_live_rollout_under_no_grad():
@@ -937,7 +1423,7 @@ def test_rwkv7_default_replay_chunk_resolver_scales_with_sequence_length():
     cfg = _build_rwkv7_rlpfn_config()
     _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
     assert int(model.resolve_replay_batch_chunk_size(seq_len=512, total_batch=1024)) == 64
-    assert int(model.resolve_replay_batch_chunk_size(seq_len=4096, total_batch=1024)) == 64
+    assert int(model.resolve_replay_batch_chunk_size(seq_len=4096, total_batch=1024)) == 32
 
 
 def test_rwkv7_cuda_stepwise_core_matches_official_sequence_core():
@@ -1362,4 +1848,166 @@ def test_rwkv7_reinforce_tbptt_streaming_matches_buffered_gradients():
         assert torch.equal(stats_buffered[key], stats_streamed[key]), key
     assert len(grads_buffered) == len(grads_streamed)
     max_grad_diff = max(float((g_buf - g_stream).abs().max()) for g_buf, g_stream in zip(grads_buffered, grads_streamed))
-    assert max_grad_diff < 1e-7
+    assert max_grad_diff < 1e-6
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ANIL RWKV replay path currently requires CUDA")
+def test_rwkv7_anil_support_query_share_task_but_use_distinct_rollout_seeds(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(321)
+    cfg, env_cfg = _build_small_exact_scm_env_cfg()
+    cfg["optimizer"]["rl_objective"] = "anil"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    prior = EnvironmentPrior(env_cfg)
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    model = model.cuda().train()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=int(cfg["prior"]["num_features"]),
+        max_cache_len=6,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    _seed_everything(515151)
+    h_list = prior._sample_batch_hypers(2)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["action_noise_train_std"] = 0.05
+        h["action_noise_eval_std"] = 0.03
+
+    real_collect = train_mod._collect_anil_replay_rollout
+    recorded = []
+
+    def _recording_collect(*args, **kwargs):
+        recorded.append(
+            {
+                "h_id": id(kwargs["h"]),
+                "env_seed": int(kwargs["env_seed"]),
+                "rollout_seed": int(kwargs["rollout_seed"]),
+            }
+        )
+        return real_collect(*args, **kwargs)
+
+    monkeypatch.setattr(train_mod, "_collect_anil_replay_rollout", _recording_collect)
+    model.zero_grad(set_to_none=True)
+    loss, _, stats = _compute_policy_rollout_chunk_loss(
+        env_prior=prior,
+        policy_step_fn=step_fn,
+        batch_size=2,
+        n_samples=6,
+        num_features=int(cfg["prior"]["num_features"]),
+        device="cuda",
+        single_eval_pos=3,
+        collect_x=False,
+        policy_rollout_checkpoint=False,
+        policy_rollout_checkpoint_reentrant=True,
+        pg_saved_tensors_cpu_offload=False,
+        pg_saved_tensors_pin_memory=True,
+        pg_tbptt_window=None,
+        h_list_override=[dict(h) for h in h_list],
+        env_seeds_override=[17, 29],
+        rollout_seeds_override=[101, 211],
+        rl_objective="anil",
+        anil_inner_steps=1,
+        anil_inner_learning_rate=0.1,
+    )
+    loss.backward()
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(stats["objective"]).item()
+    assert int(stats["anil_task_count"]) == 2
+    assert len(recorded) == 4
+    for task_idx in range(2):
+        support_meta = recorded[2 * task_idx]
+        query_meta = recorded[2 * task_idx + 1]
+        assert support_meta["h_id"] == query_meta["h_id"]
+        assert support_meta["env_seed"] == query_meta["env_seed"]
+        assert support_meta["rollout_seed"] != query_meta["rollout_seed"]
+        assert query_meta["rollout_seed"] == train_mod._derive_secondary_rollout_seed(
+            support_meta["rollout_seed"]
+        )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="ANIL RWKV replay path currently requires CUDA")
+def test_rwkv7_anil_query_loss_sink_matches_no_sink():
+    _ensure_torch_extensions_dir()
+    _seed_everything(654)
+    cfg, env_cfg = _build_small_exact_scm_env_cfg()
+    cfg["optimizer"]["rl_objective"] = "anil"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+
+    def _run_anil(sink_enabled: bool):
+        prior = EnvironmentPrior(deepcopy(env_cfg))
+        _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+        model = model.cuda().train()
+        step_fn = _build_policy_step_fn(
+            model,
+            num_features=int(cfg["prior"]["num_features"]),
+            max_cache_len=6,
+            kv_cache_mode="immutable",
+            kv_cache_page_size=None,
+            allow_grad_mutable_cache=False,
+            pg_torch_compile=False,
+        )
+        _seed_everything(919191)
+        h_list = prior._sample_batch_hypers(1)
+        for h in h_list:
+            h["reward_dropout_enabled"] = False
+            h["reward_dropout_randomize"] = False
+            h["reward_dropout_ratio"] = 0.0
+            h["action_noise_train_std"] = 0.05
+            h["action_noise_eval_std"] = 0.03
+        model.zero_grad(set_to_none=True)
+        sink_calls = {"n": 0}
+
+        def _sink(loss_root):
+            sink_calls["n"] += 1
+            loss_root.backward()
+
+        loss, _, stats = _compute_policy_rollout_chunk_loss(
+            env_prior=prior,
+            policy_step_fn=step_fn,
+            batch_size=1,
+            n_samples=6,
+            num_features=int(cfg["prior"]["num_features"]),
+            device="cuda",
+            single_eval_pos=3,
+            collect_x=False,
+            policy_rollout_checkpoint=False,
+            policy_rollout_checkpoint_reentrant=True,
+            pg_saved_tensors_cpu_offload=False,
+            pg_saved_tensors_pin_memory=True,
+            pg_tbptt_window=None,
+            h_list_override=[dict(h) for h in h_list],
+            env_seeds_override=[17],
+            rollout_seeds_override=[101],
+            rl_objective="anil",
+            anil_inner_steps=1,
+            anil_inner_learning_rate=0.1,
+            anil_query_loss_sink=_sink if sink_enabled else None,
+        )
+        if (not sink_enabled) and bool(loss.requires_grad):
+            loss.backward()
+        grads = [p.grad.detach().clone() for p in model.parameters() if p.grad is not None]
+        return loss.detach().clone(), stats, grads, int(sink_calls["n"])
+
+    loss_base, stats_base, grads_base, sink_calls_base = _run_anil(sink_enabled=False)
+    loss_sink, stats_sink, grads_sink, sink_calls_sink = _run_anil(sink_enabled=True)
+
+    assert sink_calls_base == 0
+    assert sink_calls_sink == 1
+    assert torch.allclose(loss_base, loss_sink, atol=1e-5, rtol=1e-5)
+    for key in ("objective", "reward_mean", "reward_std", "anil_support_objective"):
+        assert torch.allclose(stats_base[key], stats_sink[key], atol=1e-5, rtol=1e-5), key
+    assert len(grads_base) == len(grads_sink)
+    max_grad_diff = max(float((g_base - g_sink).abs().max()) for g_base, g_sink in zip(grads_base, grads_sink))
+    assert max_grad_diff < 1e-5

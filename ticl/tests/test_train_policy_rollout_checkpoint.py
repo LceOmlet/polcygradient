@@ -1082,6 +1082,10 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "policy_total_loss": torch.as_tensor(1.75, device=device),
+            "reinforce_loss": torch.as_tensor(1.25, device=device),
+            "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
+            "next_state_flow_matching_loss": torch.as_tensor(0.20, device=device),
             "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
@@ -1194,6 +1198,10 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch(rl_object
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "policy_total_loss": torch.as_tensor(1.75, device=device),
+            "reinforce_loss": torch.as_tensor(1.25, device=device),
+            "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
+            "next_state_flow_matching_loss": torch.as_tensor(0.20, device=device),
             "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
@@ -1311,6 +1319,10 @@ def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "policy_total_loss": torch.as_tensor(1.75, device=device),
+            "reinforce_loss": torch.as_tensor(1.25, device=device),
+            "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
+            "next_state_flow_matching_loss": torch.as_tensor(0.20, device=device),
             "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
@@ -2289,6 +2301,10 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
             "objective": torch.zeros((), device=device),
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
+            "policy_total_loss": torch.as_tensor(1.75, device=device),
+            "reinforce_loss": torch.as_tensor(1.25, device=device),
+            "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
+            "next_state_flow_matching_loss": torch.as_tensor(0.20, device=device),
             "reinforce_action_dim_mean": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_min": torch.as_tensor(3.0, device=device),
             "reinforce_action_dim_max": torch.as_tensor(3.0, device=device),
@@ -2336,7 +2352,17 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
     assert len(finish_lines) == 1
     assert "status=start" in start_lines[0]
     assert "status=ok" in finish_lines[0]
+    assert "loss_total=+1.750e+00" in finish_lines[0]
+    assert "loss_reinforce=+1.250e+00" in finish_lines[0]
+    assert "loss_qaux=+3.000e-01" in finish_lines[0]
+    assert "loss_fmaux=+2.000e-01" in finish_lines[0]
     assert "actdim_mean=3.000" in finish_lines[0]
     assert "policy_std_mean=5.000e-02" in finish_lines[0]
     assert "logstd_mean=-2.996e+00" in finish_lines[0]
     assert "z2_mean=1.250e+00" in finish_lines[0]
+    pg_diag = getattr(model, "last_pg_epoch_metrics", None)
+    assert isinstance(pg_diag, dict)
+    assert pg_diag["policy_total_loss_mean"] == pytest.approx(1.75)
+    assert pg_diag["reinforce_loss_mean"] == pytest.approx(1.25)
+    assert pg_diag["normalized_q_value_loss_mean"] == pytest.approx(0.30)
+    assert pg_diag["next_state_flow_matching_loss_mean"] == pytest.approx(0.20)

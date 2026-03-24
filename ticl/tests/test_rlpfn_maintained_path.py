@@ -1041,6 +1041,9 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["reinforce_normalize_advantages"] is True
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_clip"] == 10.0
+    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
+    assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "cfmi_resnet"
     assert cfg["optimizer"]["rl_objective"] == "reinforce"
     assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False

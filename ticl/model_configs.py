@@ -40,6 +40,8 @@ def get_optimizer_config():
         "pg_compile_observe_reset_after_warmup": True,
         "pg_phase_log_every_batches": 1,
         "pg_phase_log_file": None,
+        "anil_inner_steps": 1,
+        "anil_inner_learning_rate": 0.1,
         "adamw_fused": True,
         "train_profiler_enabled": False,
         "train_profiler_output_path": None,
@@ -87,8 +89,8 @@ def get_optimizer_config():
 
 def get_transformer_config():
     transformer = {
-        "emsize": 256,
-        "nlayers": 6,
+        "emsize": 512,
+        "nlayers": 8,
         "dropout": 0.0,
         "nhid_factor": 1,
         'nhead': 256 // 64,
@@ -257,6 +259,9 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reinforce_normalize_advantages": False,
         "reinforce_advantage_norm_eps": 1e-6,
         "reinforce_advantage_norm_clip": 10.0,
+        "normalized_q_value_weight": 1.0,
+        "next_state_flow_matching_weight": 1.0,
+        "next_state_flow_head_type": "cfmi_resnet",
         # Keep Bellman-style undiscounted default unless overridden.
         "discount": 1.0,
         # SCM (aligned with priors/mlp.py names).

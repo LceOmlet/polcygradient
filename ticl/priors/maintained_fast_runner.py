@@ -357,6 +357,8 @@ def dispatch_policy_rollout(prior, ctx):
                 sampled_action_group = group_replay.get("sampled_action", None)
                 action_std_group = group_replay.get("action_std", None)
                 action_mask_group = group_replay.get("action_mask", None)
+                next_obs_group = group_replay.get("next_obs", None)
+                obs_mask_group = group_replay.get("obs_mask", None)
                 eval_start_group = int(group_replay.get("eval_start", 0) or 0)
                 full_length_group = int(group_replay.get("full_length", int(n_samples)) or int(n_samples))
                 if all(
@@ -368,6 +370,11 @@ def dispatch_policy_rollout(prior, ctx):
                         action_mask_group,
                     )
                 ):
+                    has_flow_targets = bool(
+                        torch.is_tensor(next_obs_group) and torch.is_tensor(obs_mask_group)
+                    )
+                    if has_flow_targets != bool(torch.is_tensor(next_obs_group) or torch.is_tensor(obs_mask_group)):
+                        raise RuntimeError("reinforce replay flow payload was only partially populated")
                     replay_steps = int(sampled_action_group.shape[0])
                     action_dim_group = int(sampled_action_group.shape[-1])
                     if reinforce_replay_payload is None:
@@ -395,7 +402,23 @@ def dispatch_policy_rollout(prior, ctx):
                             "eval_start": int(eval_start_group),
                             "full_length": int(full_length_group),
                         }
+                        if has_flow_targets:
+                            next_obs_dim_group = int(next_obs_group.shape[-1])
+                            reinforce_replay_payload["next_obs"] = torch.empty(
+                                (replay_steps, batch_size, next_obs_dim_group),
+                                device=next_obs_group.device,
+                                dtype=next_obs_group.dtype,
+                            )
+                            reinforce_replay_payload["obs_mask"] = torch.empty(
+                                (batch_size, int(obs_mask_group.shape[-1])),
+                                device=obs_mask_group.device,
+                                dtype=obs_mask_group.dtype,
+                            )
                     else:
+                        payload_has_flow_targets = bool(
+                            torch.is_tensor(reinforce_replay_payload.get("next_obs", None))
+                            and torch.is_tensor(reinforce_replay_payload.get("obs_mask", None))
+                        )
                         if (
                             int(reinforce_replay_payload["eval_start"]) != int(eval_start_group)
                             or int(reinforce_replay_payload["full_length"]) != int(full_length_group)
@@ -403,10 +426,22 @@ def dispatch_policy_rollout(prior, ctx):
                             != (replay_steps, action_dim_group)
                         ):
                             raise RuntimeError("reinforce replay payload shapes were inconsistent across rollout groups")
+                        if payload_has_flow_targets != has_flow_targets:
+                            raise RuntimeError("reinforce replay flow payload availability was inconsistent across rollout groups")
+                        if has_flow_targets:
+                            next_obs_dim_group = int(next_obs_group.shape[-1])
+                            if tuple(reinforce_replay_payload["next_obs"].shape[:1] + reinforce_replay_payload["next_obs"].shape[2:]) != (
+                                replay_steps,
+                                next_obs_dim_group,
+                            ):
+                                raise RuntimeError("reinforce replay next_obs shapes were inconsistent across rollout groups")
                     reinforce_replay_payload["reward_in"][:, group_indices] = reward_in_group
                     reinforce_replay_payload["sampled_action"][:, group_indices] = sampled_action_group
                     reinforce_replay_payload["action_std"][:, group_indices] = action_std_group
                     reinforce_replay_payload["action_mask"][group_indices] = action_mask_group
+                    if has_flow_targets:
+                        reinforce_replay_payload["next_obs"][:, group_indices] = next_obs_group
+                        reinforce_replay_payload["obs_mask"][group_indices] = obs_mask_group
             group_log_probs = None
             if policy_collect_reinforce_replay and (not policy_defer_reinforce_replay):
                 group_log_probs = _maybe_replay_reinforce_log_probs(

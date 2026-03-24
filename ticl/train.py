@@ -5,6 +5,7 @@ import time, wandb
 import random
 import gc
 import traceback
+from collections import OrderedDict
 from contextlib import nullcontext
 from functools import wraps
 
@@ -25,6 +26,7 @@ from ticl.utils import ExponentialLR, ReduceLROnSpike, init_dist
 from ticl.profiling import TrainProfiler, TrainProfilerConfig
 from ticl.gpu_observer import GPUProcessObserver
 from ticl.kernel_profiling import TrainKernelProfiler, TrainKernelProfilerConfig
+from ticl.priors.maintained_policy_gradient_loss import attach_common_rollout_diagnostics
 
 def _has_nonfinite_gradients(model, device):
     has_nonfinite = torch.zeros((), dtype=torch.bool, device=device)
@@ -833,7 +835,17 @@ def _build_policy_step_fn(
     token_alloc_opt_flag = str(os.environ.get("TICL_POLICY_STEP_TOKEN_ALLOC_OPT", "1")).strip().lower()
     token_alloc_opt = token_alloc_opt_flag not in {"0", "false", "no", "off"}
 
-    def policy_step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+    def policy_step_fn(
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        cache,
+        step_idx,
+        env_info,
+        *,
+        _policy_action_head_params_override=None,
+    ):
         nonlocal policy_forward_step, compile_active
         nonlocal split_policy_forward_step, split_compile_active
         del step_idx
@@ -908,6 +920,9 @@ def _build_policy_step_fn(
             step_allow_grad_inplace_paged_cache = False
 
         def _call_split_forward_step():
+            split_extra_kwargs = {}
+            if _policy_action_head_params_override is not None:
+                split_extra_kwargs["policy_action_head_params_override"] = _policy_action_head_params_override
             return split_policy_forward_step(
                 obs_t,
                 action_t,
@@ -921,6 +936,7 @@ def _build_policy_step_fn(
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=step_allow_grad_mutable_cache,
                 allow_grad_inplace_paged_cache=step_allow_grad_inplace_paged_cache,
+                **split_extra_kwargs,
             )
 
         if use_split_fastpath:
@@ -1009,6 +1025,9 @@ def _build_policy_step_fn(
             y_token[0].copy_(reward_scalar)
 
         def _call_forward_step():
+            forward_extra_kwargs = {}
+            if _policy_action_head_params_override is not None:
+                forward_extra_kwargs["policy_action_head_params_override"] = _policy_action_head_params_override
             return policy_forward_step(
                 x_token,
                 y_token,
@@ -1018,6 +1037,7 @@ def _build_policy_step_fn(
                 kv_cache_page_size=kv_cache_page_size,
                 allow_grad_mutable_cache=step_allow_grad_mutable_cache,
                 allow_grad_inplace_paged_cache=step_allow_grad_inplace_paged_cache,
+                **forward_extra_kwargs,
             )
 
         if compile_active:
@@ -1050,6 +1070,10 @@ def _build_policy_step_fn(
     reinforce_sequence_replay_fn = getattr(model_ref, "replay_policy_sequence_tokens", None)
     policy_step_fn._reinforce_sequence_replay_fn = (
         reinforce_sequence_replay_fn if callable(reinforce_sequence_replay_fn) else None
+    )
+    reinforce_sequence_replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
+    policy_step_fn._reinforce_sequence_replay_outputs_fn = (
+        reinforce_sequence_replay_outputs_fn if callable(reinforce_sequence_replay_outputs_fn) else None
     )
     policy_step_fn._fit_action_dim_fn = _fit_action_dim
     return policy_step_fn
@@ -1100,6 +1124,378 @@ def _freeze_env_h_list_for_replay(env_prior, h_list):
     return frozen
 
 
+def _derive_secondary_rollout_seed(seed: int) -> int:
+    seed_i = int(seed) & 0x7FFFFFFF
+    mixed = (seed_i * 1103515245 + 12345) & 0x7FFFFFFF
+    if mixed == seed_i:
+        mixed = (mixed + 1) & 0x7FFFFFFF
+    return int(mixed)
+
+
+def _resolve_anil_policy_action_head(policy_step_fn):
+    model_ref = getattr(policy_step_fn, "_model_ref", None)
+    head = getattr(model_ref, "policy_action_head", None)
+    require_head = getattr(model_ref, "require_policy_action_head", None)
+    if callable(require_head):
+        require_head()
+    if not isinstance(head, nn.Module):
+        raise RuntimeError("ANIL requires a model with a concrete policy_action_head module.")
+    named_params = tuple(head.named_parameters())
+    if len(named_params) <= 0:
+        raise RuntimeError("ANIL requires policy_action_head to expose trainable parameters.")
+    return model_ref, head, OrderedDict((name, param) for name, param in named_params)
+
+
+def _wrap_policy_step_fn_with_head_override(policy_step_fn, head_params_override):
+    if head_params_override is None:
+        return policy_step_fn
+    model_ref = getattr(policy_step_fn, "_model_ref", None)
+
+    def _wrapped(*args, **kwargs):
+        kwargs["_policy_action_head_params_override"] = head_params_override
+        return policy_step_fn(*args, **kwargs)
+
+    _wrapped.__dict__.update(getattr(policy_step_fn, "__dict__", {}))
+    _wrapped._model_ref = model_ref
+    replay_fn = getattr(model_ref, "replay_policy_sequence_tokens", None)
+    if callable(replay_fn):
+        def _replay_with_override(x_tokens, y_tokens, *, eval_start=0):
+            return replay_fn(
+                x_tokens,
+                y_tokens,
+                eval_start=eval_start,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_replay_fn = _replay_with_override
+    replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
+    if callable(replay_outputs_fn):
+        def _replay_outputs_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            eval_start=0,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return replay_outputs_fn(
+                x_tokens,
+                y_tokens,
+                eval_start=eval_start,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_replay_outputs_fn = _replay_outputs_with_override
+    return _wrapped
+
+
+def _collect_anil_replay_rollout(
+    env_prior,
+    policy_step_fn,
+    *,
+    h,
+    env_seed,
+    rollout_seed,
+    n_samples,
+    num_features,
+    device,
+    single_eval_pos,
+):
+    rollout = env_prior.rollout_with_policy(
+        policy_step_fn=policy_step_fn,
+        batch_size=1,
+        n_samples=int(n_samples),
+        num_features=int(num_features),
+        device=device,
+        single_eval_pos=int(single_eval_pos),
+        collect_x=True,
+        collect_runtime_info=False,
+        store_rewards=True,
+        policy_objective_kind="reinforce",
+        h_list_override=[h],
+        env_seeds_override=[int(env_seed)],
+        rollout_seeds_override=[int(rollout_seed)],
+        _policy_collect_reinforce_replay=True,
+        _policy_disable_log_probs=True,
+        _policy_force_no_grad=True,
+        _policy_defer_reinforce_replay=True,
+    )
+    replay_payload = getattr(env_prior, "last_rollout_reinforce_replay", None)
+    if not isinstance(replay_payload, dict):
+        raise RuntimeError("ANIL rollout did not record reinforce replay payload.")
+    return rollout, dict(replay_payload)
+
+
+def _adapt_anil_policy_action_head(
+    env_prior,
+    policy_step_fn,
+    *,
+    support_rollout,
+    support_replay_payload,
+    anil_inner_steps,
+    anil_inner_learning_rate,
+):
+    _, _, head_params = _resolve_anil_policy_action_head(policy_step_fn)
+    fit_action_dim_fn = getattr(policy_step_fn, "_fit_action_dim_fn", None)
+    support_single_eval_pos = int(support_rollout.get("single_eval_pos", 0))
+    adapted_head_params = head_params
+    support_stats_last = None
+    for _ in range(int(anil_inner_steps)):
+        support_step_fn = _wrap_policy_step_fn_with_head_override(policy_step_fn, adapted_head_params)
+        support_loss, support_stats_last, _ = env_prior.reinforce_sequence_replay_loss_from_rollout(
+            policy_step_fn=support_step_fn,
+            x_tokens=support_rollout["x"],
+            rewards=support_rollout["rewards"],
+            replay_payload=support_replay_payload,
+            single_eval_pos=support_single_eval_pos,
+            baseline_mode="leave_one_out",
+            fit_action_dim_fn=fit_action_dim_fn,
+        )
+        support_grads = torch.autograd.grad(
+            support_loss,
+            tuple(adapted_head_params.values()),
+            create_graph=True,
+            allow_unused=False,
+        )
+        adapted_head_params = OrderedDict(
+            (name, param - (float(anil_inner_learning_rate) * grad))
+            for (name, param), grad in zip(adapted_head_params.items(), support_grads)
+        )
+    if support_stats_last is None:
+        raise RuntimeError("ANIL inner adaptation did not produce support statistics.")
+    return adapted_head_params, support_stats_last
+
+
+def _merge_anil_rollout_profile(profile_acc, rollout_profile):
+    if not isinstance(rollout_profile, dict):
+        return profile_acc
+    if profile_acc is None:
+        profile_acc = {}
+    for key, value in rollout_profile.items():
+        if torch.is_tensor(value):
+            if value.ndim != 0:
+                continue
+            value = float(value.detach().cpu().item())
+        if isinstance(value, bool):
+            value = int(value)
+        if isinstance(value, (int, float)):
+            profile_acc[key] = profile_acc.get(key, 0.0) + float(value)
+        elif isinstance(value, str):
+            prev = profile_acc.get(key, None)
+            if prev is None or prev == value:
+                profile_acc[key] = value
+            else:
+                profile_acc[key] = "mixed"
+    return profile_acc
+
+
+def _accumulate_anil_scalar_stats(stats_accum, stats, weight):
+    if not isinstance(stats, dict):
+        return
+    for key, value in stats.items():
+        if torch.is_tensor(value):
+            if value.ndim != 0:
+                continue
+            value_f = float(value.detach().cpu().item())
+        elif isinstance(value, bool):
+            value_f = float(int(value))
+        elif isinstance(value, (int, float)):
+            value_f = float(value)
+        else:
+            continue
+        if key.endswith("_min"):
+            prev = stats_accum.get(key, None)
+            stats_accum[key] = value_f if prev is None else min(prev, value_f)
+        elif key.endswith("_max") or key.endswith("_abs_max"):
+            prev = stats_accum.get(key, None)
+            stats_accum[key] = value_f if prev is None else max(prev, value_f)
+        else:
+            stats_accum[key] = stats_accum.get(key, 0.0) + (value_f * float(weight))
+
+
+def _accumulate_anil_terminal_stats(terminal_accum, terminal_stats, weight):
+    if not isinstance(terminal_stats, dict):
+        return
+    for key, value in terminal_stats.items():
+        if torch.is_tensor(value):
+            if value.ndim != 0:
+                continue
+            value_f = float(value.detach().cpu().item())
+        elif isinstance(value, (int, float, bool)):
+            value_f = float(value)
+        else:
+            continue
+        if key.endswith("_min"):
+            prev = terminal_accum.get(key, None)
+            terminal_accum[key] = value_f if prev is None else min(prev, value_f)
+        elif key.endswith("_max"):
+            prev = terminal_accum.get(key, None)
+            terminal_accum[key] = value_f if prev is None else max(prev, value_f)
+        else:
+            terminal_accum[key] = terminal_accum.get(key, 0.0) + (value_f * float(weight))
+
+
+def _finalize_anil_scalar_stats(stats_accum, *, device):
+    stats_out = {}
+    int_like_suffixes = (
+        "_count",
+        "_steps",
+        "_chunk_count",
+        "_batch_chunk",
+        "_applied",
+        "_enabled",
+        "_task_count",
+        "_inner_steps",
+    )
+    for key, value in stats_accum.items():
+        if any(key.endswith(suffix) for suffix in int_like_suffixes):
+            stats_out[key] = int(round(float(value)))
+        else:
+            stats_out[key] = torch.as_tensor(float(value), device=device, dtype=torch.float32)
+    return stats_out
+
+
+def _compute_anil_rollout_chunk_loss(
+    env_prior,
+    policy_step_fn,
+    *,
+    batch_size,
+    n_samples,
+    num_features,
+    device,
+    single_eval_pos,
+    h_list_override=None,
+    env_seeds_override=None,
+    rollout_seeds_override=None,
+    anil_inner_steps=1,
+    anil_inner_learning_rate=0.1,
+    anil_query_loss_sink=None,
+):
+    if int(batch_size) <= 0:
+        raise ValueError("ANIL batch_size must be positive.")
+    model_ref, _, _ = _resolve_anil_policy_action_head(policy_step_fn)
+    replay_fn = getattr(model_ref, "replay_policy_sequence_tokens", None)
+    if not callable(replay_fn):
+        raise RuntimeError("ANIL currently requires a policy model with replay_policy_sequence_tokens support.")
+    device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+    if device_obj.type != "cuda":
+        raise RuntimeError("ANIL currently requires CUDA because it uses the official RWKV sequence replay path.")
+    if int(anil_inner_steps) <= 0:
+        raise ValueError("ANIL requires anil_inner_steps >= 1.")
+    frozen_h_list = _freeze_env_h_list_for_replay(
+        env_prior,
+        list(h_list_override) if h_list_override is not None else env_prior._sample_batch_hypers(int(batch_size)),
+    )
+    env_seeds = (
+        [int(s) for s in env_seeds_override]
+        if env_seeds_override is not None
+        else env_prior._sample_seed_list(int(batch_size))
+    )
+    support_rollout_seeds = (
+        [int(s) for s in rollout_seeds_override]
+        if rollout_seeds_override is not None
+        else env_prior._sample_seed_list(int(batch_size))
+    )
+    query_rollout_seeds = [_derive_secondary_rollout_seed(seed) for seed in support_rollout_seeds]
+
+    loss_total = torch.zeros((), device=device_obj, dtype=torch.float32)
+    loss_monitor = torch.zeros((), device=device_obj, dtype=torch.float32)
+    query_stats_accum = {}
+    support_objective_sum = 0.0
+    rollout_profile_acc = None
+    query_terminal_stats_accum = {}
+    task_weight = 1.0 / float(int(batch_size))
+    for task_idx in range(int(batch_size)):
+        task_h = frozen_h_list[task_idx]
+        task_env_seed = int(env_seeds[task_idx])
+        support_rollout, support_replay_payload = _collect_anil_replay_rollout(
+            env_prior,
+            policy_step_fn,
+            h=task_h,
+            env_seed=task_env_seed,
+            rollout_seed=int(support_rollout_seeds[task_idx]),
+            n_samples=n_samples,
+            num_features=num_features,
+            device=device,
+            single_eval_pos=single_eval_pos,
+        )
+        rollout_profile_acc = _merge_anil_rollout_profile(
+            rollout_profile_acc,
+            support_rollout.get("rollout_profile", None),
+        )
+        adapted_head_params, support_stats = _adapt_anil_policy_action_head(
+            env_prior,
+            policy_step_fn,
+            support_rollout=support_rollout,
+            support_replay_payload=support_replay_payload,
+            anil_inner_steps=anil_inner_steps,
+            anil_inner_learning_rate=anil_inner_learning_rate,
+        )
+        support_objective_sum += (
+            float(torch.as_tensor(support_stats["objective"]).detach().cpu().item()) * float(task_weight)
+        )
+
+        query_step_fn = _wrap_policy_step_fn_with_head_override(policy_step_fn, adapted_head_params)
+        query_rollout, query_replay_payload = _collect_anil_replay_rollout(
+            env_prior,
+            query_step_fn,
+            h=task_h,
+            env_seed=task_env_seed,
+            rollout_seed=int(query_rollout_seeds[task_idx]),
+            n_samples=n_samples,
+            num_features=num_features,
+            device=device,
+            single_eval_pos=single_eval_pos,
+        )
+        rollout_profile_acc = _merge_anil_rollout_profile(
+            rollout_profile_acc,
+            query_rollout.get("rollout_profile", None),
+        )
+        query_single_eval_pos = int(query_rollout.get("single_eval_pos", 0))
+        query_loss, query_stats, _ = env_prior.reinforce_sequence_replay_loss_from_rollout(
+            policy_step_fn=query_step_fn,
+            x_tokens=query_rollout["x"],
+            rewards=query_rollout["rewards"],
+            replay_payload=query_replay_payload,
+            single_eval_pos=query_single_eval_pos,
+            baseline_mode="leave_one_out",
+            fit_action_dim_fn=getattr(policy_step_fn, "_fit_action_dim_fn", None),
+        )
+        _accumulate_anil_scalar_stats(query_stats_accum, query_stats, task_weight)
+        _accumulate_anil_terminal_stats(
+            query_terminal_stats_accum,
+            query_rollout.get("terminal_stats", None),
+            task_weight,
+        )
+        scaled_query_loss = query_loss * float(task_weight)
+        loss_monitor = loss_monitor + scaled_query_loss.detach()
+        if callable(anil_query_loss_sink):
+            anil_query_loss_sink(scaled_query_loss)
+        else:
+            loss_total = loss_total + scaled_query_loss
+
+    stats = _finalize_anil_scalar_stats(query_stats_accum, device=device_obj)
+    stats["anil_support_objective"] = torch.as_tensor(
+        float(support_objective_sum),
+        device=device_obj,
+        dtype=torch.float32,
+    )
+    stats["anil_inner_steps"] = int(anil_inner_steps)
+    stats["anil_inner_learning_rate"] = float(anil_inner_learning_rate)
+    stats["anil_task_count"] = int(batch_size)
+    if query_terminal_stats_accum:
+        stats.update(_finalize_anil_scalar_stats(query_terminal_stats_accum, device=device_obj))
+    if isinstance(rollout_profile_acc, dict):
+        fake_rollout = {
+            "rewards": torch.zeros((1, int(batch_size)), device=device_obj, dtype=torch.float32),
+            "rollout_profile": rollout_profile_acc,
+        }
+        attach_common_rollout_diagnostics(fake_rollout, stats)
+    return (loss_monitor.detach() if callable(anil_query_loss_sink) else loss_total), None, stats
+
+
 def _compute_policy_rollout_chunk_loss(
     env_prior,
     policy_step_fn,
@@ -1122,6 +1518,9 @@ def _compute_policy_rollout_chunk_loss(
     pg_tbptt_window=None,
     tbptt_loss_sink=None,
     reinforce_replay_loss_sink=None,
+    anil_inner_steps=1,
+    anil_inner_learning_rate=0.1,
+    anil_query_loss_sink=None,
     h_list_override=None,
     env_seeds_override=None,
     rollout_seeds_override=None,
@@ -1156,6 +1555,27 @@ def _compute_policy_rollout_chunk_loss(
         rollout_kwargs["env_seeds_override"] = env_seeds_override
     if rollout_seeds_override is not None:
         rollout_kwargs["rollout_seeds_override"] = rollout_seeds_override
+
+    if str(rl_objective).strip().lower() == "anil":
+        if pg_tbptt_window is not None or tbptt_loss_sink is not None:
+            raise RuntimeError("ANIL currently requires pg_tbptt_window=None and does not support TBPTT.")
+        if bool(policy_rollout_checkpoint):
+            raise RuntimeError("ANIL currently does not support policy_rollout_checkpoint.")
+        return _compute_anil_rollout_chunk_loss(
+            env_prior,
+            policy_step_fn,
+            batch_size=batch_size,
+            n_samples=n_samples,
+            num_features=num_features,
+            device=device,
+            single_eval_pos=single_eval_pos,
+            h_list_override=rollout_kwargs.get("h_list_override", None),
+            env_seeds_override=rollout_kwargs.get("env_seeds_override", None),
+            rollout_seeds_override=rollout_kwargs.get("rollout_seeds_override", None),
+            anil_inner_steps=anil_inner_steps,
+            anil_inner_learning_rate=anil_inner_learning_rate,
+            anil_query_loss_sink=anil_query_loss_sink,
+        )
 
     if tbptt_loss_sink is not None:
         # True TBPTT mode: window loss is backpropagated as soon as the window ends.
@@ -1229,6 +1649,16 @@ def _compute_policy_rollout_chunk_loss(
             pg_stats_inner["objective"].detach(),
             pg_stats_inner["reward_mean"].detach(),
             pg_stats_inner["reward_std"].detach(),
+            pg_stats_inner.get("policy_total_loss", pg_loss_inner).detach(),
+            pg_stats_inner.get("reinforce_loss", pg_loss_inner).detach(),
+            pg_stats_inner.get(
+                "normalized_q_value_loss",
+                torch.zeros((), device=device, dtype=torch.float32),
+            ).detach(),
+            pg_stats_inner.get(
+                "next_state_flow_matching_loss",
+                torch.zeros((), device=device, dtype=torch.float32),
+            ).detach(),
             pg_stats_inner.get("reward_min", torch.zeros((), device=device, dtype=torch.float32)).detach(),
             pg_stats_inner.get("reward_max", torch.zeros((), device=device, dtype=torch.float32)).detach(),
             pg_stats_inner.get("reward_abs_max", torch.zeros((), device=device, dtype=torch.float32)).detach(),
@@ -1244,6 +1674,10 @@ def _compute_policy_rollout_chunk_loss(
         objective,
         reward_mean,
         reward_std,
+        policy_total_loss,
+        reinforce_loss,
+        normalized_q_value_loss,
+        next_state_flow_matching_loss,
         reward_min,
         reward_max,
         reward_abs_max,
@@ -1259,6 +1693,10 @@ def _compute_policy_rollout_chunk_loss(
         "objective": objective,
         "reward_mean": reward_mean,
         "reward_std": reward_std,
+        "policy_total_loss": policy_total_loss,
+        "reinforce_loss": reinforce_loss,
+        "normalized_q_value_loss": normalized_q_value_loss,
+        "next_state_flow_matching_loss": next_state_flow_matching_loss,
         "reward_min": reward_min,
         "reward_max": reward_max,
         "reward_abs_max": reward_abs_max,
@@ -1551,6 +1989,8 @@ def train_epoch_policy_gradient(
     pg_compile_observe_reset_after_warmup=True,
     pg_phase_log_every_batches=1,
     pg_phase_log_file=None,
+    anil_inner_steps=1,
+    anil_inner_learning_rate=0.1,
     epoch_idx=None,
     progress_bar=False,
     epoch_profiler=None,
@@ -1579,6 +2019,8 @@ def train_epoch_policy_gradient(
             "pg_env_replay_steps > 1 requires aggregate_k_gradients == 1 "
             "so each replay rollout is followed by exactly one optimizer step."
         )
+    if rl_objective == "anil" and pg_env_replay_steps != 1:
+        raise ValueError("ANIL currently requires pg_env_replay_steps == 1.")
     requires_midaccum_grad_finite_check = aggregate_k_gradients > 1
     pg_epoch_objective_values = []
     pg_epoch_reward_mean_values = []
@@ -1596,6 +2038,10 @@ def train_epoch_policy_gradient(
     pg_epoch_rollout_wall_values = []
     pg_epoch_backward_wall_values = []
     pg_epoch_step_wall_values = []
+    pg_epoch_policy_total_loss_values = []
+    pg_epoch_reinforce_loss_values = []
+    pg_epoch_normalized_q_value_loss_values = []
+    pg_epoch_next_state_flow_matching_loss_values = []
     pg_epoch_loss_signatures = set()
 
     base_steps_per_epoch = int(len(dl))
@@ -2107,6 +2553,10 @@ def train_epoch_policy_gradient(
                     batch_objective = torch.tensor(0.0, device=device)
                     batch_reward_mean = torch.tensor(0.0, device=device)
                     batch_reward_std = torch.tensor(0.0, device=device)
+                    batch_policy_total_loss_value = None
+                    batch_reinforce_loss_value = None
+                    batch_normalized_q_value_loss_value = None
+                    batch_next_state_flow_matching_loss_value = None
                     batch_reward_min_value = float("inf")
                     batch_reward_max_value = float("-inf")
                     batch_reward_absmax_value = 0.0
@@ -2344,11 +2794,13 @@ def train_epoch_policy_gradient(
                                             pg_saved_tensors_cpu_offload_auto_min_free_gb=pg_saved_tensors_cpu_offload_auto_min_free_gb,
                                             pg_saved_tensors_cpu_offload_auto_max_batch_size=pg_saved_tensors_cpu_offload_auto_max_batch_size,
                                             pg_saved_tensors_cpu_offload_auto_max_n_samples=pg_saved_tensors_cpu_offload_auto_max_n_samples,
-                                            pg_tbptt_window=current_tbptt_window,
-                                            tbptt_loss_sink=None,
-                                            h_list_override=warmup_h_list_override,
-                                            env_seeds_override=warmup_env_seeds_override,
-                                            rl_objective=rl_objective,
+                                        pg_tbptt_window=current_tbptt_window,
+                                        tbptt_loss_sink=None,
+                                        anil_inner_steps=anil_inner_steps,
+                                        anil_inner_learning_rate=anil_inner_learning_rate,
+                                        h_list_override=warmup_h_list_override,
+                                        env_seeds_override=warmup_env_seeds_override,
+                                        rl_objective=rl_objective,
                                         )
                                         del _warmup_loss
                             elif bool(policy_fastpath_compile_active) and callable(policy_fastpath_warmup_fn):
@@ -2475,6 +2927,7 @@ def train_epoch_policy_gradient(
     
                         backward_scale = float(chunk_weight) / float(aggregate_k_gradients)
                         reinforce_replay_backward_called = False
+                        anil_query_backward_called = False
 
                         if tbptt_stream_backward_active:
                             tbptt_merge_guard_active = bool(
@@ -2672,6 +3125,44 @@ def train_epoch_policy_gradient(
                                 return None
                         else:
                             _reinforce_replay_loss_sink = None
+
+                        if (not tbptt_stream_backward_active) and (current_tbptt_window is None) and rl_objective == "anil":
+                            def _anil_query_loss_sink(loss_root):
+                                nonlocal anil_query_backward_called
+                                nonlocal batch_backward_wall, batch_backward_calls
+                                nonlocal backward_t_start_unix, backward_t_end_unix
+                                if (not torch.is_tensor(loss_root)) or (not bool(loss_root.requires_grad)):
+                                    return None
+                                anil_query_backward_called = True
+                                scaled_loss = loss_root * backward_scale
+                                backward_t0_unix = time.time()
+                                backward_t0 = time.perf_counter()
+                                backward_cuda_start = None
+                                if gpu_observer_active and ("cuda" in str(device)) and torch.cuda.is_available():
+                                    backward_cuda_start = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_start.record()
+                                with (
+                                    kernel_profiler.phase("pg.backward")
+                                    if (kernel_profiler is not None and kernel_profiler.enabled())
+                                    else nullcontext()
+                                ):
+                                    if scaler is None:
+                                        scaled_loss.backward()
+                                    else:
+                                        scaler.scale(scaled_loss).backward()
+                                if backward_cuda_start is not None:
+                                    backward_cuda_end = torch.cuda.Event(enable_timing=True)
+                                    backward_cuda_end.record()
+                                    backward_cuda_pairs.append((backward_cuda_start, backward_cuda_end))
+                                batch_backward_wall += (time.perf_counter() - backward_t0)
+                                batch_backward_calls += 1
+                                backward_t1_unix = time.time()
+                                if backward_t_start_unix is None:
+                                    backward_t_start_unix = backward_t0_unix
+                                backward_t_end_unix = backward_t1_unix
+                                return None
+                        else:
+                            _anil_query_loss_sink = None
     
                         try:
                             rollout_t0_unix = time.time()
@@ -2716,6 +3207,9 @@ def train_epoch_policy_gradient(
                                         pg_tbptt_window=current_tbptt_window,
                                         tbptt_loss_sink=_tbptt_chunk_loss_sink,
                                         reinforce_replay_loss_sink=_reinforce_replay_loss_sink,
+                                        anil_inner_steps=anil_inner_steps,
+                                        anil_inner_learning_rate=anil_inner_learning_rate,
+                                        anil_query_loss_sink=_anil_query_loss_sink,
                                         rl_objective=rl_objective,
                                         **rollout_override_kwargs,
                                     )
@@ -2725,6 +3219,8 @@ def train_epoch_policy_gradient(
                                     if tbptt_stream_backward_active and tbptt_window_backward_called:
                                         loss = loss.detach()
                                     if reinforce_replay_backward_called:
+                                        loss = loss.detach()
+                                    if anil_query_backward_called:
                                         loss = loss.detach()
                                     metric_loss = loss.detach().mean()
                                     if tbptt_stream_backward_active and tbptt_window_backward_called:
@@ -2899,6 +3395,62 @@ def train_epoch_policy_gradient(
                         batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
                         batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
                         batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
+                        chunk_policy_total_loss = pg_stats_chunk.get("policy_total_loss", None)
+                        if chunk_policy_total_loss is not None:
+                            try:
+                                contrib = (
+                                    float(torch.as_tensor(chunk_policy_total_loss).detach().cpu())
+                                    * chunk_weight
+                                    / float(aggregate_k_gradients)
+                                )
+                                if batch_policy_total_loss_value is None:
+                                    batch_policy_total_loss_value = contrib
+                                else:
+                                    batch_policy_total_loss_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reinforce_loss = pg_stats_chunk.get("reinforce_loss", None)
+                        if chunk_reinforce_loss is not None:
+                            try:
+                                contrib = (
+                                    float(torch.as_tensor(chunk_reinforce_loss).detach().cpu())
+                                    * chunk_weight
+                                    / float(aggregate_k_gradients)
+                                )
+                                if batch_reinforce_loss_value is None:
+                                    batch_reinforce_loss_value = contrib
+                                else:
+                                    batch_reinforce_loss_value += contrib
+                            except Exception:
+                                pass
+                        chunk_normalized_q_value_loss = pg_stats_chunk.get("normalized_q_value_loss", None)
+                        if chunk_normalized_q_value_loss is not None:
+                            try:
+                                contrib = (
+                                    float(torch.as_tensor(chunk_normalized_q_value_loss).detach().cpu())
+                                    * chunk_weight
+                                    / float(aggregate_k_gradients)
+                                )
+                                if batch_normalized_q_value_loss_value is None:
+                                    batch_normalized_q_value_loss_value = contrib
+                                else:
+                                    batch_normalized_q_value_loss_value += contrib
+                            except Exception:
+                                pass
+                        chunk_next_state_flow_matching_loss = pg_stats_chunk.get("next_state_flow_matching_loss", None)
+                        if chunk_next_state_flow_matching_loss is not None:
+                            try:
+                                contrib = (
+                                    float(torch.as_tensor(chunk_next_state_flow_matching_loss).detach().cpu())
+                                    * chunk_weight
+                                    / float(aggregate_k_gradients)
+                                )
+                                if batch_next_state_flow_matching_loss_value is None:
+                                    batch_next_state_flow_matching_loss_value = contrib
+                                else:
+                                    batch_next_state_flow_matching_loss_value += contrib
+                            except Exception:
+                                pass
                         chunk_reward_min = pg_stats_chunk.get("reward_min", None)
                         if chunk_reward_min is not None:
                             try:
@@ -5352,9 +5904,48 @@ def train_epoch_policy_gradient(
                     pg_epoch_backward_wall_values.append(float(batch_backward_wall))
                 if math.isfinite(batch_step_wall):
                     pg_epoch_step_wall_values.append(float(batch_step_wall))
+                if (
+                    batch_policy_total_loss_value is not None
+                    and math.isfinite(float(batch_policy_total_loss_value))
+                ):
+                    pg_epoch_policy_total_loss_values.append(float(batch_policy_total_loss_value))
+                if batch_reinforce_loss_value is not None and math.isfinite(float(batch_reinforce_loss_value)):
+                    pg_epoch_reinforce_loss_values.append(float(batch_reinforce_loss_value))
+                if (
+                    batch_normalized_q_value_loss_value is not None
+                    and math.isfinite(float(batch_normalized_q_value_loss_value))
+                ):
+                    pg_epoch_normalized_q_value_loss_values.append(float(batch_normalized_q_value_loss_value))
+                if (
+                    batch_next_state_flow_matching_loss_value is not None
+                    and math.isfinite(float(batch_next_state_flow_matching_loss_value))
+                ):
+                    pg_epoch_next_state_flow_matching_loss_values.append(
+                        float(batch_next_state_flow_matching_loss_value)
+                    )
                 if batch_pg_loss_signature is not None:
                     pg_epoch_loss_signatures.add(str(batch_pg_loss_signature))
                 if should_log_pg_phase:
+                    loss_total_info = (
+                        "na"
+                        if batch_policy_total_loss_value is None
+                        else f"{float(batch_policy_total_loss_value):+.3e}"
+                    )
+                    loss_reinforce_info = (
+                        "na"
+                        if batch_reinforce_loss_value is None
+                        else f"{float(batch_reinforce_loss_value):+.3e}"
+                    )
+                    loss_qaux_info = (
+                        "na"
+                        if batch_normalized_q_value_loss_value is None
+                        else f"{float(batch_normalized_q_value_loss_value):+.3e}"
+                    )
+                    loss_fmaux_info = (
+                        "na"
+                        if batch_next_state_flow_matching_loss_value is None
+                        else f"{float(batch_next_state_flow_matching_loss_value):+.3e}"
+                    )
                     grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
                     grad_norm_post_info = (
                         "na"
@@ -5408,6 +5999,10 @@ def train_epoch_policy_gradient(
                         f"step_s={batch_step_wall:.3f} backward_calls={batch_backward_calls} "
                         f"bridge_count={int(batch_pg_bridge_replay_count_value)} "
                         f"chunk={current_rollout_chunk_size} tbptt={current_tbptt_window} status=ok "
+                        f"loss_total={loss_total_info} "
+                        f"loss_reinforce={loss_reinforce_info} "
+                        f"loss_qaux={loss_qaux_info} "
+                        f"loss_fmaux={loss_fmaux_info} "
                         f"objective={float(batch_objective.detach().cpu()):+.3e} "
                         f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
                         f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
@@ -5496,6 +6091,14 @@ def train_epoch_policy_gradient(
     rollout_wall_mean, _ = _mean_std(pg_epoch_rollout_wall_values)
     backward_wall_mean, _ = _mean_std(pg_epoch_backward_wall_values)
     step_wall_mean, _ = _mean_std(pg_epoch_step_wall_values)
+    policy_total_loss_mean, policy_total_loss_std = _mean_std(pg_epoch_policy_total_loss_values)
+    reinforce_loss_mean, reinforce_loss_std = _mean_std(pg_epoch_reinforce_loss_values)
+    normalized_q_value_loss_mean, normalized_q_value_loss_std = _mean_std(
+        pg_epoch_normalized_q_value_loss_values
+    )
+    next_state_flow_matching_loss_mean, next_state_flow_matching_loss_std = _mean_std(
+        pg_epoch_next_state_flow_matching_loss_values
+    )
     clip_hit_mean, _ = _mean_std(pg_epoch_clip_hit_values)
     norm_clip_hit_mean, _ = _mean_std(pg_epoch_norm_clip_hit_values)
     objective_sign_flips = 0
@@ -5562,6 +6165,14 @@ def train_epoch_policy_gradient(
         "rollout_wall_mean": rollout_wall_mean,
         "backward_wall_mean": backward_wall_mean,
         "step_wall_mean": step_wall_mean,
+        "policy_total_loss_mean": policy_total_loss_mean,
+        "policy_total_loss_std": policy_total_loss_std,
+        "reinforce_loss_mean": reinforce_loss_mean,
+        "reinforce_loss_std": reinforce_loss_std,
+        "normalized_q_value_loss_mean": normalized_q_value_loss_mean,
+        "normalized_q_value_loss_std": normalized_q_value_loss_std,
+        "next_state_flow_matching_loss_mean": next_state_flow_matching_loss_mean,
+        "next_state_flow_matching_loss_std": next_state_flow_matching_loss_std,
         "pg_loss_signature": ",".join(sorted(pg_epoch_loss_signatures)) if pg_epoch_loss_signatures else None,
     }
     if verbose and target_model.last_pg_epoch_metrics.get("objective_snr") is not None:
@@ -5570,6 +6181,10 @@ def train_epoch_policy_gradient(
             f"obj_mean={target_model.last_pg_epoch_metrics['objective_mean']:+.3e} "
             f"obj_std={target_model.last_pg_epoch_metrics['objective_std']:.3e} "
             f"obj_snr={target_model.last_pg_epoch_metrics['objective_snr']:.3e} "
+            f"loss_total={target_model.last_pg_epoch_metrics['policy_total_loss_mean'] if target_model.last_pg_epoch_metrics['policy_total_loss_mean'] is not None else 'na'} "
+            f"loss_reinf={target_model.last_pg_epoch_metrics['reinforce_loss_mean'] if target_model.last_pg_epoch_metrics['reinforce_loss_mean'] is not None else 'na'} "
+            f"loss_qaux={target_model.last_pg_epoch_metrics['normalized_q_value_loss_mean'] if target_model.last_pg_epoch_metrics['normalized_q_value_loss_mean'] is not None else 'na'} "
+            f"loss_fmaux={target_model.last_pg_epoch_metrics['next_state_flow_matching_loss_mean'] if target_model.last_pg_epoch_metrics['next_state_flow_matching_loss_mean'] is not None else 'na'} "
             f"grad_snr={target_model.last_pg_epoch_metrics['grad_norm_snr'] if target_model.last_pg_epoch_metrics['grad_norm_snr'] is not None else 'na'} "
             f"flip_rate={target_model.last_pg_epoch_metrics['objective_sign_flip_rate'] if target_model.last_pg_epoch_metrics['objective_sign_flip_rate'] is not None else 'na'}"
         )
@@ -5645,11 +6260,13 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_compile_observe_reset_after_warmup=True,
           pg_phase_log_every_batches=1,
           pg_phase_log_file=None,
+          anil_inner_steps=1,
+          anil_inner_learning_rate=0.1,
           ):
     del train_host_rss_limit_gib, train_host_rss_limit_poll_interval_sec, train_host_rss_limit_try_rlimit_as
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
-    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}:
+    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
         raise ValueError(f"Unknown rl_objective: {rl_objective}")
     if rank == 0 and verbose:
         print(f'Using {device} device')
@@ -5660,7 +6277,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
 
     policy_tf32_prev = None
     if (
-        rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}
+        rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}
         and ("cuda" in str(device))
         and torch.cuda.is_available()
     ):
@@ -5758,7 +6375,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"export_trace={kernel_profiler_cfg.export_trace}, "
                 f"summary_top_k={kernel_profiler_cfg.summary_top_k})"
             )
-    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}:
+    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
         if using_dist:
             raise ValueError(f"{rl_objective} objective does not support distributed training yet.")
         env_prior = _resolve_environment_prior(getattr(dl, "prior", None))
@@ -6348,7 +6965,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 torch.cuda.reset_peak_memory_stats()
                 gpu_start_time.record()
             
-            if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}:
+            if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
                 new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
                     model=model,
                     aggregate_k_gradients=aggregate_k_gradients,
@@ -6390,6 +7007,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     pg_compile_observe_reset_after_warmup=pg_compile_observe_reset_after_warmup,
                     pg_phase_log_every_batches=pg_phase_log_every_batches,
                     pg_phase_log_file=pg_phase_log_file_rank0,
+                    anil_inner_steps=anil_inner_steps,
+                    anil_inner_learning_rate=anil_inner_learning_rate,
                     epoch_idx=epoch,
                     progress_bar=progress_bar,
                     epoch_profiler=train_profiler,
@@ -6426,7 +7045,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             else:
                 last_lr = scheduler.get_last_lr()[0]
             if (
-                rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}
+                rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}
                 and (not pg_warmup_note_emitted)
                 and warmup_epochs > 0
                 and epoch <= warmup_epochs
@@ -6497,12 +7116,33 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     print(
                         f' peak gpu mem alloc/reserved {peak_alloc_gib:5.2f}GiB/{peak_reserved_gib:5.2f}GiB |',
                     )
-                if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}:
+                if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
                     mean_loss_str = f"{float(total_loss):+.6e}"
                 else:
                     mean_loss_str = f"{float(total_loss):5.4f}"
                 print(
                     f'| end of epoch {epoch:3d} | Wallclock time: {train_time[-1]:5.2f}s | GPU time: {train_gpu_time[-1]:5.2f}s | mean loss {mean_loss_str} | ')
+                if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
+                    pg_diag = getattr(model, "last_pg_epoch_metrics", None)
+                    if hasattr(model, "module"):
+                        pg_diag = getattr(model.module, "last_pg_epoch_metrics", pg_diag)
+                    if isinstance(pg_diag, dict):
+                        def _fmt_pg_loss_value(key):
+                            value = pg_diag.get(key, None)
+                            if value is None:
+                                return "na"
+                            try:
+                                return f"{float(value):+.3e}"
+                            except Exception:
+                                return "na"
+
+                        print(
+                            " pg-losses "
+                            f"total { _fmt_pg_loss_value('policy_total_loss_mean') } | "
+                            f"reinforce { _fmt_pg_loss_value('reinforce_loss_mean') } | "
+                            f"qaux { _fmt_pg_loss_value('normalized_q_value_loss_mean') } | "
+                            f"fmaux { _fmt_pg_loss_value('next_state_flow_matching_loss_mean') }"
+                        )
                 if profile_record is not None:
                     print(
                         " profile "
@@ -6534,7 +7174,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print('-' * 89)
                 
             if (
-                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'}
+                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}
                 and math.isfinite(prev_total_loss)
                 and new_loss > 1.5 * prev_total_loss
             ):

@@ -236,12 +236,20 @@ def get_model(
     model_type = config['model_type']
     n_features = config['prior']['num_features']
     transformer_cfg = dict(config.get('transformer', {}))
+    env_cfg = dict(config.get('prior', {}).get('environment', {}))
     backbone_kind = str(transformer_cfg.pop('backbone', 'transformer')).strip().lower()
     rwkv_head_size = transformer_cfg.pop('rwkv_head_size', 64)
     rwkv_ffn_mult = transformer_cfg.pop('rwkv_ffn_mult', 4)
     rwkv_sequence_replay_checkpoint = transformer_cfg.pop('rwkv_sequence_replay_checkpoint', False)
     rwkv_sequence_replay_batch_chunk_size = transformer_cfg.pop('rwkv_sequence_replay_batch_chunk_size', None)
     rwkv_sequence_replay_token_budget = transformer_cfg.pop('rwkv_sequence_replay_token_budget', None)
+    normalized_q_value_head_enabled = bool(float(env_cfg.get('normalized_q_value_weight', 0.0) or 0.0) > 0.0)
+    next_state_flow_dim = (
+        int(env_cfg.get('obs_slot_dim', 0))
+        if float(env_cfg.get('next_state_flow_matching_weight', 0.0) or 0.0) > 0.0
+        else None
+    )
+    next_state_flow_head_type = str(env_cfg.get('next_state_flow_head_type', 'cfmi_resnet') or 'cfmi_resnet').strip().lower()
 
     if model_type == "mothernet":
         model = MotherNet(
@@ -266,10 +274,21 @@ def get_model(
                 rwkv_sequence_replay_checkpoint=rwkv_sequence_replay_checkpoint,
                 rwkv_sequence_replay_batch_chunk_size=rwkv_sequence_replay_batch_chunk_size,
                 rwkv_sequence_replay_token_budget=rwkv_sequence_replay_token_budget,
+                normalized_q_value_head_enabled=normalized_q_value_head_enabled,
+                next_state_flow_dim=next_state_flow_dim,
+                next_state_flow_head_type=next_state_flow_head_type,
                 **transformer_cfg,
             )
         else:
-            model = TabPFN(n_out=n_out, n_features=n_features, y_encoder_layer=y_encoder, **transformer_cfg)
+            model = TabPFN(
+                n_out=n_out,
+                n_features=n_features,
+                y_encoder_layer=y_encoder,
+                normalized_q_value_head_enabled=normalized_q_value_head_enabled,
+                next_state_flow_dim=next_state_flow_dim,
+                next_state_flow_head_type=next_state_flow_head_type,
+                **transformer_cfg,
+            )
     elif model_type == "batabpfn":
         # FIXME hack
         transformer_cfg['nhead'] = 4

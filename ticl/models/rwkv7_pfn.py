@@ -14,6 +14,16 @@ import torch.utils.checkpoint
 import wandb
 
 from ticl.models.encoders import Linear, SplitObsActionEncoder
+from ticl.models.rl_aux_heads import (
+    CFMIResidualFlowMatchingHead,
+    ConditionalFlowMatchingHead,
+    TimeEmbeddingNet,
+    build_two_layer_mlp_head,
+)
+from ticl.models.tabpfn_bar_distribution import (
+    FullSupportBarDistribution,
+    make_standardized_full_support_bar_distribution,
+)
 from ticl.utils import SeqBN
 
 
@@ -45,11 +55,14 @@ def _group_norm_last_dim(x: torch.Tensor, *, num_groups: int, weight: torch.Tens
 
 
 def _default_mlp_head(in_dim: int, hidden_dim: int, out_dim: int):
-    return nn.Sequential(
-        nn.Linear(in_dim, hidden_dim),
-        nn.GELU(),
-        nn.Linear(hidden_dim, out_dim),
-    )
+    return build_two_layer_mlp_head(in_dim, hidden_dim, out_dim)
+
+
+def _functional_call_module(module: nn.Module, params_override, *args):
+    func_mod = getattr(torch, "func", None)
+    if func_mod is None or not hasattr(func_mod, "functional_call"):
+        raise RuntimeError("torch.func.functional_call is required for policy head parameter overrides.")
+    return func_mod.functional_call(module, params_override, args)
 
 
 _OFFICIAL_RWKV7_DEMO_RNN = None
@@ -129,10 +142,24 @@ def _load_official_rwkv7_train_temp(head_size: int):
     for name, mod in injected.items():
         old_modules[name] = sys.modules.get(name)
         sys.modules[name] = mod
+    cpp_ext_mod = None
+    cpp_ext_load_prev = None
+    if not torch.cuda.is_available():
+        import torch.utils.cpp_extension as cpp_ext
+
+        cpp_ext_mod = cpp_ext
+        cpp_ext_load_prev = cpp_ext.load
+
+        def _load_stub(*args, **kwargs):
+            return None
+
+        cpp_ext.load = _load_stub
     try:
         with _pushd(module_path.parent.parent):
             spec.loader.exec_module(module)
     finally:
+        if cpp_ext_mod is not None and cpp_ext_load_prev is not None:
+            cpp_ext_mod.load = cpp_ext_load_prev
         for key, value in prev_env.items():
             if value is None:
                 os.environ.pop(key, None)
@@ -813,6 +840,82 @@ class RWKV7Core(nn.Module):
         return x
 
 
+class RWKVTwoLayerFlowMatchingHead(nn.Module):
+    """RWKV-7 sequence decoder head for flow matching over replay query states."""
+
+    def __init__(
+        self,
+        *,
+        hidden_dim: int,
+        target_dim: int,
+        head_size: int,
+        ffn_mult: int,
+        time_embedding_dim: int = 128,
+    ):
+        super().__init__()
+        self.hidden_dim = int(hidden_dim)
+        self.target_dim = int(target_dim)
+        self.time_embedding_dim = int(time_embedding_dim)
+        self.time_embedding_net = TimeEmbeddingNet(
+            embedding_dim=self.time_embedding_dim,
+            projection_dim=self.time_embedding_dim,
+        )
+        self.input_proj = nn.Linear(
+            self.hidden_dim + self.target_dim + self.time_embedding_dim,
+            self.hidden_dim,
+        )
+        self.rwkv_core = RWKV7Core(
+            emb_dim=self.hidden_dim,
+            nlayers=2,
+            head_size=int(head_size),
+            ffn_mult=int(ffn_mult),
+            sequence_replay_checkpoint=False,
+        )
+        self.output_proj = nn.Linear(self.hidden_dim, self.target_dim)
+
+    def forward(self, hidden: torch.Tensor, x_t: torch.Tensor, t: torch.Tensor):
+        if hidden.ndim != 3:
+            raise ValueError(
+                "RWKVTwoLayerFlowMatchingHead expects hidden with shape (T, B, C), "
+                f"got {tuple(hidden.shape)}"
+            )
+        if tuple(hidden.shape[:-1]) != tuple(x_t.shape[:-1]):
+            raise ValueError(
+                "hidden and x_t must share leading dims, "
+                f"got {tuple(hidden.shape)} and {tuple(x_t.shape)}"
+            )
+        if int(x_t.shape[-1]) != self.target_dim:
+            raise ValueError(
+                f"x_t last dim must be {self.target_dim}, got {tuple(x_t.shape)}"
+            )
+        if not hidden.is_cuda:
+            raise RuntimeError("RWKVTwoLayerFlowMatchingHead requires CUDA inputs.")
+        if t.ndim == hidden.ndim - 1:
+            t = t.unsqueeze(-1)
+        if t.ndim != hidden.ndim or int(t.shape[-1]) != 1:
+            raise ValueError(
+                "t must broadcast as (T, B, 1), "
+                f"got {tuple(t.shape)} for hidden {tuple(hidden.shape)}"
+            )
+        if tuple(t.shape[:-1]) != tuple(hidden.shape[:-1]):
+            t = t.expand(*hidden.shape[:-1], 1)
+
+        proj_param = self.input_proj.weight
+        hidden_in = hidden.to(dtype=proj_param.dtype)
+        x_t_in = x_t.to(device=hidden.device, dtype=proj_param.dtype)
+        t_in = t.to(device=hidden.device, dtype=proj_param.dtype)
+        t_emb = self.time_embedding_net(t_in.reshape(-1, 1)).reshape(
+            int(hidden.shape[0]),
+            int(hidden.shape[1]),
+            self.time_embedding_dim,
+        )
+        tokens = self.input_proj(torch.cat([t_emb, x_t_in, hidden_in], dim=-1))
+        decoded = self.rwkv_core.forward_tokens_sequence_only(tokens)
+        out_param = self.output_proj.weight
+        decoded = decoded.to(dtype=out_param.dtype)
+        return self.output_proj(decoded)
+
+
 class RWKV7PFN(nn.Module):
     def __init__(
         self,
@@ -846,6 +949,9 @@ class RWKV7PFN(nn.Module):
         rwkv_sequence_replay_checkpoint=False,
         rwkv_sequence_replay_batch_chunk_size=None,
         rwkv_sequence_replay_token_budget=None,
+        normalized_q_value_head_enabled=False,
+        next_state_flow_dim=None,
+        next_state_flow_head_type="cfmi_resnet",
     ):
         del dropout, pre_norm, activation, recompute_attn, all_layers_same_init, y_encoder
         super().__init__()
@@ -865,6 +971,14 @@ class RWKV7PFN(nn.Module):
             None if rwkv_sequence_replay_token_budget in (None, 0, False)
             else int(rwkv_sequence_replay_token_budget)
         )
+        self.normalized_q_value_head_enabled = bool(normalized_q_value_head_enabled)
+        self.normalized_q_value_num_buckets = 100
+        self.normalized_q_value_bar_range = 5.0
+        self.next_state_flow_dim = (
+            None if next_state_flow_dim in (None, 0, False)
+            else int(next_state_flow_dim)
+        )
+        self.next_state_flow_head_type = str(next_state_flow_head_type or "mlp").strip().lower()
 
         if self.x_encoder_type == "single":
             self.encoder = Linear(n_features, self.emsize, replace_nan_by_zero=True)
@@ -908,6 +1022,47 @@ class RWKV7PFN(nn.Module):
                 if decoder is not None
                 else _default_mlp_head(self.emsize, nhid, self.policy_action_dim)
             )
+        self.normalized_q_value_head = None
+        self.normalized_q_value_bardist = None
+        if self.normalized_q_value_head_enabled:
+            self.normalized_q_value_bardist = make_standardized_full_support_bar_distribution(
+                num_buckets=self.normalized_q_value_num_buckets,
+                value_range=self.normalized_q_value_bar_range,
+            )
+            self.normalized_q_value_head = (
+                decoder(self.emsize, nhid, self.normalized_q_value_bardist.num_bars)
+                if decoder is not None
+                else _default_mlp_head(self.emsize, nhid, self.normalized_q_value_bardist.num_bars)
+            )
+        self.next_state_flow_head = None
+        if self.next_state_flow_dim is not None and self.next_state_flow_dim > 0:
+            if self.next_state_flow_head_type == "mlp":
+                self.next_state_flow_head = ConditionalFlowMatchingHead(
+                    hidden_dim=self.emsize,
+                    target_dim=int(self.next_state_flow_dim),
+                    mlp_hidden_dim=self.nhid if hasattr(self, "nhid") else nhid,
+                )
+            elif self.next_state_flow_head_type == "cfmi_resnet":
+                self.next_state_flow_head = CFMIResidualFlowMatchingHead(
+                    hidden_dim=self.emsize,
+                    target_dim=int(self.next_state_flow_dim),
+                    time_embedding_dim=128,
+                    num_residual_blocks=4,
+                    residual_block_dim=256,
+                )
+            elif self.next_state_flow_head_type == "rwkv_two_layer":
+                self.next_state_flow_head = RWKVTwoLayerFlowMatchingHead(
+                    hidden_dim=self.emsize,
+                    target_dim=int(self.next_state_flow_dim),
+                    head_size=self.rwkv_head_size,
+                    ffn_mult=self.rwkv_ffn_mult,
+                    time_embedding_dim=128,
+                )
+            else:
+                raise ValueError(
+                    "Unsupported next_state_flow_head_type for RWKV7PFN: "
+                    f"{self.next_state_flow_head_type}"
+                )
 
         self.input_ln = SeqBN(self.emsize) if input_normalization else None
         self.init_method = init_method
@@ -977,14 +1132,26 @@ class RWKV7PFN(nn.Module):
             )
         return True
 
-    def _decode_policy_action(self, hidden):
+    def _decode_policy_action(self, hidden, *, policy_action_head_params_override=None):
         target_dtype = None
         if self.policy_action_head_required():
             self.require_policy_action_head()
-            head_param = next(self.policy_action_head.parameters())
+            if policy_action_head_params_override is not None:
+                try:
+                    head_param = next(iter(policy_action_head_params_override.values()))
+                except StopIteration as exc:
+                    raise ValueError("policy_action_head_params_override must not be empty.") from exc
+            else:
+                head_param = next(self.policy_action_head.parameters())
             target_dtype = head_param.dtype
             if hidden.dtype != target_dtype:
                 hidden = hidden.to(dtype=target_dtype)
+            if policy_action_head_params_override is not None:
+                return _functional_call_module(
+                    self.policy_action_head,
+                    policy_action_head_params_override,
+                    hidden,
+                )
             return self.policy_action_head(hidden)
         head_param = next(self.decoder.parameters())
         target_dtype = head_param.dtype
@@ -994,6 +1161,62 @@ class RWKV7PFN(nn.Module):
 
     def consume_policy_step_profile(self):
         return None
+
+    def has_normalized_q_value_head(self):
+        return isinstance(self.normalized_q_value_head, nn.Module) and isinstance(
+            self.normalized_q_value_bardist,
+            FullSupportBarDistribution,
+        )
+
+    def has_next_state_flow_head(self):
+        return isinstance(self.next_state_flow_head, nn.Module)
+
+    @staticmethod
+    def _cast_hidden_for_head(hidden, head):
+        head_param = next(head.parameters())
+        if hidden.dtype != head_param.dtype:
+            hidden = hidden.to(dtype=head_param.dtype)
+        return hidden
+
+    def get_normalized_q_value_bardist(self):
+        if not self.has_normalized_q_value_head():
+            raise RuntimeError("normalized_q_value_head is not initialized")
+        return self.normalized_q_value_bardist
+
+    def _decode_normalized_q_value_logits(self, hidden):
+        if not self.has_normalized_q_value_head():
+            raise RuntimeError("normalized_q_value_head is not initialized")
+        hidden = self._cast_hidden_for_head(hidden, self.normalized_q_value_head)
+        return self.normalized_q_value_head(hidden)
+
+    def _decode_next_state_flow(self, hidden, x_t, t):
+        if not self.has_next_state_flow_head():
+            raise RuntimeError("next_state_flow_head is not initialized")
+        return self.next_state_flow_head(hidden, x_t, t)
+
+    def _decode_replay_outputs(
+        self,
+        hidden_q,
+        *,
+        policy_action_head_params_override=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        outputs = {
+            "action_mean": self._decode_policy_action(
+                hidden_q,
+                policy_action_head_params_override=policy_action_head_params_override,
+            )
+        }
+        if self.has_normalized_q_value_head():
+            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q)
+            outputs["normalized_q_logits"] = normalized_q_logits
+            outputs["normalized_q"] = self.normalized_q_value_bardist.mean(
+                normalized_q_logits,
+            )
+        if self.has_next_state_flow_head() and flow_matching_xt is not None and flow_matching_t is not None:
+            outputs["next_state_flow"] = self._decode_next_state_flow(hidden_q, flow_matching_xt, flow_matching_t)
+        return outputs
 
     def policy_fastpath_compile_active(self):
         return False
@@ -1118,7 +1341,7 @@ class RWKV7PFN(nn.Module):
             token = self.input_ln(token)
         return token
 
-    def forward(self, src, single_eval_pos=None):
+    def forward(self, src, single_eval_pos=None, *, policy_action_head_params_override=None):
         assert isinstance(src, tuple), "inputs (src) have to be given as (x,y) or (style,x,y) tuple"
         if single_eval_pos is None:
             raise ValueError("single_eval_pos has to be given, instead of None.")
@@ -1134,7 +1357,10 @@ class RWKV7PFN(nn.Module):
         full_tokens = self._cast_token_for_rwkv_core(full_tokens)
         hidden_all = self.rwkv_core.forward_tokens_sequence_only(full_tokens)
         hidden_q = hidden_all[single_eval_pos:]
-        return self._decode_policy_action(hidden_q)
+        return self._decode_policy_action(
+            hidden_q,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
 
     def init_kv_cache(self, x_train, y_train):
         if not self.single_eval_causal:
@@ -1163,31 +1389,72 @@ class RWKV7PFN(nn.Module):
         _, state = self.rwkv_core.forward_tokens(token, kv_cache)
         return state
 
-    def predict_query_with_kv(self, x_query, kv_cache):
+    def predict_query_with_kv(self, x_query, kv_cache, *, policy_action_head_params_override=None):
         if not self.single_eval_causal:
             raise ValueError("RWKV state cache requires single_eval_causal=True.")
         token = self._encode_query_token(x_query)
         token = self._cast_token_for_rwkv_core(token)
         hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
-        return self._decode_policy_action(hidden)
+        return self._decode_policy_action(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
 
-    def replay_policy_sequence_tokens(self, x_tokens, y_tokens, *, eval_start: int = 0):
+    def replay_policy_sequence_tokens(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start: int = 0,
+        policy_action_head_params_override=None,
+    ):
+        return self.replay_policy_sequence_outputs(
+            x_tokens,
+            y_tokens,
+            eval_start=eval_start,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )["action_mean"]
+
+    def replay_policy_sequence_outputs(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start: int = 0,
+        policy_action_head_params_override=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
         if not self.single_eval_causal:
-            raise ValueError("replay_policy_sequence_tokens requires single_eval_causal=True.")
+            raise ValueError("replay_policy_sequence_outputs requires single_eval_causal=True.")
         if x_tokens.ndim != 3:
             raise ValueError(
-                f"replay_policy_sequence_tokens expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+                f"replay_policy_sequence_outputs expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
             )
         if y_tokens.ndim != 2:
             raise ValueError(
-                f"replay_policy_sequence_tokens expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+                f"replay_policy_sequence_outputs expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
             )
         if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
             raise ValueError(
-                "replay_policy_sequence_tokens expects matching leading dims, "
+                "replay_policy_sequence_outputs expects matching leading dims, "
                 f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
             )
         eval_start = int(max(0, min(int(x_tokens.shape[0]), int(eval_start))))
+        if flow_matching_xt is not None:
+            expected_shape = (int(x_tokens.shape[0]) - eval_start, int(x_tokens.shape[1]))
+            if tuple(flow_matching_xt.shape[:2]) != expected_shape:
+                raise ValueError(
+                    "flow_matching_xt must match replay query shape, "
+                    f"expected {expected_shape + (int(flow_matching_xt.shape[-1]),)}, got {tuple(flow_matching_xt.shape)}"
+                )
+        if flow_matching_t is not None:
+            expected_shape = (int(x_tokens.shape[0]) - eval_start, int(x_tokens.shape[1]))
+            if tuple(flow_matching_t.shape[:2]) != expected_shape:
+                raise ValueError(
+                    "flow_matching_t must match replay query leading shape, "
+                    f"expected {expected_shape + (1,)}, got {tuple(flow_matching_t.shape)}"
+                )
         total_batch = int(x_tokens.shape[1])
         batch_chunk_size = self.resolve_replay_batch_chunk_size(
             seq_len=int(x_tokens.shape[0]),
@@ -1197,13 +1464,18 @@ class RWKV7PFN(nn.Module):
             tokens = self._encode_train_token(x_tokens, y_tokens)
             tokens = self._cast_token_for_rwkv_core(tokens)
             hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
-            return self._decode_policy_action(hidden_all[eval_start:])
+            return self._decode_replay_outputs(
+                hidden_all[eval_start:],
+                policy_action_head_params_override=policy_action_head_params_override,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
         if self.input_ln is not None:
             raise RuntimeError(
                 "RWKV sequence replay batch microbatching requires input_normalization=False "
                 "to preserve exact BatchNorm semantics."
             )
-        decoded_chunks = []
+        output_chunks = []
         for start in range(0, total_batch, int(batch_chunk_size)):
             end = min(total_batch, start + int(batch_chunk_size))
             tokens_chunk = self._encode_train_token(
@@ -1212,8 +1484,20 @@ class RWKV7PFN(nn.Module):
             )
             tokens_chunk = self._cast_token_for_rwkv_core(tokens_chunk)
             hidden_chunk = self.rwkv_core.forward_tokens_sequence_only(tokens_chunk)
-            decoded_chunks.append(self._decode_policy_action(hidden_chunk[eval_start:]))
-        return torch.cat(decoded_chunks, dim=1)
+            flow_xt_chunk = None if flow_matching_xt is None else flow_matching_xt[:, start:end]
+            flow_t_chunk = None if flow_matching_t is None else flow_matching_t[:, start:end]
+            output_chunks.append(
+                self._decode_replay_outputs(
+                    hidden_chunk[eval_start:],
+                    policy_action_head_params_override=policy_action_head_params_override,
+                    flow_matching_xt=flow_xt_chunk,
+                    flow_matching_t=flow_t_chunk,
+                )
+            )
+        merged = {}
+        for key in output_chunks[0].keys():
+            merged[key] = torch.cat([chunk[key] for chunk in output_chunks], dim=1)
+        return merged
 
     def resolve_replay_batch_chunk_size(self, *, seq_len: int, total_batch: int):
         seq_len = int(max(1, seq_len))
@@ -1223,6 +1507,10 @@ class RWKV7PFN(nn.Module):
             effective_chunk = min(effective_chunk, int(max(1, self.rwkv_sequence_replay_batch_chunk_size)))
         if self.rwkv_sequence_replay_token_budget is not None:
             token_budget = int(max(1, self.rwkv_sequence_replay_token_budget))
+            # Preserve historical 256-hidden defaults while shrinking replay
+            # microbatches for wider backbones whose per-token activations are larger.
+            hidden_scale = max(1.0, float(self.emsize) / 256.0)
+            token_budget = int(max(1, math.floor(float(token_budget) / hidden_scale)))
             effective_chunk = min(effective_chunk, int(max(1, token_budget // seq_len)))
         return int(max(1, effective_chunk))
 
@@ -1236,6 +1524,7 @@ class RWKV7PFN(nn.Module):
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
     ):
         del max_cache_len, kv_cache_mode, kv_cache_page_size, allow_grad_mutable_cache, allow_grad_inplace_paged_cache
         if not self.single_eval_causal:
@@ -1245,7 +1534,10 @@ class RWKV7PFN(nn.Module):
         token = self._encode_train_token(x_token, y_token)
         token = self._cast_token_for_rwkv_core(token)
         hidden, kv_cache = self.rwkv_core.forward_step(token[0], kv_cache)
-        out = self._decode_policy_action(hidden.unsqueeze(0))
+        out = self._decode_policy_action(
+            hidden.unsqueeze(0),
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
         return out, kv_cache
 
     def forward_policy_step_split(
@@ -1262,6 +1554,7 @@ class RWKV7PFN(nn.Module):
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
     ):
         del max_cache_len, kv_cache_mode, kv_cache_page_size, allow_grad_mutable_cache, allow_grad_inplace_paged_cache
         if not self.single_eval_causal:
@@ -1278,10 +1571,13 @@ class RWKV7PFN(nn.Module):
         )
         token = self._cast_token_for_rwkv_core(token)
         hidden, kv_cache = self.rwkv_core.forward_step(token, kv_cache)
-        out = self._decode_policy_action(hidden.unsqueeze(0))
+        out = self._decode_policy_action(
+            hidden.unsqueeze(0),
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
         return out, kv_cache
 
-    def forward_with_kv(self, src, single_eval_pos=None):
+    def forward_with_kv(self, src, single_eval_pos=None, *, policy_action_head_params_override=None):
         assert isinstance(src, tuple), "inputs (src) have to be given as (x,y) or (style,x,y) tuple"
         if single_eval_pos is None:
             raise ValueError("single_eval_pos has to be given, instead of None.")
@@ -1292,4 +1588,8 @@ class RWKV7PFN(nn.Module):
         else:
             x_src, y_src = src
         kv_cache = self.init_kv_cache(x_src[:single_eval_pos], y_src[:single_eval_pos])
-        return self.predict_query_with_kv(x_src[single_eval_pos:], kv_cache)
+        return self.predict_query_with_kv(
+            x_src[single_eval_pos:],
+            kv_cache,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )

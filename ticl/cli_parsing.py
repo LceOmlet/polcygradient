@@ -119,8 +119,12 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
-    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad'],
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'],
                            help='Training objective for RL-style models.')
+    optimizer.add_argument('--anil-inner-steps', type=int,
+                           help='Number of head-only support adaptation steps for ANIL.')
+    optimizer.add_argument('--anil-inner-learning-rate', type=float,
+                           help='Inner-loop learning rate for ANIL head adaptation.')
     optimizer.add_argument('--policy-rollout-chunk-size', type=int,
                            help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')
     optimizer.add_argument('--policy-rollout-chunk-autotune', type=str2bool,
@@ -404,6 +408,17 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='If true, optimize normalized rewards; if false, optimize raw discounted reward mean.')
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
+    environment_prior.add_argument('--normalized-q-value-weight', type=float,
+                                   help='Auxiliary loss weight for normalized Q-value prediction from replay query hidden states.')
+    environment_prior.add_argument('--next-state-flow-matching-weight', type=float,
+                                   help='Auxiliary loss weight for official affine/CondOT flow matching of next-step observations.')
+    environment_prior.add_argument(
+        '--next-state-flow-head-type',
+        type=str,
+        choices=['mlp', 'cfmi_resnet', 'rwkv_two_layer'],
+        help='Architecture for next-state flow matching head. '
+             "'cfmi_resnet' matches the CFMI tabular residual MLP (4 residual blocks, width 256).",
+    )
     environment_prior.add_argument('--discount', type=float, help='Discount factor for policy-gradient objective.')
     environment_prior.add_argument('--first-policy-gradient-state-grad-clip-norm', type=float,
                                    help='Per-sample global-norm clip applied to environment state adjoints for first_policy_gradient/alpha_grad.')

@@ -4400,6 +4400,20 @@ class EnvironmentPrior:
         return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_sequence_replay_enabled", False)))
 
     @staticmethod
+    def _resolve_normalized_q_value_weight(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("normalized_q_value_weight", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(max(0.0, v))
+
+    @staticmethod
+    def _resolve_next_state_flow_matching_weight(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("next_state_flow_matching_weight", 0.0))
+        if not math.isfinite(v):
+            return 0.0
+        return float(max(0.0, v))
+
+    @staticmethod
     def _resolve_first_policy_gradient_state_grad_clip_norm(h):
         v = EnvironmentPrior._resolve_scalar(h.get("first_policy_gradient_state_grad_clip_norm", 0.0))
         if not math.isfinite(v):
@@ -12120,12 +12134,16 @@ class EnvironmentPrior:
         )
         self.last_rollout_reinforce_replay = (
             {
-                "reward_in": replay_reward_in_steps,
-                "sampled_action": replay_sampled_action_steps,
-                "action_std": replay_action_std_steps,
-                "action_mask": replay_action_mask,
+                "reward_in": locals().get("replay_reward_in_steps", None),
+                "sampled_action": locals().get("replay_sampled_action_steps", None),
+                "action_std": locals().get("replay_action_std_steps", None),
+                "action_mask": locals().get("replay_action_mask", None),
+                "next_obs": locals().get("replay_next_obs_steps", None),
+                "obs_mask": locals().get("replay_obs_mask", None),
+                "eval_start": int(locals().get("replay_eval_start", 0) or 0),
+                "full_length": int(n_samples),
             }
-            if collect_reinforce_replay
+            if bool(locals().get("collect_reinforce_replay", False))
             else None
         )
         self.last_rollout_policy_trace = None
@@ -12783,6 +12801,12 @@ class EnvironmentPrior:
         action_mask_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
         replay_eval_start = int(max(0, min(int(n_samples), int(single_eval_pos))))
         replay_eval_steps = int(max(0, int(n_samples) - replay_eval_start))
+        normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
+        next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
+        collect_reinforce_flow_matching = bool(
+            collect_reinforce_replay and (next_state_flow_matching_weight > 0.0)
+        )
+        replay_next_obs_dim = int(self._resolve_scalar(self.config.get("obs_slot_dim", max_obs_dim)))
         replay_reward_in_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_reinforce_replay
@@ -12799,6 +12823,19 @@ class EnvironmentPrior:
             else None
         )
         replay_action_mask = action_mask.to(device=device, dtype=torch.bool) if collect_reinforce_replay else None
+        replay_next_obs_steps = (
+            torch.zeros((replay_eval_steps, batch_size, replay_next_obs_dim), device=device, dtype=torch.float32)
+            if collect_reinforce_flow_matching
+            else None
+        )
+        replay_obs_mask = (
+            (
+                torch.arange(replay_next_obs_dim, device=device, dtype=torch.long).unsqueeze(0)
+                < obs_dims.unsqueeze(1)
+            ).to(dtype=torch.bool)
+            if collect_reinforce_flow_matching
+            else None
+        )
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -14538,6 +14575,16 @@ class EnvironmentPrior:
             if collect_runtime_info:
                 reward_values[t] = reward_next.detach()
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
+            if collect_reinforce_flow_matching and t >= replay_eval_start:
+                replay_t = int(t - replay_eval_start)
+                if replay_next_obs_dim > 0:
+                    replay_next_obs_steps[replay_t].zero_()
+                    obs_copy = int(min(replay_next_obs_dim, int(state_next.shape[-1])))
+                    if obs_copy > 0:
+                        replay_next_obs_steps[replay_t, :, :obs_copy] = (
+                            state_next[:, :obs_copy].detach()
+                            * replay_obs_mask[:, :obs_copy].to(dtype=state_next.dtype)
+                        )
 
             state_t = state_next
             action_t = action_env
@@ -14892,6 +14939,8 @@ class EnvironmentPrior:
                 "sampled_action": replay_sampled_action_steps,
                 "action_std": replay_action_std_steps,
                 "action_mask": replay_action_mask,
+                "next_obs": replay_next_obs_steps,
+                "obs_mask": replay_obs_mask,
                 "eval_start": int(replay_eval_start),
                 "full_length": int(n_samples),
             }
@@ -16687,6 +16736,35 @@ class EnvironmentPrior:
         return normalized
 
     @staticmethod
+    def _sample_condot_flow_matching_path(x_1: torch.Tensor):
+        """
+        Official affine/CondOT path:
+          x_t = (1 - t) * x_0 + t * x_1
+          dx_t = x_1 - x_0
+        This matches facebookresearch/flow_matching CondOTProbPath.
+        """
+        x_0 = torch.randn_like(x_1)
+        t = torch.rand((*x_1.shape[:-1], 1), device=x_1.device, dtype=x_1.dtype)
+        x_t = ((1.0 - t) * x_0) + (t * x_1)
+        dx_t = x_1 - x_0
+        return x_t, t, dx_t
+
+    @staticmethod
+    def _masked_mean_squared_error(pred, target, *, mask=None, eps=1e-6):
+        sq_err = (pred - target).square()
+        if mask is None:
+            return sq_err.mean()
+        mask_t = mask
+        if not torch.is_tensor(mask_t):
+            mask_t = torch.as_tensor(mask_t, device=pred.device)
+        mask_t = mask_t.to(device=pred.device, dtype=sq_err.dtype)
+        while mask_t.ndim < sq_err.ndim:
+            mask_t = mask_t.unsqueeze(0)
+        weighted = sq_err * mask_t
+        denom = mask_t.sum().clamp_min(float(eps))
+        return weighted.sum() / denom
+
+    @staticmethod
     def _gaussian_log_prob(action, action_mean, action_std, *, mask=None, eps=1e-6):
         if action.shape != action_mean.shape:
             raise ValueError(
@@ -16917,6 +16995,8 @@ class EnvironmentPrior:
 
         stats = {
             "objective": returns[0].mean().detach(),
+            "reinforce_loss": loss.detach(),
+            "policy_total_loss": loss.detach(),
             "reward_mean": rewards.mean().detach(),
             "reward_std": rewards.std(unbiased=False).detach(),
             "reward_min": rewards.min().detach(),
@@ -16985,10 +17065,13 @@ class EnvironmentPrior:
             raise ValueError("reinforce sequence replay requires recorded replay payload tensors")
 
         replay_fn = policy_step_fn._reinforce_sequence_replay_fn
+        replay_outputs_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_outputs_fn", None)
         reward_in = replay_payload.get("reward_in", None)
         sampled_action = replay_payload.get("sampled_action", None)
         action_std = replay_payload.get("action_std", None)
         action_mask = replay_payload.get("action_mask", None)
+        next_obs = replay_payload.get("next_obs", None)
+        obs_mask = replay_payload.get("obs_mask", None)
         eval_start = int(replay_payload.get("eval_start", int(single_eval_pos) or 0) or 0)
         full_length = int(replay_payload.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
         if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_std, action_mask)):
@@ -17009,9 +17092,46 @@ class EnvironmentPrior:
         )
         discount = reinforce_terms["discount"]
         baseline_mode = reinforce_terms["baseline_mode"]
+        returns = reinforce_terms["returns"]
         advantages = reinforce_terms["advantages"].detach()
-        batch_size = int(x_tokens.shape[1])
+        normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
+        next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
+        use_aux_outputs = bool(
+            (normalized_q_value_weight > 0.0) or (next_state_flow_matching_weight > 0.0)
+        )
+        if use_aux_outputs and not callable(replay_outputs_fn):
+            raise RuntimeError(
+                "replay auxiliary heads were enabled, but policy_step_fn does not expose replay_policy_sequence_outputs"
+            )
         model_ref = getattr(policy_step_fn, "_model_ref", None)
+        normalized_q_targets = None
+        normalized_q_bardist = None
+        if normalized_q_value_weight > 0.0:
+            normalized_q_targets = self.normalize_rewards(
+                returns,
+                eps=1e-6,
+                clip=0.0,
+                detach_stats=True,
+            ).detach()
+            if model_ref is None or not hasattr(model_ref, "get_normalized_q_value_bardist"):
+                raise RuntimeError(
+                    "normalized_q_value_weight requires model_ref.get_normalized_q_value_bardist()"
+                )
+            normalized_q_bardist = model_ref.get_normalized_q_value_bardist()
+        if next_state_flow_matching_weight > 0.0:
+            if not all(torch.is_tensor(t) for t in (next_obs, obs_mask)):
+                raise RuntimeError(
+                    "next-state flow matching requires replay next_obs and obs_mask tensors"
+                )
+            flow_total_elements = float(
+                max(
+                    1.0,
+                    int(next_obs.shape[0]) * float(obs_mask.to(dtype=torch.float32).sum().detach().cpu()),
+                )
+            )
+        else:
+            flow_total_elements = 1.0
+        batch_size = int(x_tokens.shape[1])
         if model_ref is not None and hasattr(model_ref, "resolve_replay_batch_chunk_size"):
             replay_batch_chunk = int(
                 model_ref.resolve_replay_batch_chunk_size(
@@ -17026,6 +17146,8 @@ class EnvironmentPrior:
         total_elements = float(max(1, rewards_eval.numel()))
         full_log_probs = torch.empty_like(rewards_eval, dtype=torch.float32)
         loss_total = torch.zeros((), device=rewards_eval.device, dtype=torch.float32)
+        normalized_q_loss_total = torch.zeros((), device=rewards_eval.device, dtype=torch.float32)
+        next_state_flow_loss_total = torch.zeros((), device=rewards_eval.device, dtype=torch.float32)
         replay_decomp_accum = {
             "reinforce_action_dim_mean": 0.0,
             "reinforce_action_std_mean": 0.0,
@@ -17047,11 +17169,34 @@ class EnvironmentPrior:
 
         for start in range(0, batch_size, replay_batch_chunk):
             end = min(batch_size, start + replay_batch_chunk)
-            action_mean_replay = replay_fn(
-                x_tokens[:, start:end],
-                reward_in[:, start:end],
-                eval_start=eval_start,
-            )
+            flow_matching_xt_chunk = None
+            flow_matching_t_chunk = None
+            flow_matching_dx_chunk = None
+            if next_state_flow_matching_weight > 0.0:
+                flow_matching_xt_chunk, flow_matching_t_chunk, flow_matching_dx_chunk = (
+                    self._sample_condot_flow_matching_path(next_obs[:, start:end])
+                )
+            if callable(replay_outputs_fn):
+                replay_outputs = replay_outputs_fn(
+                    x_tokens[:, start:end],
+                    reward_in[:, start:end],
+                    eval_start=eval_start,
+                    flow_matching_xt=flow_matching_xt_chunk,
+                    flow_matching_t=flow_matching_t_chunk,
+                )
+                action_mean_replay = replay_outputs["action_mean"]
+                normalized_q_pred = replay_outputs.get("normalized_q", None)
+                normalized_q_logits = replay_outputs.get("normalized_q_logits", None)
+                next_state_flow_pred = replay_outputs.get("next_state_flow", None)
+            else:
+                action_mean_replay = replay_fn(
+                    x_tokens[:, start:end],
+                    reward_in[:, start:end],
+                    eval_start=eval_start,
+                )
+                normalized_q_pred = None
+                normalized_q_logits = None
+                next_state_flow_pred = None
             if int(sampled_action.shape[0]) != int(action_mean_replay.shape[0]):
                 action_mean_replay = action_mean_replay[eval_start : eval_start + int(sampled_action.shape[0])]
             replay_action_dim = int(sampled_action.shape[-1])
@@ -17091,6 +17236,45 @@ class EnvironmentPrior:
             chunk_loss = -(
                 advantages[:, start:end] * log_probs_chunk
             ).sum() / total_elements
+            if normalized_q_value_weight > 0.0:
+                if normalized_q_logits is None:
+                    raise RuntimeError(
+                        "normalized_q_value_head was enabled, but replay outputs omitted normalized_q_logits"
+                    )
+                if tuple(normalized_q_logits.shape[:-1]) != tuple(normalized_q_targets[:, start:end].shape):
+                    raise RuntimeError(
+                        "normalized Q replay logits shape mismatch: "
+                        f"{tuple(normalized_q_logits.shape)} vs {tuple(normalized_q_targets[:, start:end].shape)}"
+                    )
+                normalized_q_logits = normalized_q_logits.to(dtype=torch.float32)
+                normalized_q_pred = normalized_q_bardist.mean(normalized_q_logits)
+                normalized_q_loss_chunk = (
+                    normalized_q_bardist(
+                        normalized_q_logits,
+                        normalized_q_targets[:, start:end].to(
+                            device=normalized_q_logits.device,
+                            dtype=normalized_q_logits.dtype,
+                        ),
+                    ).sum()
+                    / total_elements
+                )
+                normalized_q_loss_total = normalized_q_loss_total + normalized_q_loss_chunk.detach()
+                chunk_loss = chunk_loss + (float(normalized_q_value_weight) * normalized_q_loss_chunk)
+            if next_state_flow_matching_weight > 0.0:
+                if next_state_flow_pred is None:
+                    raise RuntimeError(
+                        "next_state_flow_head was enabled, but replay outputs omitted next_state_flow"
+                    )
+                flow_mask_chunk = obs_mask[start:end].to(
+                    device=flow_matching_dx_chunk.device,
+                    dtype=flow_matching_dx_chunk.dtype,
+                ).unsqueeze(0)
+                flow_loss_chunk = (
+                    ((next_state_flow_pred.to(dtype=flow_matching_dx_chunk.dtype) - flow_matching_dx_chunk).square() * flow_mask_chunk).sum()
+                    / flow_total_elements
+                )
+                next_state_flow_loss_total = next_state_flow_loss_total + flow_loss_chunk.detach()
+                chunk_loss = chunk_loss + (float(next_state_flow_matching_weight) * flow_loss_chunk)
             if callable(loss_sink):
                 loss_sink(chunk_loss)
             else:
@@ -17108,6 +17292,16 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
         stats["reinforce_sequence_replay_full_length"] = int(full_length)
         stats["reinforce_sequence_replay_eval_steps"] = int(sampled_action.shape[0])
+        stats["normalized_q_value_weight"] = float(normalized_q_value_weight)
+        stats["next_state_flow_matching_weight"] = float(next_state_flow_matching_weight)
+        if normalized_q_targets is not None:
+            stats["normalized_q_value_loss"] = normalized_q_loss_total.detach()
+            stats["normalized_q_target_mean"] = normalized_q_targets.mean().detach()
+            stats["normalized_q_target_std"] = normalized_q_targets.std(unbiased=False).detach()
+            stats["normalized_q_value_head_applied"] = 1
+        if next_state_flow_matching_weight > 0.0:
+            stats["next_state_flow_matching_loss"] = next_state_flow_loss_total.detach()
+            stats["next_state_flow_matching_head_applied"] = 1
         if replay_decomp_count > 0.0:
             stats["reinforce_action_dim_mean"] = torch.as_tensor(
                 replay_decomp_accum["reinforce_action_dim_mean"] / replay_decomp_count,
@@ -17132,11 +17326,16 @@ class EnvironmentPrior:
             for key, value in replay_decomp_min.items():
                 stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
             for key, value in replay_decomp_max.items():
-                stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
+                    stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
         if callable(loss_sink):
             loss_total = -(
                 advantages * full_log_probs
             ).mean().detach()
+            if normalized_q_targets is not None:
+                loss_total = loss_total + (float(normalized_q_value_weight) * normalized_q_loss_total.detach())
+            if next_state_flow_matching_weight > 0.0:
+                loss_total = loss_total + (float(next_state_flow_matching_weight) * next_state_flow_loss_total.detach())
+        stats["policy_total_loss"] = loss_total.detach()
         return loss_total, stats, full_log_probs
 
     def policy_gradient_loss_signature(
@@ -17170,8 +17369,10 @@ class EnvironmentPrior:
         reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
         reinforce_adv_norm_eps = self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6))
         reinforce_adv_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
+        normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
+        next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
         objective_kind = str(objective_kind).strip().lower()
-        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce"}:
+        if objective_kind not in {"policy_gradient", "first_policy_gradient", "reinforce", "anil"}:
             objective_kind = "policy_gradient"
 
         return (
@@ -17189,6 +17390,8 @@ class EnvironmentPrior:
             f"|anorm={int(reinforce_adv_normalized)}"
             f"|aneps={_fmt_float(reinforce_adv_norm_eps)}"
             f"|anclip={_fmt_float(reinforce_adv_norm_clip)}"
+            f"|qaux={_fmt_float(normalized_q_value_weight)}"
+            f"|fmaux={_fmt_float(next_state_flow_matching_weight)}"
         )
 
     def policy_gradient_loss_from_rewards(
@@ -19419,9 +19622,18 @@ class EnvironmentPrior:
         markov_adjacent_replay_enabled = bool(request["markov_adjacent_replay_enabled"])
         markov_adjacent_replay_sample_prob = float(request["markov_adjacent_replay_sample_prob"])
         one_hop_tbptt_active = bool(request["one_hop_tbptt_active"])
+        normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
+        next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
+        auxiliary_replay_heads_enabled = bool(
+            (normalized_q_value_weight > 0.0) or (next_state_flow_matching_weight > 0.0)
+        )
         reinforce_sequence_replay_enabled = bool(
             reinforce_enabled and self._resolve_reinforce_sequence_replay_enabled(self.config)
         )
+        if auxiliary_replay_heads_enabled and not reinforce_sequence_replay_enabled:
+            raise RuntimeError(
+                "normalized_q_value_weight/next_state_flow_matching_weight currently require reinforce_sequence_replay_enabled=True"
+            )
         if reinforce_sequence_replay_enabled:
             if tbptt_window_active:
                 raise RuntimeError("reinforce sequence replay is currently implemented only for no-TBPTT rollouts")
@@ -19430,6 +19642,12 @@ class EnvironmentPrior:
                 raise RuntimeError(
                     "reinforce sequence replay was enabled, but policy_step_fn does not expose an official sequence replay helper"
                 )
+            if auxiliary_replay_heads_enabled:
+                replay_outputs_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_outputs_fn", None)
+                if not callable(replay_outputs_fn):
+                    raise RuntimeError(
+                        "replay auxiliary heads were enabled, but policy_step_fn does not expose replay_policy_sequence_outputs"
+                    )
             device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
             if device_obj.type != "cuda":
                 raise RuntimeError("reinforce sequence replay currently requires CUDA")

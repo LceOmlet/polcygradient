@@ -203,6 +203,36 @@ def test_rlpfn_parser_accepts_alpha_grad_objective():
     assert args.optimizer.rl_objective == "alpha_grad"
 
 
+def test_rlpfn_parser_accepts_anil_objective_and_inner_hparams():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "anil",
+            "--anil-inner-steps", "3",
+            "--anil-inner-learning-rate", "0.05",
+        ]
+    )
+    assert args.optimizer.rl_objective == "anil"
+    assert args.optimizer.anil_inner_steps == 3
+    assert args.optimizer.anil_inner_learning_rate == 0.05
+
+
+def test_rlpfn_parser_accepts_replay_aux_head_weights():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--normalized-q-value-weight", "0.2",
+            "--next-state-flow-matching-weight", "0.5",
+            "--next-state-flow-head-type", "cfmi_resnet",
+        ]
+    )
+    assert args.prior.environment.normalized_q_value_weight == 0.2
+    assert args.prior.environment.next_state_flow_matching_weight == 0.5
+    assert args.prior.environment.next_state_flow_head_type == "cfmi_resnet"
+
+
 def test_rlpfn_parser_accepts_rl_validate_max_parallel_columns():
     parser = make_model_level_argparser()
     args = parser.parse_args(
@@ -308,6 +338,9 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
+    assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "cfmi_resnet"
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
