@@ -1469,11 +1469,11 @@ class EnvironmentPrior:
         cfg.setdefault("terminal_reset_count_target", 0)
         cfg.setdefault("terminal_bonus_tanh_c", 10.0)
         cfg.setdefault("terminal_bonus_scale_min", 1.0)
-        cfg.setdefault("terminal_bonus_scale_max", 10.0)
+        cfg.setdefault("terminal_bonus_scale_max", 5.0)
         cfg.setdefault("reinforce_reward_transform", "none")
         cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
-        cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 10.0})
+        cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 5.0})
         cfg.setdefault("reinforce_action_transform", "none")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
@@ -10135,7 +10135,7 @@ class EnvironmentPrior:
             terminal_bonus_scale_min = torch.full((batch_size,), float(terminal_bonus_scale_min), device=device, dtype=torch.float32)
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 10.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full((batch_size,), float(terminal_bonus_scale_max), device=device, dtype=torch.float32)
         else:
@@ -10256,7 +10256,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
             )
 
             if not callable(transition_generator):
@@ -11365,7 +11365,7 @@ class EnvironmentPrior:
             )
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 10.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full(
                 (batch_size,),
@@ -11905,7 +11905,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
             )
             if profile_rollout_timing and dropout_timed and dropout_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
@@ -15183,7 +15183,7 @@ class EnvironmentPrior:
         )
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         terminal_bonus_scale_min = env.get("terminal_bonus_scale_min", 1.0)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 10.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
         terminal_reset_draws = None
         terminal_bonus_scale_draws = None
         terminal_reset_states = None
@@ -15617,7 +15617,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
             )
 
             if not callable(transition_generator):
@@ -16049,7 +16049,7 @@ class EnvironmentPrior:
             terminal_bonus_scale_min = torch.full((batch_size,), float(terminal_bonus_scale_min), device=device, dtype=torch.float32)
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 10.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full((batch_size,), float(terminal_bonus_scale_max), device=device, dtype=torch.float32)
         else:
@@ -16184,7 +16184,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 10.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
             )
 
             if not callable(transition_generator):

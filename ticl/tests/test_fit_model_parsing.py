@@ -354,7 +354,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 0.0,
-        "max": 10.0,
+        "max": 5.0,
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6

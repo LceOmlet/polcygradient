@@ -41,7 +41,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 0.0,
-        "max": 10.0,
+        "max": 5.0,
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
@@ -75,7 +75,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     }
     assert cfg["prior"]["environment"]["terminal_bonus_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["terminal_bonus_scale_min"] == 1.0
-    assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 10.0
+    assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 5.0
     assert cfg["optimizer"]["policy_rollout_chunk_size"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
     assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is False

@@ -129,9 +129,9 @@ def resolve_reinforce_reward_tanh_c(h):
 
 
 def resolve_reinforce_reward_tanh_bound(h):
-    v = resolve_scalar(h.get("reinforce_reward_tanh_bound", 10.0))
+    v = resolve_scalar(h.get("reinforce_reward_tanh_bound", 5.0))
     if (not math.isfinite(v)) or v <= 0.0:
-        return 10.0
+        return 5.0
     return float(v)
 
 
@@ -175,9 +175,9 @@ def resolve_terminal_bonus_scale_min(h):
 
 
 def resolve_terminal_bonus_scale_max(h):
-    v = resolve_scalar(h.get("terminal_bonus_scale_max", 10.0))
+    v = resolve_scalar(h.get("terminal_bonus_scale_max", 5.0))
     if not math.isfinite(v):
-        return 10.0
+        return 5.0
     return float(v)
 
 
