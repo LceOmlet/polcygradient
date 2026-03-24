@@ -223,11 +223,13 @@ def test_rlpfn_parser_accepts_replay_aux_head_weights():
     args = parser.parse_args(
         [
             "rlpfn",
+            "--policy-gradient-weight", "0.1",
             "--normalized-q-value-weight", "0.2",
             "--next-state-flow-matching-weight", "0.5",
             "--next-state-flow-head-type", "cfmi_resnet",
         ]
     )
+    assert args.prior.environment.policy_gradient_weight == 0.1
     assert args.prior.environment.normalized_q_value_weight == 0.2
     assert args.prior.environment.next_state_flow_matching_weight == 0.5
     assert args.prior.environment.next_state_flow_head_type == "cfmi_resnet"
@@ -338,6 +340,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.1
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "cfmi_resnet"

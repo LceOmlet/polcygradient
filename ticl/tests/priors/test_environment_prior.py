@@ -1751,6 +1751,45 @@ def test_environment_prior_reinforce_advantage_normalization_is_loss_only():
         float(norm_stats["normalized_clip_hit_share"])
     )
 
+
+def test_environment_prior_policy_gradient_weight_scales_reinforce_loss():
+    prior = EnvironmentPrior(
+        {
+            "discount": 1.0,
+            "policy_gradient_weight": 0.1,
+        }
+    )
+    rewards = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+        ],
+        dtype=torch.float32,
+    )
+    log_probs = torch.tensor(
+        [
+            [0.5, -0.25],
+            [0.1, 0.2],
+        ],
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+
+    loss, stats = prior.reinforce_loss_from_rewards(
+        rewards=rewards,
+        log_probs=log_probs,
+        discount=1.0,
+    )
+
+    returns = prior._returns_to_go(rewards, discount=1.0)
+    advantages_raw = returns - prior._leave_one_out_baseline(returns)
+    expected_loss = -0.1 * (advantages_raw.detach() * log_probs).mean()
+
+    assert torch.allclose(loss, expected_loss)
+    assert torch.allclose(stats["reinforce_loss"], expected_loss.detach())
+    assert torch.allclose(stats["policy_total_loss"], expected_loss.detach())
+    assert float(stats["policy_gradient_weight"]) == 0.1
+
     loss.backward()
     assert log_probs.grad is not None
     assert torch.isfinite(log_probs.grad).all()

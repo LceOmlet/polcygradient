@@ -4407,6 +4407,13 @@ class EnvironmentPrior:
         return float(max(0.0, v))
 
     @staticmethod
+    def _resolve_policy_gradient_weight(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("policy_gradient_weight", 1.0))
+        if not math.isfinite(v):
+            return 1.0
+        return float(max(0.0, v))
+
+    @staticmethod
     def _resolve_next_state_flow_matching_weight(h):
         v = EnvironmentPrior._resolve_scalar(h.get("next_state_flow_matching_weight", 0.0))
         if not math.isfinite(v):
@@ -16988,7 +16995,9 @@ class EnvironmentPrior:
         baseline_mode = reinforce_terms["baseline_mode"]
         advantages_raw = reinforce_terms["advantages_raw"]
         advantages = reinforce_terms["advantages"]
-        loss = -(advantages.detach() * log_probs).mean()
+        policy_gradient_weight = self._resolve_policy_gradient_weight(self.config)
+        reinforce_loss = -(advantages.detach() * log_probs).mean()
+        loss = float(policy_gradient_weight) * reinforce_loss
 
         def _share(mask):
             return mask.to(dtype=torch.float32).mean().detach()
@@ -16997,6 +17006,7 @@ class EnvironmentPrior:
             "objective": returns[0].mean().detach(),
             "reinforce_loss": loss.detach(),
             "policy_total_loss": loss.detach(),
+            "policy_gradient_weight": float(policy_gradient_weight),
             "reward_mean": rewards.mean().detach(),
             "reward_std": rewards.std(unbiased=False).detach(),
             "reward_min": rewards.min().detach(),
@@ -17094,6 +17104,7 @@ class EnvironmentPrior:
         baseline_mode = reinforce_terms["baseline_mode"]
         returns = reinforce_terms["returns"]
         advantages = reinforce_terms["advantages"].detach()
+        policy_gradient_weight = self._resolve_policy_gradient_weight(self.config)
         normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
         next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
         use_aux_outputs = bool(
@@ -17233,9 +17244,10 @@ class EnvironmentPrior:
             for key in replay_decomp_max:
                 replay_decomp_max[key] = max(replay_decomp_max[key], float(decomp_stats_chunk[key].detach().cpu()))
             full_log_probs[:, start:end] = log_probs_chunk.detach()
-            chunk_loss = -(
+            reinforce_loss_chunk = -(
                 advantages[:, start:end] * log_probs_chunk
             ).sum() / total_elements
+            chunk_loss = float(policy_gradient_weight) * reinforce_loss_chunk
             if normalized_q_value_weight > 0.0:
                 if normalized_q_logits is None:
                     raise RuntimeError(
@@ -17292,6 +17304,7 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
         stats["reinforce_sequence_replay_full_length"] = int(full_length)
         stats["reinforce_sequence_replay_eval_steps"] = int(sampled_action.shape[0])
+        stats["policy_gradient_weight"] = float(policy_gradient_weight)
         stats["normalized_q_value_weight"] = float(normalized_q_value_weight)
         stats["next_state_flow_matching_weight"] = float(next_state_flow_matching_weight)
         if normalized_q_targets is not None:
@@ -17328,9 +17341,7 @@ class EnvironmentPrior:
             for key, value in replay_decomp_max.items():
                     stats[key] = torch.as_tensor(value, device=rewards_eval.device, dtype=torch.float32)
         if callable(loss_sink):
-            loss_total = -(
-                advantages * full_log_probs
-            ).mean().detach()
+            loss_total = stats["reinforce_loss"].detach()
             if normalized_q_targets is not None:
                 loss_total = loss_total + (float(normalized_q_value_weight) * normalized_q_loss_total.detach())
             if next_state_flow_matching_weight > 0.0:
@@ -17369,6 +17380,7 @@ class EnvironmentPrior:
         reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
         reinforce_adv_norm_eps = self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6))
         reinforce_adv_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
+        policy_gradient_weight = self._resolve_policy_gradient_weight(self.config)
         normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
         next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
         objective_kind = str(objective_kind).strip().lower()
@@ -17390,6 +17402,7 @@ class EnvironmentPrior:
             f"|anorm={int(reinforce_adv_normalized)}"
             f"|aneps={_fmt_float(reinforce_adv_norm_eps)}"
             f"|anclip={_fmt_float(reinforce_adv_norm_clip)}"
+            f"|pgw={_fmt_float(policy_gradient_weight)}"
             f"|qaux={_fmt_float(normalized_q_value_weight)}"
             f"|fmaux={_fmt_float(next_state_flow_matching_weight)}"
         )

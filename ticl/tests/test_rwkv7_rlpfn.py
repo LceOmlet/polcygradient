@@ -907,6 +907,7 @@ def test_transformer_rejects_rwkv_two_layer_flow_head():
 def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
     _seed_everything(999)
     _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
     env_cfg["normalized_q_value_weight"] = 0.25
     env_cfg["next_state_flow_matching_weight"] = 0.5
     env_cfg["obs_slot_dim"] = 8
@@ -998,6 +999,7 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
     assert int(stats["normalized_q_value_head_applied"]) == 1
     assert int(stats["next_state_flow_matching_head_applied"]) == 1
     assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
+    assert float(stats["policy_gradient_weight"]) == 0.1
 
 
 def test_rwkv7_reinforce_sequence_replay_requires_cuda():

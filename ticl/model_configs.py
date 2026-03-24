@@ -259,6 +259,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reinforce_normalize_advantages": False,
         "reinforce_advantage_norm_eps": 1e-6,
         "reinforce_advantage_norm_clip": 10.0,
+        "policy_gradient_weight": 0.1,
         "normalized_q_value_weight": 1.0,
         "next_state_flow_matching_weight": 1.0,
         "next_state_flow_head_type": "cfmi_resnet",

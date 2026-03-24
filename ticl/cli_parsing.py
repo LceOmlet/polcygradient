@@ -408,6 +408,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='If true, optimize normalized rewards; if false, optimize raw discounted reward mean.')
     environment_prior.add_argument('--reward-norm-eps', type=float, help='Epsilon for reward normalization.')
     environment_prior.add_argument('--reward-norm-clip', type=float, help='Clip bound for normalized rewards.')
+    environment_prior.add_argument('--policy-gradient-weight', type=float,
+                                   help='Main REINFORCE/policy-gradient loss weight before auxiliary losses are added.')
     environment_prior.add_argument('--normalized-q-value-weight', type=float,
                                    help='Auxiliary loss weight for normalized Q-value prediction from replay query hidden states.')
     environment_prior.add_argument('--next-state-flow-matching-weight', type=float,
