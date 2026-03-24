@@ -951,7 +951,7 @@ class RWKV7PFN(nn.Module):
         rwkv_sequence_replay_token_budget=None,
         normalized_q_value_head_enabled=False,
         next_state_flow_dim=None,
-        next_state_flow_head_type="cfmi_resnet",
+        next_state_flow_head_type="rwkv_two_layer",
     ):
         del dropout, pre_norm, activation, recompute_attn, all_layers_same_init, y_encoder
         super().__init__()

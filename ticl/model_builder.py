@@ -249,7 +249,11 @@ def get_model(
         if float(env_cfg.get('next_state_flow_matching_weight', 0.0) or 0.0) > 0.0
         else None
     )
-    next_state_flow_head_type = str(env_cfg.get('next_state_flow_head_type', 'cfmi_resnet') or 'cfmi_resnet').strip().lower()
+    default_next_state_flow_head_type = 'rwkv_two_layer' if backbone_kind == 'rwkv7' else 'cfmi_resnet'
+    next_state_flow_head_type = str(
+        env_cfg.get('next_state_flow_head_type', default_next_state_flow_head_type)
+        or default_next_state_flow_head_type
+    ).strip().lower()
 
     if model_type == "mothernet":
         model = MotherNet(

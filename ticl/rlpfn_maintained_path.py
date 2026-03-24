@@ -24,7 +24,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "policy_gradient_weight": 0.1,
     "normalized_q_value_weight": 1.0,
     "next_state_flow_matching_weight": 1.0,
-    "next_state_flow_head_type": "cfmi_resnet",
+    "next_state_flow_head_type": "rwkv_two_layer",
     "reinforce_sequence_replay_enabled": True,
     "first_policy_gradient_state_grad_clip_norm": 4.0,
     "first_policy_gradient_action_grad_clip_value": 0.0,
