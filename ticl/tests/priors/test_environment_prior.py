@@ -272,6 +272,8 @@ def test_environment_prior_tbptt_policy_gradient_stats_include_reward_range():
     env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
     env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
     env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.0
     prior = EnvironmentPrior(env_cfg)
 
     class TinyPolicy(nn.Module):
@@ -2217,6 +2219,8 @@ def test_environment_prior_first_policy_gradient_shares_reinforce_rollout_reward
     env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
     env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
     env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.0
     prior = EnvironmentPrior(env_cfg)
 
     class TinyPolicy(nn.Module):
@@ -2288,6 +2292,8 @@ def test_environment_prior_alpha_grad_shares_reinforce_rollout_rewards_and_trace
     env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
     env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
     env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.0
     prior = EnvironmentPrior(env_cfg)
 
     class TinyPolicy(nn.Module):
@@ -3473,6 +3479,69 @@ def test_environment_prior_compose_exact_scm_reward_adds_aux_after_tanh_transfor
         atol=1e-6,
     )
     assert not torch.allclose(reward, reward_inside_tanh, atol=1e-6)
+
+
+def test_environment_prior_rollout_policy_gradient_loss_reports_exact_scm_reward_components():
+    _seed_everything(3458)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_vectorized_grouping"] = "family"
+    env_cfg["batch_vectorized_strict_rng_match"] = False
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.0
+    prior = EnvironmentPrior(env_cfg)
+
+    class TinyPolicy(nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.net = nn.Linear(4 + 3 + 1, 3)
+
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            del cache, step_idx, env_info
+            return self.net(torch.cat([obs_t[:, :4], action_t[:, :3], reward_t], dim=-1))
+
+    policy = TinyPolicy()
+    h_list = prior._sample_batch_hypers(4)
+    for h in h_list:
+        h["reward_dropout_enabled"] = False
+        h["reward_dropout_randomize"] = False
+        h["reward_dropout_ratio"] = 0.0
+        h["terminal_reset_enabled"] = False
+        h["terminal_reset_count_target"] = 0.0
+        h["ctrl_reward_weight"] = 0.1
+        h["ctrl_reward_enable_prob"] = 1.0
+        h["_ctrl_reward_enable_u"] = 0.0
+        h["survival_reward_weight"] = 0.0
+        h["survival_reward_enable_prob"] = 0.0
+        h["_survival_reward_enable_u"] = 1.0
+
+    loss, _, stats = prior.rollout_policy_gradient_loss(
+        policy_step_fn=policy.step,
+        batch_size=4,
+        n_samples=6,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=2,
+        collect_x=False,
+        policy_objective_kind="first_policy_gradient",
+        h_list_override=h_list,
+    )
+
+    assert torch.isfinite(loss)
+    assert "reward_env_mean" in stats
+    assert "reward_env_std" in stats
+    assert "reward_ctrl_mean" in stats
+    assert "reward_ctrl_std" in stats
+    assert float(stats["reward_ctrl_mean"]) <= 0.0
+    total_from_parts = float(stats["reward_env_mean"]) + float(stats["reward_ctrl_mean"])
+    assert float(stats["reward_mean"]) == pytest.approx(total_from_parts, abs=1e-5)
 
 
 def _reference_scm_apply_weight_init(

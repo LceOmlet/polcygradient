@@ -102,6 +102,12 @@ def _new_rollout_profile_accumulator(*, n_samples, batch_size):
         "fixed_gp_count": 0,
         "legacy_scm_count": 0,
         "legacy_gp_count": 0,
+        "reward_env_mean": 0.0,
+        "reward_env_std": 0.0,
+        "reward_ctrl_mean": 0.0,
+        "reward_ctrl_std": 0.0,
+        "reward_survival_mean": 0.0,
+        "reward_survival_std": 0.0,
     }
 
 
@@ -694,6 +700,19 @@ def dispatch_policy_rollout(prior, ctx):
                     "legacy_gp_count",
                 ):
                     rollout_profile_acc[key] += int(group_profile.get(key, 0) or 0)
+                batch_weight = float(len(group_indices)) / float(max(1, batch_size))
+                for key in (
+                    "reward_env_mean",
+                    "reward_env_std",
+                    "reward_ctrl_mean",
+                    "reward_ctrl_std",
+                    "reward_survival_mean",
+                    "reward_survival_std",
+                ):
+                    value = group_profile.get(key, None)
+                    if value is None:
+                        continue
+                    rollout_profile_acc[key] += batch_weight * float(value)
         if rollout_profile_acc is not None:
             rollout_profile_acc["transition_bucket_mean_batch"] = float(
                 batch_size / max(1, int(rollout_profile_acc.get("transition_group_count", 0) or 0))

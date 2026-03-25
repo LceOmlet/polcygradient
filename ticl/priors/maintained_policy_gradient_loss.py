@@ -224,6 +224,17 @@ def attach_common_rollout_diagnostics(rollout, stats):
         stats["rollout_transition_async_commit_in_stream"] = int(
             rollout_profile.get("transition_async_commit_in_stream", 0) or 0
         )
+        for key in (
+            "reward_env_mean",
+            "reward_env_std",
+            "reward_ctrl_mean",
+            "reward_ctrl_std",
+            "reward_survival_mean",
+            "reward_survival_std",
+        ):
+            value = rollout_profile.get(key, None)
+            if value is not None:
+                stats[key] = value
         stats["rollout_noise_mode"] = rollout_profile.get("noise_mode", None)
         stats["rollout_noise_block_size"] = int(rollout_profile.get("noise_block_size", 0) or 0)
         stats["rollout_env_count"] = int(rollout_profile.get("env_count", 0) or 0)

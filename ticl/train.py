@@ -2025,6 +2025,8 @@ def train_epoch_policy_gradient(
     pg_epoch_objective_values = []
     pg_epoch_reward_mean_values = []
     pg_epoch_reward_std_values = []
+    pg_epoch_reward_env_mean_values = []
+    pg_epoch_reward_ctrl_mean_values = []
     pg_epoch_reward_absmax_values = []
     pg_epoch_clip_hit_values = []
     pg_epoch_norm_clip_hit_values = []
@@ -2553,6 +2555,8 @@ def train_epoch_policy_gradient(
                     batch_objective = torch.tensor(0.0, device=device)
                     batch_reward_mean = torch.tensor(0.0, device=device)
                     batch_reward_std = torch.tensor(0.0, device=device)
+                    batch_reward_env_mean_value = None
+                    batch_reward_ctrl_mean_value = None
                     batch_policy_total_loss_value = None
                     batch_reinforce_loss_value = None
                     batch_normalized_q_value_loss_value = None
@@ -3395,6 +3399,26 @@ def train_epoch_policy_gradient(
                         batch_objective += pg_stats_chunk["objective"].detach() * chunk_weight
                         batch_reward_mean += pg_stats_chunk["reward_mean"].detach() * chunk_weight
                         batch_reward_std += pg_stats_chunk["reward_std"].detach() * chunk_weight
+                        chunk_reward_env_mean = pg_stats_chunk.get("reward_env_mean", None)
+                        if chunk_reward_env_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reward_env_mean).detach().cpu()) * chunk_weight
+                                if batch_reward_env_mean_value is None:
+                                    batch_reward_env_mean_value = contrib
+                                else:
+                                    batch_reward_env_mean_value += contrib
+                            except Exception:
+                                pass
+                        chunk_reward_ctrl_mean = pg_stats_chunk.get("reward_ctrl_mean", None)
+                        if chunk_reward_ctrl_mean is not None:
+                            try:
+                                contrib = float(torch.as_tensor(chunk_reward_ctrl_mean).detach().cpu()) * chunk_weight
+                                if batch_reward_ctrl_mean_value is None:
+                                    batch_reward_ctrl_mean_value = contrib
+                                else:
+                                    batch_reward_ctrl_mean_value += contrib
+                            except Exception:
+                                pass
                         chunk_policy_total_loss = pg_stats_chunk.get("policy_total_loss", None)
                         if chunk_policy_total_loss is not None:
                             try:
@@ -5873,6 +5897,10 @@ def train_epoch_policy_gradient(
                         pg_epoch_reward_std_values.append(batch_reward_std_value)
                 except Exception:
                     pass
+                if batch_reward_env_mean_value is not None and math.isfinite(float(batch_reward_env_mean_value)):
+                    pg_epoch_reward_env_mean_values.append(float(batch_reward_env_mean_value))
+                if batch_reward_ctrl_mean_value is not None and math.isfinite(float(batch_reward_ctrl_mean_value)):
+                    pg_epoch_reward_ctrl_mean_values.append(float(batch_reward_ctrl_mean_value))
                 if math.isfinite(batch_reward_absmax_value):
                     pg_epoch_reward_absmax_values.append(float(batch_reward_absmax_value))
                 if math.isfinite(batch_reward_clip_hit_share):
@@ -5946,6 +5974,16 @@ def train_epoch_policy_gradient(
                         if batch_next_state_flow_matching_loss_value is None
                         else f"{float(batch_next_state_flow_matching_loss_value):+.3e}"
                     )
+                    reward_env_info = (
+                        "na"
+                        if batch_reward_env_mean_value is None
+                        else f"{float(batch_reward_env_mean_value):+.3e}"
+                    )
+                    reward_ctrl_info = (
+                        "na"
+                        if batch_reward_ctrl_mean_value is None
+                        else f"{float(batch_reward_ctrl_mean_value):+.3e}"
+                    )
                     grad_norm_info = "na" if batch_grad_norm_value is None else f"{float(batch_grad_norm_value):.3e}"
                     grad_norm_post_info = (
                         "na"
@@ -6005,6 +6043,8 @@ def train_epoch_policy_gradient(
                         f"loss_fmaux={loss_fmaux_info} "
                         f"objective={float(batch_objective.detach().cpu()):+.3e} "
                         f"reward_mean={float(batch_reward_mean.detach().cpu()):+.3e} "
+                        f"reward_env_mean={reward_env_info} "
+                        f"reward_ctrl_mean={reward_ctrl_info} "
                         f"reward_std={float(batch_reward_std.detach().cpu()):.3e} "
                         f"reward_min={reward_min_info} reward_max={reward_max_info} "
                         f"reward_absmax={reward_absmax_info} "
@@ -6080,6 +6120,8 @@ def train_epoch_policy_gradient(
     objective_mean, objective_std = _mean_std(pg_epoch_objective_values)
     reward_mean_mean, reward_mean_std = _mean_std(pg_epoch_reward_mean_values)
     reward_std_mean, reward_std_std = _mean_std(pg_epoch_reward_std_values)
+    reward_env_mean_mean, reward_env_mean_std = _mean_std(pg_epoch_reward_env_mean_values)
+    reward_ctrl_mean_mean, reward_ctrl_mean_std = _mean_std(pg_epoch_reward_ctrl_mean_values)
     reward_absmax_mean, reward_absmax_std = _mean_std(pg_epoch_reward_absmax_values)
     grad_norm_mean, grad_norm_std = _mean_std(pg_epoch_grad_norm_values)
     grad_abs_mean_mean, grad_abs_mean_std = _mean_std(pg_epoch_grad_abs_mean_values)
@@ -6143,6 +6185,10 @@ def train_epoch_policy_gradient(
         "reward_mean_std": reward_mean_std,
         "reward_std_mean": reward_std_mean,
         "reward_std_std": reward_std_std,
+        "reward_env_mean_mean": reward_env_mean_mean,
+        "reward_env_mean_std": reward_env_mean_std,
+        "reward_ctrl_mean_mean": reward_ctrl_mean_mean,
+        "reward_ctrl_mean_std": reward_ctrl_mean_std,
         "reward_absmax_mean": reward_absmax_mean,
         "reward_absmax_std": reward_absmax_std,
         "clip_hit_mean": clip_hit_mean,
@@ -6181,6 +6227,8 @@ def train_epoch_policy_gradient(
             f"obj_mean={target_model.last_pg_epoch_metrics['objective_mean']:+.3e} "
             f"obj_std={target_model.last_pg_epoch_metrics['objective_std']:.3e} "
             f"obj_snr={target_model.last_pg_epoch_metrics['objective_snr']:.3e} "
+            f"reward_env={target_model.last_pg_epoch_metrics['reward_env_mean_mean'] if target_model.last_pg_epoch_metrics['reward_env_mean_mean'] is not None else 'na'} "
+            f"reward_ctrl={target_model.last_pg_epoch_metrics['reward_ctrl_mean_mean'] if target_model.last_pg_epoch_metrics['reward_ctrl_mean_mean'] is not None else 'na'} "
             f"loss_total={target_model.last_pg_epoch_metrics['policy_total_loss_mean'] if target_model.last_pg_epoch_metrics['policy_total_loss_mean'] is not None else 'na'} "
             f"loss_reinf={target_model.last_pg_epoch_metrics['reinforce_loss_mean'] if target_model.last_pg_epoch_metrics['reinforce_loss_mean'] is not None else 'na'} "
             f"loss_qaux={target_model.last_pg_epoch_metrics['normalized_q_value_loss_mean'] if target_model.last_pg_epoch_metrics['normalized_q_value_loss_mean'] is not None else 'na'} "

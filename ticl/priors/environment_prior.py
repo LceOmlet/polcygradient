@@ -5008,7 +5008,7 @@ class EnvironmentPrior:
         return action_next
 
     @staticmethod
-    def _exact_scm_aux_reward_terms(
+    def _exact_scm_aux_reward_components(
         action,
         *,
         action_mask=None,
@@ -5052,13 +5052,32 @@ class EnvironmentPrior:
             survival_weight_t.expand_as(ctrl_mean_sq),
             torch.zeros_like(ctrl_mean_sq),
         )
+        return ctrl_reward, survival_reward
+
+    @staticmethod
+    def _exact_scm_aux_reward_terms(
+        action,
+        *,
+        action_mask=None,
+        ctrl_weight=0.0,
+        ctrl_enabled=False,
+        survival_weight=0.0,
+        survival_enabled=False,
+    ):
+        ctrl_reward, survival_reward = EnvironmentPrior._exact_scm_aux_reward_components(
+            action,
+            action_mask=action_mask,
+            ctrl_weight=ctrl_weight,
+            ctrl_enabled=ctrl_enabled,
+            survival_weight=survival_weight,
+            survival_enabled=survival_enabled,
+        )
         return ctrl_reward + survival_reward
 
-    def _compose_exact_scm_reward(
+    def _transform_exact_scm_base_reward(
         self,
         reward_raw,
         *,
-        aux_reward=0.0,
         reward_clip=10.0,
         mode="none",
         rms_eps=1e-6,
@@ -5071,6 +5090,68 @@ class EnvironmentPrior:
         reward_base = torch.maximum(torch.minimum(reward_raw, reward_clip_t), -reward_clip_t)
         reward_base = self._transform_rollout_reward(
             reward_base,
+            mode=mode,
+            rms_eps=rms_eps,
+            tanh_c=tanh_c,
+            tanh_bound=tanh_bound,
+        )
+        return reward_base
+
+    @staticmethod
+    def _accumulate_reward_component_profile_stats(stats_accum, name, values):
+        if stats_accum is None or values is None:
+            return
+        det = values.detach().to(dtype=torch.float64)
+        entry = stats_accum.setdefault(
+            str(name),
+            {
+                "sum": None,
+                "sumsq": None,
+                "count": 0,
+            },
+        )
+        value_sum = det.sum()
+        value_sumsq = (det * det).sum()
+        entry["sum"] = value_sum if entry["sum"] is None else (entry["sum"] + value_sum)
+        entry["sumsq"] = value_sumsq if entry["sumsq"] is None else (entry["sumsq"] + value_sumsq)
+        entry["count"] += int(det.numel())
+
+    @staticmethod
+    def _finalize_reward_component_profile_stats(stats_accum, *, device):
+        out = {}
+        device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
+        zero = torch.zeros((), device=device_obj, dtype=torch.float32)
+        for name, entry in (stats_accum or {}).items():
+            count = int(entry.get("count", 0) or 0)
+            if count <= 0 or entry.get("sum", None) is None or entry.get("sumsq", None) is None:
+                mean_t = zero
+                std_t = zero
+            else:
+                sum_t = entry["sum"]
+                sumsq_t = entry["sumsq"]
+                mean64 = sum_t / float(count)
+                var64 = (sumsq_t / float(count)) - (mean64 * mean64)
+                std64 = torch.sqrt(torch.clamp(var64, min=0.0))
+                mean_t = mean64.to(device=device_obj, dtype=torch.float32)
+                std_t = std64.to(device=device_obj, dtype=torch.float32)
+            out[f"reward_{name}_mean"] = mean_t.detach()
+            out[f"reward_{name}_std"] = std_t.detach()
+        return out
+
+    def _compose_exact_scm_reward(
+        self,
+        reward_raw,
+        *,
+        aux_reward=0.0,
+        reward_clip=10.0,
+        mode="none",
+        rms_eps=1e-6,
+        tanh_c=1.0,
+        tanh_bound=2.0,
+    ):
+        reward_base = self._transform_exact_scm_base_reward(
+            reward_raw,
+            reward_clip=reward_clip,
             mode=mode,
             rms_eps=rms_eps,
             tanh_c=tanh_c,
@@ -10347,6 +10428,9 @@ class EnvironmentPrior:
             if terminal_token_enabled
             else None
         )
+        reward_component_profile_accum = {}
+        reward_component_profile_accum = {}
+        reward_component_profile_accum = {}
 
         env_total_dim = int(env_layout["total_dim"])
         env_in = torch.zeros((batch_size, env_total_dim), device=device, dtype=torch.float32)
@@ -12039,7 +12123,7 @@ class EnvironmentPrior:
                     env_in,
                     generators_for_noise=env_noise_generators,
                 ).reshape(batch_size)
-            aux_reward_next = self._exact_scm_aux_reward_terms(
+            ctrl_reward_next, survival_reward_next = self._exact_scm_aux_reward_components(
                 action_env,
                 action_mask=(
                     (torch.arange(action_dim, device=device, dtype=torch.long).unsqueeze(0)
@@ -12051,6 +12135,15 @@ class EnvironmentPrior:
                 ctrl_enabled=env.get("ctrl_reward_enabled", False),
                 survival_weight=env.get("survival_reward_weight", 0.0),
                 survival_enabled=env.get("survival_reward_enabled", False),
+            )
+            aux_reward_next = ctrl_reward_next + survival_reward_next
+            reward_env_next = self._transform_exact_scm_base_reward(
+                reward_next_raw,
+                reward_clip=env["reward_clip"],
+                mode=env.get("reinforce_reward_transform", "none"),
+                rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
+                tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 2.0),
             )
             reward_next = self._compose_exact_scm_reward(
                 reward_next_raw,
@@ -12074,6 +12167,13 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                reward_env_next = torch.where(impute_mask, torch.zeros_like(reward_env_next), reward_env_next)
+                ctrl_reward_next = torch.where(impute_mask, torch.zeros_like(ctrl_reward_next), ctrl_reward_next)
+                survival_reward_next = torch.where(
+                    impute_mask,
+                    torch.zeros_like(survival_reward_next),
+                    survival_reward_next,
+                )
             elif noise_streaming_mode and dropout_draws_block is not None and noise_block_idx is not None:
                 dropout_timed = True
                 drop_mask = dropout_active & (dropout_draws_block[noise_block_idx] < env["reward_dropout_ratio"])
@@ -12082,6 +12182,13 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                reward_env_next = torch.where(impute_mask, torch.zeros_like(reward_env_next), reward_env_next)
+                ctrl_reward_next = torch.where(impute_mask, torch.zeros_like(ctrl_reward_next), ctrl_reward_next)
+                survival_reward_next = torch.where(
+                    impute_mask,
+                    torch.zeros_like(survival_reward_next),
+                    survival_reward_next,
+                )
             elif dropout_draws is not None:
                 dropout_timed = True
                 drop_mask = dropout_active & (dropout_draws[t] < env["reward_dropout_ratio"])
@@ -12090,6 +12197,13 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & env["reward_dropout_impute_zero"]
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                reward_env_next = torch.where(impute_mask, torch.zeros_like(reward_env_next), reward_env_next)
+                ctrl_reward_next = torch.where(impute_mask, torch.zeros_like(ctrl_reward_next), ctrl_reward_next)
+                survival_reward_next = torch.where(
+                    impute_mask,
+                    torch.zeros_like(survival_reward_next),
+                    survival_reward_next,
+                )
             if profile_rollout_timing and dropout_timed and dropout_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
 
@@ -12200,6 +12314,22 @@ class EnvironmentPrior:
             reward_t = reward_next
             reward_mask_t = reward_mask_next
             terminal_t = terminal_next
+            if t >= int(single_eval_pos):
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "env",
+                    reward_env_next,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "ctrl",
+                    ctrl_reward_next,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "survival",
+                    survival_reward_next,
+                )
 
             if tbptt_window_active:
                 is_window_end = (len(tbptt_reward_buffer) >= tbptt_window_size) or (t == (n_samples - 1))
@@ -12291,6 +12421,12 @@ class EnvironmentPrior:
             "transition_noise_wall_ms": float(transition_noise_wall_s * 1000.0),
         }
         rollout_profile.update(self._summarize_env_semantics(env, batch_size))
+        rollout_profile.update(
+            self._finalize_reward_component_profile_stats(
+                reward_component_profile_accum,
+                device=device,
+            )
+        )
         if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
             torch.cuda.synchronize(device=device_obj)
             policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
@@ -13142,6 +13278,7 @@ class EnvironmentPrior:
             if terminal_token_enabled
             else None
         )
+        reward_component_profile_accum = {}
 
         def _refresh_noise_block(block_start_idx):
             nonlocal noise_block_start, noise_block_end
@@ -14378,6 +14515,8 @@ class EnvironmentPrior:
 
             reward_next_raw = torch.empty((batch_size,), device=device, dtype=torch.float32)
             reward_next_aux = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+            reward_next_ctrl = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+            reward_next_survival = torch.zeros((batch_size,), device=device, dtype=torch.float32)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
             state_next = torch.zeros((batch_size, max_state_dim), device=device, dtype=torch.float32)
             terminal_signal_next = None
@@ -14437,7 +14576,7 @@ class EnvironmentPrior:
                 reward_scale_g = group["reward_scale_view"]
                 alpha_g = group["alpha_view"]
                 transition_generator_g = group.get("transition_generator", None)
-                aux_reward_next_g = self._exact_scm_aux_reward_terms(
+                ctrl_reward_next_g, survival_reward_next_g = self._exact_scm_aux_reward_components(
                     action_in,
                     action_mask=group.get("action_mask_view", None),
                     ctrl_weight=group.get("ctrl_reward_weight_view", 0.0),
@@ -14445,6 +14584,7 @@ class EnvironmentPrior:
                     survival_weight=group.get("survival_reward_weight_view", 0.0),
                     survival_enabled=group.get("survival_reward_enabled_view", False),
                 )
+                aux_reward_next_g = ctrl_reward_next_g + survival_reward_next_g
                 use_fused_transition = bool(group.get("use_fused_transition", False)) and callable(
                     transition_generator_g
                 )
@@ -14550,13 +14690,24 @@ class EnvironmentPrior:
                             if async_group_commit_in_stream:
                                 state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                                 reward_next_raw[group_slice] = reward_next_raw_g
+                                reward_next_ctrl[group_slice] = ctrl_reward_next_g
+                                reward_next_survival[group_slice] = survival_reward_next_g
                                 state_next[group_slice, :state_dim_g] = state_next_g
                         if async_group_commit_in_stream:
                             pending_async_streams.append((stream_transition,))
                         else:
                             pending_async_group_ops[pending_async_group_count] = (
                                 "deferred_commit",
-                                (group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, aux_reward_next_g),
+                                (
+                                    group_slice,
+                                    alpha_g,
+                                    state_dim_g,
+                                    x_next_g,
+                                    reward_next_raw_g,
+                                    aux_reward_next_g,
+                                    ctrl_reward_next_g,
+                                    survival_reward_next_g,
+                                ),
                                 (stream_transition,),
                             )
                             pending_async_group_count += 1
@@ -14593,6 +14744,8 @@ class EnvironmentPrior:
                         if group_slice is None:
                             reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
                             reward_next_aux.index_copy_(0, group_indices, aux_reward_next_g)
+                            reward_next_ctrl.index_copy_(0, group_indices, ctrl_reward_next_g)
+                            reward_next_survival.index_copy_(0, group_indices, survival_reward_next_g)
                             state_next[group_indices, :state_dim_g] = state_next_g
                             if terminal_signal_next_g is not None:
                                 if terminal_signal_next is None:
@@ -14617,6 +14770,8 @@ class EnvironmentPrior:
                         else:
                             reward_next_raw[group_slice] = reward_next_raw_g
                             reward_next_aux[group_slice] = aux_reward_next_g
+                            reward_next_ctrl[group_slice] = ctrl_reward_next_g
+                            reward_next_survival[group_slice] = survival_reward_next_g
                             state_next[group_slice, :state_dim_g] = state_next_g
                             if terminal_signal_next_g is not None:
                                 if terminal_signal_next is None:
@@ -14645,6 +14800,8 @@ class EnvironmentPrior:
                         if async_group_commit_in_stream:
                             reward_next_raw[group_slice] = reward_next_raw_g
                             reward_next_aux[group_slice] = aux_reward_next_g
+                            reward_next_ctrl[group_slice] = ctrl_reward_next_g
+                            reward_next_survival[group_slice] = survival_reward_next_g
                     with torch.cuda.stream(stream_x):
                         x_next_g = env_g["x_generator"](
                             transition_input,
@@ -14659,7 +14816,16 @@ class EnvironmentPrior:
                     else:
                         pending_async_group_ops[pending_async_group_count] = (
                             "deferred_commit",
-                            (group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, aux_reward_next_g),
+                            (
+                                group_slice,
+                                alpha_g,
+                                state_dim_g,
+                                x_next_g,
+                                reward_next_raw_g,
+                                aux_reward_next_g,
+                                ctrl_reward_next_g,
+                                survival_reward_next_g,
+                            ),
                             (stream_y, stream_x),
                         )
                         pending_async_group_count += 1
@@ -14691,10 +14857,14 @@ class EnvironmentPrior:
                     if group_slice is None:
                         reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
                         reward_next_aux.index_copy_(0, group_indices, aux_reward_next_g)
+                        reward_next_ctrl.index_copy_(0, group_indices, ctrl_reward_next_g)
+                        reward_next_survival.index_copy_(0, group_indices, survival_reward_next_g)
                         state_next[group_indices, :state_dim_g] = state_next_g
                     else:
                         reward_next_raw[group_slice] = reward_next_raw_g
                         reward_next_aux[group_slice] = aux_reward_next_g
+                        reward_next_ctrl[group_slice] = ctrl_reward_next_g
+                        reward_next_survival[group_slice] = survival_reward_next_g
                         state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and group_wall_t0 is not None:
                     transition_group_wall_s += (time.perf_counter() - group_wall_t0)
@@ -14723,11 +14893,22 @@ class EnvironmentPrior:
                     op_meta = pending_async_group_ops[op_idx]
                     if op_meta[0] != "deferred_commit":
                         continue
-                    group_slice, alpha_g, state_dim_g, x_next_g, reward_next_raw_g, aux_reward_next_g = op_meta[1]
+                    (
+                        group_slice,
+                        alpha_g,
+                        state_dim_g,
+                        x_next_g,
+                        reward_next_raw_g,
+                        aux_reward_next_g,
+                        ctrl_reward_next_g,
+                        survival_reward_next_g,
+                    ) = op_meta[1]
                     state_in = state_t[group_slice, :state_dim_g]
                     state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
                     reward_next_raw[group_slice] = reward_next_raw_g
                     reward_next_aux[group_slice] = aux_reward_next_g
+                    reward_next_ctrl[group_slice] = ctrl_reward_next_g
+                    reward_next_survival[group_slice] = survival_reward_next_g
                     state_next[group_slice, :state_dim_g] = state_next_g
                 if profile_rollout_timing and state_update_wall_t0 is not None:
                     transition_state_update_wall_s += (time.perf_counter() - state_update_wall_t0)
@@ -14736,6 +14917,14 @@ class EnvironmentPrior:
                     transition_group_sync_wall_s += float(sync_dt)
                     transition_group_wall_s += float(sync_dt)
 
+            reward_env_next = self._transform_exact_scm_base_reward(
+                reward_next_raw,
+                reward_clip=reward_clip,
+                mode=self._resolve_reinforce_reward_transform(self.config),
+                rms_eps=reinforce_reward_rms_eps,
+                tanh_c=reinforce_reward_tanh_c,
+                tanh_bound=reinforce_reward_tanh_bound,
+            )
             reward_next = self._compose_exact_scm_reward(
                 reward_next_raw,
                 aux_reward=reward_next_aux,
@@ -14753,6 +14942,13 @@ class EnvironmentPrior:
                 reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
                 impute_mask = drop_mask & reward_dropout_impute_zero
                 reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+                reward_env_next = torch.where(impute_mask, torch.zeros_like(reward_env_next), reward_env_next)
+                reward_next_ctrl = torch.where(impute_mask, torch.zeros_like(reward_next_ctrl), reward_next_ctrl)
+                reward_next_survival = torch.where(
+                    impute_mask,
+                    torch.zeros_like(reward_next_survival),
+                    reward_next_survival,
+                )
                 if profile_rollout_timing and dropout_timing_t0 is not None:
                     transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
             if state_noise_t is not None:
@@ -14844,6 +15040,22 @@ class EnvironmentPrior:
             reward_t = reward_next
             reward_mask_t = reward_mask_next
             terminal_t = terminal_next
+            if t >= int(single_eval_pos):
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "env",
+                    reward_env_next,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "ctrl",
+                    reward_next_ctrl,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "survival",
+                    reward_next_survival,
+                )
 
             if tbptt_window_active:
                 is_window_end = (len(tbptt_reward_buffer) >= tbptt_window_size) or (t == (n_samples - 1))
@@ -15058,6 +15270,12 @@ class EnvironmentPrior:
             "noise_block_size": int(noise_block_size) if noise_streaming_mode else 0,
         }
         rollout_profile.update(self._summarize_env_semantics(env_meta, batch_size))
+        rollout_profile.update(
+            self._finalize_reward_component_profile_stats(
+                reward_component_profile_accum,
+                device=device,
+            )
+        )
         if profile_rollout_breakdown_cuda and (policy_cuda_pairs or transition_cuda_pairs):
             torch.cuda.synchronize(device=device_obj)
             policy_cuda_ms = float(sum(start.elapsed_time(end) for start, end in policy_cuda_pairs))
