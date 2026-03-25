@@ -201,9 +201,9 @@ def _legacy_resolve_reinforce_reward_tanh_c(h):
 
 
 def _legacy_resolve_reinforce_reward_tanh_bound(h):
-    v = _legacy_resolve_scalar(h.get("reinforce_reward_tanh_bound", 5.0))
+    v = _legacy_resolve_scalar(h.get("reinforce_reward_tanh_bound", 2.0))
     if (not math.isfinite(v)) or v <= 0.0:
-        return 5.0
+        return 2.0
     return float(v)
 
 
@@ -243,9 +243,9 @@ def _legacy_resolve_terminal_bonus_scale_min(h):
 
 
 def _legacy_resolve_terminal_bonus_scale_max(h):
-    v = _legacy_resolve_scalar(h.get("terminal_bonus_scale_max", 5.0))
+    v = _legacy_resolve_scalar(h.get("terminal_bonus_scale_max", 2.0))
     if not math.isfinite(v):
-        return 5.0
+        return 2.0
     return float(v)
 
 
@@ -702,6 +702,10 @@ def _small_exact_scm_env_cfg():
             "reward_dropout_randomize": False,
             "reward_dropout_ratio_min": 0.5,
             "reward_dropout_ratio_max": 0.5,
+            "ctrl_reward_weight": 0.0,
+            "ctrl_reward_enable_prob": 0.0,
+            "survival_reward_weight": 0.0,
+            "survival_reward_enable_prob": 0.0,
             "action_noise_train_std": 0.05,
             "action_noise_eval_std": 0.03,
         }
@@ -1045,6 +1049,18 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
+    assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
+        "distribution": "log_uniform",
+        "min": 1e-3,
+        "max": 3e-1,
+    }
+    assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
+    assert cfg["prior"]["environment"]["survival_reward_weight"] == {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.1,
+    }
+    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.7
     assert cfg["optimizer"]["rl_objective"] == "reinforce"
     assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False

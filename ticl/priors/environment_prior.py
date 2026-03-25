@@ -21,6 +21,8 @@ except Exception:  # pragma: no cover - optional CUDA path
 
 from ticl.distributions import parse_distributions, sample_distributions
 from ticl.priors.maintained_exact_scm import (
+    resolve_ctrl_reward_enable_prob as maintained_resolve_ctrl_reward_enable_prob,
+    resolve_ctrl_reward_weight as maintained_resolve_ctrl_reward_weight,
     env_input_layout as maintained_env_input_layout,
     env_obs_input_dim as maintained_env_obs_input_dim,
     env_uses_reference_semantics as maintained_env_uses_reference_semantics,
@@ -40,6 +42,8 @@ from ticl.priors.maintained_exact_scm import (
     resolve_state_input_scale as maintained_resolve_state_input_scale,
     resolve_state_input_scale_enabled as maintained_resolve_state_input_scale_enabled,
     resolve_strict_joint_transition_enabled as maintained_resolve_strict_joint_transition_enabled,
+    resolve_survival_reward_enable_prob as maintained_resolve_survival_reward_enable_prob,
+    resolve_survival_reward_weight as maintained_resolve_survival_reward_weight,
     resolve_terminal_bonus_scale_max as maintained_resolve_terminal_bonus_scale_max,
     resolve_terminal_bonus_scale_min as maintained_resolve_terminal_bonus_scale_min,
     resolve_terminal_bonus_tanh_c as maintained_resolve_terminal_bonus_tanh_c,
@@ -1465,15 +1469,19 @@ class EnvironmentPrior:
         cfg.setdefault("state_input_scale", 1.0)
         cfg.setdefault("state_full_rms_enabled", False)
         cfg.setdefault("state_full_rms_target", 1.0)
+        cfg.setdefault("ctrl_reward_weight", 0.0)
+        cfg.setdefault("ctrl_reward_enable_prob", 0.0)
+        cfg.setdefault("survival_reward_weight", 0.0)
+        cfg.setdefault("survival_reward_enable_prob", 0.0)
         cfg.setdefault("terminal_reset_enabled", False)
         cfg.setdefault("terminal_reset_count_target", 0)
         cfg.setdefault("terminal_bonus_tanh_c", 10.0)
         cfg.setdefault("terminal_bonus_scale_min", 1.0)
-        cfg.setdefault("terminal_bonus_scale_max", 5.0)
+        cfg.setdefault("terminal_bonus_scale_max", 2.0)
         cfg.setdefault("reinforce_reward_transform", "none")
         cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
-        cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 5.0})
+        cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 2.0})
         cfg.setdefault("reinforce_action_transform", "none")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
@@ -4230,6 +4238,14 @@ class EnvironmentPrior:
             return np.nextafter(1.0, 0.0)
         return value
 
+    def _sample_exact_scm_reward_term_enabled(self, h, *, prob_key, latent_key):
+        prob = float(self._resolve_scalar(h.get(prob_key, 0.0)))
+        if (not math.isfinite(prob)) or prob <= 0.0:
+            return False
+        if prob >= 1.0:
+            return True
+        return bool(self._latent_uniform_from_h(h, latent_key) < prob)
+
     @staticmethod
     def _resolve_constrained_dim_sampling_enabled(h):
         enabled = h.get("constrained_dim_sampling_enabled", False)
@@ -4370,6 +4386,22 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_state_full_rms_target(h):
         return maintained_resolve_state_full_rms_target(h)
+
+    @staticmethod
+    def _resolve_ctrl_reward_weight(h):
+        return maintained_resolve_ctrl_reward_weight(h)
+
+    @staticmethod
+    def _resolve_ctrl_reward_enable_prob(h):
+        return maintained_resolve_ctrl_reward_enable_prob(h)
+
+    @staticmethod
+    def _resolve_survival_reward_weight(h):
+        return maintained_resolve_survival_reward_weight(h)
+
+    @staticmethod
+    def _resolve_survival_reward_enable_prob(h):
+        return maintained_resolve_survival_reward_enable_prob(h)
 
     @staticmethod
     def _resolve_reinforce_reward_transform(h):
@@ -4975,6 +5007,53 @@ class EnvironmentPrior:
             raise ValueError(f"Unknown reinforce action transform: {mode}")
         return action_next
 
+    @staticmethod
+    def _exact_scm_aux_reward_terms(
+        action,
+        *,
+        action_mask=None,
+        ctrl_weight=0.0,
+        ctrl_enabled=False,
+        survival_weight=0.0,
+        survival_enabled=False,
+    ):
+        if not torch.is_tensor(action):
+            action_t = torch.as_tensor(action, dtype=torch.float32)
+        else:
+            action_t = action
+        if action_mask is None:
+            mask_t = torch.ones_like(action_t, dtype=action_t.dtype)
+        else:
+            mask_t = action_mask.to(device=action_t.device, dtype=action_t.dtype)
+            while mask_t.ndim < action_t.ndim:
+                mask_t = mask_t.unsqueeze(0)
+            mask_t = mask_t.expand_as(action_t)
+        ctrl_denom = mask_t.sum(dim=-1).clamp_min(1.0)
+        ctrl_mean_sq = ((action_t * mask_t) ** 2).sum(dim=-1) / ctrl_denom
+        ctrl_weight_t = torch.as_tensor(ctrl_weight, device=action_t.device, dtype=action_t.dtype)
+        survival_weight_t = torch.as_tensor(survival_weight, device=action_t.device, dtype=action_t.dtype)
+        ctrl_enabled_t = torch.as_tensor(ctrl_enabled, device=action_t.device, dtype=torch.bool)
+        survival_enabled_t = torch.as_tensor(survival_enabled, device=action_t.device, dtype=torch.bool)
+        while ctrl_weight_t.ndim < ctrl_mean_sq.ndim:
+            ctrl_weight_t = ctrl_weight_t.unsqueeze(0)
+        while survival_weight_t.ndim < ctrl_mean_sq.ndim:
+            survival_weight_t = survival_weight_t.unsqueeze(0)
+        while ctrl_enabled_t.ndim < ctrl_mean_sq.ndim:
+            ctrl_enabled_t = ctrl_enabled_t.unsqueeze(0)
+        while survival_enabled_t.ndim < ctrl_mean_sq.ndim:
+            survival_enabled_t = survival_enabled_t.unsqueeze(0)
+        ctrl_reward = torch.where(
+            ctrl_enabled_t,
+            -ctrl_weight_t * ctrl_mean_sq,
+            torch.zeros_like(ctrl_mean_sq),
+        )
+        survival_reward = torch.where(
+            survival_enabled_t,
+            survival_weight_t.expand_as(ctrl_mean_sq),
+            torch.zeros_like(ctrl_mean_sq),
+        )
+        return ctrl_reward + survival_reward
+
     def _transform_reinforce_rewards(self, rewards):
         mode = self._resolve_reinforce_reward_transform(self.config)
         if mode == "none":
@@ -5325,6 +5404,22 @@ class EnvironmentPrior:
         state_input_scale = float(self._resolve_state_input_scale(h))
         state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
         state_full_rms_target = float(self._resolve_state_full_rms_target(h))
+        ctrl_reward_weight = float(self._resolve_ctrl_reward_weight(h))
+        ctrl_reward_enabled = bool(
+            self._sample_exact_scm_reward_term_enabled(
+                h,
+                prob_key="ctrl_reward_enable_prob",
+                latent_key="_ctrl_reward_enable_u",
+            )
+        )
+        survival_reward_weight = float(self._resolve_survival_reward_weight(h))
+        survival_reward_enabled = bool(
+            self._sample_exact_scm_reward_term_enabled(
+                h,
+                prob_key="survival_reward_enable_prob",
+                latent_key="_survival_reward_enable_u",
+            )
+        )
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(h)
         reinforce_reward_rms_eps = float(self._resolve_reinforce_reward_rms_eps(h))
         reinforce_reward_tanh_c = float(self._resolve_reinforce_reward_tanh_c(h))
@@ -5410,6 +5505,10 @@ class EnvironmentPrior:
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "ctrl_reward_weight": ctrl_reward_weight,
+            "ctrl_reward_enabled": ctrl_reward_enabled,
+            "survival_reward_weight": survival_reward_weight,
+            "survival_reward_enabled": survival_reward_enabled,
             "reinforce_reward_transform": reinforce_reward_transform,
             "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
@@ -8365,6 +8464,44 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        ctrl_reward_weight = torch.tensor(
+            [float(self._resolve_ctrl_reward_weight(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        ctrl_reward_enabled = torch.tensor(
+            [
+                bool(
+                    self._sample_exact_scm_reward_term_enabled(
+                        h,
+                        prob_key="ctrl_reward_enable_prob",
+                        latent_key="_ctrl_reward_enable_u",
+                    )
+                )
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.bool,
+        )
+        survival_reward_weight = torch.tensor(
+            [float(self._resolve_survival_reward_weight(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        survival_reward_enabled = torch.tensor(
+            [
+                bool(
+                    self._sample_exact_scm_reward_term_enabled(
+                        h,
+                        prob_key="survival_reward_enable_prob",
+                        latent_key="_survival_reward_enable_u",
+                    )
+                )
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.bool,
+        )
         state_full_rms_enabled = torch.tensor(
             [bool(self._resolve_state_full_rms_enabled(h)) for h in h_list],
             device=device,
@@ -8545,6 +8682,10 @@ class EnvironmentPrior:
             "state_clip": state_clip,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
+            "ctrl_reward_weight": ctrl_reward_weight,
+            "ctrl_reward_enabled": ctrl_reward_enabled,
+            "survival_reward_weight": survival_reward_weight,
+            "survival_reward_enabled": survival_reward_enabled,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
@@ -10135,7 +10276,7 @@ class EnvironmentPrior:
             terminal_bonus_scale_min = torch.full((batch_size,), float(terminal_bonus_scale_min), device=device, dtype=torch.float32)
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 2.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full((batch_size,), float(terminal_bonus_scale_max), device=device, dtype=torch.float32)
         else:
@@ -10239,6 +10380,13 @@ class EnvironmentPrior:
                     env_in,
                     generators_for_noise=rollout_generators,
                 ).reshape(batch_size)
+            reward_next_raw = reward_next_raw + self._exact_scm_aux_reward_terms(
+                action_next,
+                ctrl_weight=env.get("ctrl_reward_weight", 0.0),
+                ctrl_enabled=env.get("ctrl_reward_enabled", False),
+                survival_weight=env.get("survival_reward_weight", 0.0),
+                survival_enabled=env.get("survival_reward_enabled", False),
+            )
             reward_next = torch.maximum(
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
@@ -10256,7 +10404,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 2.0),
             )
 
             if not callable(transition_generator):
@@ -11365,7 +11513,7 @@ class EnvironmentPrior:
             )
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 2.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full(
                 (batch_size,),
@@ -11867,6 +12015,19 @@ class EnvironmentPrior:
                     env_in,
                     generators_for_noise=env_noise_generators,
                 ).reshape(batch_size)
+            reward_next_raw = reward_next_raw + self._exact_scm_aux_reward_terms(
+                action_env,
+                action_mask=(
+                    (torch.arange(action_dim, device=device, dtype=torch.long).unsqueeze(0)
+                     < env["action_dim_per_sample"].to(device=device, dtype=torch.long).unsqueeze(1)).to(dtype=action_env.dtype)
+                    if torch.is_tensor(env.get("action_dim_per_sample", None))
+                    else None
+                ),
+                ctrl_weight=env.get("ctrl_reward_weight", 0.0),
+                ctrl_enabled=env.get("ctrl_reward_enabled", False),
+                survival_weight=env.get("survival_reward_weight", 0.0),
+                survival_enabled=env.get("survival_reward_enabled", False),
+            )
             reward_next = torch.maximum(
                 torch.minimum(reward_next_raw, env["reward_clip"]),
                 -env["reward_clip"],
@@ -11905,7 +12066,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 2.0),
             )
             if profile_rollout_timing and dropout_timed and dropout_timing_t0 is not None:
                 transition_noise_wall_s += (time.perf_counter() - dropout_timing_t0)
@@ -12328,6 +12489,10 @@ class EnvironmentPrior:
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_input_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        ctrl_reward_weight = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        ctrl_reward_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        survival_reward_weight = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        survival_reward_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_full_rms_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_full_rms_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_highway_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -12485,6 +12650,10 @@ class EnvironmentPrior:
                 state_clip[group_idx] = env_batch["state_clip"]
                 state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
                 state_input_scale[group_idx] = env_batch["state_input_scale"]
+                ctrl_reward_weight[group_idx] = env_batch["ctrl_reward_weight"]
+                ctrl_reward_enabled[group_idx] = env_batch["ctrl_reward_enabled"]
+                survival_reward_weight[group_idx] = env_batch["survival_reward_weight"]
+                survival_reward_enabled[group_idx] = env_batch["survival_reward_enabled"]
                 state_full_rms_enabled[group_idx] = env_batch["state_full_rms_enabled"]
                 state_full_rms_target[group_idx] = env_batch["state_full_rms_target"]
                 state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
@@ -12703,16 +12872,25 @@ class EnvironmentPrior:
 
         for group in transition_groups:
             state_dim_g = int(group["state_dim"])
+            env_group = group["env"]
             if keep_policy_order:
                 group["slice"] = None
                 group["reward_scale_view"] = reward_scale.index_select(0, group["indices"])
                 group["alpha_view"] = alpha.index_select(0, group["indices"]).unsqueeze(1)
+                group["ctrl_reward_weight_view"] = env_group.get("ctrl_reward_weight", 0.0)
+                group["ctrl_reward_enabled_view"] = env_group.get("ctrl_reward_enabled", False)
+                group["survival_reward_weight_view"] = env_group.get("survival_reward_weight", 0.0)
+                group["survival_reward_enabled_view"] = env_group.get("survival_reward_enabled", False)
             else:
                 start = int(group["start"])
                 end = int(group["end"])
                 group["slice"] = slice(start, end)
                 group["reward_scale_view"] = reward_scale[start:end]
                 group["alpha_view"] = alpha[start:end].unsqueeze(1)
+                group["ctrl_reward_weight_view"] = env_group.get("ctrl_reward_weight", 0.0)
+                group["ctrl_reward_enabled_view"] = env_group.get("ctrl_reward_enabled", False)
+                group["survival_reward_weight_view"] = env_group.get("survival_reward_weight", 0.0)
+                group["survival_reward_enabled_view"] = env_group.get("survival_reward_enabled", False)
 
         state_idx = torch.arange(max_state_dim, device=device, dtype=torch.long)
         obs_idx = torch.arange(max_obs_dim, device=device, dtype=torch.long)
@@ -12723,6 +12901,12 @@ class EnvironmentPrior:
         obs_mask = (obs_idx.unsqueeze(0) < obs_dims.unsqueeze(1)).to(dtype=torch.float32)
         action_mask = (action_idx.unsqueeze(0) < action_dims.unsqueeze(1)).to(dtype=torch.float32)
         noise_mask = (noise_idx.unsqueeze(0) < noise_dims.unsqueeze(1)).to(dtype=torch.float32)
+        for group in transition_groups:
+            group_slice = group["slice"]
+            if group_slice is None:
+                group["action_mask_view"] = action_mask.index_select(0, group["indices"])[:, : int(group["action_dim"])]
+            else:
+                group["action_mask_view"] = action_mask[group_slice, : int(group["action_dim"])]
 
         dropout_active = reward_dropout_enabled & (reward_dropout_ratio > 0.0)
 
@@ -13485,6 +13669,14 @@ class EnvironmentPrior:
                                 transition_input,
                                 generators_for_noise=group["rollout_generators"],
                             )
+                        reward_next_raw_g = reward_next_raw_g + self._exact_scm_aux_reward_terms(
+                            action_in,
+                            action_mask=group.get("action_mask_view", None),
+                            ctrl_weight=group.get("ctrl_reward_weight_view", 0.0),
+                            ctrl_enabled=group.get("ctrl_reward_enabled_view", False),
+                            survival_weight=group.get("survival_reward_weight_view", 0.0),
+                            survival_enabled=group.get("survival_reward_enabled_view", False),
+                        )
                         state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
                         if group_slice is None:
                             reward_next_raw_replay.index_copy_(0, group_indices, reward_next_raw_g)
@@ -14443,6 +14635,14 @@ class EnvironmentPrior:
                     if profile_rollout_timing and x_wall_t0 is not None:
                         transition_x_wall_s += (time.perf_counter() - x_wall_t0)
                     state_next_g = (1.0 - alpha_g) * state_in + alpha_g * x_next_g
+                    reward_next_raw_g = reward_next_raw_g + self._exact_scm_aux_reward_terms(
+                        action_in,
+                        action_mask=group.get("action_mask_view", None),
+                        ctrl_weight=group.get("ctrl_reward_weight_view", 0.0),
+                        ctrl_enabled=group.get("ctrl_reward_enabled_view", False),
+                        survival_weight=group.get("survival_reward_weight_view", 0.0),
+                        survival_enabled=group.get("survival_reward_enabled_view", False),
+                    )
                     if group_slice is None:
                         reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)
                         state_next[group_indices, :state_dim_g] = state_next_g
@@ -15183,7 +15383,7 @@ class EnvironmentPrior:
         )
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         terminal_bonus_scale_min = env.get("terminal_bonus_scale_min", 1.0)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 2.0)
         terminal_reset_draws = None
         terminal_bonus_scale_draws = None
         terminal_reset_states = None
@@ -15583,6 +15783,13 @@ class EnvironmentPrior:
                     env_in,
                     generator=local_generator,
                 ).reshape(())
+            reward_next_raw = reward_next_raw + self._exact_scm_aux_reward_terms(
+                action_env,
+                ctrl_weight=env.get("ctrl_reward_weight", 0.0),
+                ctrl_enabled=env.get("ctrl_reward_enabled", False),
+                survival_weight=env.get("survival_reward_weight", 0.0),
+                survival_enabled=env.get("survival_reward_enabled", False),
+            )
             reward_next = torch.clamp(
                 reward_next_raw,
                 -float(env["reward_clip"]),
@@ -15617,7 +15824,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 2.0),
             )
 
             if not callable(transition_generator):
@@ -16049,7 +16256,7 @@ class EnvironmentPrior:
             terminal_bonus_scale_min = torch.full((batch_size,), float(terminal_bonus_scale_min), device=device, dtype=torch.float32)
         else:
             terminal_bonus_scale_min = terminal_bonus_scale_min.to(device=device, dtype=torch.float32)
-        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 5.0)
+        terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 2.0)
         if not torch.is_tensor(terminal_bonus_scale_max):
             terminal_bonus_scale_max = torch.full((batch_size,), float(terminal_bonus_scale_max), device=device, dtype=torch.float32)
         else:
@@ -16171,6 +16378,19 @@ class EnvironmentPrior:
                         env_in[bi: bi + 1],
                         generator=g,
                     ).reshape(())
+            reward_next_raw = reward_next_raw + self._exact_scm_aux_reward_terms(
+                action_next,
+                action_mask=(
+                    (torch.arange(action_dim, device=device, dtype=torch.long).unsqueeze(0)
+                     < env["action_dim_per_sample"].to(device=device, dtype=torch.long).unsqueeze(1)).to(dtype=action_next.dtype)
+                    if torch.is_tensor(env.get("action_dim_per_sample", None))
+                    else None
+                ),
+                ctrl_weight=env.get("ctrl_reward_weight", 0.0),
+                ctrl_enabled=env.get("ctrl_reward_enabled", False),
+                survival_weight=env.get("survival_reward_weight", 0.0),
+                survival_enabled=env.get("survival_reward_enabled", False),
+            )
             reward_next = torch.maximum(torch.minimum(reward_next_raw, reward_clip), -reward_clip)
             reward_mask_next = torch.ones((batch_size,), device=device, dtype=torch.float32)
 
@@ -16184,7 +16404,7 @@ class EnvironmentPrior:
                 mode=env.get("reinforce_reward_transform", "none"),
                 rms_eps=env.get("reinforce_reward_rms_eps", 1e-6),
                 tanh_c=env.get("reinforce_reward_tanh_c", 1.0),
-                tanh_bound=env.get("reinforce_reward_tanh_bound", 5.0),
+                tanh_bound=env.get("reinforce_reward_tanh_bound", 2.0),
             )
 
             if not callable(transition_generator):
@@ -18323,6 +18543,10 @@ class EnvironmentPrior:
                         "env_noise_start": state_dim_g + obs_input_dim_g + action_dim_g,
                         "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
                         "state_input_scale_view": state_input_scale[group_idx],
+                        "ctrl_reward_weight_view": ctrl_reward_weight[group_idx],
+                        "ctrl_reward_enabled_view": ctrl_reward_enabled[group_idx],
+                        "survival_reward_weight_view": survival_reward_weight[group_idx],
+                        "survival_reward_enabled_view": survival_reward_enabled[group_idx],
                         "packed_input_enabled": packed_input_enabled,
                         "packed_input": packed_input_buf,
                         "packed_state_mask": packed_state_mask,
@@ -18382,6 +18606,10 @@ class EnvironmentPrior:
             state_clip = state_clip.index_select(0, perm)
             state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
             state_input_scale = state_input_scale.index_select(0, perm)
+            ctrl_reward_weight = ctrl_reward_weight.index_select(0, perm)
+            ctrl_reward_enabled = ctrl_reward_enabled.index_select(0, perm)
+            survival_reward_weight = survival_reward_weight.index_select(0, perm)
+            survival_reward_enabled = survival_reward_enabled.index_select(0, perm)
             state_full_rms_enabled = state_full_rms_enabled.index_select(0, perm)
             state_full_rms_target = state_full_rms_target.index_select(0, perm)
             state_highway_enabled = state_highway_enabled.index_select(0, perm)
@@ -18417,12 +18645,20 @@ class EnvironmentPrior:
                 group["slice"] = None
                 group["reward_scale_view"] = reward_scale.index_select(0, group["indices"])
                 group["alpha_view"] = alpha.index_select(0, group["indices"]).unsqueeze(1)
+                group["ctrl_reward_weight_view"] = ctrl_reward_weight.index_select(0, group["indices"])
+                group["ctrl_reward_enabled_view"] = ctrl_reward_enabled.index_select(0, group["indices"])
+                group["survival_reward_weight_view"] = survival_reward_weight.index_select(0, group["indices"])
+                group["survival_reward_enabled_view"] = survival_reward_enabled.index_select(0, group["indices"])
             else:
                 start = int(group["start"])
                 end = int(group["end"])
                 group["slice"] = slice(start, end)
                 group["reward_scale_view"] = reward_scale[start:end]
                 group["alpha_view"] = alpha[start:end].unsqueeze(1)
+                group["ctrl_reward_weight_view"] = ctrl_reward_weight[start:end]
+                group["ctrl_reward_enabled_view"] = ctrl_reward_enabled[start:end]
+                group["survival_reward_weight_view"] = survival_reward_weight[start:end]
+                group["survival_reward_enabled_view"] = survival_reward_enabled[start:end]
 
         state_idx = torch.arange(max_state_dim, device=device, dtype=torch.long)
         obs_idx = torch.arange(max_obs_dim, device=device, dtype=torch.long)
@@ -18434,6 +18670,12 @@ class EnvironmentPrior:
         noise_mask = (noise_idx.unsqueeze(0) < noise_dims.unsqueeze(1)).to(dtype=torch.float32)
         action_mask_bool = action_mask.to(dtype=torch.bool)
         dropout_active = reward_dropout_enabled & (reward_dropout_ratio > 0.0)
+        for group in transition_groups:
+            group_slice = group["slice"]
+            if group_slice is None:
+                group["action_mask_view"] = action_mask.index_select(0, group["indices"])[:, : int(group["action_dim"])]
+            else:
+                group["action_mask_view"] = action_mask[group_slice, : int(group["action_dim"])]
 
         state_t = self._stack_randn_with_generators(
             rollout_generators,
@@ -18639,6 +18881,10 @@ class EnvironmentPrior:
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
+            "ctrl_reward_weight": ctrl_reward_weight,
+            "ctrl_reward_enabled": ctrl_reward_enabled,
+            "survival_reward_weight": survival_reward_weight,
+            "survival_reward_enabled": survival_reward_enabled,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(self.config),
@@ -19017,6 +19263,14 @@ class EnvironmentPrior:
                             transition_input,
                             generators_for_noise=group["rollout_generators"],
                         )
+                    reward_next_raw_g = reward_next_raw_g + self._exact_scm_aux_reward_terms(
+                        action_in,
+                        action_mask=group.get("action_mask_view", None),
+                        ctrl_weight=group.get("ctrl_reward_weight_view", 0.0),
+                        ctrl_enabled=group.get("ctrl_reward_enabled_view", False),
+                        survival_weight=group.get("survival_reward_weight_view", 0.0),
+                        survival_enabled=group.get("survival_reward_enabled_view", False),
+                    )
                     state_next_g = (1.0 - group["alpha_view"]) * state_in + group["alpha_view"] * x_next_g
                     if group_slice is None:
                         reward_next_raw.index_copy_(0, group_indices, reward_next_raw_g)

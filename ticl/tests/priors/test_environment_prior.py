@@ -3386,6 +3386,63 @@ def _manual_sampled_h(*, family, state_dim, obs_dim, action_dim, noise_dim, zero
     return h
 
 
+def test_environment_prior_exact_scm_aux_reward_terms_use_masked_mean_and_survival():
+    action = torch.tensor(
+        [
+            [1.0, 3.0, 10.0],
+            [2.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    action_mask = torch.tensor(
+        [
+            [1.0, 1.0, 0.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=torch.float32,
+    )
+    reward = EnvironmentPrior._exact_scm_aux_reward_terms(
+        action,
+        action_mask=action_mask,
+        ctrl_weight=torch.tensor([0.5, 0.25], dtype=torch.float32),
+        ctrl_enabled=torch.tensor([True, False]),
+        survival_weight=torch.tensor([0.1, 0.2], dtype=torch.float32),
+        survival_enabled=torch.tensor([True, True]),
+    )
+    expected = torch.tensor(
+        [
+            0.1 - 0.5 * ((1.0**2 + 3.0**2) / 2.0),
+            0.2,
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(reward, expected, atol=1e-6)
+
+
+def test_environment_prior_samples_exact_scm_aux_reward_enable_flags_from_latent_h():
+    prior = EnvironmentPrior(get_prior_config()["prior"]["environment"])
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=4,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=1,
+        zero_pad_dim=0,
+    )
+    h["ctrl_reward_weight"] = 0.05
+    h["ctrl_reward_enable_prob"] = 0.7
+    h["_ctrl_reward_enable_u"] = 0.69
+    h["survival_reward_weight"] = 0.03
+    h["survival_reward_enable_prob"] = 0.7
+    h["_survival_reward_enable_u"] = 0.71
+
+    env = prior._sample_environment(h, device="cpu", rng_seed=123)
+    assert float(env["ctrl_reward_weight"]) == pytest.approx(0.05)
+    assert bool(env["ctrl_reward_enabled"]) is True
+    assert float(env["survival_reward_weight"]) == pytest.approx(0.03)
+    assert bool(env["survival_reward_enabled"]) is False
+
+
 def _reference_scm_apply_weight_init(
     weight,
     *,

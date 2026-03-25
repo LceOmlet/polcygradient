@@ -308,7 +308,7 @@ def _resolve_validation_policy_hparams(env_cfg, rng, *, orch_cfg=None):
             _resolve_validation_sample(env_cfg.get("reinforce_reward_tanh_c", 1.0), rng)
         ),
         "reward_transform_tanh_bound": float(
-            _resolve_validation_sample(env_cfg.get("reinforce_reward_tanh_bound", 5.0), rng)
+            _resolve_validation_sample(env_cfg.get("reinforce_reward_tanh_bound", 2.0), rng)
         ),
     }
 

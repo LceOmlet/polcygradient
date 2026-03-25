@@ -35,13 +35,25 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
+    assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
+        "distribution": "log_uniform",
+        "min": 1e-3,
+        "max": 3e-1,
+    }
+    assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
+    assert cfg["prior"]["environment"]["survival_reward_weight"] == {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": 0.1,
+    }
+    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
         "distribution": "uniform",
         "min": 0.0,
-        "max": 5.0,
+        "max": 2.0,
     }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
@@ -75,7 +87,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     }
     assert cfg["prior"]["environment"]["terminal_bonus_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["terminal_bonus_scale_min"] == 1.0
-    assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 5.0
+    assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 2.0
     assert cfg["optimizer"]["policy_rollout_chunk_size"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
     assert cfg["optimizer"]["policy_rollout_checkpoint_reentrant"] is False

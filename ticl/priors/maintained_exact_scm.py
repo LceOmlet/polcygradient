@@ -129,10 +129,38 @@ def resolve_reinforce_reward_tanh_c(h):
 
 
 def resolve_reinforce_reward_tanh_bound(h):
-    v = resolve_scalar(h.get("reinforce_reward_tanh_bound", 5.0))
+    v = resolve_scalar(h.get("reinforce_reward_tanh_bound", 2.0))
     if (not math.isfinite(v)) or v <= 0.0:
-        return 5.0
+        return 2.0
     return float(v)
+
+
+def resolve_ctrl_reward_weight(h):
+    v = resolve_scalar(h.get("ctrl_reward_weight", 0.0))
+    if (not math.isfinite(v)) or v < 0.0:
+        return 0.0
+    return float(v)
+
+
+def resolve_ctrl_reward_enable_prob(h):
+    v = resolve_scalar(h.get("ctrl_reward_enable_prob", 0.0))
+    if not math.isfinite(v):
+        return 0.0
+    return float(max(0.0, min(1.0, v)))
+
+
+def resolve_survival_reward_weight(h):
+    v = resolve_scalar(h.get("survival_reward_weight", 0.0))
+    if (not math.isfinite(v)) or v < 0.0:
+        return 0.0
+    return float(v)
+
+
+def resolve_survival_reward_enable_prob(h):
+    v = resolve_scalar(h.get("survival_reward_enable_prob", 0.0))
+    if not math.isfinite(v):
+        return 0.0
+    return float(max(0.0, min(1.0, v)))
 
 
 def resolve_reinforce_action_transform(h):
@@ -175,9 +203,9 @@ def resolve_terminal_bonus_scale_min(h):
 
 
 def resolve_terminal_bonus_scale_max(h):
-    v = resolve_scalar(h.get("terminal_bonus_scale_max", 5.0))
+    v = resolve_scalar(h.get("terminal_bonus_scale_max", 2.0))
     if not math.isfinite(v):
-        return 5.0
+        return 2.0
     return float(v)
 
 
