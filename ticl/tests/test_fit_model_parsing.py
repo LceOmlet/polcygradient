@@ -351,12 +351,8 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
         "max": 3e-1,
     }
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
-    assert cfg["prior"]["environment"]["survival_reward_weight"] == {
-        "distribution": "uniform",
-        "min": 0.0,
-        "max": 0.1,
-    }
-    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.7
+    assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
+    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True

@@ -3443,6 +3443,38 @@ def test_environment_prior_samples_exact_scm_aux_reward_enable_flags_from_latent
     assert bool(env["survival_reward_enabled"]) is False
 
 
+def test_environment_prior_compose_exact_scm_reward_adds_aux_after_tanh_transform():
+    prior = EnvironmentPrior({})
+    reward_raw = torch.tensor([10.0], dtype=torch.float32)
+    reward = prior._compose_exact_scm_reward(
+        reward_raw,
+        aux_reward=torch.tensor([0.5], dtype=torch.float32),
+        reward_clip=10.0,
+        mode="tanh",
+        tanh_c=2.0,
+        tanh_bound=2.0,
+    )
+
+    reward_inside_tanh = prior._transform_rollout_reward(
+        torch.tensor([10.5], dtype=torch.float32),
+        mode="tanh",
+        tanh_c=2.0,
+        tanh_bound=2.0,
+    )
+
+    assert torch.allclose(
+        reward,
+        prior._transform_rollout_reward(
+            torch.tensor([10.0], dtype=torch.float32),
+            mode="tanh",
+            tanh_c=2.0,
+            tanh_bound=2.0,
+        ) + 0.5,
+        atol=1e-6,
+    )
+    assert not torch.allclose(reward, reward_inside_tanh, atol=1e-6)
+
+
 def _reference_scm_apply_weight_init(
     weight,
     *,

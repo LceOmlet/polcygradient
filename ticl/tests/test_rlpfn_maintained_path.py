@@ -1055,12 +1055,8 @@ def test_rlpfn_maintained_path_default_contract():
         "max": 3e-1,
     }
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
-    assert cfg["prior"]["environment"]["survival_reward_weight"] == {
-        "distribution": "uniform",
-        "min": 0.0,
-        "max": 0.1,
-    }
-    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.7
+    assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
+    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
     assert cfg["optimizer"]["rl_objective"] == "reinforce"
     assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
