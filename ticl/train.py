@@ -480,6 +480,32 @@ def _fit_action_dim(a, action_dim):
     return tiled[..., :t]
 
 
+def _fit_actor_output_dim(actor_outputs, action_dim):
+    if not isinstance(actor_outputs, dict):
+        return actor_outputs
+    fitted = dict(actor_outputs)
+    for key in (
+        "action_mean",
+        "action_std",
+        "action_log_std",
+        "raw_action_mean",
+        "raw_action_std",
+    ):
+        value = fitted.get(key, None)
+        if not torch.is_tensor(value):
+            continue
+        if value.ndim >= 2 and int(value.shape[0]) == 1:
+            value = value.squeeze(0)
+        original_shape = tuple(value.shape)
+        if not original_shape:
+            continue
+        fitted[key] = _fit_action_dim(
+            value.reshape(-1, int(original_shape[-1])),
+            action_dim,
+        ).reshape(*original_shape[:-1], int(action_dim))
+    return fitted
+
+
 def _infer_batch_shape_for_profile(data, targets):
     # Returns (batch_size, n_samples) as logical training workload counters.
     batch_size = None
@@ -784,7 +810,9 @@ def _build_policy_step_fn(
         if not main_compile_requested:
             print("[pg-compile-note] main forward step compile skipped (split fastpath active).")
 
-    policy_forward_step = model_ref.forward_policy_step
+    policy_forward_step = getattr(model_ref, "forward_policy_step_actor", None)
+    if not callable(policy_forward_step):
+        policy_forward_step = model_ref.forward_policy_step
     policy_forward_step, compile_active = _compile_policy_forward_step(
         policy_forward_step,
         enabled=bool(main_compile_requested),
@@ -805,7 +833,9 @@ def _build_policy_step_fn(
     split_obs_total_dim = None
     split_action_slot_dim = None
     if split_fastpath_available:
-        split_policy_forward_step = model_ref.forward_policy_step_split
+        split_policy_forward_step = getattr(model_ref, "forward_policy_step_split_actor", None)
+        if not callable(split_policy_forward_step):
+            split_policy_forward_step = model_ref.forward_policy_step_split
         split_policy_forward_step, split_compile_active = _compile_policy_forward_step(
             split_policy_forward_step,
             enabled=bool(split_compile_requested),
@@ -949,10 +979,15 @@ def _build_policy_step_fn(
                 except Exception as e:
                     print(f"[pg-compile-warn] runtime compile failure on split policy step, fallback to eager: {e}")
                     split_compile_active = False
-                    split_policy_forward_step = model_ref.forward_policy_step_split
+                    split_policy_forward_step = (
+                        getattr(model_ref, "forward_policy_step_split_actor", None)
+                        or model_ref.forward_policy_step_split
+                    )
                     out, kv_cache = _call_split_forward_step()
             else:
                 out, kv_cache = _call_split_forward_step()
+            if isinstance(out, dict):
+                return _fit_actor_output_dim(out, action_dim), kv_cache
             action_raw = out.squeeze(0)
             action_next = _fit_action_dim(action_raw, action_dim)
             return action_next, kv_cache
@@ -1049,10 +1084,15 @@ def _build_policy_step_fn(
             except Exception as e:
                 print(f"[pg-compile-warn] runtime compile failure, fallback to eager: {e}")
                 compile_active = False
-                policy_forward_step = model_ref.forward_policy_step
+                policy_forward_step = (
+                    getattr(model_ref, "forward_policy_step_actor", None)
+                    or model_ref.forward_policy_step
+                )
                 out, kv_cache = _call_forward_step()
         else:
             out, kv_cache = _call_forward_step()
+        if isinstance(out, dict):
+            return _fit_actor_output_dim(out, action_dim), kv_cache
         action_raw = out.squeeze(0)
         action_next = _fit_action_dim(action_raw, action_dim)
         return action_next, kv_cache
@@ -1076,6 +1116,14 @@ def _build_policy_step_fn(
         reinforce_sequence_replay_outputs_fn if callable(reinforce_sequence_replay_outputs_fn) else None
     )
     policy_step_fn._fit_action_dim_fn = _fit_action_dim
+    sample_action_fn = getattr(model_ref, "sample_policy_action_from_outputs", None)
+    log_prob_action_fn = getattr(model_ref, "log_prob_policy_action_from_outputs", None)
+    score_action_fn = getattr(model_ref, "log_prob_score_wrt_mean_from_outputs", None)
+    decomp_action_fn = getattr(model_ref, "policy_log_prob_decomposition_stats_from_outputs", None)
+    policy_step_fn._policy_actor_sample_fn = sample_action_fn if callable(sample_action_fn) else None
+    policy_step_fn._policy_actor_log_prob_fn = log_prob_action_fn if callable(log_prob_action_fn) else None
+    policy_step_fn._policy_actor_score_fn = score_action_fn if callable(score_action_fn) else None
+    policy_step_fn._policy_actor_decomp_stats_fn = decomp_action_fn if callable(decomp_action_fn) else None
     return policy_step_fn
 
 

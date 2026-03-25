@@ -14,6 +14,7 @@ import torch.utils.checkpoint
 import wandb
 
 from ticl.models.encoders import Linear, SplitObsActionEncoder
+from ticl.models.dreamer_v3_policy import DreamerV3ContinuousActorHead
 from ticl.models.rl_aux_heads import (
     CFMIResidualFlowMatchingHead,
     ConditionalFlowMatchingHead,
@@ -1017,10 +1018,9 @@ class RWKV7PFN(nn.Module):
         self.policy_action_dim = int(x_action_dim) if x_action_dim is not None else None
         self.policy_action_head = None
         if self.policy_action_dim is not None and self.policy_action_dim > 0:
-            self.policy_action_head = (
-                decoder(self.emsize, nhid, self.policy_action_dim)
-                if decoder is not None
-                else _default_mlp_head(self.emsize, nhid, self.policy_action_dim)
+            self.policy_action_head = DreamerV3ContinuousActorHead(
+                self.emsize,
+                self.policy_action_dim,
             )
         self.normalized_q_value_head = None
         self.normalized_q_value_bardist = None
@@ -1091,6 +1091,9 @@ class RWKV7PFN(nn.Module):
 
     @staticmethod
     def _infer_head_out_dim(head):
+        action_dim = getattr(head, "action_dim", None)
+        if action_dim is not None:
+            return int(action_dim)
         if isinstance(head, nn.Linear):
             return int(head.out_features)
         if isinstance(head, nn.Sequential):
@@ -1132,8 +1135,7 @@ class RWKV7PFN(nn.Module):
             )
         return True
 
-    def _decode_policy_action(self, hidden, *, policy_action_head_params_override=None):
-        target_dtype = None
+    def _decode_policy_actor_outputs(self, hidden, *, policy_action_head_params_override=None):
         if self.policy_action_head_required():
             self.require_policy_action_head()
             if policy_action_head_params_override is not None:
@@ -1143,9 +1145,8 @@ class RWKV7PFN(nn.Module):
                     raise ValueError("policy_action_head_params_override must not be empty.") from exc
             else:
                 head_param = next(self.policy_action_head.parameters())
-            target_dtype = head_param.dtype
-            if hidden.dtype != target_dtype:
-                hidden = hidden.to(dtype=target_dtype)
+            if hidden.dtype != head_param.dtype:
+                hidden = hidden.to(dtype=head_param.dtype)
             if policy_action_head_params_override is not None:
                 return _functional_call_module(
                     self.policy_action_head,
@@ -1154,10 +1155,31 @@ class RWKV7PFN(nn.Module):
                 )
             return self.policy_action_head(hidden)
         head_param = next(self.decoder.parameters())
-        target_dtype = head_param.dtype
-        if hidden.dtype != target_dtype:
-            hidden = hidden.to(dtype=target_dtype)
-        return self.decoder(hidden)
+        if hidden.dtype != head_param.dtype:
+            hidden = hidden.to(dtype=head_param.dtype)
+        return {"action_mean": self.decoder(hidden)}
+
+    def _decode_policy_action(self, hidden, *, policy_action_head_params_override=None):
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )["action_mean"]
+
+    def sample_policy_action_from_outputs(self, actor_outputs, *, noise=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.sample(actor_outputs, noise=noise)
+
+    def log_prob_policy_action_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.log_prob(actor_outputs, action, mask=action_mask)
+
+    def log_prob_score_wrt_mean_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.score_wrt_mean(actor_outputs, action, mask=action_mask)
+
+    def policy_log_prob_decomposition_stats_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.decomposition_stats(actor_outputs, action, mask=action_mask)
 
     def consume_policy_step_profile(self):
         return None
@@ -1203,7 +1225,7 @@ class RWKV7PFN(nn.Module):
         flow_matching_t=None,
     ):
         outputs = {
-            "action_mean": self._decode_policy_action(
+            **self._decode_policy_actor_outputs(
                 hidden_q,
                 policy_action_head_params_override=policy_action_head_params_override,
             )
@@ -1400,6 +1422,17 @@ class RWKV7PFN(nn.Module):
             policy_action_head_params_override=policy_action_head_params_override,
         )
 
+    def predict_query_actor_outputs_with_kv(self, x_query, kv_cache, *, policy_action_head_params_override=None):
+        if not self.single_eval_causal:
+            raise ValueError("RWKV state cache requires single_eval_causal=True.")
+        token = self._encode_query_token(x_query)
+        token = self._cast_token_for_rwkv_core(token)
+        hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
     def replay_policy_sequence_tokens(
         self,
         x_tokens,
@@ -1540,6 +1573,31 @@ class RWKV7PFN(nn.Module):
         )
         return out, kv_cache
 
+    def forward_policy_step_actor(
+        self,
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode: str = "auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
+    ):
+        del max_cache_len, kv_cache_mode, kv_cache_page_size, allow_grad_mutable_cache, allow_grad_inplace_paged_cache
+        if not self.single_eval_causal:
+            raise ValueError("forward_policy_step_actor requires single_eval_causal=True.")
+        if x_token.ndim != 3 or x_token.shape[0] != 1:
+            raise ValueError(f"x_token must have shape (1, B, F), got {tuple(x_token.shape)}")
+        token = self._encode_train_token(x_token, y_token)
+        token = self._cast_token_for_rwkv_core(token)
+        hidden, kv_cache = self.rwkv_core.forward_step(token[0], kv_cache)
+        return self._decode_policy_actor_outputs(
+            hidden.unsqueeze(0),
+            policy_action_head_params_override=policy_action_head_params_override,
+        ), kv_cache
+
     def forward_policy_step_split(
         self,
         obs_t,
@@ -1576,6 +1634,42 @@ class RWKV7PFN(nn.Module):
             policy_action_head_params_override=policy_action_head_params_override,
         )
         return out, kv_cache
+
+    def forward_policy_step_split_actor(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode: str = "auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
+    ):
+        del max_cache_len, kv_cache_mode, kv_cache_page_size, allow_grad_mutable_cache, allow_grad_inplace_paged_cache
+        if not self.single_eval_causal:
+            raise ValueError("forward_policy_step_split_actor requires single_eval_causal=True.")
+        if self.x_encoder_type != "split_obs_action" or (not isinstance(self.encoder, SplitObsActionEncoder)):
+            raise ValueError("forward_policy_step_split_actor requires split_obs_action encoder.")
+        token = self._encode_split_train_token(
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=phase_t,
+            terminal_t=terminal_t,
+        )
+        token = self._cast_token_for_rwkv_core(token)
+        hidden, kv_cache = self.rwkv_core.forward_step(token, kv_cache)
+        return self._decode_policy_actor_outputs(
+            hidden.unsqueeze(0),
+            policy_action_head_params_override=policy_action_head_params_override,
+        ), kv_cache
 
     def forward_with_kv(self, src, single_eval_pos=None, *, policy_action_head_params_override=None):
         assert isinstance(src, tuple), "inputs (src) have to be given as (x,y) or (style,x,y) tuple"

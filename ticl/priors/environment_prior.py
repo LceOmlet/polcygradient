@@ -5008,6 +5008,196 @@ class EnvironmentPrior:
         return action_next
 
     @staticmethod
+    def _unpack_policy_step_output(policy_out):
+        cache = None
+        main_out = policy_out
+        if isinstance(policy_out, tuple):
+            if len(policy_out) != 2:
+                raise ValueError(
+                    "policy_step_fn must return either action tensor / actor dict, "
+                    f"or a (output, cache) tuple; got tuple len={len(policy_out)}"
+                )
+            main_out, cache = policy_out
+        actor_outputs = (
+            main_out
+            if isinstance(main_out, dict) and torch.is_tensor(main_out.get("action_mean", None))
+            else None
+        )
+        action_mean = actor_outputs["action_mean"] if actor_outputs is not None else main_out
+        return actor_outputs, action_mean, cache
+
+    @staticmethod
+    def _reduce_action_std_for_storage(action_std, *, action_mask=None, eps=1e-6):
+        if action_std is None:
+            return None
+        if not torch.is_tensor(action_std):
+            action_std = torch.as_tensor(action_std, dtype=torch.float32)
+        action_std = action_std.to(dtype=torch.float32)
+        if action_std.ndim <= 1:
+            return action_std.detach()
+        if action_mask is None:
+            return action_std.mean(dim=-1).detach()
+        mask_t = action_mask.to(device=action_std.device, dtype=action_std.dtype)
+        while mask_t.ndim < action_std.ndim:
+            mask_t = mask_t.unsqueeze(0)
+        denom = mask_t.sum(dim=-1).clamp_min(float(eps))
+        return ((action_std * mask_t).sum(dim=-1) / denom).detach()
+
+    def _resolve_policy_action_sample(
+        self,
+        *,
+        policy_step_fn,
+        actor_outputs,
+        action_mean,
+        sample_action,
+        action_eps_t,
+        action_mask=None,
+        action_transform_mode="rms",
+        action_rms_eps=1e-6,
+        collect_log_probs=False,
+        collect_log_prob_score=False,
+        legacy_action_std=None,
+    ):
+        actor_sample_fn = getattr(policy_step_fn, "_policy_actor_sample_fn", None)
+        actor_log_prob_fn = getattr(policy_step_fn, "_policy_actor_log_prob_fn", None)
+        actor_score_fn = getattr(policy_step_fn, "_policy_actor_score_fn", None)
+
+        action_std_for_storage = None
+        if actor_outputs is not None:
+            if sample_action:
+                if callable(actor_sample_fn):
+                    action_raw = actor_sample_fn(actor_outputs, noise=action_eps_t)
+                else:
+                    actor_std = actor_outputs.get("action_std", None)
+                    if actor_std is None:
+                        raise RuntimeError(
+                            "policy_step_fn returned actor outputs, but neither actor sample function nor action_std is available"
+                        )
+                    action_raw = actor_outputs["action_mean"] + (action_eps_t * actor_std)
+            else:
+                action_raw = actor_outputs["action_mean"]
+            action_next = self._transform_reinforce_action(
+                action_raw,
+                mode=action_transform_mode,
+                rms_eps=action_rms_eps,
+                mask=action_mask,
+            )
+            action_std_for_storage = self._reduce_action_std_for_storage(
+                actor_outputs.get("action_std", None),
+                action_mask=action_mask,
+            )
+            reinforce_log_prob_t = None
+            reinforce_log_prob_score_t = None
+            if collect_log_probs:
+                if callable(actor_log_prob_fn):
+                    reinforce_log_prob_t = actor_log_prob_fn(
+                        actor_outputs,
+                        action_next.detach(),
+                        action_mask=action_mask,
+                    )
+                else:
+                    actor_std = actor_outputs.get("action_std", None)
+                    if actor_std is None:
+                        raise RuntimeError(
+                            "actor outputs omitted action_std and no actor log-prob function is attached"
+                        )
+                    reinforce_log_prob_t = self._gaussian_log_prob(
+                        action_next.detach(),
+                        actor_outputs["action_mean"],
+                        actor_std,
+                        mask=action_mask,
+                    )
+                if collect_log_prob_score:
+                    if callable(actor_score_fn):
+                        reinforce_log_prob_score_t = actor_score_fn(
+                            actor_outputs,
+                            action_next.detach(),
+                            action_mask=action_mask,
+                        ).detach().to(dtype=torch.float32)
+                    else:
+                        actor_std = actor_outputs.get("action_std", None)
+                        if actor_std is None:
+                            raise RuntimeError(
+                                "actor outputs omitted action_std and no actor score function is attached"
+                            )
+                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                            action_next.detach(),
+                            actor_outputs["action_mean"].detach(),
+                            actor_std,
+                            mask=action_mask,
+                        ).detach().to(dtype=torch.float32)
+                    reinforce_log_prob_t = reinforce_log_prob_t.detach()
+            return {
+                "action_next": action_next,
+                "action_std_for_storage": action_std_for_storage,
+                "log_prob": reinforce_log_prob_t,
+                "log_prob_score": reinforce_log_prob_score_t,
+            }
+
+        if sample_action:
+            if legacy_action_std is None:
+                raise RuntimeError("legacy policy sampling requires legacy_action_std")
+            legacy_action_std_t = torch.as_tensor(
+                legacy_action_std,
+                device=action_mean.device,
+                dtype=action_mean.dtype,
+            )
+            if torch.any(legacy_action_std_t <= 0):
+                raise ValueError("stochastic policy objective requires positive legacy action std")
+            while legacy_action_std_t.ndim < action_mean.ndim:
+                legacy_action_std_t = legacy_action_std_t.unsqueeze(-1)
+            action_pre_tanh = action_mean + (action_eps_t * legacy_action_std_t)
+            action_next = self._transform_reinforce_action(
+                action_pre_tanh,
+                mode=action_transform_mode,
+                rms_eps=action_rms_eps,
+                mask=action_mask,
+            )
+            reinforce_log_prob_t = None
+            reinforce_log_prob_score_t = None
+            if collect_log_probs:
+                reinforce_log_prob_t = self._gaussian_log_prob(
+                    action_next.detach(),
+                    action_mean,
+                    legacy_action_std_t,
+                    mask=action_mask,
+                )
+                if collect_log_prob_score:
+                    reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
+                        action_next.detach(),
+                        action_mean.detach(),
+                        legacy_action_std_t,
+                        mask=action_mask,
+                    ).detach().to(dtype=torch.float32)
+                    reinforce_log_prob_t = reinforce_log_prob_t.detach()
+            return {
+                "action_next": action_next,
+                "action_std_for_storage": self._reduce_action_std_for_storage(
+                    legacy_action_std_t,
+                    action_mask=action_mask,
+                ),
+                "log_prob": reinforce_log_prob_t,
+                "log_prob_score": reinforce_log_prob_score_t,
+            }
+
+        action_next = self._transform_reinforce_action(
+            action_mean,
+            mode=action_transform_mode,
+            rms_eps=action_rms_eps,
+            mask=action_mask,
+        )
+        return {
+            "action_next": action_next,
+            "action_std_for_storage": (
+                torch.as_tensor(legacy_action_std, device=action_mean.device, dtype=torch.float32).detach()
+                if legacy_action_std is not None
+                else None
+            ),
+            "log_prob": None,
+            "log_prob_score": None,
+        }
+
+    @staticmethod
     def _exact_scm_aux_reward_components(
         action,
         *,
@@ -11946,10 +12136,9 @@ class EnvironmentPrior:
                 policy_cuda_end = torch.cuda.Event(enable_timing=True)
                 policy_cuda_end.record()
                 policy_cuda_pairs.append((policy_cuda_start, policy_cuda_end))
-            if isinstance(policy_out, tuple):
-                action_next, cache = policy_out
-            else:
-                action_next = policy_out
+            actor_outputs, action_next, cache_update = self._unpack_policy_step_output(policy_out)
+            if cache_update is not None:
+                cache = cache_update
 
             if action_next.ndim == 1:
                 action_next = action_next.reshape(batch_size, 1)
@@ -11982,10 +12171,8 @@ class EnvironmentPrior:
                 noise_block_idx = int(t - noise_block_start)
 
             if sample_action:
+                legacy_action_std_t = env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
                 if t < single_eval_pos:
-                    action_std_t = env["action_noise_train_std"]
-                    if torch.any(action_std_t <= 0):
-                        raise ValueError("stochastic policy objective requires action_noise_train_std > 0 for every batch item")
                     if strict_seed_mode:
                         action_eps_t = _draw_step_randn_with_optional_generators(
                             action_noise_train_generators,
@@ -12003,9 +12190,6 @@ class EnvironmentPrior:
                             dtype=torch.float32,
                         )
                 else:
-                    action_std_t = env["action_noise_eval_std"]
-                    if torch.any(action_std_t <= 0):
-                        raise ValueError("stochastic policy objective requires action_noise_eval_std > 0 for every batch item")
                     if strict_seed_mode:
                         action_eps_t = _draw_step_randn_with_optional_generators(
                             action_noise_eval_generators,
@@ -12022,31 +12206,37 @@ class EnvironmentPrior:
                             device=device,
                             dtype=torch.float32,
                         )
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = self._transform_reinforce_action(
-                    action_pre_tanh,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=True,
+                    action_eps_t=action_eps_t,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=collect_log_probs,
+                    collect_log_prob_score=collect_log_prob_score,
+                    legacy_action_std=legacy_action_std_t,
                 )
-                if collect_log_probs:
-                    reinforce_log_prob_t = self._gaussian_log_prob(
-                        action_next.detach(),
-                        action_mean,
-                        action_std_t,
-                    )
-                    if collect_log_prob_score:
-                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_next.detach(),
-                            action_mean.detach(),
-                            action_std_t,
-                        ).detach().to(dtype=torch.float32)
-                        reinforce_log_prob_t = reinforce_log_prob_t.detach()
+                action_next = sampled_action["action_next"]
+                reinforce_log_prob_t = sampled_action["log_prob"]
+                reinforce_log_prob_score_t = sampled_action["log_prob_score"]
             else:
-                action_next = self._transform_reinforce_action(
-                    action_mean,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=False,
+                    action_eps_t=None,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=False,
+                    collect_log_prob_score=False,
+                    legacy_action_std=(
+                        env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
+                    ),
                 )
+                action_next = sampled_action["action_next"]
                 if not reference_semantics_enabled:
                     # Keep legacy RNG consumption for action-noise streams, but
                     # do not perturb policy actions in the learned-policy rollout
@@ -13295,7 +13485,7 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1) * noise_mask.unsqueeze(0)
-            if torch.any(action_noise_train_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
                 action_noise_train_block = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, block_len, max_action_dim),
@@ -13304,7 +13494,7 @@ class EnvironmentPrior:
                 ).transpose(0, 1) * action_mask.unsqueeze(0)
             else:
                 action_noise_train_block = None
-            if torch.any(action_noise_eval_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
                 action_noise_eval_block = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, block_len, max_action_dim),
@@ -13364,14 +13554,14 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1) * noise_mask.unsqueeze(0)
-            if torch.any(action_noise_train_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
                 action_noise_train = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, n_samples, max_action_dim),
                     device=device,
                     dtype=torch.float32,
                 ).transpose(0, 1) * action_mask.unsqueeze(0)
-            if torch.any(action_noise_eval_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
                 action_noise_eval = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, n_samples, max_action_dim),
@@ -13552,7 +13742,7 @@ class EnvironmentPrior:
                         device=device,
                         dtype=torch.float32,
                     ).transpose(0, 1) * noise_mask.unsqueeze(0)
-                    if torch.any(action_noise_train_std > 0):
+                    if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
                         replay_action_noise_train_block = self._stack_randn_with_generators(
                             rollout_generators,
                             (batch_size, block_len, max_action_dim),
@@ -13561,7 +13751,7 @@ class EnvironmentPrior:
                         ).transpose(0, 1) * action_mask.unsqueeze(0)
                     else:
                         replay_action_noise_train_block = None
-                    if torch.any(action_noise_eval_std > 0):
+                    if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
                         replay_action_noise_eval_block = self._stack_randn_with_generators(
                             rollout_generators,
                             (batch_size, block_len, max_action_dim),
@@ -13638,10 +13828,11 @@ class EnvironmentPrior:
                             t_replay,
                             env_info,
                         )
-                    if isinstance(policy_out_replay, tuple):
-                        action_next_replay, cache_local = policy_out_replay
-                    else:
-                        action_next_replay = policy_out_replay
+                    actor_outputs_replay, action_next_replay, cache_update = self._unpack_policy_step_output(
+                        policy_out_replay
+                    )
+                    if cache_update is not None:
+                        cache_local = cache_update
                     if action_next_replay.ndim == 1:
                         action_next_replay = action_next_replay.reshape(batch_size, 1)
                     action_mean_replay = action_next_replay
@@ -13656,40 +13847,33 @@ class EnvironmentPrior:
                         noise_block_idx_replay = int(t_replay - replay_noise_block_start)
 
                     if t_replay < single_eval_pos:
-                        action_std_t_replay = action_noise_train_std
+                        legacy_action_std_t_replay = action_noise_train_std
                         if noise_streaming_mode:
                             action_eps_t_replay = replay_action_noise_train_block[noise_block_idx_replay]
                         else:
                             action_eps_t_replay = action_noise_train[t_replay]
                     else:
-                        action_std_t_replay = action_noise_eval_std
+                        legacy_action_std_t_replay = action_noise_eval_std
                         if noise_streaming_mode:
                             action_eps_t_replay = replay_action_noise_eval_block[noise_block_idx_replay]
                         else:
                             action_eps_t_replay = action_noise_eval[t_replay]
-                    action_pre_tanh_replay = action_mean_replay + (
-                        action_eps_t_replay * action_std_t_replay[:, None]
+                    sampled_action_replay = self._resolve_policy_action_sample(
+                        policy_step_fn=policy_step_fn,
+                        actor_outputs=actor_outputs_replay,
+                        action_mean=action_mean_replay,
+                        sample_action=True,
+                        action_eps_t=action_eps_t_replay,
+                        action_mask=action_mask,
+                        action_transform_mode=env_info.get("reinforce_action_transform", "rms"),
+                        action_rms_eps=env_info.get("reinforce_action_rms_eps", 1e-6),
+                        collect_log_probs=True,
+                        collect_log_prob_score=collect_log_prob_score,
+                        legacy_action_std=legacy_action_std_t_replay,
                     )
-                    action_next_replay = self._transform_reinforce_action(
-                        action_pre_tanh_replay,
-                        mode=env_info.get("reinforce_action_transform", "rms"),
-                        rms_eps=env_info.get("reinforce_action_rms_eps", 1e-6),
-                        mask=action_mask,
-                    )
-                    reinforce_log_prob_t_replay = self._gaussian_log_prob(
-                        action_next_replay.detach(),
-                        action_mean_replay,
-                        action_std_t_replay,
-                        mask=action_mask,
-                    )
-                    if collect_log_prob_score:
-                        reinforce_log_prob_score_t_replay = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_next_replay.detach(),
-                            action_mean_replay.detach(),
-                            action_std_t_replay,
-                            mask=action_mask,
-                        ).detach().to(dtype=torch.float32)
-                        reinforce_log_prob_t_replay = reinforce_log_prob_t_replay.detach()
+                    action_next_replay = sampled_action_replay["action_next"]
+                    reinforce_log_prob_t_replay = sampled_action_replay["log_prob"]
+                    reinforce_log_prob_score_t_replay = sampled_action_replay["log_prob_score"]
 
                     if noise_streaming_mode:
                         noise_t_replay = replay_transition_noise_block[noise_block_idx_replay]
@@ -14193,6 +14377,7 @@ class EnvironmentPrior:
             transition_gp_shared_call_count += int(gp_stats.get("shared_call_count", 0) or 0)
 
         for t in range(n_samples):
+            actor_outputs = None
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
@@ -14367,10 +14552,9 @@ class EnvironmentPrior:
                 policy_cuda_end = torch.cuda.Event(enable_timing=True)
                 policy_cuda_end.record()
                 policy_cuda_pairs.append((policy_cuda_start, policy_cuda_end))
-            if isinstance(policy_out, tuple):
-                action_next, cache = policy_out
-            else:
-                action_next = policy_out
+            actor_outputs, action_next, cache_update = self._unpack_policy_step_output(policy_out)
+            if cache_update is not None:
+                cache = cache_update
             if action_next.ndim == 1:
                 action_next = action_next.reshape(batch_size, 1)
             if action_next.ndim != 2 or action_next.shape[0] != batch_size:
@@ -14404,61 +14588,57 @@ class EnvironmentPrior:
 
             if sample_action:
                 if t < single_eval_pos:
-                    if torch.any(action_noise_train_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
-                        )
                     if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_train_block[noise_block_idx]
                     elif action_noise_train is not None:
                         action_eps_t = action_noise_train[t]
                     else:
                         raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
-                    action_std_t = action_noise_train_std
+                    legacy_action_std_t = action_noise_train_std
                 else:
-                    if torch.any(action_noise_eval_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
-                        )
                     if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_eval_block[noise_block_idx]
                     elif action_noise_eval is not None:
                         action_eps_t = action_noise_eval[t]
                     else:
                         raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
-                    action_std_t = action_noise_eval_std
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = self._transform_reinforce_action(
-                    action_pre_tanh,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
-                    mask=action_mask,
+                    legacy_action_std_t = action_noise_eval_std
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=True,
+                    action_eps_t=action_eps_t,
+                    action_mask=action_mask,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=True,
+                    collect_log_prob_score=collect_log_prob_score,
+                    legacy_action_std=legacy_action_std_t,
                 )
+                action_next = sampled_action["action_next"]
                 if collect_reinforce_replay and t >= replay_eval_start:
                     replay_t = int(t - replay_eval_start)
                     replay_sampled_action_steps[replay_t] = action_next.detach()
-                    replay_action_std_steps[replay_t] = action_std_t.detach()
-                reinforce_log_prob_t = self._gaussian_log_prob(
-                    action_next.detach(),
-                    action_mean,
-                    action_std_t,
-                    mask=action_mask,
-                )
-                if collect_log_prob_score:
-                    reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                        action_next.detach(),
-                        action_mean.detach(),
-                        action_std_t,
-                        mask=action_mask,
-                    ).detach().to(dtype=torch.float32)
-                    reinforce_log_prob_t = reinforce_log_prob_t.detach()
+                    if sampled_action["action_std_for_storage"] is not None:
+                        replay_action_std_steps[replay_t] = sampled_action["action_std_for_storage"]
+                reinforce_log_prob_t = sampled_action["log_prob"]
+                reinforce_log_prob_score_t = sampled_action["log_prob_score"]
             else:
-                action_next = self._transform_reinforce_action(
-                    action_mean,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
-                    mask=action_mask,
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=False,
+                    action_eps_t=None,
+                    action_mask=action_mask,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=False,
+                    collect_log_prob_score=False,
+                    legacy_action_std=(action_noise_train_std if t < single_eval_pos else action_noise_eval_std),
                 )
+                action_next = sampled_action["action_next"]
                 # Preserve action-noise RNG draws for reproducible downstream
                 # transition/state noise, but keep the learned policy deterministic
                 # after the configured action transform.
@@ -15674,9 +15854,9 @@ class EnvironmentPrior:
             # Keep legacy rollout RNG ordering for data-generation path so
             # strict serial/vectorized semantic checks remain identical.
             transition_noise = _randn((n_samples, noise_dim), dtype=state_t.dtype)
-            if env["action_noise_train_std"] > 0:
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or env["action_noise_train_std"] > 0:
                 action_noise_train = _randn((n_samples, action_dim), dtype=state_t.dtype)
-            if env["action_noise_eval_std"] > 0:
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or env["action_noise_eval_std"] > 0:
                 action_noise_eval = _randn((n_samples, action_dim), dtype=state_t.dtype)
             if env["state_noise_std"] > 0:
                 state_noise = _randn((n_samples, state_dim), dtype=state_t.dtype)
@@ -15688,10 +15868,10 @@ class EnvironmentPrior:
             if local_generator is not None:
                 transition_noise_generator = _clone_generator_state(local_generator)
                 _advance_generator_randn(local_generator, n_samples * noise_dim)
-                if env["action_noise_train_std"] > 0:
+                if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or env["action_noise_train_std"] > 0:
                     action_noise_train_generator = _clone_generator_state(local_generator)
                     _advance_generator_randn(local_generator, n_samples * action_dim)
-                if env["action_noise_eval_std"] > 0:
+                if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or env["action_noise_eval_std"] > 0:
                     action_noise_eval_generator = _clone_generator_state(local_generator)
                     _advance_generator_randn(local_generator, n_samples * action_dim)
                 if env["state_noise_std"] > 0:
@@ -15832,10 +16012,9 @@ class EnvironmentPrior:
                         t,
                         env,
                     )
-                if isinstance(policy_out, tuple):
-                    action_next, cache = policy_out
-                else:
-                    action_next = policy_out
+                actor_outputs, action_next, cache_update = self._unpack_policy_step_output(policy_out)
+                if cache_update is not None:
+                    cache = cache_update
                 if action_next.ndim == 2 and action_next.shape[0] == 1:
                     action_next = action_next.squeeze(0)
                 if action_next.shape[-1] != env["action_dim"]:
@@ -15855,9 +16034,6 @@ class EnvironmentPrior:
 
             action_noise_std = env["action_noise_train_std"] if t < single_eval_pos else env["action_noise_eval_std"]
             if sample_action:
-                if action_noise_std <= 0:
-                    phase_name = "train" if t < single_eval_pos else "eval"
-                    raise ValueError(f"stochastic policy objective requires positive action_noise_{phase_name}_std")
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
                         action_eps_t = action_noise_train[t]
@@ -15908,32 +16084,41 @@ class EnvironmentPrior:
                                 dtype=state_t.dtype,
                                 generator=action_noise_eval_generator,
                             )
-                action_pre_tanh = action_mean + (action_eps_t * float(action_noise_std))
-                action_next = self._transform_reinforce_action(
-                    action_pre_tanh,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
-                )
-                if collect_log_probs:
-                    reinforce_log_prob_t = self._gaussian_log_prob(
-                        action_next.detach(),
-                        action_mean,
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=True,
+                    action_eps_t=action_eps_t,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=collect_log_probs,
+                    collect_log_prob_score=collect_log_prob_score,
+                    legacy_action_std=torch.full(
+                        (1,),
                         float(action_noise_std),
-                    )
-                    if collect_log_prob_score:
-                        reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                            action_next.detach(),
-                            action_mean.detach(),
-                            float(action_noise_std),
-                        ).detach().to(dtype=torch.float32)
-                        reinforce_log_prob_t = reinforce_log_prob_t.detach()
+                        device=action_mean.device,
+                        dtype=action_mean.dtype,
+                    ),
+                )
+                action_next = sampled_action["action_next"]
+                reinforce_log_prob_t = sampled_action["log_prob"]
+                reinforce_log_prob_score_t = sampled_action["log_prob_score"]
             else:
                 if not use_fast_env_in:
-                    action_next = self._transform_reinforce_action(
-                        action_mean,
-                        mode=action_transform_mode,
-                        rms_eps=action_rms_eps,
+                    sampled_action = self._resolve_policy_action_sample(
+                        policy_step_fn=policy_step_fn,
+                        actor_outputs=actor_outputs,
+                        action_mean=action_mean,
+                        sample_action=False,
+                        action_eps_t=None,
+                        action_transform_mode=action_transform_mode,
+                        action_rms_eps=action_rms_eps,
+                        collect_log_probs=False,
+                        collect_log_prob_score=False,
+                        legacy_action_std=torch.full((1,), float(action_noise_std), device=action_mean.device, dtype=action_mean.dtype),
                     )
+                    action_next = sampled_action["action_next"]
             if (not sample_action) and (not reference_semantics_enabled) and action_noise_std > 0:
                 if use_fast_env_in:
                     if t < single_eval_pos and action_noise_train is not None:
@@ -16467,14 +16652,14 @@ class EnvironmentPrior:
         action_noise_train = None
         action_noise_eval = None
         state_noise = None
-        if torch.any(action_noise_train_std > 0):
+        if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
             action_noise_train = self._stack_randn_with_generators(
                 rollout_generators,
                 (batch_size, n_samples, action_dim),
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1)
-        if torch.any(action_noise_eval_std > 0):
+        if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
             action_noise_eval = self._stack_randn_with_generators(
                 rollout_generators,
                 (batch_size, n_samples, action_dim),
@@ -17558,6 +17743,8 @@ class EnvironmentPrior:
 
         replay_fn = policy_step_fn._reinforce_sequence_replay_fn
         replay_outputs_fn = getattr(policy_step_fn, "_reinforce_sequence_replay_outputs_fn", None)
+        actor_log_prob_fn = getattr(policy_step_fn, "_policy_actor_log_prob_fn", None)
+        actor_decomp_stats_fn = getattr(policy_step_fn, "_policy_actor_decomp_stats_fn", None)
         reward_in = replay_payload.get("reward_in", None)
         sampled_action = replay_payload.get("sampled_action", None)
         action_std = replay_payload.get("action_std", None)
@@ -17566,11 +17753,11 @@ class EnvironmentPrior:
         obs_mask = replay_payload.get("obs_mask", None)
         eval_start = int(replay_payload.get("eval_start", int(single_eval_pos) or 0) or 0)
         full_length = int(replay_payload.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
-        if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_std, action_mask)):
+        if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_mask)):
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
 
         rewards_eval = rewards[eval_start:]
-        if tuple(rewards_eval.shape) != tuple(action_std.shape):
+        if torch.is_tensor(action_std) and tuple(rewards_eval.shape) != tuple(action_std.shape):
             raise RuntimeError(
                 "reinforce sequence replay reward/action_std shape mismatch: "
                 f"{tuple(rewards_eval.shape)} vs {tuple(action_std.shape)}"
@@ -17678,6 +17865,8 @@ class EnvironmentPrior:
                     flow_matching_t=flow_matching_t_chunk,
                 )
                 action_mean_replay = replay_outputs["action_mean"]
+                action_std_replay = replay_outputs.get("action_std", None)
+                action_log_std_replay = replay_outputs.get("action_log_std", None)
                 normalized_q_pred = replay_outputs.get("normalized_q", None)
                 normalized_q_logits = replay_outputs.get("normalized_q_logits", None)
                 next_state_flow_pred = replay_outputs.get("next_state_flow", None)
@@ -17687,6 +17876,8 @@ class EnvironmentPrior:
                     reward_in[:, start:end],
                     eval_start=eval_start,
                 )
+                action_std_replay = None
+                action_log_std_replay = None
                 normalized_q_pred = None
                 normalized_q_logits = None
                 next_state_flow_pred = None
@@ -17705,18 +17896,62 @@ class EnvironmentPrior:
             elif int(action_mean_replay.shape[-1]) != replay_action_dim:
                 action_mean_replay = action_mean_replay[..., :replay_action_dim]
             action_mean_replay = action_mean_replay.to(dtype=sampled_action.dtype)
-            log_probs_chunk = self._gaussian_log_prob(
-                sampled_action[:, start:end],
-                action_mean_replay,
-                action_std[:, start:end],
-                mask=action_mask[start:end],
-            ).to(dtype=torch.float32)
-            decomp_stats_chunk = self._gaussian_log_prob_decomposition_stats(
-                sampled_action[:, start:end],
-                action_mean_replay,
-                action_std[:, start:end],
-                mask=action_mask[start:end],
-            )
+            action_mask_chunk = action_mask[start:end]
+            sampled_action_chunk = sampled_action[:, start:end]
+            if torch.is_tensor(action_std_replay):
+                if int(action_std_replay.shape[-1]) != replay_action_dim:
+                    action_std_replay = action_std_replay[..., :replay_action_dim]
+                actor_outputs_chunk = {
+                    "action_mean": action_mean_replay,
+                    "action_std": action_std_replay.to(dtype=sampled_action.dtype),
+                }
+                if torch.is_tensor(action_log_std_replay):
+                    if int(action_log_std_replay.shape[-1]) != replay_action_dim:
+                        action_log_std_replay = action_log_std_replay[..., :replay_action_dim]
+                    actor_outputs_chunk["action_log_std"] = action_log_std_replay.to(dtype=sampled_action.dtype)
+                if callable(actor_log_prob_fn):
+                    log_probs_chunk = actor_log_prob_fn(
+                        actor_outputs_chunk,
+                        sampled_action_chunk,
+                        action_mask=action_mask_chunk,
+                    ).to(dtype=torch.float32)
+                else:
+                    log_probs_chunk = self._gaussian_log_prob(
+                        sampled_action_chunk,
+                        action_mean_replay,
+                        actor_outputs_chunk["action_std"],
+                        mask=action_mask_chunk,
+                    ).to(dtype=torch.float32)
+                if callable(actor_decomp_stats_fn):
+                    decomp_stats_chunk = actor_decomp_stats_fn(
+                        actor_outputs_chunk,
+                        sampled_action_chunk,
+                        action_mask=action_mask_chunk,
+                    )
+                else:
+                    decomp_stats_chunk = self._gaussian_log_prob_decomposition_stats(
+                        sampled_action_chunk,
+                        action_mean_replay,
+                        actor_outputs_chunk["action_std"],
+                        mask=action_mask_chunk,
+                    )
+            else:
+                if not torch.is_tensor(action_std):
+                    raise RuntimeError(
+                        "reinforce sequence replay requires either replay actor std outputs or recorded action_std"
+                    )
+                log_probs_chunk = self._gaussian_log_prob(
+                    sampled_action_chunk,
+                    action_mean_replay,
+                    action_std[:, start:end],
+                    mask=action_mask_chunk,
+                ).to(dtype=torch.float32)
+                decomp_stats_chunk = self._gaussian_log_prob_decomposition_stats(
+                    sampled_action_chunk,
+                    action_mean_replay,
+                    action_std[:, start:end],
+                    mask=action_mask_chunk,
+                )
             chunk_weight = float(end - start)
             replay_decomp_count += chunk_weight
             for key in replay_decomp_accum:
@@ -17859,6 +18094,7 @@ class EnvironmentPrior:
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(self.config)
         reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
+        reinforce_action_transform = str(self.config.get("reinforce_action_transform", "rms")).strip().lower()
         reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
         reinforce_adv_norm_eps = self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6))
         reinforce_adv_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
@@ -17881,6 +18117,7 @@ class EnvironmentPrior:
             f"|rrtx={reinforce_reward_transform}"
             f"|rrtc={_fmt_float(reinforce_reward_tanh_c)}"
             f"|rrtb={_fmt_float(reinforce_reward_tanh_bound)}"
+            f"|atx={reinforce_action_transform}"
             f"|anorm={int(reinforce_adv_normalized)}"
             f"|aneps={_fmt_float(reinforce_adv_norm_eps)}"
             f"|anclip={_fmt_float(reinforce_adv_norm_clip)}"
@@ -19010,7 +19247,7 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1) * noise_mask.unsqueeze(0)
-            if torch.any(action_noise_train_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
                 action_noise_train_block = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, block_len, max_action_dim),
@@ -19019,7 +19256,7 @@ class EnvironmentPrior:
                 ).transpose(0, 1) * action_mask.unsqueeze(0)
             else:
                 action_noise_train_block = None
-            if torch.any(action_noise_eval_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
                 action_noise_eval_block = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, block_len, max_action_dim),
@@ -19079,14 +19316,14 @@ class EnvironmentPrior:
                 device=device,
                 dtype=torch.float32,
             ).transpose(0, 1) * noise_mask.unsqueeze(0)
-            if torch.any(action_noise_train_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_train_std > 0):
                 action_noise_train = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, n_samples, max_action_dim),
                     device=device,
                     dtype=torch.float32,
                 ).transpose(0, 1) * action_mask.unsqueeze(0)
-            if torch.any(action_noise_eval_std > 0):
+            if callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)) or torch.any(action_noise_eval_std > 0):
                 action_noise_eval = self._stack_randn_with_generators(
                     rollout_generators,
                     (batch_size, n_samples, max_action_dim),
@@ -19325,10 +19562,9 @@ class EnvironmentPrior:
                         t,
                         env_info,
                     )
-                if isinstance(policy_out, tuple):
-                    action_next, cache_local = policy_out
-                else:
-                    action_next = policy_out
+                actor_outputs, action_next, cache_update = self._unpack_policy_step_output(policy_out)
+                if cache_update is not None:
+                    cache_local = cache_update
                 if action_next.ndim == 1:
                     action_next = action_next.reshape(batch_size, 1)
                 if action_next.ndim != 2 or action_next.shape[0] != batch_size:
@@ -19347,51 +19583,39 @@ class EnvironmentPrior:
                         _refresh_noise_block(t)
                     noise_block_idx = int(t - noise_block_start)
                 if t < single_eval_pos:
-                    if torch.any(action_noise_train_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_train_std > 0 for every batch item"
-                        )
                     if noise_streaming_mode and action_noise_train_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_train_block[noise_block_idx]
                     elif action_noise_train is not None:
                         action_eps_t = action_noise_train[t]
                     else:
                         raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_train")
-                    action_std_t = action_noise_train_std
+                    legacy_action_std_t = action_noise_train_std
                 else:
-                    if torch.any(action_noise_eval_std <= 0):
-                        raise ValueError(
-                            "stochastic policy objective requires action_noise_eval_std > 0 for every batch item"
-                        )
                     if noise_streaming_mode and action_noise_eval_block is not None and noise_block_idx is not None:
                         action_eps_t = action_noise_eval_block[noise_block_idx]
                     elif action_noise_eval is not None:
                         action_eps_t = action_noise_eval[t]
                     else:
                         raise RuntimeError("stochastic policy rollout expected pre-sampled action_noise_eval")
-                    action_std_t = action_noise_eval_std
-                action_pre_tanh = action_mean + (action_eps_t * action_std_t[:, None])
-                action_next = self._transform_reinforce_action(
-                    action_pre_tanh,
-                    mode=action_transform_mode,
-                    rms_eps=action_rms_eps,
-                    mask=action_mask,
+                    legacy_action_std_t = action_noise_eval_std
+                sampled_action = self._resolve_policy_action_sample(
+                    policy_step_fn=policy_step_fn,
+                    actor_outputs=actor_outputs,
+                    action_mean=action_mean,
+                    sample_action=True,
+                    action_eps_t=action_eps_t,
+                    action_mask=action_mask,
+                    action_transform_mode=action_transform_mode,
+                    action_rms_eps=action_rms_eps,
+                    collect_log_probs=True,
+                    collect_log_prob_score=alpha_grad_enabled,
+                    legacy_action_std=legacy_action_std_t,
                 )
-                reinforce_log_prob_t = self._gaussian_log_prob(
-                    action_next.detach(),
-                    action_mean,
-                    action_std_t,
-                    mask=action_mask,
-                )
+                action_next = sampled_action["action_next"]
+                reinforce_log_prob_t = sampled_action["log_prob"]
                 reinforce_log_prob_score_t = None
                 if alpha_grad_enabled:
-                    reinforce_log_prob_score_t = self._reinforce_log_prob_score_wrt_action_mean(
-                        action_next.detach(),
-                        action_mean.detach(),
-                        action_std_t,
-                        mask=action_mask,
-                    ).detach().to(dtype=torch.float32)
-                    reinforce_log_prob_t = reinforce_log_prob_t.detach()
+                    reinforce_log_prob_score_t = sampled_action["log_prob_score"]
 
                 if noise_streaming_mode and noise_block_idx is not None:
                     noise_t = transition_noise_block[noise_block_idx]
@@ -20210,14 +20434,14 @@ class EnvironmentPrior:
                 _policy_collect_reinforce_replay=bool(reinforce_sequence_replay_enabled),
                 _policy_disable_log_probs=bool(reinforce_sequence_replay_enabled),
                 _policy_force_no_grad=bool(reinforce_sequence_replay_enabled),
-                _policy_defer_reinforce_replay=bool(reinforce_sequence_replay_enabled and callable(reinforce_replay_loss_sink)),
+                _policy_defer_reinforce_replay=bool(reinforce_sequence_replay_enabled),
             )
             effective_single_eval_pos = int(rollout.get("single_eval_pos", single_eval_pos or 0))
             effective_single_eval_pos = int(max(0, min(int(rollout["rewards"].shape[0]), effective_single_eval_pos)))
             rewards_eval = rollout["rewards"][effective_single_eval_pos:]
             if reinforce_enabled:
                 reinforce_rollout = rollout.get("reinforce", None)
-                if reinforce_sequence_replay_enabled and callable(reinforce_replay_loss_sink):
+                if reinforce_sequence_replay_enabled:
                     replay_payload = getattr(self, "last_rollout_reinforce_replay", None)
                     loss, stats, replay_log_probs = self.reinforce_sequence_replay_loss_from_rollout(
                         policy_step_fn=policy_step_fn,
@@ -20240,8 +20464,6 @@ class EnvironmentPrior:
                     rollout["reinforce"] = self.last_rollout_reinforce
                 elif not isinstance(reinforce_rollout, dict) or (not torch.is_tensor(reinforce_rollout.get("log_probs", None))):
                     raise RuntimeError("reinforce rollout did not return log_probs")
-                elif reinforce_sequence_replay_enabled and (not bool(reinforce_rollout.get("sequence_replay_applied", False))):
-                    raise RuntimeError("reinforce sequence replay was enabled, but rollout did not apply replayed log_probs")
                 else:
                     loss, stats = self.reinforce_loss_from_rewards(
                         rewards=rewards_eval,

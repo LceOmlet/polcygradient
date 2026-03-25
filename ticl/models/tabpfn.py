@@ -6,6 +6,7 @@ import torch, wandb
 import torch.nn as nn
 import torch.nn.functional as F
 
+from ticl.models.dreamer_v3_policy import DreamerV3ContinuousActorHead
 from ticl.models.layer import TransformerEncoderLayer, TransformerEncoderSimple
 from ticl.models.rl_aux_heads import (
     CFMIResidualFlowMatchingHead,
@@ -106,10 +107,9 @@ class TabPFN(nn.Module):
         self.next_state_flow_head_type = str(next_state_flow_head_type or "mlp").strip().lower()
         self.policy_action_head = None
         if self.policy_action_dim is not None and self.policy_action_dim > 0:
-            self.policy_action_head = (
-                decoder(emsize, nhid, self.policy_action_dim)
-                if decoder is not None
-                else build_two_layer_mlp_head(emsize, nhid, self.policy_action_dim)
+            self.policy_action_head = DreamerV3ContinuousActorHead(
+                emsize,
+                self.policy_action_dim,
             )
         self.normalized_q_value_head = None
         self.normalized_q_value_bardist = None
@@ -226,6 +226,9 @@ class TabPFN(nn.Module):
 
     @staticmethod
     def _infer_head_out_dim(head):
+        action_dim = getattr(head, "action_dim", None)
+        if action_dim is not None:
+            return int(action_dim)
         if isinstance(head, nn.Linear):
             return int(head.out_features)
         if isinstance(head, nn.Sequential):
@@ -267,7 +270,7 @@ class TabPFN(nn.Module):
             )
         return True
 
-    def _decode_policy_action(self, hidden, *, policy_action_head_params_override=None):
+    def _decode_policy_actor_outputs(self, hidden, *, policy_action_head_params_override=None):
         if self.policy_action_head_required():
             self.require_policy_action_head()
             hidden = self._cast_hidden_for_head(hidden, self.policy_action_head)
@@ -278,7 +281,30 @@ class TabPFN(nn.Module):
                     hidden,
                 )
             return self.policy_action_head(hidden)
-        return self.decoder(hidden)
+        hidden = self._cast_hidden_for_head(hidden, self.decoder)
+        return {"action_mean": self.decoder(hidden)}
+
+    def _decode_policy_action(self, hidden, *, policy_action_head_params_override=None):
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )["action_mean"]
+
+    def sample_policy_action_from_outputs(self, actor_outputs, *, noise=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.sample(actor_outputs, noise=noise)
+
+    def log_prob_policy_action_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.log_prob(actor_outputs, action, mask=action_mask)
+
+    def log_prob_score_wrt_mean_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.score_wrt_mean(actor_outputs, action, mask=action_mask)
+
+    def policy_log_prob_decomposition_stats_from_outputs(self, actor_outputs, action, *, action_mask=None):
+        self.require_policy_action_head()
+        return self.policy_action_head.decomposition_stats(actor_outputs, action, mask=action_mask)
 
     def has_normalized_q_value_head(self):
         return isinstance(self.normalized_q_value_head, nn.Module) and isinstance(
@@ -320,12 +346,10 @@ class TabPFN(nn.Module):
         flow_matching_t=None,
         policy_action_head_params_override=None,
     ):
-        outputs = {
-            "action_mean": self._decode_policy_action(
-                hidden_q,
-                policy_action_head_params_override=policy_action_head_params_override,
-            )
-        }
+        outputs = self._decode_policy_actor_outputs(
+            hidden_q,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
         if self.has_normalized_q_value_head():
             normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q)
             outputs["normalized_q_logits"] = normalized_q_logits
@@ -658,6 +682,18 @@ class TabPFN(nn.Module):
         hidden = self.transformer_encoder.forward_query(x_enc, kv_cache)
         return self._decode_policy_action(hidden)
 
+    def predict_query_actor_outputs_with_kv(self, x_query, kv_cache, *, policy_action_head_params_override=None):
+        if not self.single_eval_causal:
+            raise ValueError("KV cache requires single_eval_causal=True.")
+        x_enc = self.encoder(x_query)
+        if self.input_ln is not None:
+            x_enc = self.input_ln(x_enc)
+        hidden = self.transformer_encoder.forward_query(x_enc, kv_cache)
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
     def replay_policy_sequence_tokens(
         self,
         x_tokens,
@@ -723,6 +759,7 @@ class TabPFN(nn.Module):
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
     ):
         """
         Incremental single-step forward for autoregressive policy rollout.
@@ -762,7 +799,10 @@ class TabPFN(nn.Module):
             if callable(consume_tf_profile):
                 transformer_layer_profile = consume_tf_profile()
         decoder_t0 = time.perf_counter() if profile_enabled else None
-        out = self._decode_policy_action(hidden)
+        out = self._decode_policy_action(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
         decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
         if total_t0 is not None:
             stats = self._policy_step_profile_stats
@@ -857,6 +897,42 @@ class TabPFN(nn.Module):
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache
 
+    def forward_policy_step_actor(
+        self,
+        x_token,
+        y_token,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode: str = "auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("forward_policy_step_actor requires single_eval_causal=True.")
+        if x_token.ndim != 3 or x_token.shape[0] != 1:
+            raise ValueError(f"x_token must have shape (1, B, F), got {tuple(x_token.shape)}")
+        x_enc = self.encoder(x_token)
+        y_enc = self.y_encoder(y_token.unsqueeze(-1) if len(y_token.shape) < len(x_enc.shape) else y_token)
+        token = x_enc + y_enc
+        if self.input_ln is not None:
+            token = self.input_ln(token)
+        hidden, kv_cache = self.transformer_encoder.forward_step(
+            token,
+            kv_cache=kv_cache,
+            append_to_cache=True,
+            max_cache_len=max_cache_len,
+            kv_cache_mode=kv_cache_mode,
+            kv_cache_page_size=kv_cache_page_size,
+            allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+        )
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        ), kv_cache
+
     def forward_policy_step_split(
         self,
         obs_t,
@@ -871,6 +947,7 @@ class TabPFN(nn.Module):
         kv_cache_page_size=None,
         allow_grad_mutable_cache: bool = False,
         allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
     ):
         """
         Incremental single-step forward optimized for split_obs_action layout.
@@ -1047,7 +1124,10 @@ class TabPFN(nn.Module):
             if callable(consume_tf_profile):
                 transformer_layer_profile = consume_tf_profile()
         decoder_t0 = time.perf_counter() if profile_enabled else None
-        out = self._decode_policy_action(hidden)
+        out = self._decode_policy_action(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
         decoder_dt = (time.perf_counter() - decoder_t0) if decoder_t0 is not None else 0.0
         if total_t0 is not None:
             stats = self._policy_step_profile_stats
@@ -1141,6 +1221,165 @@ class TabPFN(nn.Module):
                 )
                 stats["transformer_layer_total_wall_s"] += float(transformer_layer_profile.get("total_wall_s", 0.0) or 0.0)
         return out, kv_cache
+
+    def forward_policy_step_split_actor(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode: str = "auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache: bool = False,
+        allow_grad_inplace_paged_cache: bool = False,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("forward_policy_step_split_actor requires single_eval_causal=True.")
+        if self.x_encoder_type != "split_obs_action" or (not isinstance(self.encoder, SplitObsActionEncoder)):
+            raise ValueError("forward_policy_step_split_actor requires split_obs_action encoder.")
+        if obs_t.ndim != 2 or action_t.ndim != 2:
+            raise ValueError(
+                f"obs_t/action_t must have shape (B, D), got {tuple(obs_t.shape)} / {tuple(action_t.shape)}"
+            )
+
+        batch_size = int(obs_t.shape[0])
+        if int(action_t.shape[0]) != batch_size:
+            raise ValueError("obs_t and action_t batch size mismatch")
+
+        reward_scalar = reward_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        reward_mask_scalar = reward_mask_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        phase_scalar = None
+        if phase_t is not None:
+            phase_scalar = phase_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+        terminal_scalar = None
+        if terminal_t is not None:
+            terminal_scalar = terminal_t.reshape(batch_size, 1).to(dtype=obs_t.dtype, device=obs_t.device)
+
+        obs_encoder = self.encoder.obs_encoder
+        action_encoder = self.encoder.action_encoder
+        obs_weight = obs_encoder.weight
+        obs_bias = obs_encoder.bias
+        action_weight = action_encoder.weight
+        action_bias = action_encoder.bias
+        fuse_y_linear = isinstance(self.y_encoder, nn.Linear) and int(getattr(self.y_encoder, "in_features", 0)) == 1
+        if fuse_y_linear:
+            y_weight_vec = self.y_encoder.weight[:, 0]
+            y_bias_vec = self.y_encoder.bias
+        else:
+            y_weight_vec = None
+            y_bias_vec = None
+        obs_dim = int(self.encoder.obs_dim)
+        action_dim = int(self.encoder.action_dim)
+        extra_scalar_slots = int(max(0, obs_dim - int(obs_t.shape[-1]) - 2))
+        phase_slot_expected = int(phase_scalar is not None)
+        terminal_slot_expected = int(terminal_scalar is not None)
+        remaining_slots = int(max(0, extra_scalar_slots - phase_slot_expected - terminal_slot_expected))
+        if remaining_slots > 0 and phase_scalar is None:
+            phase_scalar = torch.zeros((batch_size, 1), device=obs_t.device, dtype=obs_t.dtype)
+            phase_slot_expected = 1
+            remaining_slots -= 1
+        if remaining_slots > 0 and terminal_scalar is None:
+            terminal_scalar = torch.zeros((batch_size, 1), device=obs_t.device, dtype=obs_t.dtype)
+            terminal_slot_expected = 1
+            remaining_slots -= 1
+        scalar_slots = 2 + phase_slot_expected + terminal_slot_expected
+        obs_slot_dim = int(max(0, obs_dim - scalar_slots))
+        reward_idx = obs_slot_dim
+        mask_idx = obs_slot_dim + 1
+        phase_idx = obs_slot_dim + 2 if phase_slot_expected else None
+        terminal_idx = obs_slot_dim + 2 + phase_slot_expected if terminal_slot_expected else None
+        obs_copy = int(min(int(obs_t.shape[-1]), obs_slot_dim))
+        action_copy = int(min(int(action_t.shape[-1]), action_dim))
+        obs_src = torch.nan_to_num(obs_t, nan=0.0) if bool(getattr(obs_encoder, "replace_nan_by_zero", False)) else obs_t
+        action_src = torch.nan_to_num(action_t, nan=0.0) if bool(getattr(action_encoder, "replace_nan_by_zero", False)) else action_t
+
+        if _SPLIT_ENCODE_FUSION_ENABLED:
+            fused_inputs = []
+            fused_weights = []
+            if obs_copy > 0:
+                fused_inputs.append(obs_src[:, :obs_copy])
+                fused_weights.append(obs_weight[:, :obs_copy])
+            if action_copy > 0:
+                fused_inputs.append(action_src[:, :action_copy])
+                fused_weights.append(action_weight[:, :action_copy])
+            if reward_idx < obs_dim:
+                reward_weight_col = obs_weight[:, reward_idx].unsqueeze(1)
+                if y_weight_vec is not None:
+                    reward_weight_col = reward_weight_col + y_weight_vec.unsqueeze(1)
+                fused_inputs.append(reward_scalar)
+                fused_weights.append(reward_weight_col)
+            elif y_weight_vec is not None:
+                fused_inputs.append(reward_scalar)
+                fused_weights.append(y_weight_vec.unsqueeze(1))
+            if mask_idx < obs_dim:
+                fused_inputs.append(reward_mask_scalar)
+                fused_weights.append(obs_weight[:, mask_idx].unsqueeze(1))
+            if phase_idx is not None and phase_idx < obs_dim:
+                fused_inputs.append(phase_scalar)
+                fused_weights.append(obs_weight[:, phase_idx].unsqueeze(1))
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                fused_inputs.append(terminal_scalar)
+                fused_weights.append(obs_weight[:, terminal_idx].unsqueeze(1))
+            fused_bias = obs_bias + action_bias
+            if y_bias_vec is not None:
+                fused_bias = fused_bias + y_bias_vec
+            if fused_inputs:
+                fused_in = fused_inputs[0] if len(fused_inputs) == 1 else torch.cat(fused_inputs, dim=1)
+                fused_w = fused_weights[0] if len(fused_weights) == 1 else torch.cat(fused_weights, dim=1)
+                token_be = F.linear(fused_in, fused_w, fused_bias)
+            else:
+                token_be = fused_bias.unsqueeze(0).expand(batch_size, -1)
+            token = token_be.unsqueeze(0)
+        else:
+            if obs_copy > 0:
+                obs_enc = F.linear(obs_src[:, :obs_copy], obs_weight[:, :obs_copy], obs_bias)
+            else:
+                obs_enc = obs_bias.unsqueeze(0).expand(batch_size, -1)
+            if reward_idx < obs_dim:
+                reward_weight = obs_weight[:, reward_idx]
+                if y_weight_vec is not None:
+                    reward_weight = reward_weight + y_weight_vec
+                obs_enc = obs_enc + reward_scalar * reward_weight.unsqueeze(0)
+            elif y_weight_vec is not None:
+                obs_enc = obs_enc + reward_scalar * y_weight_vec.unsqueeze(0)
+            if mask_idx < obs_dim:
+                obs_enc = obs_enc + reward_mask_scalar * obs_weight[:, mask_idx].unsqueeze(0)
+            if phase_idx is not None and phase_idx < obs_dim:
+                obs_enc = obs_enc + phase_scalar * obs_weight[:, phase_idx].unsqueeze(0)
+            if terminal_idx is not None and terminal_idx < obs_dim:
+                obs_enc = obs_enc + terminal_scalar * obs_weight[:, terminal_idx].unsqueeze(0)
+            if y_bias_vec is not None:
+                obs_enc = obs_enc + y_bias_vec.unsqueeze(0)
+            if action_copy > 0:
+                action_enc = F.linear(action_src[:, :action_copy], action_weight[:, :action_copy], action_bias)
+            else:
+                action_enc = action_bias.unsqueeze(0).expand(batch_size, -1)
+            token = (obs_enc + action_enc).unsqueeze(0)
+        if not fuse_y_linear:
+            y_in = reward_scalar.reshape(1, batch_size)
+            y_enc = self.y_encoder(y_in.unsqueeze(-1) if len(y_in.shape) < len(token.shape) else y_in)
+            token = token + y_enc
+        if self.input_ln is not None:
+            token = self.input_ln(token)
+        hidden, kv_cache = self.transformer_encoder.forward_step(
+            token,
+            kv_cache=kv_cache,
+            append_to_cache=True,
+            max_cache_len=max_cache_len,
+            kv_cache_mode=kv_cache_mode,
+            kv_cache_page_size=kv_cache_page_size,
+            allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+        )
+        return self._decode_policy_actor_outputs(
+            hidden,
+            policy_action_head_params_override=policy_action_head_params_override,
+        ), kv_cache
 
     def forward_with_kv(self, src, single_eval_pos=None):
         """

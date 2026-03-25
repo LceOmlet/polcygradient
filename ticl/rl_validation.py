@@ -454,24 +454,37 @@ def _select_policy_action(
             env_info,
         )
     if isinstance(policy_out, tuple):
-        action_mean, cache_next = policy_out
+        policy_core, cache_next = policy_out
     else:
-        action_mean = policy_out
+        policy_core = policy_out
         cache_next = state["policy_cache"]
+    if isinstance(policy_core, dict):
+        actor_outputs = policy_core
+        action_mean = actor_outputs["action_mean"]
+    else:
+        actor_outputs = None
+        action_mean = policy_core
     if action_mean.ndim == 1:
         action_mean = action_mean.reshape(1, -1)
 
     policy_hparams = state["policy_hparams"]
-    action_std = (
-        float(policy_hparams["action_noise_eval_std"])
-        if float(state["phase_flag"]) >= 1.0
-        else float(policy_hparams["action_noise_train_std"])
-    )
-    if action_std > 0.0:
+    if actor_outputs is not None and callable(getattr(policy_step_fn, "_policy_actor_sample_fn", None)):
         action_eps = state["rng"].normal(size=tuple(action_mean.shape)).astype(np.float32)
-        action_pre_tanh = action_mean + torch.from_numpy(action_eps).to(device=device, dtype=action_mean.dtype) * action_std
+        action_pre_tanh = policy_step_fn._policy_actor_sample_fn(
+            actor_outputs,
+            noise=torch.from_numpy(action_eps).to(device=device, dtype=action_mean.dtype),
+        )
     else:
-        action_pre_tanh = action_mean
+        action_std = (
+            float(policy_hparams["action_noise_eval_std"])
+            if float(state["phase_flag"]) >= 1.0
+            else float(policy_hparams["action_noise_train_std"])
+        )
+        if action_std > 0.0:
+            action_eps = state["rng"].normal(size=tuple(action_mean.shape)).astype(np.float32)
+            action_pre_tanh = action_mean + torch.from_numpy(action_eps).to(device=device, dtype=action_mean.dtype) * action_std
+        else:
+            action_pre_tanh = action_mean
     action_env = EnvironmentPrior._transform_reinforce_action(
         action_pre_tanh,
         mode=policy_hparams["action_transform_mode"],
