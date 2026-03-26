@@ -6,11 +6,13 @@ from ticl.fit_model import main
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
 from ticl.model_configs import get_model_default_config
+from ticl.utils import get_model_string
 from argparse import Namespace
 from ticl.fit_model import (
     _cli_flag_is_set,
     _apply_continue_run_cli_overrides,
     _apply_continue_run_resume_safe_defaults,
+    _clear_continue_run_stale_output_paths,
 )
 
 
@@ -691,6 +693,73 @@ def test_continue_run_resume_safe_defaults_apply_current_rlpfn_hparams():
     assert out["prior"]["environment"]["terminal_bonus_scale_max"] == 2.0
 
 
+def test_get_model_string_ignores_pg_phase_log_file_and_ephemeral_outputs():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(["rlpfn"])
+    config = get_model_default_config("rlpfn")
+    config["model_type"] = "rlpfn"
+    for group_name in vars(args):
+        if group_name == "model_type":
+            continue
+        if group_name not in config:
+            config[group_name] = {}
+        group = getattr(args, group_name)
+        for k, v in vars(group).items():
+            if isinstance(v, Namespace):
+                if k not in config[group_name]:
+                    config[group_name][k] = {}
+                config[group_name][k].update(vars(v))
+            else:
+                config[group_name][k] = v
+    config["optimizer"]["pg_phase_log_file"] = "./log/old_run.log"
+    config["optimizer"]["train_profiler_output_path"] = "/tmp/profile.jsonl"
+    config["optimizer"]["train_gpu_observer_output_path"] = "/tmp/gpu.jsonl"
+
+    model_string = get_model_string(config, 1, "cuda", parser)
+
+    assert "pgphaselogfile" not in model_string.lower()
+    assert "old_run" not in model_string
+    assert "profile.jsonl" not in model_string
+    assert "gpu.jsonl" not in model_string
+
+
+def test_clear_continue_run_stale_output_paths_resets_old_outputs_when_not_explicit():
+    config = {
+        "optimizer": {
+            "pg_phase_log_file": "./log/old.log",
+            "train_profiler_output_path": "/tmp/profile.jsonl",
+            "train_gpu_observer_output_path": "/tmp/gpu_samples.jsonl",
+            "train_gpu_stage_output_path": "/tmp/gpu_stages.jsonl",
+            "train_kernel_profiler_output_dir": "/tmp/kernel_profile",
+            "pg_compile_observe_output_path": "/tmp/compile.jsonl",
+        }
+    }
+
+    out = _clear_continue_run_stale_output_paths(config, ["rlpfn", "-c"])
+
+    assert out["optimizer"]["pg_phase_log_file"] is None
+    assert out["optimizer"]["train_profiler_output_path"] is None
+    assert out["optimizer"]["train_gpu_observer_output_path"] is None
+    assert out["optimizer"]["train_gpu_stage_output_path"] is None
+    assert out["optimizer"]["train_kernel_profiler_output_dir"] is None
+    assert out["optimizer"]["pg_compile_observe_output_path"] is None
+
+
+def test_clear_continue_run_stale_output_paths_preserves_explicit_pg_phase_log_file():
+    config = {
+        "optimizer": {
+            "pg_phase_log_file": "./log/old.log",
+        }
+    }
+
+    out = _clear_continue_run_stale_output_paths(
+        config,
+        ["rlpfn", "-c", "--pg-phase-log-file", "./log/new.log"],
+    )
+
+    assert out["optimizer"]["pg_phase_log_file"] == "./log/old.log"
+
+
 def test_main_continue_run_applies_resume_safe_defaults_and_explicit_cli_overrides(tmp_path, monkeypatch):
     ckpt_path = tmp_path / "resume_test.cpkt"
     parser = make_model_level_argparser()
@@ -750,6 +819,59 @@ def test_main_continue_run_applies_resume_safe_defaults_and_explicit_cli_overrid
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.25
     assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 1.5
+
+
+def test_main_continue_run_clears_stale_pg_phase_log_file_when_not_explicit(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "resume_test.cpkt"
+    parser = make_model_level_argparser()
+    default_args = parser.parse_args(["rlpfn"])
+    old_config = get_model_default_config("rlpfn")
+    old_config["optimizer"]["pg_phase_log_file"] = "./log/old_pg_phase.log"
+    old_config["orchestration"] = vars(default_args.orchestration).copy()
+
+    captured = {}
+
+    def _fake_init_device(gpu_id, use_cpu):
+        del gpu_id, use_cpu
+        return "cpu", 0, 1
+
+    def _fake_guard(**kwargs):
+        del kwargs
+        return None, {"enabled": False}
+
+    def _fake_model_string(config, num_gpus, device, parser):
+        del config, num_gpus, device, parser
+        return "resume_test_model"
+
+    def _fake_callback(*args, **kwargs):
+        del args, kwargs
+        return lambda *cb_args, **cb_kwargs: None
+
+    def _fake_get_model(config, device, should_train=True, **kwargs):
+        del device, should_train, kwargs
+        captured["config"] = config
+        return 0.0, object(), None, 0
+
+    monkeypatch.setattr(fit_model_mod, "init_device", _fake_init_device)
+    monkeypatch.setattr(fit_model_mod, "install_host_rss_limit_guard", _fake_guard)
+    monkeypatch.setattr(fit_model_mod, "get_model_string", _fake_model_string)
+    monkeypatch.setattr(fit_model_mod, "make_training_callback", _fake_callback)
+    monkeypatch.setattr(fit_model_mod, "get_model", _fake_get_model)
+    monkeypatch.setattr(fit_model_mod.torch, "load", lambda *args, **kwargs: ({}, None, None, old_config))
+
+    main(
+        [
+            "rlpfn",
+            "-f", str(ckpt_path),
+            "-c",
+            "--stop-after-epochs", "1",
+            "--validate", "false",
+            "--rl-validate-enabled", "false",
+        ]
+    )
+
+    cfg = captured["config"]
+    assert cfg["optimizer"]["pg_phase_log_file"] == "./log/resume_test_model.log"
 
 
 def test_continue_run_cli_override_applies_train_profiler_flags():

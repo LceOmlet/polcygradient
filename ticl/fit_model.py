@@ -189,6 +189,15 @@ _RLPFN_CONTINUE_RUN_RESUME_SAFE_DEFAULT_KEYS = (
     ("prior", "environment", "survival_reward_enable_prob"),
 )
 
+_CONTINUE_RUN_EPHEMERAL_OPTIMIZER_FLAGS = (
+    ("--train-profiler-output-path", "train_profiler_output_path"),
+    ("--train-gpu-observer-output-path", "train_gpu_observer_output_path"),
+    ("--train-gpu-stage-output-path", "train_gpu_stage_output_path"),
+    ("--train-kernel-profiler-output-dir", "train_kernel_profiler_output_dir"),
+    ("--pg-compile-observe-output-path", "pg_compile_observe_output_path"),
+    ("--pg-phase-log-file", "pg_phase_log_file"),
+)
+
 
 def _get_nested_config_value(config, path_parts):
     cur = config
@@ -207,6 +216,16 @@ def _apply_continue_run_resume_safe_defaults(config, new_defaults, model_type):
         if value is None:
             continue
         _set_nested_config_value(config, list(path_parts), value)
+    return config
+
+
+def _clear_continue_run_stale_output_paths(config, argv):
+    if "optimizer" not in config:
+        config["optimizer"] = {}
+    for flag, key in _CONTINUE_RUN_EPHEMERAL_OPTIMIZER_FLAGS:
+        if _cli_flag_is_set(argv, flag):
+            continue
+        config["optimizer"][key] = None
     return config
 
 
@@ -420,6 +439,7 @@ def main(argv, extra_config=None):
             if not args.orchestration.restart_scheduler:
                 scheduler = old_scheduler
             _apply_continue_run_cli_overrides(config, args, argv, parser=parser)
+            _clear_continue_run_stale_output_paths(config, argv)
             if _cli_flag_is_set(argv, "--policy-rollout-chunk-size"):
                 print(
                     "[continue-run-override] policy_rollout_chunk_size set from CLI to",

@@ -430,6 +430,16 @@ def enforce_path_filename_limit(path, *, max_component_bytes=None):
     return safe_base
 
 
+_MODEL_STRING_EPHEMERAL_KEYS = {
+    "pg_phase_log_file",
+    "train_profiler_output_path",
+    "train_gpu_observer_output_path",
+    "train_gpu_stage_output_path",
+    "train_kernel_profiler_output_dir",
+    "pg_compile_observe_output_path",
+}
+
+
 def get_model_string(config, num_gpus, device, parser):
     # get the subparser for the model type
     subparser = parser._actions[1].choices[config['model_type']]
@@ -441,6 +451,8 @@ def get_model_string(config, num_gpus, device, parser):
     config_string = ""
     for k in sorted(config_flat.keys()):
         if k in ['run_id', 'use_cpu', 'gpu_id', 'help', 'model_type', 'num_gpus', 'device', 'nhead']:
+            continue
+        if k in _MODEL_STRING_EPHEMERAL_KEYS:
             continue
         v = config_flat[k]
         if k not in default_config_flat:
