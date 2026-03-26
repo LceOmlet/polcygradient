@@ -1,11 +1,17 @@
 import pytest
+import torch
 
+import ticl.fit_model as fit_model_mod
 from ticl.fit_model import main
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.rl_validation import RLPFN_DEFAULT_OOP_ENVS
 from ticl.model_configs import get_model_default_config
 from argparse import Namespace
-from ticl.fit_model import _cli_flag_is_set, _apply_continue_run_cli_overrides
+from ticl.fit_model import (
+    _cli_flag_is_set,
+    _apply_continue_run_cli_overrides,
+    _apply_continue_run_resume_safe_defaults,
+)
 
 
 def test_fit_model_help():
@@ -639,6 +645,111 @@ def test_continue_run_cli_override_applies_pg_env_replay_steps():
     argv = ["rlpfn", "--pg-env-replay-steps", "3"]
     out = _apply_continue_run_cli_overrides(config, args, argv)
     assert out["optimizer"]["pg_env_replay_steps"] == 3
+
+
+def test_continue_run_cli_override_applies_policy_gradient_weight_via_parser():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--policy-gradient-weight", "0.25",
+        ]
+    )
+    config = get_model_default_config("rlpfn")
+    config["prior"]["environment"]["policy_gradient_weight"] = 1.0
+    argv = ["rlpfn", "--policy-gradient-weight", "0.25"]
+    out = _apply_continue_run_cli_overrides(config, args, argv, parser=parser)
+    assert out["prior"]["environment"]["policy_gradient_weight"] == 0.25
+
+
+def test_continue_run_cli_override_applies_terminal_bonus_scale_max_via_parser():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--terminal-bonus-scale-max", "1.5",
+        ]
+    )
+    config = get_model_default_config("rlpfn")
+    config["prior"]["environment"]["terminal_bonus_scale_max"] = 9.0
+    argv = ["rlpfn", "--terminal-bonus-scale-max", "1.5"]
+    out = _apply_continue_run_cli_overrides(config, args, argv, parser=parser)
+    assert out["prior"]["environment"]["terminal_bonus_scale_max"] == 1.5
+
+
+def test_continue_run_resume_safe_defaults_apply_current_rlpfn_hparams():
+    config = get_model_default_config("rlpfn")
+    config["prior"]["environment"]["policy_gradient_weight"] = 0.1
+    config["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] = False
+    config["prior"]["environment"]["terminal_bonus_scale_max"] = 5.0
+    new_defaults = get_model_default_config("rlpfn")
+
+    out = _apply_continue_run_resume_safe_defaults(config, new_defaults, "rlpfn")
+
+    assert out["prior"]["environment"]["policy_gradient_weight"] == 1.0
+    assert out["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
+    assert out["prior"]["environment"]["terminal_bonus_scale_max"] == 2.0
+
+
+def test_main_continue_run_applies_resume_safe_defaults_and_explicit_cli_overrides(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "resume_test.cpkt"
+    parser = make_model_level_argparser()
+    default_args = parser.parse_args(["rlpfn"])
+    old_config = get_model_default_config("rlpfn")
+    old_config["prior"]["environment"]["policy_gradient_weight"] = 0.1
+    old_config["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] = False
+    old_config["prior"]["environment"]["terminal_bonus_scale_max"] = 5.0
+    old_config["orchestration"] = vars(default_args.orchestration).copy()
+
+    captured = {}
+
+    def _fake_init_device(gpu_id, use_cpu):
+        del gpu_id, use_cpu
+        return "cpu", 0, 1
+
+    def _fake_guard(**kwargs):
+        del kwargs
+        return None, {"enabled": False}
+
+    def _fake_model_string(config, num_gpus, device, parser):
+        del config, num_gpus, device, parser
+        return "resume_test_model"
+
+    def _fake_callback(*args, **kwargs):
+        del args, kwargs
+        return lambda *cb_args, **cb_kwargs: None
+
+    def _fake_get_model(config, device, should_train=True, **kwargs):
+        del device, should_train, kwargs
+        captured["config"] = config
+        return 0.0, object(), None, 0
+
+    monkeypatch.setattr(fit_model_mod, "init_device", _fake_init_device)
+    monkeypatch.setattr(fit_model_mod, "install_host_rss_limit_guard", _fake_guard)
+    monkeypatch.setattr(fit_model_mod, "get_model_string", _fake_model_string)
+    monkeypatch.setattr(fit_model_mod, "make_training_callback", _fake_callback)
+    monkeypatch.setattr(fit_model_mod, "get_model", _fake_get_model)
+    monkeypatch.setattr(fit_model_mod.torch, "load", lambda *args, **kwargs: ({}, None, None, old_config))
+
+    main(
+        [
+            "rlpfn",
+            "-f", str(ckpt_path),
+            "-c",
+            "--policy-gradient-weight", "0.25",
+            "--terminal-bonus-scale-max", "1.5",
+            "--stop-after-epochs", "1",
+            "--validate", "false",
+            "--rl-validate-enabled", "false",
+        ]
+    )
+
+    cfg = captured["config"]
+    assert cfg["orchestration"]["continue_run"] is True
+    assert cfg["orchestration"]["warm_start_from"] == str(ckpt_path)
+    assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
+    assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.25
+    assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 1.5
 
 
 def test_continue_run_cli_override_applies_train_profiler_flags():

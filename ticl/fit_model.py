@@ -108,7 +108,110 @@ def _cli_flag_is_set(argv, flag):
     return False
 
 
-def _apply_continue_run_cli_overrides(config, args, argv):
+def _get_nested_attr(obj, parts):
+    cur = obj
+    for part in parts:
+        if cur is None or not hasattr(cur, part):
+            return None
+        cur = getattr(cur, part)
+    return cur
+
+
+def _set_nested_config_value(config, path_parts, value):
+    if not path_parts:
+        return config
+    cur = config
+    for part in path_parts[:-1]:
+        if part not in cur or not isinstance(cur.get(part), dict):
+            cur[part] = {}
+        cur = cur[part]
+    cur[path_parts[-1]] = value
+    return config
+
+
+def _selected_subparser(parser, model_type):
+    for action in getattr(parser, "_actions", []):
+        choices = getattr(action, "choices", None)
+        if isinstance(choices, dict) and model_type in choices:
+            return choices[model_type]
+    return None
+
+
+def _apply_explicit_continue_run_cli_overrides_from_parser(config, args, argv, parser):
+    model_type = getattr(args, "model_type", None)
+    if parser is None or model_type is None:
+        return config
+    subparser = _selected_subparser(parser, model_type)
+    if subparser is None:
+        return config
+    for group in getattr(subparser, "_action_groups", []):
+        title = str(getattr(group, "title", "") or "").strip()
+        if not title or title in {"positional arguments", "options"}:
+            continue
+        group_parts = title.split(".")
+        ns = _get_nested_attr(args, group_parts)
+        if ns is None:
+            continue
+        if title == "general":
+            config_path_prefix = []
+        else:
+            config_path_prefix = group_parts
+        for action in getattr(group, "_group_actions", []):
+            dest = getattr(action, "dest", None)
+            if not dest or dest == "help":
+                continue
+            option_strings = tuple(getattr(action, "option_strings", ()) or ())
+            if not option_strings:
+                continue
+            if not any(_cli_flag_is_set(argv, opt) for opt in option_strings):
+                continue
+            if not hasattr(ns, dest):
+                continue
+            value = getattr(ns, dest)
+            _set_nested_config_value(config, [*config_path_prefix, dest], value)
+    return config
+
+
+_RLPFN_CONTINUE_RUN_RESUME_SAFE_DEFAULT_KEYS = (
+    ("prior", "environment", "reinforce_normalize_advantages"),
+    ("prior", "environment", "reinforce_scale_advantages_by_suffix_episode_count"),
+    ("prior", "environment", "reinforce_advantage_norm_eps"),
+    ("prior", "environment", "reinforce_advantage_norm_clip"),
+    ("prior", "environment", "policy_gradient_weight"),
+    ("prior", "environment", "reinforce_reward_tanh_c"),
+    ("prior", "environment", "reinforce_reward_tanh_bound"),
+    ("prior", "environment", "terminal_bonus_tanh_c"),
+    ("prior", "environment", "terminal_bonus_scale_min"),
+    ("prior", "environment", "terminal_bonus_scale_max"),
+    ("prior", "environment", "ctrl_reward_weight"),
+    ("prior", "environment", "ctrl_reward_enable_prob"),
+    ("prior", "environment", "survival_reward_weight"),
+    ("prior", "environment", "survival_reward_enable_prob"),
+)
+
+
+def _get_nested_config_value(config, path_parts):
+    cur = config
+    for part in path_parts:
+        if not isinstance(cur, dict) or part not in cur:
+            return None
+        cur = cur[part]
+    return cur
+
+
+def _apply_continue_run_resume_safe_defaults(config, new_defaults, model_type):
+    if str(model_type).strip().lower() != "rlpfn":
+        return config
+    for path_parts in _RLPFN_CONTINUE_RUN_RESUME_SAFE_DEFAULT_KEYS:
+        value = _get_nested_config_value(new_defaults, path_parts)
+        if value is None:
+            continue
+        _set_nested_config_value(config, list(path_parts), value)
+    return config
+
+
+def _apply_continue_run_cli_overrides(config, args, argv, parser=None):
+    config = _apply_explicit_continue_run_cli_overrides_from_parser(config, args, argv, parser)
     # Continue-run keeps historical config semantics, but explicitly provided
     # CLI safety knobs must override old checkpoint values.
     if _cli_flag_is_set(argv, "--policy-rollout-chunk-size"):
@@ -307,6 +410,7 @@ def main(argv, extra_config=None):
             # introduced defaults so safety knobs (e.g. rollout chunking) exist.
             new_defaults = get_model_default_config(args.model_type, model)
             _merge_missing_keys(config, new_defaults)
+            _apply_continue_run_resume_safe_defaults(config, new_defaults, args.model_type)
             # we want to overwrite specific parts of the old config with current values
             config['device'] = device
             config['orchestration']['warm_start_from'] = warm_start_weights
@@ -315,7 +419,7 @@ def main(argv, extra_config=None):
             config['orchestration']['stop_after_epochs'] = args.orchestration.stop_after_epochs
             if not args.orchestration.restart_scheduler:
                 scheduler = old_scheduler
-            _apply_continue_run_cli_overrides(config, args, argv)
+            _apply_continue_run_cli_overrides(config, args, argv, parser=parser)
             if _cli_flag_is_set(argv, "--policy-rollout-chunk-size"):
                 print(
                     "[continue-run-override] policy_rollout_chunk_size set from CLI to",
