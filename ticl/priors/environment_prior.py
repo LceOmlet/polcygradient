@@ -1519,6 +1519,7 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_normalize_advantages", False)
         cfg.setdefault("reinforce_advantage_norm_eps", 1e-6)
         cfg.setdefault("reinforce_advantage_norm_clip", 10.0)
+        cfg.setdefault("reinforce_scale_advantages_by_suffix_episode_count", False)
         cfg.setdefault("discount", 1.0)
 
         # SCM-style knobs (aligned with names in priors/mlp.py).
@@ -1820,8 +1821,10 @@ class EnvironmentPrior:
         self.last_runtime_info = []
         self.last_rollout_profile = None
         self.last_rollout_terminal_stats = None
+        self.last_rollout_eval_terminal_counts = None
         self.last_rollout_reinforce = None
         self.last_rollout_reinforce_replay = None
+        self.last_rollout_reward_components = None
         self.last_rollout_policy_trace = None
         self.last_rollout_env_semantics = None
 
@@ -10611,6 +10614,7 @@ class EnvironmentPrior:
         token_obs_cap = min(obs_dim, obs_slot_dim)
         token_action_cap = min(action_dim, action_slot_dim)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        suffix_terminal_count = torch.zeros((batch_size,), device=device, dtype=torch.float32)
         phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
         phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
         terminal_signal_history = (
@@ -10618,8 +10622,14 @@ class EnvironmentPrior:
             if terminal_token_enabled
             else None
         )
-        reward_component_profile_accum = {}
-        reward_component_profile_accum = {}
+        reward_component_eval_steps = None
+        eval_steps_count = max(0, int(n_samples) - int(single_eval_pos))
+        if bool(store_rewards) and eval_steps_count > 0:
+            reward_component_eval_steps = {
+                "env": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+                "ctrl": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+                "survival": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+            }
         reward_component_profile_accum = {}
 
         env_total_dim = int(env_layout["total_dim"])
@@ -12498,6 +12508,8 @@ class EnvironmentPrior:
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
             if terminal_token_enabled:
                 terminal_count_realized = terminal_count_realized + terminal_next.to(dtype=torch.float32)
+                if t >= int(single_eval_pos):
+                    suffix_terminal_count = suffix_terminal_count + terminal_next.to(dtype=torch.float32)
 
             state_t = state_next
             action_t = action_env
@@ -12505,6 +12517,11 @@ class EnvironmentPrior:
             reward_mask_t = reward_mask_next
             terminal_t = terminal_next
             if t >= int(single_eval_pos):
+                if reward_component_eval_steps is not None:
+                    eval_t = int(t - int(single_eval_pos))
+                    reward_component_eval_steps["env"][eval_t] = reward_env_next.detach()
+                    reward_component_eval_steps["ctrl"][eval_t] = reward_next_ctrl.detach()
+                    reward_component_eval_steps["survival"][eval_t] = reward_next_survival.detach()
                 self._accumulate_reward_component_profile_stats(
                     reward_component_profile_accum,
                     "env",
@@ -12602,6 +12619,7 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        self.last_rollout_eval_terminal_counts = suffix_terminal_count.detach()
         noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
         rollout_profile = {
             "steps": int(n_samples),
@@ -13463,11 +13481,20 @@ class EnvironmentPrior:
             n_samples,
         ).to(device=device, dtype=torch.float32)
         terminal_count_realized = torch.zeros((batch_size,), device=device, dtype=torch.float32)
+        suffix_terminal_count = torch.zeros((batch_size,), device=device, dtype=torch.float32)
         terminal_signal_history = (
             torch.zeros((n_samples, batch_size), device=device, dtype=torch.float32)
             if terminal_token_enabled
             else None
         )
+        reward_component_eval_steps = None
+        eval_steps_count = max(0, int(n_samples) - int(single_eval_pos))
+        if bool(store_rewards) and eval_steps_count > 0:
+            reward_component_eval_steps = {
+                "env": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+                "ctrl": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+                "survival": torch.empty((eval_steps_count, batch_size), device=device, dtype=torch.float32),
+            }
         reward_component_profile_accum = {}
 
         def _refresh_noise_block(block_start_idx):
@@ -15185,6 +15212,8 @@ class EnvironmentPrior:
                 )
             if terminal_token_enabled:
                 terminal_count_realized = terminal_count_realized + terminal_next.to(dtype=torch.float32)
+                if t >= int(single_eval_pos):
+                    suffix_terminal_count = suffix_terminal_count + terminal_next.to(dtype=torch.float32)
             action_next = action_next * action_mask
             if tbptt_window_active:
                 if y_steps is not None:
@@ -15221,6 +15250,11 @@ class EnvironmentPrior:
             reward_mask_t = reward_mask_next
             terminal_t = terminal_next
             if t >= int(single_eval_pos):
+                if reward_component_eval_steps is not None:
+                    eval_t = int(t - int(single_eval_pos))
+                    reward_component_eval_steps["env"][eval_t] = reward_env_next.detach()
+                    reward_component_eval_steps["ctrl"][eval_t] = reward_next_ctrl.detach()
+                    reward_component_eval_steps["survival"][eval_t] = reward_next_survival.detach()
                 self._accumulate_reward_component_profile_stats(
                     reward_component_profile_accum,
                     "env",
@@ -15360,6 +15394,11 @@ class EnvironmentPrior:
                 log_prob_steps = log_prob_steps.index_select(1, inv_perm)
             if log_prob_score_steps is not None:
                 log_prob_score_steps = log_prob_score_steps.index_select(1, inv_perm)
+            if reward_component_eval_steps is not None:
+                reward_component_eval_steps = {
+                    key: value.index_select(1, inv_perm)
+                    for key, value in reward_component_eval_steps.items()
+                }
 
         if collect_runtime_info:
             if needs_unpermute:
@@ -15442,6 +15481,7 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        self.last_rollout_eval_terminal_counts = suffix_terminal_count.detach()
         noise_mode = "strict_seed" if strict_seed_mode else ("block_stream" if noise_streaming_mode else "full_prealloc")
         rollout_profile = {
             "steps": int(n_samples),
@@ -15598,6 +15638,8 @@ class EnvironmentPrior:
             if collect_reinforce_replay
             else None
         )
+        self.last_rollout_reward_components = reward_component_eval_steps
+        self.last_rollout_eval_terminal_counts = suffix_terminal_count.detach()
         self.last_rollout_policy_trace = None
         if collect_action_trace and isinstance(action_mean_steps, list) and isinstance(action_mask_steps, list):
             self.last_rollout_policy_trace = {
@@ -17574,6 +17616,7 @@ class EnvironmentPrior:
         baseline_mode="leave_one_out",
         detach_baseline=True,
         normalize_advantages=None,
+        suffix_terminal_counts=None,
     ):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
@@ -17593,17 +17636,50 @@ class EnvironmentPrior:
         if detach_baseline:
             baseline = baseline.detach()
         advantages_raw = returns - baseline
+        scale_by_suffix_episode_count = bool(
+            self.config.get("reinforce_scale_advantages_by_suffix_episode_count", False)
+        )
+        if suffix_terminal_counts is None:
+            suffix_terminal_counts_t = torch.zeros(
+                (int(rewards.shape[1]),),
+                device=rewards.device,
+                dtype=rewards.dtype,
+            )
+        else:
+            suffix_terminal_counts_t = suffix_terminal_counts
+            if not torch.is_tensor(suffix_terminal_counts_t):
+                suffix_terminal_counts_t = torch.as_tensor(
+                    suffix_terminal_counts_t,
+                    device=rewards.device,
+                    dtype=rewards.dtype,
+                )
+            else:
+                suffix_terminal_counts_t = suffix_terminal_counts_t.to(
+                    device=rewards.device,
+                    dtype=rewards.dtype,
+                )
+            suffix_terminal_counts_t = suffix_terminal_counts_t.reshape(-1)
+            if int(suffix_terminal_counts_t.numel()) != int(rewards.shape[1]):
+                raise ValueError(
+                    "suffix_terminal_counts must have one value per rollout/batch column, "
+                    f"got {tuple(suffix_terminal_counts_t.shape)} for rewards shape {tuple(rewards.shape)}"
+                )
+        suffix_episode_divisor = torch.ones_like(suffix_terminal_counts_t)
+        if scale_by_suffix_episode_count:
+            # Use episode count rather than raw terminal count so a single
+            # unfinished suffix episode still has divisor 1 rather than 0.
+            suffix_episode_divisor = (1.0 + suffix_terminal_counts_t).clamp_min(1.0)
         normalize_advantages_enabled = (
             bool(self.config.get("reinforce_normalize_advantages", False))
             if normalize_advantages is None
             else bool(normalize_advantages)
         )
-        advantages_used = advantages_raw
+        advantages_pre_episode_scale = advantages_raw
         advantage_norm_clip_hit_share = torch.zeros((), device=rewards.device, dtype=torch.float32)
         advantage_norm_eps = float(self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6)))
         advantage_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
         if normalize_advantages_enabled:
-            advantages_used, norm_stats = self.normalize_rewards(
+            advantages_pre_episode_scale, norm_stats = self.normalize_rewards(
                 advantages_raw,
                 eps=advantage_norm_eps,
                 clip=advantage_norm_clip,
@@ -17611,13 +17687,21 @@ class EnvironmentPrior:
                 return_stats=True,
             )
             advantage_norm_clip_hit_share = norm_stats["normalized_clip_hit_share"].detach()
+        advantages_used = advantages_pre_episode_scale
+        if scale_by_suffix_episode_count:
+            advantages_used = advantages_pre_episode_scale / suffix_episode_divisor.unsqueeze(0)
         return {
             "discount": discount,
             "returns": returns,
             "baseline_mode": baseline_mode,
             "advantages_raw": advantages_raw,
+            "advantages_pre_episode_scale": advantages_pre_episode_scale,
+            "advantages_scaled_raw": advantages_used,
             "advantages": advantages_used,
             "normalize_advantages": normalize_advantages_enabled,
+            "scale_advantages_by_suffix_episode_count": scale_by_suffix_episode_count,
+            "suffix_terminal_counts": suffix_terminal_counts_t.detach(),
+            "suffix_episode_divisor": suffix_episode_divisor.detach(),
             "advantage_norm_eps": float(advantage_norm_eps),
             "advantage_norm_clip": (
                 float(advantage_norm_clip)
@@ -17635,6 +17719,8 @@ class EnvironmentPrior:
         baseline_mode="leave_one_out",
         detach_baseline=True,
         normalize_advantages=None,
+        reward_components=None,
+        suffix_terminal_counts=None,
     ):
         if rewards.ndim != 2:
             raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
@@ -17657,8 +17743,10 @@ class EnvironmentPrior:
             baseline_mode=baseline_mode,
             detach_baseline=detach_baseline,
             normalize_advantages=normalize_advantages,
+            suffix_terminal_counts=suffix_terminal_counts,
         )
         returns = reinforce_terms["returns"]
+        discount = float(reinforce_terms["discount"])
         baseline_mode = reinforce_terms["baseline_mode"]
         advantages_raw = reinforce_terms["advantages_raw"]
         advantages = reinforce_terms["advantages"]
@@ -17696,10 +17784,19 @@ class EnvironmentPrior:
             "reinforce_adv_std": advantages.std(unbiased=False).detach(),
             "reinforce_adv_raw_mean": advantages_raw.mean().detach(),
             "reinforce_adv_raw_std": advantages_raw.std(unbiased=False).detach(),
+            "reinforce_adv_scaled_raw_mean": reinforce_terms["advantages_scaled_raw"].mean().detach(),
+            "reinforce_adv_scaled_raw_std": reinforce_terms["advantages_scaled_raw"].std(unbiased=False).detach(),
             "reinforce_adv_nonfinite_share": _share(~torch.isfinite(advantages)),
             "reinforce_adv_nan_share": _share(torch.isnan(advantages)),
             "reinforce_adv_inf_share": _share(torch.isinf(advantages)),
             "reinforce_adv_normalized": int(reinforce_terms["normalize_advantages"]),
+            "reinforce_adv_scaled_by_suffix_episode_count": int(
+                reinforce_terms["scale_advantages_by_suffix_episode_count"]
+            ),
+            "reinforce_suffix_terminal_count_mean": reinforce_terms["suffix_terminal_counts"].mean().detach(),
+            "reinforce_suffix_terminal_count_std": reinforce_terms["suffix_terminal_counts"].std(unbiased=False).detach(),
+            "reinforce_suffix_episode_divisor_mean": reinforce_terms["suffix_episode_divisor"].mean().detach(),
+            "reinforce_suffix_episode_divisor_std": reinforce_terms["suffix_episode_divisor"].std(unbiased=False).detach(),
             "reinforce_adv_norm_eps": float(reinforce_terms["advantage_norm_eps"]),
             "reinforce_adv_norm_clip": (
                 float(reinforce_terms["advantage_norm_clip"])
@@ -17717,6 +17814,24 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_c": float(reward_transform_stats["tanh_c"]),
             "reinforce_reward_tanh_bound": float(reward_transform_stats["tanh_bound"]),
         }
+        if isinstance(reward_components, dict):
+            for name, component_rewards in reward_components.items():
+                if component_rewards is None:
+                    continue
+                if not torch.is_tensor(component_rewards):
+                    raise ValueError(
+                        f"reward component {name!r} must be a tensor with shape (T, B), got {type(component_rewards)}"
+                    )
+                if tuple(component_rewards.shape) != tuple(rewards.shape):
+                    raise ValueError(
+                        f"reward component {name!r} must match rewards shape {tuple(rewards.shape)}, "
+                        f"got {tuple(component_rewards.shape)}"
+                    )
+                component_returns = self._returns_to_go(component_rewards, discount=discount)
+                stats[f"reward_{name}_mean"] = component_rewards.mean().detach()
+                stats[f"reward_{name}_std"] = component_rewards.std(unbiased=False).detach()
+                stats[f"reward_{name}_return_mean"] = component_returns[0].mean().detach()
+                stats[f"reward_{name}_return_std"] = component_returns[0].std(unbiased=False).detach()
         return loss, stats
 
     def reinforce_sequence_replay_loss_from_rollout(
@@ -17725,6 +17840,8 @@ class EnvironmentPrior:
         policy_step_fn,
         x_tokens,
         rewards,
+        reward_components=None,
+        terminal_counts=None,
         replay_payload,
         single_eval_pos,
         discount=None,
@@ -17757,6 +17874,17 @@ class EnvironmentPrior:
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
 
         rewards_eval = rewards[eval_start:]
+        reward_components_eval = None
+        if isinstance(reward_components, dict):
+            reward_components_eval = {}
+            for name, value in reward_components.items():
+                if value is None:
+                    continue
+                if not torch.is_tensor(value):
+                    raise ValueError(
+                        f"reinforce sequence replay reward component {name!r} must be a tensor with shape (T, B)"
+                    )
+                reward_components_eval[str(name)] = value
         if torch.is_tensor(action_std) and tuple(rewards_eval.shape) != tuple(action_std.shape):
             raise RuntimeError(
                 "reinforce sequence replay reward/action_std shape mismatch: "
@@ -17768,6 +17896,7 @@ class EnvironmentPrior:
             baseline_mode=baseline_mode,
             detach_baseline=True,
             normalize_advantages=None,
+            suffix_terminal_counts=terminal_counts,
         )
         discount = reinforce_terms["discount"]
         baseline_mode = reinforce_terms["baseline_mode"]
@@ -18014,6 +18143,8 @@ class EnvironmentPrior:
             log_probs=full_log_probs,
             discount=discount,
             baseline_mode=baseline_mode,
+            reward_components=reward_components_eval,
+            suffix_terminal_counts=terminal_counts,
         )
         del stats_loss
         stats["reinforce_sequence_replay_applied"] = 1
@@ -18096,6 +18227,9 @@ class EnvironmentPrior:
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
         reinforce_action_transform = str(self.config.get("reinforce_action_transform", "rms")).strip().lower()
         reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
+        reinforce_adv_suffix_episode_scaled = bool(
+            self.config.get("reinforce_scale_advantages_by_suffix_episode_count", False)
+        )
         reinforce_adv_norm_eps = self._resolve_scalar(self.config.get("reinforce_advantage_norm_eps", 1e-6))
         reinforce_adv_norm_clip = self._resolve_scalar(self.config.get("reinforce_advantage_norm_clip", 10.0))
         policy_gradient_weight = self._resolve_policy_gradient_weight(self.config)
@@ -18119,6 +18253,7 @@ class EnvironmentPrior:
             f"|rrtb={_fmt_float(reinforce_reward_tanh_bound)}"
             f"|atx={reinforce_action_transform}"
             f"|anorm={int(reinforce_adv_normalized)}"
+            f"|aepcnt={int(reinforce_adv_suffix_episode_scaled)}"
             f"|aneps={_fmt_float(reinforce_adv_norm_eps)}"
             f"|anclip={_fmt_float(reinforce_adv_norm_clip)}"
             f"|pgw={_fmt_float(policy_gradient_weight)}"
@@ -20331,6 +20466,7 @@ class EnvironmentPrior:
             "rewards": rewards_out,
             "info": [None] * batch_size,
             "terminal_stats": self.last_rollout_terminal_stats,
+            "reward_components": reward_component_eval_steps,
         }
         return loss, rollout, stats
 
@@ -20447,6 +20583,8 @@ class EnvironmentPrior:
                         policy_step_fn=policy_step_fn,
                         x_tokens=rollout["x"],
                         rewards=rollout["rewards"],
+                        reward_components=rollout.get("reward_components", None),
+                        terminal_counts=rollout.get("terminal_eval_counts", None),
                         replay_payload=replay_payload,
                         single_eval_pos=effective_single_eval_pos,
                         discount=discount,
@@ -20470,6 +20608,8 @@ class EnvironmentPrior:
                         log_probs=reinforce_rollout["log_probs"][effective_single_eval_pos:],
                         discount=discount,
                         baseline_mode="leave_one_out",
+                        reward_components=rollout.get("reward_components", None),
+                        suffix_terminal_counts=rollout.get("terminal_eval_counts", None),
                     )
                     stats["reinforce_enabled"] = 1
                     if reinforce_rollout.get("sequence_replay_applied", False):
@@ -21147,6 +21287,7 @@ class EnvironmentPrior:
             log_probs=reinforce_rollout["log_probs"][effective_single_eval_pos:],
             discount=discount,
             baseline_mode="leave_one_out",
+            reward_components=rollout.get("reward_components", None),
         )
         reinforce_stats["reinforce_enabled"] = 1
         return {

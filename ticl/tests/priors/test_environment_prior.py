@@ -1797,6 +1797,46 @@ def test_environment_prior_policy_gradient_weight_scales_reinforce_loss():
     assert torch.isfinite(log_probs.grad).all()
 
 
+def test_environment_prior_scales_reinforce_advantages_by_suffix_episode_count():
+    prior = EnvironmentPrior(
+        {
+            "discount": 1.0,
+            "reinforce_scale_advantages_by_suffix_episode_count": True,
+            "reinforce_normalize_advantages": False,
+        }
+    )
+    rewards = torch.tensor(
+        [
+            [2.0, 2.0],
+            [1.0, 1.0],
+        ],
+        dtype=torch.float32,
+    )
+    log_probs = torch.ones_like(rewards, requires_grad=True)
+    suffix_terminal_counts = torch.tensor([0.0, 2.0], dtype=torch.float32)
+
+    loss, stats = prior.reinforce_loss_from_rewards(
+        rewards=rewards,
+        log_probs=log_probs,
+        discount=1.0,
+        suffix_terminal_counts=suffix_terminal_counts,
+    )
+
+    returns = prior._returns_to_go(rewards, discount=1.0)
+    advantages_raw = returns - prior._leave_one_out_baseline(returns)
+    expected_divisor = torch.tensor([1.0, 3.0], dtype=torch.float32)
+    expected_scaled = advantages_raw / expected_divisor.unsqueeze(0)
+    expected_loss = -(expected_scaled.detach() * log_probs).mean()
+
+    assert torch.allclose(loss, expected_loss)
+    assert int(stats["reinforce_adv_scaled_by_suffix_episode_count"]) == 1
+    assert float(stats["reinforce_suffix_terminal_count_mean"]) == pytest.approx(1.0)
+    assert float(stats["reinforce_suffix_episode_divisor_mean"]) == pytest.approx(2.0)
+    assert float(stats["reinforce_adv_scaled_raw_std"]) == pytest.approx(
+        float(expected_scaled.std(unbiased=False))
+    )
+
+
 def test_environment_prior_reinforce_advantage_normalization_keeps_rollout_reward_inputs_unchanged():
     _seed_everything(20260322)
     config = get_prior_config()
@@ -2708,6 +2748,51 @@ def test_environment_prior_reinforce_tanh_reward_transform_is_bounded_and_monoto
 
     assert torch.isfinite(loss)
     assert float(stats["reinforce_reward_used_abs_max"]) <= 10.0 + 1e-6
+
+
+def test_environment_prior_reinforce_reward_component_stats_include_return_summaries():
+    prior = EnvironmentPrior()
+    rewards = torch.tensor(
+        [
+            [1.0, 2.0],
+            [3.0, 4.0],
+        ],
+        dtype=torch.float32,
+    )
+    log_probs = torch.zeros_like(rewards, requires_grad=True)
+    reward_components = {
+        "env": torch.tensor(
+            [
+                [0.5, 1.0],
+                [1.5, 2.0],
+            ],
+            dtype=torch.float32,
+        ),
+        "ctrl": torch.tensor(
+            [
+                [-0.1, -0.2],
+                [-0.3, -0.4],
+            ],
+            dtype=torch.float32,
+        ),
+    }
+
+    _, stats = prior.reinforce_loss_from_rewards(
+        rewards=rewards,
+        log_probs=log_probs,
+        discount=1.0,
+        baseline_mode="zero",
+        reward_components=reward_components,
+    )
+
+    assert float(stats["reward_env_mean"]) == pytest.approx(1.25)
+    assert float(stats["reward_env_return_mean"]) == pytest.approx(2.5)
+    assert float(stats["reward_ctrl_mean"]) == pytest.approx(-0.25)
+    assert float(stats["reward_ctrl_return_mean"]) == pytest.approx(-0.5)
+    assert "reward_env_std" in stats
+    assert "reward_env_return_std" in stats
+    assert "reward_ctrl_std" in stats
+    assert "reward_ctrl_return_std" in stats
 
 
 def test_environment_prior_action_rms_masks_inactive_dims():

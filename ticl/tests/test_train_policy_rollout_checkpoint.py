@@ -1083,7 +1083,11 @@ def test_policy_rollout_chunk_size_one_runs_per_column():
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
             "reward_env_mean": torch.as_tensor(0.40, device=device),
+            "reward_env_std": torch.as_tensor(0.15, device=device),
+            "reward_env_return_mean": torch.as_tensor(1.60, device=device),
             "reward_ctrl_mean": torch.as_tensor(-0.05, device=device),
+            "reward_ctrl_std": torch.as_tensor(0.02, device=device),
+            "reward_ctrl_return_mean": torch.as_tensor(-0.20, device=device),
             "policy_total_loss": torch.as_tensor(1.75, device=device),
             "reinforce_loss": torch.as_tensor(1.25, device=device),
             "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
@@ -1201,7 +1205,11 @@ def test_policy_env_replay_steps_runs_multiple_inner_updates_per_batch(rl_object
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
             "reward_env_mean": torch.as_tensor(0.40, device=device),
+            "reward_env_std": torch.as_tensor(0.15, device=device),
+            "reward_env_return_mean": torch.as_tensor(1.60, device=device),
             "reward_ctrl_mean": torch.as_tensor(-0.05, device=device),
+            "reward_ctrl_std": torch.as_tensor(0.02, device=device),
+            "reward_ctrl_return_mean": torch.as_tensor(-0.20, device=device),
             "policy_total_loss": torch.as_tensor(1.75, device=device),
             "reinforce_loss": torch.as_tensor(1.25, device=device),
             "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
@@ -1324,7 +1332,11 @@ def test_policy_rollout_chunk_autotune_grows_after_oom_recovery():
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
             "reward_env_mean": torch.as_tensor(0.40, device=device),
+            "reward_env_std": torch.as_tensor(0.15, device=device),
+            "reward_env_return_mean": torch.as_tensor(1.60, device=device),
             "reward_ctrl_mean": torch.as_tensor(-0.05, device=device),
+            "reward_ctrl_std": torch.as_tensor(0.02, device=device),
+            "reward_ctrl_return_mean": torch.as_tensor(-0.20, device=device),
             "policy_total_loss": torch.as_tensor(1.75, device=device),
             "reinforce_loss": torch.as_tensor(1.25, device=device),
             "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
@@ -2308,7 +2320,11 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
             "reward_mean": torch.zeros((), device=device),
             "reward_std": torch.zeros((), device=device),
             "reward_env_mean": torch.as_tensor(0.40, device=device),
+            "reward_env_std": torch.as_tensor(0.15, device=device),
+            "reward_env_return_mean": torch.as_tensor(1.60, device=device),
             "reward_ctrl_mean": torch.as_tensor(-0.05, device=device),
+            "reward_ctrl_std": torch.as_tensor(0.02, device=device),
+            "reward_ctrl_return_mean": torch.as_tensor(-0.20, device=device),
             "policy_total_loss": torch.as_tensor(1.75, device=device),
             "reinforce_loss": torch.as_tensor(1.25, device=device),
             "normalized_q_value_loss": torch.as_tensor(0.30, device=device),
@@ -2365,7 +2381,11 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
     assert "loss_qaux=+3.000e-01" in finish_lines[0]
     assert "loss_fmaux=+2.000e-01" in finish_lines[0]
     assert "reward_env_mean=+4.000e-01" in finish_lines[0]
+    assert "reward_env_std=1.500e-01" in finish_lines[0]
+    assert "reward_env_return=+1.600e+00" in finish_lines[0]
     assert "reward_ctrl_mean=-5.000e-02" in finish_lines[0]
+    assert "reward_ctrl_std=2.000e-02" in finish_lines[0]
+    assert "reward_ctrl_return=-2.000e-01" in finish_lines[0]
     assert "actdim_mean=3.000" in finish_lines[0]
     assert "policy_std_mean=5.000e-02" in finish_lines[0]
     assert "logstd_mean=-2.996e+00" in finish_lines[0]
@@ -2377,4 +2397,8 @@ def test_pg_phase_start_and_finish_are_both_written(tmp_path):
     assert pg_diag["normalized_q_value_loss_mean"] == pytest.approx(0.30)
     assert pg_diag["next_state_flow_matching_loss_mean"] == pytest.approx(0.20)
     assert pg_diag["reward_env_mean_mean"] == pytest.approx(0.40)
+    assert pg_diag["reward_env_std_mean"] == pytest.approx(0.15)
+    assert pg_diag["reward_env_return_mean"] == pytest.approx(1.60)
     assert pg_diag["reward_ctrl_mean_mean"] == pytest.approx(-0.05)
+    assert pg_diag["reward_ctrl_std_mean"] == pytest.approx(0.02)
+    assert pg_diag["reward_ctrl_return_mean"] == pytest.approx(-0.20)

@@ -181,6 +181,8 @@ def dispatch_policy_rollout(prior, ctx):
     reinforce_sequence_replay_eval_start = None
     reinforce_sequence_replay_action_steps = None
     reinforce_replay_payload = None
+    reward_component_payload = None
+    terminal_eval_count_payload = None
     reinforce_decomp_accum = {
         "reinforce_action_dim_mean": 0.0,
         "reinforce_action_std_mean": 0.0,
@@ -358,6 +360,32 @@ def dispatch_policy_rollout(prior, ctx):
                 rewards[:, group_indices] = y_group
             group_reinforce = prior.last_rollout_reinforce
             group_replay = getattr(prior, "last_rollout_reinforce_replay", None)
+            group_reward_components = getattr(prior, "last_rollout_reward_components", None)
+            group_terminal_eval_counts = getattr(prior, "last_rollout_eval_terminal_counts", None)
+            if isinstance(group_reward_components, dict):
+                for key, value in group_reward_components.items():
+                    if not torch.is_tensor(value):
+                        continue
+                    if reward_component_payload is None:
+                        reward_component_payload = {}
+                    if key not in reward_component_payload:
+                        reward_component_payload[key] = torch.zeros(
+                            (int(value.shape[0]), batch_size),
+                            device=value.device,
+                            dtype=value.dtype,
+                        )
+                    payload_value = reward_component_payload[key]
+                    if int(payload_value.shape[0]) != int(value.shape[0]):
+                        raise RuntimeError("reward component rollout shapes were inconsistent across rollout groups")
+                    payload_value[:, group_indices] = value
+            if torch.is_tensor(group_terminal_eval_counts):
+                if terminal_eval_count_payload is None:
+                    terminal_eval_count_payload = torch.zeros(
+                        (batch_size,),
+                        device=group_terminal_eval_counts.device,
+                        dtype=group_terminal_eval_counts.dtype,
+                    )
+                terminal_eval_count_payload[group_indices] = group_terminal_eval_counts.reshape(-1)
             if policy_collect_reinforce_replay and isinstance(group_replay, dict):
                 reward_in_group = group_replay.get("reward_in", None)
                 sampled_action_group = group_replay.get("sampled_action", None)
@@ -798,6 +826,8 @@ def dispatch_policy_rollout(prior, ctx):
             device=device,
             dtype=torch.float32,
         )
+        prior.last_rollout_reward_components = reward_component_payload
+        prior.last_rollout_eval_terminal_counts = terminal_eval_count_payload
         if alpha_grad_outer_merge_state["enabled"] and alpha_grad_outer_merge_state["window_buckets"]:
             raise RuntimeError("alpha_grad TBPTT outer merge finished with incomplete window buckets")
         prior.last_runtime_info = infos if collect_runtime_info else [None] * batch_size
@@ -808,6 +838,8 @@ def dispatch_policy_rollout(prior, ctx):
             "single_eval_pos": single_eval_pos,
             "rollout_profile": prior.last_rollout_profile,
             "reinforce": prior.last_rollout_reinforce,
+            "reward_components": prior.last_rollout_reward_components,
+            "terminal_eval_counts": prior.last_rollout_eval_terminal_counts,
             "policy_trace": prior.last_rollout_policy_trace,
             "terminal_stats": prior.last_rollout_terminal_stats,
         }
