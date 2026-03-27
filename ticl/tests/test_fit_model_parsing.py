@@ -349,7 +349,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
-    assert cfg["prior"]["environment"]["policy_gradient_weight"] == 1.0
+    assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.4
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
@@ -688,7 +688,7 @@ def test_continue_run_resume_safe_defaults_apply_current_rlpfn_hparams():
 
     out = _apply_continue_run_resume_safe_defaults(config, new_defaults, "rlpfn")
 
-    assert out["prior"]["environment"]["policy_gradient_weight"] == 1.0
+    assert out["prior"]["environment"]["policy_gradient_weight"] == 0.4
     assert out["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
     assert out["prior"]["environment"]["terminal_bonus_scale_max"] == 2.0
 
