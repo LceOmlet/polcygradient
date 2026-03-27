@@ -19015,6 +19015,7 @@ class EnvironmentPrior:
             )
         else:
             replay_batch_chunk = int(batch_size)
+        replay_batch_chunk = int(max(1, replay_batch_chunk // 4))
         replay_batch_chunk = int(max(1, min(batch_size, replay_batch_chunk)))
         replay_chunk_count = int((batch_size + replay_batch_chunk - 1) // replay_batch_chunk)
         total_elements = float(max(1, rewards_eval.numel()))
