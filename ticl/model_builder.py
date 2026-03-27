@@ -169,6 +169,24 @@ def old_config_to_new(old_config, new_config):
     return translated_config
 
 
+def _resolve_env_dim_upper_bound(spec, default=0):
+    if spec is None:
+        return int(default)
+    if isinstance(spec, bool):
+        return int(spec)
+    if isinstance(spec, (int, float)):
+        return int(spec)
+    if isinstance(spec, dict):
+        if "max" in spec:
+            return int(spec["max"])
+        if "value" in spec:
+            return int(spec["value"])
+        choice_values = spec.get("choice_values", None)
+        if isinstance(choice_values, (list, tuple)) and len(choice_values) > 0:
+            return int(max(choice_values))
+    return int(default)
+
+
 def get_model(
     config, 
     device, 
@@ -245,7 +263,7 @@ def get_model(
     rwkv_sequence_replay_token_budget = transformer_cfg.pop('rwkv_sequence_replay_token_budget', None)
     normalized_q_value_head_enabled = bool(float(env_cfg.get('normalized_q_value_weight', 0.0) or 0.0) > 0.0)
     next_state_flow_dim = (
-        int(env_cfg.get('obs_slot_dim', 0))
+        _resolve_env_dim_upper_bound(env_cfg.get('state_dim', None), default=0)
         if float(env_cfg.get('next_state_flow_matching_weight', 0.0) or 0.0) > 0.0
         else None
     )

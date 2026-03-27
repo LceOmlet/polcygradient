@@ -1,3 +1,4 @@
+import inspect
 import math
 import os
 import json
@@ -1111,7 +1112,9 @@ def _build_policy_step_fn(
     policy_step_fn._reinforce_sequence_replay_fn = (
         reinforce_sequence_replay_fn if callable(reinforce_sequence_replay_fn) else None
     )
-    reinforce_sequence_replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
+    reinforce_sequence_replay_outputs_fn = getattr(model_ref, "replay_policy_actor_outputs", None)
+    if not callable(reinforce_sequence_replay_outputs_fn):
+        reinforce_sequence_replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
     policy_step_fn._reinforce_sequence_replay_outputs_fn = (
         reinforce_sequence_replay_outputs_fn if callable(reinforce_sequence_replay_outputs_fn) else None
     )
@@ -1216,26 +1219,431 @@ def _wrap_policy_step_fn_with_head_override(policy_step_fn, head_params_override
             )
 
         _wrapped._reinforce_sequence_replay_fn = _replay_with_override
-    replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
+    replay_outputs_fn = getattr(model_ref, "replay_policy_actor_outputs", None)
+    if not callable(replay_outputs_fn):
+        replay_outputs_fn = getattr(model_ref, "replay_policy_sequence_outputs", None)
     if callable(replay_outputs_fn):
         def _replay_outputs_with_override(
             x_tokens,
             y_tokens,
             *,
             eval_start=0,
+            action_query=None,
             flow_matching_xt=None,
             flow_matching_t=None,
         ):
+            kwargs = {
+                "eval_start": eval_start,
+                "policy_action_head_params_override": head_params_override,
+            }
+            sig = inspect.signature(replay_outputs_fn)
+            if "action_query" in sig.parameters:
+                kwargs["action_query"] = action_query
+            if "flow_matching_xt" in sig.parameters:
+                kwargs["flow_matching_xt"] = flow_matching_xt
+            if "flow_matching_t" in sig.parameters:
+                kwargs["flow_matching_t"] = flow_matching_t
             return replay_outputs_fn(
                 x_tokens,
                 y_tokens,
-                eval_start=eval_start,
+                **kwargs,
+            )
+
+        _wrapped._reinforce_sequence_replay_outputs_fn = _replay_outputs_with_override
+    encode_train_tokens_fn = getattr(model_ref, "encode_train_sequence_tokens", None)
+    if callable(encode_train_tokens_fn):
+        _wrapped._reinforce_sequence_encode_train_tokens_fn = encode_train_tokens_fn
+    replay_outputs_from_train_tokens_fn = getattr(
+        model_ref,
+        "replay_policy_actor_outputs_from_train_tokens",
+        None,
+    )
+    if not callable(replay_outputs_from_train_tokens_fn):
+        replay_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_policy_sequence_outputs_from_train_tokens",
+            None,
+        )
+    if callable(replay_outputs_from_train_tokens_fn):
+        def _replay_outputs_from_train_tokens_with_override(
+            train_tokens,
+            *,
+            eval_start=0,
+            action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            kwargs = {
+                "eval_start": eval_start,
+                "policy_action_head_params_override": head_params_override,
+            }
+            sig = inspect.signature(replay_outputs_from_train_tokens_fn)
+            if "action_query" in sig.parameters:
+                kwargs["action_query"] = action_query
+            if "flow_matching_xt" in sig.parameters:
+                kwargs["flow_matching_xt"] = flow_matching_xt
+            if "flow_matching_t" in sig.parameters:
+                kwargs["flow_matching_t"] = flow_matching_t
+            return replay_outputs_from_train_tokens_fn(
+                train_tokens,
+                **kwargs,
+            )
+
+        _wrapped._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+            _replay_outputs_from_train_tokens_with_override
+        )
+    init_kv_cache_fn = getattr(model_ref, "init_kv_cache", None)
+    if callable(init_kv_cache_fn):
+        _wrapped._reinforce_sequence_init_kv_cache_fn = init_kv_cache_fn
+    append_train_token_to_kv_fn = getattr(model_ref, "append_train_token_to_kv", None)
+    if callable(append_train_token_to_kv_fn):
+        _wrapped._reinforce_sequence_append_train_token_to_kv_fn = append_train_token_to_kv_fn
+    predict_query_replay_outputs_with_kv_fn = getattr(model_ref, "predict_query_replay_outputs_with_kv", None)
+    if callable(predict_query_replay_outputs_with_kv_fn):
+        def _predict_query_replay_outputs_with_override(
+            x_query,
+            kv_cache,
+            *,
+            action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return predict_query_replay_outputs_with_kv_fn(
+                x_query,
+                kv_cache,
+                action_query=action_query,
                 flow_matching_xt=flow_matching_xt,
                 flow_matching_t=flow_matching_t,
                 policy_action_head_params_override=head_params_override,
             )
 
-        _wrapped._reinforce_sequence_replay_outputs_fn = _replay_outputs_with_override
+        _wrapped._reinforce_sequence_predict_query_outputs_with_kv_fn = (
+            _predict_query_replay_outputs_with_override
+        )
+    stream_replay_aux_outputs_with_kv_fn = getattr(model_ref, "stream_replay_aux_outputs_with_kv", None)
+    if callable(stream_replay_aux_outputs_with_kv_fn):
+        def _stream_replay_aux_outputs_with_kv_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return stream_replay_aux_outputs_with_kv_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+            _stream_replay_aux_outputs_with_kv_with_override
+        )
+    replay_aux_strict_sequence_outputs_fn = getattr(model_ref, "replay_aux_strict_sequence_outputs", None)
+    if callable(replay_aux_strict_sequence_outputs_fn):
+        def _replay_aux_strict_sequence_outputs_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+            output_chunk_sink=None,
+        ):
+            return replay_aux_strict_sequence_outputs_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                output_chunk_sink=output_chunk_sink,
+            )
+
+        _wrapped._reinforce_sequence_replay_aux_strict_sequence_outputs_fn = (
+            _replay_aux_strict_sequence_outputs_with_override
+        )
+    replay_aux_sequence_outputs_fn = getattr(model_ref, "replay_aux_sequence_outputs", None)
+    if callable(replay_aux_sequence_outputs_fn):
+        def _replay_aux_sequence_outputs_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return replay_aux_sequence_outputs_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+
+        _wrapped._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+            _replay_aux_sequence_outputs_with_override
+        )
+    replay_aux_strict_sequence_outputs_from_train_tokens_fn = getattr(
+        model_ref,
+        "replay_aux_strict_sequence_outputs_from_train_tokens",
+        None,
+    )
+    if callable(replay_aux_strict_sequence_outputs_from_train_tokens_fn):
+        def _replay_aux_strict_sequence_outputs_from_train_tokens_with_override(
+            train_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+            output_chunk_sink=None,
+        ):
+            return replay_aux_strict_sequence_outputs_from_train_tokens_fn(
+                train_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                output_chunk_sink=output_chunk_sink,
+            )
+
+        _wrapped._reinforce_sequence_replay_aux_strict_sequence_outputs_from_train_tokens_fn = (
+            _replay_aux_strict_sequence_outputs_from_train_tokens_with_override
+        )
+    replay_aux_sequence_outputs_from_train_tokens_fn = getattr(
+        model_ref,
+        "replay_aux_sequence_outputs_from_train_tokens",
+        None,
+    )
+    if callable(replay_aux_sequence_outputs_from_train_tokens_fn):
+        def _replay_aux_sequence_outputs_from_train_tokens_with_override(
+            train_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return replay_aux_sequence_outputs_from_train_tokens_fn(
+                train_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+
+        _wrapped._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+            _replay_aux_sequence_outputs_from_train_tokens_with_override
+        )
+    replay_policy_and_aux_sequence_outputs_fn = getattr(
+        model_ref,
+        "replay_policy_and_aux_sequence_outputs",
+        None,
+    )
+    if callable(replay_policy_and_aux_sequence_outputs_fn):
+        def _replay_policy_and_aux_sequence_outputs_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            eval_start=0,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return replay_policy_and_aux_sequence_outputs_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                eval_start=eval_start,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_replay_policy_and_aux_sequence_outputs_fn = (
+            _replay_policy_and_aux_sequence_outputs_with_override
+        )
+    replay_policy_and_aux_sequence_outputs_from_train_tokens_fn = getattr(
+        model_ref,
+        "replay_policy_and_aux_sequence_outputs_from_train_tokens",
+        None,
+    )
+    if callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn):
+        def _replay_policy_and_aux_sequence_outputs_from_train_tokens_with_override(
+            train_tokens,
+            *,
+            full_length,
+            eval_start=0,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return replay_policy_and_aux_sequence_outputs_from_train_tokens_fn(
+                train_tokens,
+                full_length=full_length,
+                eval_start=eval_start,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_replay_policy_and_aux_sequence_outputs_from_train_tokens_fn = (
+            _replay_policy_and_aux_sequence_outputs_from_train_tokens_with_override
+        )
+    stream_replay_policy_and_aux_outputs_with_kv_fn = getattr(
+        model_ref,
+        "stream_replay_policy_and_aux_outputs_with_kv",
+        None,
+    )
+    if callable(stream_replay_policy_and_aux_outputs_with_kv_fn):
+        def _stream_replay_policy_and_aux_outputs_with_kv_with_override(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            eval_start=0,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            return stream_replay_policy_and_aux_outputs_with_kv_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                eval_start=eval_start,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=q_action_query,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action_query,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+                policy_action_head_params_override=head_params_override,
+            )
+
+        _wrapped._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+            _stream_replay_policy_and_aux_outputs_with_kv_with_override
+        )
     return _wrapped
 
 
@@ -3155,6 +3563,10 @@ def train_epoch_policy_gradient(
                                 nonlocal reinforce_replay_backward_called
                                 nonlocal batch_backward_wall, batch_backward_calls
                                 nonlocal backward_t_start_unix, backward_t_end_unix
+                                retain_graph = False
+                                if isinstance(loss_root, dict):
+                                    retain_graph = bool(loss_root.get("retain_graph", False))
+                                    loss_root = loss_root.get("loss", None)
                                 if (not torch.is_tensor(loss_root)) or (not bool(loss_root.requires_grad)):
                                     return None
                                 reinforce_replay_backward_called = True
@@ -3171,9 +3583,9 @@ def train_epoch_policy_gradient(
                                     else nullcontext()
                                 ):
                                     if scaler is None:
-                                        scaled_loss.backward()
+                                        scaled_loss.backward(retain_graph=bool(retain_graph))
                                     else:
-                                        scaler.scale(scaled_loss).backward()
+                                        scaler.scale(scaled_loss).backward(retain_graph=bool(retain_graph))
                                 if backward_cuda_start is not None:
                                     backward_cuda_end = torch.cuda.Event(enable_timing=True)
                                     backward_cuda_end.record()
@@ -3185,6 +3597,7 @@ def train_epoch_policy_gradient(
                                     backward_t_start_unix = backward_t0_unix
                                 backward_t_end_unix = backward_t1_unix
                                 return None
+                            _reinforce_replay_loss_sink._ticl_accepts_replay_payload = True
                         else:
                             _reinforce_replay_loss_sink = None
 

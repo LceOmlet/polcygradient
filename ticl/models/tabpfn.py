@@ -327,13 +327,13 @@ class TabPFN(nn.Module):
             raise RuntimeError("normalized_q_value_head is not initialized")
         return self.normalized_q_value_bardist
 
-    def _decode_normalized_q_value_logits(self, hidden):
+    def _decode_normalized_q_value_logits(self, hidden, *, action=None):
         if not self.has_normalized_q_value_head():
             raise RuntimeError("normalized_q_value_head is not initialized")
         hidden = self._cast_hidden_for_head(hidden, self.normalized_q_value_head)
         return self.normalized_q_value_head(hidden)
 
-    def _decode_next_state_flow(self, hidden, x_t, t):
+    def _decode_next_state_flow(self, hidden, x_t, t, *, action=None):
         if not self.has_next_state_flow_head():
             raise RuntimeError("next_state_flow_head is not initialized")
         return self.next_state_flow_head(hidden, x_t, t)
@@ -342,6 +342,7 @@ class TabPFN(nn.Module):
         self,
         hidden_q,
         *,
+        action_query=None,
         flow_matching_xt=None,
         flow_matching_t=None,
         policy_action_head_params_override=None,
@@ -351,13 +352,18 @@ class TabPFN(nn.Module):
             policy_action_head_params_override=policy_action_head_params_override,
         )
         if self.has_normalized_q_value_head():
-            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q)
+            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q, action=action_query)
             outputs["normalized_q_logits"] = normalized_q_logits
             outputs["normalized_q"] = self.normalized_q_value_bardist.mean(
                 normalized_q_logits,
             )
         if self.has_next_state_flow_head() and flow_matching_xt is not None and flow_matching_t is not None:
-            outputs["next_state_flow"] = self._decode_next_state_flow(hidden_q, flow_matching_xt, flow_matching_t)
+            outputs["next_state_flow"] = self._decode_next_state_flow(
+                hidden_q,
+                flow_matching_xt,
+                flow_matching_t,
+                action=action_query,
+            )
         return outputs
 
     def reset_policy_action_head_from_decoder_(self):
@@ -694,6 +700,30 @@ class TabPFN(nn.Module):
             policy_action_head_params_override=policy_action_head_params_override,
         )
 
+    def predict_query_replay_outputs_with_kv(
+        self,
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("KV cache requires single_eval_causal=True.")
+        x_enc = self.encoder(x_query)
+        if self.input_ln is not None:
+            x_enc = self.input_ln(x_enc)
+        hidden = self.transformer_encoder.forward_query(x_enc, kv_cache)
+        return self._decode_replay_outputs(
+            hidden,
+            action_query=action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
     def replay_policy_sequence_tokens(
         self,
         x_tokens,
@@ -702,10 +732,31 @@ class TabPFN(nn.Module):
         eval_start: int = 0,
         policy_action_head_params_override=None,
     ):
-        return self.replay_policy_sequence_outputs(
-            x_tokens,
-            y_tokens,
-            eval_start=eval_start,
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_sequence_tokens requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_policy_sequence_tokens expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        eval_start = int(max(0, min(int(x_tokens.shape[0]), int(eval_start))))
+        x_src, y_src = self._encode_xy((x_tokens, y_tokens))
+        train_x = x_src[:eval_start] + y_src[:eval_start]
+        query_x = x_src[eval_start:]
+        if self.input_ln is not None:
+            train_x = self.input_ln(train_x)
+            query_x = self.input_ln(query_x)
+        hidden_q = self._forward_queries_with_kv_from_encoded(train_x, query_x)
+        return self._decode_policy_actor_outputs(
+            hidden_q,
             policy_action_head_params_override=policy_action_head_params_override,
         )["action_mean"]
 
@@ -715,6 +766,7 @@ class TabPFN(nn.Module):
         y_tokens,
         *,
         eval_start: int = 0,
+        action_query=None,
         flow_matching_xt=None,
         flow_matching_t=None,
         policy_action_head_params_override=None,
@@ -744,6 +796,7 @@ class TabPFN(nn.Module):
         hidden_q = self._forward_queries_with_kv_from_encoded(train_x, query_x)
         return self._decode_replay_outputs(
             hidden_q,
+            action_query=action_query,
             flow_matching_xt=flow_matching_xt,
             flow_matching_t=flow_matching_t,
             policy_action_head_params_override=policy_action_head_params_override,

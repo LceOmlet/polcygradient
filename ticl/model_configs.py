@@ -263,6 +263,17 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "normalized_q_value_weight": 1.0,
         "next_state_flow_matching_weight": 1.0,
         "next_state_flow_head_type": "cfmi_resnet",
+        # Keep legacy replay next-state/next-obs targets opt-in only; the maintained
+        # action-conditioned aux path uses flow_* targets instead.
+        "reinforce_sequence_replay_store_legacy_targets": False,
+        # Share x/y -> train-token encoding across policy replay and aux replay when
+        # the backbone exposes an exact encoded-token replay path. Disable to compare
+        # against the legacy separate-encoding behavior.
+        "reinforce_sequence_replay_share_train_token_encoding": True,
+        # Keep the maintained RWKV replay path on the official sequence-train helpers by
+        # default. The shared context-forward helper remains opt-in for legacy
+        # comparisons, but it is not the canonical high-performance training path.
+        "reinforce_sequence_replay_share_context_forward": False,
         # Keep Bellman-style undiscounted default unless overridden.
         "discount": 1.0,
         # SCM (aligned with priors/mlp.py names).
@@ -425,7 +436,7 @@ def get_rlpfn_default_config():
     config['prior']['prior_type'] = 'environment_only'
     config['prior']['num_features'] = 432
     # RLPFN default rollout horizon.
-    config['prior']['n_samples'] = 1024 * 4
+    config['prior']['n_samples'] = 2048
 
     env_cfg = config['prior']['environment']
     apply_rlpfn_maintained_path_defaults(config)

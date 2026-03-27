@@ -31,6 +31,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "next_state_flow_matching_weight": 1.0,
     "next_state_flow_head_type": "rwkv_two_layer",
     "reinforce_sequence_replay_enabled": True,
+    "reinforce_sequence_replay_share_context_forward": True,
     "first_policy_gradient_state_grad_clip_norm": 4.0,
     "first_policy_gradient_action_grad_clip_value": 0.0,
     "first_policy_gradient_action_grad_clip_norm": 1.0,

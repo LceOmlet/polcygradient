@@ -852,6 +852,7 @@ class RWKVTwoLayerFlowMatchingHead(nn.Module):
         head_size: int,
         ffn_mult: int,
         time_embedding_dim: int = 128,
+        sequence_replay_checkpoint: bool = False,
     ):
         super().__init__()
         self.hidden_dim = int(hidden_dim)
@@ -870,7 +871,7 @@ class RWKVTwoLayerFlowMatchingHead(nn.Module):
             nlayers=2,
             head_size=int(head_size),
             ffn_mult=int(ffn_mult),
-            sequence_replay_checkpoint=False,
+            sequence_replay_checkpoint=bool(sequence_replay_checkpoint),
         )
         self.output_proj = nn.Linear(self.hidden_dim, self.target_dim)
 
@@ -1057,6 +1058,7 @@ class RWKV7PFN(nn.Module):
                     head_size=self.rwkv_head_size,
                     ffn_mult=self.rwkv_ffn_mult,
                     time_embedding_dim=128,
+                    sequence_replay_checkpoint=self.rwkv_sequence_replay_checkpoint,
                 )
             else:
                 raise ValueError(
@@ -1205,13 +1207,13 @@ class RWKV7PFN(nn.Module):
             raise RuntimeError("normalized_q_value_head is not initialized")
         return self.normalized_q_value_bardist
 
-    def _decode_normalized_q_value_logits(self, hidden):
+    def _decode_normalized_q_value_logits(self, hidden, *, action=None):
         if not self.has_normalized_q_value_head():
             raise RuntimeError("normalized_q_value_head is not initialized")
         hidden = self._cast_hidden_for_head(hidden, self.normalized_q_value_head)
         return self.normalized_q_value_head(hidden)
 
-    def _decode_next_state_flow(self, hidden, x_t, t):
+    def _decode_next_state_flow(self, hidden, x_t, t, *, action=None):
         if not self.has_next_state_flow_head():
             raise RuntimeError("next_state_flow_head is not initialized")
         return self.next_state_flow_head(hidden, x_t, t)
@@ -1220,6 +1222,7 @@ class RWKV7PFN(nn.Module):
         self,
         hidden_q,
         *,
+        action_query=None,
         policy_action_head_params_override=None,
         flow_matching_xt=None,
         flow_matching_t=None,
@@ -1231,14 +1234,66 @@ class RWKV7PFN(nn.Module):
             )
         }
         if self.has_normalized_q_value_head():
-            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q)
+            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q, action=action_query)
             outputs["normalized_q_logits"] = normalized_q_logits
             outputs["normalized_q"] = self.normalized_q_value_bardist.mean(
                 normalized_q_logits,
             )
         if self.has_next_state_flow_head() and flow_matching_xt is not None and flow_matching_t is not None:
-            outputs["next_state_flow"] = self._decode_next_state_flow(hidden_q, flow_matching_xt, flow_matching_t)
+            outputs["next_state_flow"] = self._decode_next_state_flow(
+                hidden_q,
+                flow_matching_xt,
+                flow_matching_t,
+                action=action_query,
+            )
         return outputs
+
+    def _decode_policy_replay_outputs(
+        self,
+        hidden_q,
+        *,
+        policy_action_head_params_override=None,
+    ):
+        return self._decode_policy_actor_outputs(
+            hidden_q,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
+    def _decode_aux_replay_outputs(
+        self,
+        hidden_q,
+        *,
+        action_query=None,
+        include_normalized_q_logits: bool = False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        outputs = {}
+        if include_normalized_q_logits:
+            if not self.has_normalized_q_value_head():
+                raise RuntimeError("normalized_q_value_head is not initialized")
+            outputs["normalized_q_logits"] = self._decode_normalized_q_value_logits(
+                hidden_q,
+                action=action_query,
+            )
+        if flow_matching_xt is not None or flow_matching_t is not None:
+            if flow_matching_xt is None or flow_matching_t is None:
+                raise ValueError("flow aux decoding requires both flow_matching_xt and flow_matching_t")
+            outputs["next_state_flow"] = self._decode_next_state_flow(
+                hidden_q,
+                flow_matching_xt,
+                flow_matching_t,
+                action=action_query,
+            )
+        return outputs
+
+    def _forward_query_hidden_with_kv(self, x_query, kv_cache):
+        if not self.single_eval_causal:
+            raise ValueError("RWKV state cache requires single_eval_causal=True.")
+        token = self._encode_query_token(x_query)
+        token = self._cast_token_for_rwkv_core(token)
+        hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
+        return hidden
 
     def policy_fastpath_compile_active(self):
         return False
@@ -1278,6 +1333,22 @@ class RWKV7PFN(nn.Module):
         if self.input_ln is not None:
             x_enc = self.input_ln(x_enc)
         return x_enc
+
+    def encode_train_sequence_tokens(self, x_tokens, y_tokens):
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"encode_train_sequence_tokens expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"encode_train_sequence_tokens expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "encode_train_sequence_tokens expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        return self._encode_train_token(x_tokens, y_tokens)
 
     def _encode_split_train_token(
         self,
@@ -1412,26 +1483,1613 @@ class RWKV7PFN(nn.Module):
         return state
 
     def predict_query_with_kv(self, x_query, kv_cache, *, policy_action_head_params_override=None):
-        if not self.single_eval_causal:
-            raise ValueError("RWKV state cache requires single_eval_causal=True.")
-        token = self._encode_query_token(x_query)
-        token = self._cast_token_for_rwkv_core(token)
-        hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
+        hidden = self._forward_query_hidden_with_kv(x_query, kv_cache)
         return self._decode_policy_action(
             hidden,
             policy_action_head_params_override=policy_action_head_params_override,
         )
 
     def predict_query_actor_outputs_with_kv(self, x_query, kv_cache, *, policy_action_head_params_override=None):
-        if not self.single_eval_causal:
-            raise ValueError("RWKV state cache requires single_eval_causal=True.")
-        token = self._encode_query_token(x_query)
-        token = self._cast_token_for_rwkv_core(token)
-        hidden, _ = self.rwkv_core.forward_tokens(token, kv_cache)
+        hidden = self._forward_query_hidden_with_kv(x_query, kv_cache)
         return self._decode_policy_actor_outputs(
             hidden,
             policy_action_head_params_override=policy_action_head_params_override,
         )
+
+    def predict_query_replay_outputs_with_kv(
+        self,
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        policy_action_head_params_override=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        hidden = self._forward_query_hidden_with_kv(x_query, kv_cache)
+        return self._decode_replay_outputs(
+            hidden,
+            action_query=action_query,
+            policy_action_head_params_override=policy_action_head_params_override,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    def predict_query_aux_outputs_with_kv(
+        self,
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        include_normalized_q_logits: bool = False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        hidden = self._forward_query_hidden_with_kv(x_query, kv_cache)
+        return self._decode_aux_replay_outputs(
+            hidden,
+            action_query=action_query,
+            include_normalized_q_logits=include_normalized_q_logits,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    @staticmethod
+    def _concat_replay_output_chunks(output_chunks: dict[str, list[torch.Tensor]], *, dim: int = 0):
+        return {
+            key: torch.cat(value_list, dim=dim)
+            for key, value_list in output_chunks.items()
+            if len(value_list) > 0
+        }
+
+    @staticmethod
+    def _concat_nested_replay_output_chunks(
+        output_chunks: dict[str, dict[str, list[torch.Tensor]]],
+        *,
+        dim: int = 0,
+    ):
+        merged = {}
+        for section, section_chunks in output_chunks.items():
+            merged[section] = RWKV7PFN._concat_replay_output_chunks(section_chunks, dim=dim)
+        return merged
+
+    @staticmethod
+    def _pack_aux_sequence_tokens(
+        train_tokens: torch.Tensor,
+        *,
+        full_length: int,
+        q_query_tokens: torch.Tensor | None = None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        flow_query_tokens: torch.Tensor | None = None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+    ):
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                f"_pack_aux_sequence_tokens expects train_tokens with shape (T, B, C), got {tuple(train_tokens.shape)}"
+            )
+        full_length = int(max(0, min(int(train_tokens.shape[0]), int(full_length))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None and int(q_query_tokens.shape[0]) != int(q_query_stop - q_query_start):
+            raise ValueError(
+                "q_query_tokens must align with q query range, "
+                f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop})"
+            )
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None and int(flow_query_tokens.shape[0]) != int(flow_query_stop - flow_query_start):
+            raise ValueError(
+                "flow_query_tokens must align with flow query range, "
+                f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop})"
+            )
+
+        packed_segments = []
+        q_positions = []
+        flow_positions = []
+        packed_pos = 0
+        for token_idx in range(full_length):
+            packed_segments.append(train_tokens[token_idx : token_idx + 1])
+            packed_pos += 1
+            if flow_query_tokens is not None and flow_query_start <= token_idx < flow_query_stop:
+                flow_idx = int(token_idx - flow_query_start)
+                packed_segments.append(flow_query_tokens[flow_idx : flow_idx + 1])
+                flow_positions.append(int(packed_pos))
+                packed_pos += 1
+            if q_query_tokens is not None and q_query_start <= token_idx < q_query_stop:
+                q_idx = int(token_idx - q_query_start)
+                packed_segments.append(q_query_tokens[q_idx : q_idx + 1])
+                q_positions.append(int(packed_pos))
+                packed_pos += 1
+
+        if len(packed_segments) == 0:
+            packed_tokens = train_tokens[:0]
+        else:
+            packed_tokens = torch.cat(packed_segments, dim=0)
+        q_positions_t = torch.as_tensor(q_positions, device=train_tokens.device, dtype=torch.long)
+        flow_positions_t = torch.as_tensor(flow_positions, device=train_tokens.device, dtype=torch.long)
+        return packed_tokens, q_positions_t, flow_positions_t
+
+    @staticmethod
+    def _pack_policy_and_aux_sequence_tokens(
+        train_tokens: torch.Tensor,
+        *,
+        full_length: int,
+        eval_start: int = 0,
+        q_query_tokens: torch.Tensor | None = None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        flow_query_tokens: torch.Tensor | None = None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+    ):
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "_pack_policy_and_aux_sequence_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+        full_length = int(max(0, min(int(train_tokens.shape[0]), int(full_length))))
+        eval_start = int(max(0, min(full_length, int(eval_start))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None and int(q_query_tokens.shape[0]) != int(q_query_stop - q_query_start):
+            raise ValueError(
+                "q_query_tokens must align with q query range, "
+                f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop})"
+            )
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None and int(flow_query_tokens.shape[0]) != int(flow_query_stop - flow_query_start):
+            raise ValueError(
+                "flow_query_tokens must align with flow query range, "
+                f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop})"
+            )
+
+        packed_segments = []
+        policy_positions = []
+        q_positions = []
+        flow_positions = []
+        packed_pos = 0
+        for token_idx in range(full_length):
+            packed_segments.append(train_tokens[token_idx : token_idx + 1])
+            if token_idx >= eval_start:
+                policy_positions.append(int(packed_pos))
+            packed_pos += 1
+            if flow_query_tokens is not None and flow_query_start <= token_idx < flow_query_stop:
+                flow_idx = int(token_idx - flow_query_start)
+                packed_segments.append(flow_query_tokens[flow_idx : flow_idx + 1])
+                flow_positions.append(int(packed_pos))
+                packed_pos += 1
+            if q_query_tokens is not None and q_query_start <= token_idx < q_query_stop:
+                q_idx = int(token_idx - q_query_start)
+                packed_segments.append(q_query_tokens[q_idx : q_idx + 1])
+                q_positions.append(int(packed_pos))
+                packed_pos += 1
+
+        if len(packed_segments) == 0:
+            packed_tokens = train_tokens[:0]
+        else:
+            packed_tokens = torch.cat(packed_segments, dim=0)
+        policy_positions_t = torch.as_tensor(policy_positions, device=train_tokens.device, dtype=torch.long)
+        q_positions_t = torch.as_tensor(q_positions, device=train_tokens.device, dtype=torch.long)
+        flow_positions_t = torch.as_tensor(flow_positions, device=train_tokens.device, dtype=torch.long)
+        return packed_tokens, policy_positions_t, q_positions_t, flow_positions_t
+
+    def stream_replay_aux_outputs_with_kv(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        full_length: int,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("stream_replay_aux_outputs_with_kv requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"stream_replay_aux_outputs_with_kv expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"stream_replay_aux_outputs_with_kv expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "stream_replay_aux_outputs_with_kv expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(x_tokens.shape[0]), int(full_length))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    "stream_replay_aux_outputs_with_kv expects q_query_tokens with shape (Tq, B, F)"
+                )
+            if int(q_query_tokens.shape[0]) != int(q_query_stop - q_query_start):
+                raise ValueError(
+                    "q_query_tokens must align with q query range, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop})"
+                )
+            if int(q_query_tokens.shape[1]) != int(x_tokens.shape[1]):
+                raise ValueError(
+                    "q_query_tokens batch must match x_tokens batch, "
+                    f"got {tuple(q_query_tokens.shape)} and {tuple(x_tokens.shape)}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    "stream_replay_aux_outputs_with_kv expects flow_query_tokens with shape (Tf, B, F)"
+                )
+            if int(flow_query_tokens.shape[0]) != int(flow_query_stop - flow_query_start):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop})"
+                )
+            if int(flow_query_tokens.shape[1]) != int(x_tokens.shape[1]):
+                raise ValueError(
+                    "flow_query_tokens batch must match x_tokens batch, "
+                    f"got {tuple(flow_query_tokens.shape)} and {tuple(x_tokens.shape)}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        stream_start = int(full_length)
+        if q_query_tokens is not None:
+            stream_start = min(stream_start, int(q_query_start))
+        if flow_query_tokens is not None:
+            stream_start = min(stream_start, int(flow_query_start))
+        stream_start = int(max(0, min(full_length, stream_start)))
+
+        kv_cache = None
+        if stream_start > 0:
+            kv_cache = self.init_kv_cache(x_tokens[:stream_start], y_tokens[:stream_start])
+
+        q_chunks: dict[str, list[torch.Tensor]] = {}
+        flow_chunks: dict[str, list[torch.Tensor]] = {}
+        for token_idx in range(stream_start, full_length):
+            kv_cache = self.append_train_token_to_kv(
+                x_tokens[token_idx : token_idx + 1],
+                y_tokens[token_idx : token_idx + 1],
+                kv_cache,
+            )
+            if q_query_tokens is not None and q_query_start <= token_idx < q_query_stop:
+                q_idx = int(token_idx - q_query_start)
+                q_hidden = self._forward_query_hidden_with_kv(
+                    q_query_tokens[q_idx : q_idx + 1],
+                    kv_cache,
+                )
+                q_outputs = self._decode_aux_replay_outputs(
+                    q_hidden,
+                    action_query=(
+                        None if q_action_query is None else q_action_query[q_idx : q_idx + 1]
+                    ),
+                    include_normalized_q_logits=True,
+                )
+                for key, value in q_outputs.items():
+                    q_chunks.setdefault(key, []).append(value)
+            if flow_query_tokens is not None and flow_query_start <= token_idx < flow_query_stop:
+                flow_idx = int(token_idx - flow_query_start)
+                flow_hidden = self._forward_query_hidden_with_kv(
+                    flow_query_tokens[flow_idx : flow_idx + 1],
+                    kv_cache,
+                )
+                flow_outputs = self._decode_aux_replay_outputs(
+                    flow_hidden,
+                    action_query=(
+                        None if flow_action_query is None else flow_action_query[flow_idx : flow_idx + 1]
+                    ),
+                    flow_matching_xt=(
+                        None if flow_matching_xt is None else flow_matching_xt[flow_idx : flow_idx + 1]
+                    ),
+                    flow_matching_t=(
+                        None if flow_matching_t is None else flow_matching_t[flow_idx : flow_idx + 1]
+                    ),
+                )
+                for key, value in flow_outputs.items():
+                    flow_chunks.setdefault(key, []).append(value)
+
+        return {
+            "q": self._concat_replay_output_chunks(q_chunks),
+            "flow": self._concat_replay_output_chunks(flow_chunks),
+        }
+
+    def replay_aux_sequence_outputs(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        full_length: int,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_aux_sequence_outputs requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_aux_sequence_outputs expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_aux_sequence_outputs expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_aux_sequence_outputs expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(x_tokens.shape[0]), int(full_length))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    f"replay_aux_sequence_outputs expects q_query_tokens with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                )
+            if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), int(x_tokens.shape[1])):
+                raise ValueError(
+                    "q_query_tokens must align with q query range and batch, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {int(x_tokens.shape[1])}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    f"replay_aux_sequence_outputs expects flow_query_tokens with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                )
+            if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), int(x_tokens.shape[1])):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range and batch, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {int(x_tokens.shape[1])}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        packed_seq_len = int(full_length + q_steps + flow_steps)
+        total_batch = int(x_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=packed_seq_len,
+            total_batch=total_batch,
+        )
+
+        def _single_batch_chunk(
+            x_tokens_chunk,
+            y_tokens_chunk,
+            *,
+            q_query_tokens_chunk,
+            q_action_query_chunk,
+            flow_query_tokens_chunk,
+            flow_action_query_chunk,
+            flow_matching_xt_chunk,
+            flow_matching_t_chunk,
+        ):
+            train_tokens = self._encode_train_token(
+                x_tokens_chunk[:full_length],
+                y_tokens_chunk[:full_length],
+            )
+            q_query_enc = None if q_query_tokens_chunk is None else self._encode_query_token(q_query_tokens_chunk)
+            flow_query_enc = None if flow_query_tokens_chunk is None else self._encode_query_token(flow_query_tokens_chunk)
+            packed_tokens, q_positions, flow_positions = self._pack_aux_sequence_tokens(
+                train_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_enc,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                flow_query_tokens=flow_query_enc,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+            )
+            packed_tokens = self._cast_token_for_rwkv_core(packed_tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(packed_tokens)
+            outputs = {"q": {}, "flow": {}}
+            if int(q_positions.numel()) > 0:
+                q_hidden = hidden_all.index_select(0, q_positions)
+                outputs["q"] = self._decode_aux_replay_outputs(
+                    q_hidden,
+                    action_query=q_action_query_chunk,
+                    include_normalized_q_logits=True,
+                )
+            if int(flow_positions.numel()) > 0:
+                flow_hidden = hidden_all.index_select(0, flow_positions)
+                outputs["flow"] = self._decode_aux_replay_outputs(
+                    flow_hidden,
+                    action_query=flow_action_query_chunk,
+                    flow_matching_xt=flow_matching_xt_chunk,
+                    flow_matching_t=flow_matching_t_chunk,
+                )
+            return outputs
+
+        if batch_chunk_size >= total_batch:
+            return _single_batch_chunk(
+                x_tokens,
+                y_tokens,
+                q_query_tokens_chunk=q_query_tokens,
+                q_action_query_chunk=q_action_query,
+                flow_query_tokens_chunk=flow_query_tokens,
+                flow_action_query_chunk=flow_action_query,
+                flow_matching_xt_chunk=flow_matching_xt,
+                flow_matching_t_chunk=flow_matching_t,
+            )
+
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV aux sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+
+        q_output_chunks: dict[str, list[torch.Tensor]] = {}
+        flow_output_chunks: dict[str, list[torch.Tensor]] = {}
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            chunk_outputs = _single_batch_chunk(
+                x_tokens[:, start:end],
+                y_tokens[:, start:end],
+                q_query_tokens_chunk=(None if q_query_tokens is None else q_query_tokens[:, start:end]),
+                q_action_query_chunk=(None if q_action_query is None else q_action_query[:, start:end]),
+                flow_query_tokens_chunk=(None if flow_query_tokens is None else flow_query_tokens[:, start:end]),
+                flow_action_query_chunk=(None if flow_action_query is None else flow_action_query[:, start:end]),
+                flow_matching_xt_chunk=(None if flow_matching_xt is None else flow_matching_xt[:, start:end]),
+                flow_matching_t_chunk=(None if flow_matching_t is None else flow_matching_t[:, start:end]),
+            )
+            for key, value in chunk_outputs.get("q", {}).items():
+                q_output_chunks.setdefault(key, []).append(value)
+            for key, value in chunk_outputs.get("flow", {}).items():
+                flow_output_chunks.setdefault(key, []).append(value)
+        return {
+            "q": self._concat_replay_output_chunks(q_output_chunks, dim=1),
+            "flow": self._concat_replay_output_chunks(flow_output_chunks, dim=1),
+        }
+
+    def stream_replay_policy_and_aux_outputs_with_kv(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        full_length: int,
+        eval_start: int = 0,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("stream_replay_policy_and_aux_outputs_with_kv requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                "stream_replay_policy_and_aux_outputs_with_kv expects x_tokens with shape (T, B, F), "
+                f"got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                "stream_replay_policy_and_aux_outputs_with_kv expects y_tokens with shape (T, B), "
+                f"got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "stream_replay_policy_and_aux_outputs_with_kv expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(x_tokens.shape[0]), int(full_length))))
+        eval_start = int(max(0, min(full_length, int(eval_start))))
+
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    "stream_replay_policy_and_aux_outputs_with_kv expects q_query_tokens "
+                    f"with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                )
+            if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), int(x_tokens.shape[1])):
+                raise ValueError(
+                    "q_query_tokens must align with q query range and batch, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {int(x_tokens.shape[1])}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    "stream_replay_policy_and_aux_outputs_with_kv expects flow_query_tokens "
+                    f"with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                )
+            if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), int(x_tokens.shape[1])):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range and batch, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {int(x_tokens.shape[1])}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        total_batch = int(x_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=int(full_length),
+            total_batch=total_batch,
+        )
+
+        def _single_batch_chunk(
+            x_tokens_chunk,
+            y_tokens_chunk,
+            *,
+            q_query_tokens_chunk,
+            q_action_query_chunk,
+            flow_query_tokens_chunk,
+            flow_action_query_chunk,
+            flow_matching_xt_chunk,
+            flow_matching_t_chunk,
+        ):
+            stream_start = int(full_length)
+            if int(eval_start) < stream_start:
+                stream_start = int(eval_start)
+            if q_query_tokens_chunk is not None:
+                stream_start = min(stream_start, int(q_query_start))
+            if flow_query_tokens_chunk is not None:
+                stream_start = min(stream_start, int(flow_query_start))
+            stream_start = int(max(0, min(full_length, stream_start)))
+
+            kv_cache = None
+            if stream_start > 0:
+                kv_cache = self.init_kv_cache(
+                    x_tokens_chunk[:stream_start],
+                    y_tokens_chunk[:stream_start],
+                )
+
+            output_chunks = {
+                "policy": {},
+                "q": {},
+                "flow": {},
+            }
+            for token_idx in range(stream_start, full_length):
+                if token_idx < int(eval_start):
+                    kv_cache = self.append_train_token_to_kv(
+                        x_tokens_chunk[token_idx : token_idx + 1],
+                        y_tokens_chunk[token_idx : token_idx + 1],
+                        kv_cache,
+                    )
+                else:
+                    actor_outputs_step, kv_cache = self.forward_policy_step_actor(
+                        x_tokens_chunk[token_idx : token_idx + 1],
+                        y_tokens_chunk[token_idx : token_idx + 1],
+                        kv_cache=kv_cache,
+                        policy_action_head_params_override=policy_action_head_params_override,
+                    )
+                    for key, value in actor_outputs_step.items():
+                        output_chunks["policy"].setdefault(key, []).append(value)
+
+                if q_query_tokens_chunk is not None and q_query_start <= token_idx < q_query_stop:
+                    q_idx = int(token_idx - q_query_start)
+                    q_step_outputs = self.predict_query_aux_outputs_with_kv(
+                        q_query_tokens_chunk[q_idx : q_idx + 1],
+                        kv_cache,
+                        action_query=(
+                            None if q_action_query_chunk is None else q_action_query_chunk[q_idx : q_idx + 1]
+                        ),
+                        include_normalized_q_logits=True,
+                    )
+                    for key, value in q_step_outputs.items():
+                        output_chunks["q"].setdefault(key, []).append(value)
+
+                if flow_query_tokens_chunk is not None and flow_query_start <= token_idx < flow_query_stop:
+                    flow_idx = int(token_idx - flow_query_start)
+                    flow_step_outputs = self.predict_query_aux_outputs_with_kv(
+                        flow_query_tokens_chunk[flow_idx : flow_idx + 1],
+                        kv_cache,
+                        action_query=(
+                            None
+                            if flow_action_query_chunk is None else flow_action_query_chunk[flow_idx : flow_idx + 1]
+                        ),
+                        flow_matching_xt=(
+                            None if flow_matching_xt_chunk is None else flow_matching_xt_chunk[flow_idx : flow_idx + 1]
+                        ),
+                        flow_matching_t=(
+                            None if flow_matching_t_chunk is None else flow_matching_t_chunk[flow_idx : flow_idx + 1]
+                        ),
+                    )
+                    for key, value in flow_step_outputs.items():
+                        output_chunks["flow"].setdefault(key, []).append(value)
+
+            return self._concat_nested_replay_output_chunks(output_chunks, dim=0)
+
+        if batch_chunk_size >= total_batch:
+            return _single_batch_chunk(
+                x_tokens,
+                y_tokens,
+                q_query_tokens_chunk=q_query_tokens,
+                q_action_query_chunk=q_action_query,
+                flow_query_tokens_chunk=flow_query_tokens,
+                flow_action_query_chunk=flow_action_query,
+                flow_matching_xt_chunk=flow_matching_xt,
+                flow_matching_t_chunk=flow_matching_t,
+            )
+
+        output_chunks = {
+            "policy": {},
+            "q": {},
+            "flow": {},
+        }
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            chunk_outputs = _single_batch_chunk(
+                x_tokens[:, start:end],
+                y_tokens[:, start:end],
+                q_query_tokens_chunk=(None if q_query_tokens is None else q_query_tokens[:, start:end]),
+                q_action_query_chunk=(None if q_action_query is None else q_action_query[:, start:end]),
+                flow_query_tokens_chunk=(None if flow_query_tokens is None else flow_query_tokens[:, start:end]),
+                flow_action_query_chunk=(None if flow_action_query is None else flow_action_query[:, start:end]),
+                flow_matching_xt_chunk=(None if flow_matching_xt is None else flow_matching_xt[:, start:end]),
+                flow_matching_t_chunk=(None if flow_matching_t is None else flow_matching_t[:, start:end]),
+            )
+            for section, section_outputs in chunk_outputs.items():
+                for key, value in section_outputs.items():
+                    output_chunks[section].setdefault(key, []).append(value)
+        return self._concat_nested_replay_output_chunks(output_chunks, dim=1)
+
+    def replay_policy_and_aux_sequence_outputs(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        full_length: int,
+        eval_start: int = 0,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        policy_action_head_params_override=None,
+    ):
+        train_tokens = self.encode_train_sequence_tokens(x_tokens, y_tokens)
+        return self.replay_policy_and_aux_sequence_outputs_from_train_tokens(
+            train_tokens,
+            full_length=full_length,
+            eval_start=eval_start,
+            q_query_tokens=q_query_tokens,
+            q_query_start=q_query_start,
+            q_query_stop=q_query_stop,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
+    def replay_policy_and_aux_sequence_outputs_from_train_tokens(
+        self,
+        train_tokens,
+        *,
+        full_length: int,
+        eval_start: int = 0,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_and_aux_sequence_outputs_from_train_tokens requires single_eval_causal=True.")
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "replay_policy_and_aux_sequence_outputs_from_train_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(train_tokens.shape[0]), int(full_length))))
+        eval_start = int(max(0, min(full_length, int(eval_start))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_policy_and_aux_sequence_outputs_from_train_tokens expects q_query_tokens "
+                    f"with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                )
+            if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), int(train_tokens.shape[1])):
+                raise ValueError(
+                    "q_query_tokens must align with q query range and batch, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {int(train_tokens.shape[1])}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_policy_and_aux_sequence_outputs_from_train_tokens expects flow_query_tokens "
+                    f"with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                )
+            if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), int(train_tokens.shape[1])):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range and batch, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {int(train_tokens.shape[1])}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        packed_seq_len = int(full_length + q_steps + flow_steps)
+        total_batch = int(train_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=packed_seq_len,
+            total_batch=total_batch,
+        )
+
+        def _single_batch_chunk(
+            train_tokens_chunk,
+            *,
+            q_query_tokens_chunk,
+            q_action_query_chunk,
+            flow_query_tokens_chunk,
+            flow_action_query_chunk,
+            flow_matching_xt_chunk,
+            flow_matching_t_chunk,
+        ):
+            q_query_enc = None if q_query_tokens_chunk is None else self._encode_query_token(q_query_tokens_chunk)
+            flow_query_enc = None if flow_query_tokens_chunk is None else self._encode_query_token(flow_query_tokens_chunk)
+            packed_tokens, policy_positions, q_positions, flow_positions = self._pack_policy_and_aux_sequence_tokens(
+                train_tokens_chunk[:full_length],
+                full_length=full_length,
+                eval_start=eval_start,
+                q_query_tokens=q_query_enc,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                flow_query_tokens=flow_query_enc,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+            )
+            packed_tokens = self._cast_token_for_rwkv_core(packed_tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(packed_tokens)
+            outputs = {"policy": {}, "q": {}, "flow": {}}
+
+            policy_hidden = hidden_all.index_select(0, policy_positions)
+            outputs["policy"] = self._decode_policy_replay_outputs(
+                policy_hidden,
+                policy_action_head_params_override=policy_action_head_params_override,
+            )
+            if int(q_positions.numel()) > 0:
+                q_hidden = hidden_all.index_select(0, q_positions)
+                outputs["q"] = self._decode_aux_replay_outputs(
+                    q_hidden,
+                    action_query=q_action_query_chunk,
+                    include_normalized_q_logits=True,
+                )
+            if int(flow_positions.numel()) > 0:
+                flow_hidden = hidden_all.index_select(0, flow_positions)
+                outputs["flow"] = self._decode_aux_replay_outputs(
+                    flow_hidden,
+                    action_query=flow_action_query_chunk,
+                    flow_matching_xt=flow_matching_xt_chunk,
+                    flow_matching_t=flow_matching_t_chunk,
+                )
+            return outputs
+
+        if batch_chunk_size >= total_batch:
+            return _single_batch_chunk(
+                train_tokens,
+                q_query_tokens_chunk=q_query_tokens,
+                q_action_query_chunk=q_action_query,
+                flow_query_tokens_chunk=flow_query_tokens,
+                flow_action_query_chunk=flow_action_query,
+                flow_matching_xt_chunk=flow_matching_xt,
+                flow_matching_t_chunk=flow_matching_t,
+            )
+
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV shared policy+aux sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+
+        output_chunks = {
+            "policy": {},
+            "q": {},
+            "flow": {},
+        }
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            chunk_outputs = _single_batch_chunk(
+                train_tokens[:, start:end],
+                q_query_tokens_chunk=(None if q_query_tokens is None else q_query_tokens[:, start:end]),
+                q_action_query_chunk=(None if q_action_query is None else q_action_query[:, start:end]),
+                flow_query_tokens_chunk=(None if flow_query_tokens is None else flow_query_tokens[:, start:end]),
+                flow_action_query_chunk=(None if flow_action_query is None else flow_action_query[:, start:end]),
+                flow_matching_xt_chunk=(None if flow_matching_xt is None else flow_matching_xt[:, start:end]),
+                flow_matching_t_chunk=(None if flow_matching_t is None else flow_matching_t[:, start:end]),
+            )
+            for section, section_outputs in chunk_outputs.items():
+                for key, value in section_outputs.items():
+                    output_chunks[section].setdefault(key, []).append(value)
+        return self._concat_nested_replay_output_chunks(output_chunks, dim=1)
+
+    def replay_aux_sequence_outputs_from_train_tokens(
+        self,
+        train_tokens,
+        *,
+        full_length: int,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_aux_sequence_outputs_from_train_tokens requires single_eval_causal=True.")
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "replay_aux_sequence_outputs_from_train_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(train_tokens.shape[0]), int(full_length))))
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_aux_sequence_outputs_from_train_tokens expects q_query_tokens "
+                    f"with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                )
+            if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), int(train_tokens.shape[1])):
+                raise ValueError(
+                    "q_query_tokens must align with q query range and batch, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {int(train_tokens.shape[1])}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_aux_sequence_outputs_from_train_tokens expects flow_query_tokens "
+                    f"with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                )
+            if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), int(train_tokens.shape[1])):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range and batch, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {int(train_tokens.shape[1])}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        packed_seq_len = int(full_length + q_steps + flow_steps)
+        total_batch = int(train_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=packed_seq_len,
+            total_batch=total_batch,
+        )
+
+        def _single_batch_chunk(
+            train_tokens_chunk,
+            *,
+            q_query_tokens_chunk,
+            q_action_query_chunk,
+            flow_query_tokens_chunk,
+            flow_action_query_chunk,
+            flow_matching_xt_chunk,
+            flow_matching_t_chunk,
+        ):
+            q_query_enc = None if q_query_tokens_chunk is None else self._encode_query_token(q_query_tokens_chunk)
+            flow_query_enc = None if flow_query_tokens_chunk is None else self._encode_query_token(flow_query_tokens_chunk)
+            packed_tokens, q_positions, flow_positions = self._pack_aux_sequence_tokens(
+                train_tokens_chunk[:full_length],
+                full_length=full_length,
+                q_query_tokens=q_query_enc,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                flow_query_tokens=flow_query_enc,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+            )
+            packed_tokens = self._cast_token_for_rwkv_core(packed_tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(packed_tokens)
+            outputs = {"q": {}, "flow": {}}
+            if int(q_positions.numel()) > 0:
+                q_hidden = hidden_all.index_select(0, q_positions)
+                outputs["q"] = self._decode_aux_replay_outputs(
+                    q_hidden,
+                    action_query=q_action_query_chunk,
+                    include_normalized_q_logits=True,
+                )
+            if int(flow_positions.numel()) > 0:
+                flow_hidden = hidden_all.index_select(0, flow_positions)
+                outputs["flow"] = self._decode_aux_replay_outputs(
+                    flow_hidden,
+                    action_query=flow_action_query_chunk,
+                    flow_matching_xt=flow_matching_xt_chunk,
+                    flow_matching_t=flow_matching_t_chunk,
+                )
+            return outputs
+
+        if batch_chunk_size >= total_batch:
+            return _single_batch_chunk(
+                train_tokens,
+                q_query_tokens_chunk=q_query_tokens,
+                q_action_query_chunk=q_action_query,
+                flow_query_tokens_chunk=flow_query_tokens,
+                flow_action_query_chunk=flow_action_query,
+                flow_matching_xt_chunk=flow_matching_xt,
+                flow_matching_t_chunk=flow_matching_t,
+            )
+
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV aux sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+
+        q_output_chunks: dict[str, list[torch.Tensor]] = {}
+        flow_output_chunks: dict[str, list[torch.Tensor]] = {}
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            chunk_outputs = _single_batch_chunk(
+                train_tokens[:, start:end],
+                q_query_tokens_chunk=(None if q_query_tokens is None else q_query_tokens[:, start:end]),
+                q_action_query_chunk=(None if q_action_query is None else q_action_query[:, start:end]),
+                flow_query_tokens_chunk=(None if flow_query_tokens is None else flow_query_tokens[:, start:end]),
+                flow_action_query_chunk=(None if flow_action_query is None else flow_action_query[:, start:end]),
+                flow_matching_xt_chunk=(None if flow_matching_xt is None else flow_matching_xt[:, start:end]),
+                flow_matching_t_chunk=(None if flow_matching_t is None else flow_matching_t[:, start:end]),
+            )
+            for key, value in chunk_outputs.get("q", {}).items():
+                q_output_chunks.setdefault(key, []).append(value)
+            for key, value in chunk_outputs.get("flow", {}).items():
+                flow_output_chunks.setdefault(key, []).append(value)
+        return {
+            "q": self._concat_replay_output_chunks(q_output_chunks, dim=1),
+            "flow": self._concat_replay_output_chunks(flow_output_chunks, dim=1),
+        }
+
+    def replay_aux_strict_sequence_outputs(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        full_length: int,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        output_chunk_sink=None,
+    ):
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_aux_strict_sequence_outputs expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_aux_strict_sequence_outputs expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_aux_strict_sequence_outputs expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        full_length = int(max(0, min(int(x_tokens.shape[0]), int(full_length))))
+        if callable(output_chunk_sink):
+            total_batch = int(x_tokens.shape[1])
+
+            q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+            q_query_start = int(max(0, min(full_length, int(q_query_start))))
+            if q_query_stop is None:
+                q_query_stop = int(q_query_start + q_steps)
+            q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+            if q_query_tokens is not None:
+                if q_query_tokens.ndim != 3:
+                    raise ValueError(
+                        "replay_aux_strict_sequence_outputs expects q_query_tokens "
+                        f"with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                    )
+                if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), total_batch):
+                    raise ValueError(
+                        "q_query_tokens must align with q query range and batch, "
+                        f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {total_batch}"
+                    )
+            if q_action_query is not None:
+                if q_query_tokens is None:
+                    raise ValueError("q_action_query requires q_query_tokens")
+                if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                    raise ValueError(
+                        "q_action_query must align with q_query_tokens leading shape, "
+                        f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                    )
+
+            flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+            flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+            if flow_query_stop is None:
+                flow_query_stop = int(flow_query_start + flow_steps)
+            flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+            if flow_query_tokens is not None:
+                if flow_query_tokens.ndim != 3:
+                    raise ValueError(
+                        "replay_aux_strict_sequence_outputs expects flow_query_tokens "
+                        f"with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                    )
+                if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), total_batch):
+                    raise ValueError(
+                        "flow_query_tokens must align with flow query range and batch, "
+                        f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {total_batch}"
+                    )
+            if flow_action_query is not None:
+                if flow_query_tokens is None:
+                    raise ValueError("flow_action_query requires flow_query_tokens")
+                if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                    raise ValueError(
+                        "flow_action_query must align with flow_query_tokens leading shape, "
+                        f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                    )
+            if flow_matching_xt is not None:
+                if flow_query_tokens is None:
+                    raise ValueError("flow_matching_xt requires flow_query_tokens")
+                if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                    raise ValueError(
+                        "flow_matching_xt must align with flow_query_tokens leading shape, "
+                        f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                    )
+            if flow_matching_t is not None:
+                if flow_query_tokens is None:
+                    raise ValueError("flow_matching_t requires flow_query_tokens")
+                if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                    raise ValueError(
+                        "flow_matching_t must align with flow_query_tokens leading shape, "
+                        f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                    )
+
+            def _run_query_range_streaming(
+                *,
+                section_name: str,
+                query_tokens,
+                query_start: int,
+                query_stop: int,
+                action_query,
+                include_normalized_q_logits: bool,
+                flow_matching_xt_local,
+                flow_matching_t_local,
+            ):
+                if query_tokens is None:
+                    return
+                for query_idx, token_idx in enumerate(range(int(query_start), int(query_stop))):
+                    seq_len = int(token_idx + 2)
+                    batch_chunk_size = self.resolve_replay_batch_chunk_size(
+                        seq_len=seq_len,
+                        total_batch=total_batch,
+                    )
+                    if batch_chunk_size < total_batch and self.input_ln is not None:
+                        raise RuntimeError(
+                            "RWKV strict aux sequence replay batch microbatching requires input_normalization=False "
+                            "to preserve exact BatchNorm semantics."
+                        )
+                    per_step_chunks: dict[str, list[torch.Tensor]] = {}
+                    for start in range(0, total_batch, int(batch_chunk_size)):
+                        end = min(total_batch, start + int(batch_chunk_size))
+                        train_prefix_tokens = self._encode_train_token(
+                            x_tokens[: token_idx + 1, start:end],
+                            y_tokens[: token_idx + 1, start:end],
+                        )
+                        query_enc = self._encode_query_token(
+                            query_tokens[query_idx : query_idx + 1, start:end]
+                        )
+                        seq_tokens = torch.cat([train_prefix_tokens, query_enc], dim=0)
+                        seq_tokens = self._cast_token_for_rwkv_core(seq_tokens)
+                        hidden_all = self.rwkv_core.forward_tokens_sequence_only(seq_tokens)
+                        step_outputs = self._decode_aux_replay_outputs(
+                            hidden_all[-1:],
+                            action_query=(
+                                None
+                                if action_query is None
+                                else action_query[query_idx : query_idx + 1, start:end]
+                            ),
+                            include_normalized_q_logits=include_normalized_q_logits,
+                            flow_matching_xt=(
+                                None
+                                if flow_matching_xt_local is None
+                                else flow_matching_xt_local[query_idx : query_idx + 1, start:end]
+                            ),
+                            flow_matching_t=(
+                                None
+                                if flow_matching_t_local is None
+                                else flow_matching_t_local[query_idx : query_idx + 1, start:end]
+                            ),
+                        )
+                        for key, value in step_outputs.items():
+                            per_step_chunks.setdefault(key, []).append(value)
+                    per_step_outputs = self._concat_replay_output_chunks(per_step_chunks, dim=1)
+                    output_chunk_sink(
+                        section_name,
+                        int(query_idx),
+                        int(query_idx + 1),
+                        per_step_outputs,
+                    )
+
+            _run_query_range_streaming(
+                section_name="q",
+                query_tokens=q_query_tokens,
+                query_start=q_query_start,
+                query_stop=q_query_stop,
+                action_query=q_action_query,
+                include_normalized_q_logits=True,
+                flow_matching_xt_local=None,
+                flow_matching_t_local=None,
+            )
+            _run_query_range_streaming(
+                section_name="flow",
+                query_tokens=flow_query_tokens,
+                query_start=flow_query_start,
+                query_stop=flow_query_stop,
+                action_query=flow_action_query,
+                include_normalized_q_logits=False,
+                flow_matching_xt_local=flow_matching_xt,
+                flow_matching_t_local=flow_matching_t,
+            )
+            return {
+                "_streamed_via_sink": True,
+                "q": {},
+                "flow": {},
+            }
+        train_tokens = self._encode_train_token(
+            x_tokens[:full_length],
+            y_tokens[:full_length],
+        )
+        return self.replay_aux_strict_sequence_outputs_from_train_tokens(
+            train_tokens,
+            full_length=full_length,
+            q_query_tokens=q_query_tokens,
+            q_query_start=q_query_start,
+            q_query_stop=q_query_stop,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+            output_chunk_sink=output_chunk_sink,
+        )
+
+    def replay_aux_strict_sequence_outputs_from_train_tokens(
+        self,
+        train_tokens,
+        *,
+        full_length: int,
+        q_query_tokens=None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        output_chunk_sink=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_aux_strict_sequence_outputs_from_train_tokens requires single_eval_causal=True.")
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "replay_aux_strict_sequence_outputs_from_train_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+
+        full_length = int(max(0, min(int(train_tokens.shape[0]), int(full_length))))
+        total_batch = int(train_tokens.shape[1])
+
+        q_steps = 0 if q_query_tokens is None else int(q_query_tokens.shape[0])
+        q_query_start = int(max(0, min(full_length, int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(full_length, int(q_query_stop))))
+        if q_query_tokens is not None:
+            if q_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_aux_strict_sequence_outputs_from_train_tokens expects q_query_tokens "
+                    f"with shape (Tq, B, F), got {tuple(q_query_tokens.shape)}"
+                )
+            if tuple(q_query_tokens.shape[:2]) != (int(q_query_stop - q_query_start), total_batch):
+                raise ValueError(
+                    "q_query_tokens must align with q query range and batch, "
+                    f"got {tuple(q_query_tokens.shape)} for [{q_query_start}, {q_query_stop}) and batch {total_batch}"
+                )
+        if q_action_query is not None:
+            if q_query_tokens is None:
+                raise ValueError("q_action_query requires q_query_tokens")
+            if tuple(q_action_query.shape[:2]) != tuple(q_query_tokens.shape[:2]):
+                raise ValueError(
+                    "q_action_query must align with q_query_tokens leading shape, "
+                    f"got {tuple(q_action_query.shape)} and {tuple(q_query_tokens.shape)}"
+                )
+
+        flow_steps = 0 if flow_query_tokens is None else int(flow_query_tokens.shape[0])
+        flow_query_start = int(max(0, min(full_length, int(flow_query_start))))
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_stop = int(max(flow_query_start, min(full_length, int(flow_query_stop))))
+        if flow_query_tokens is not None:
+            if flow_query_tokens.ndim != 3:
+                raise ValueError(
+                    "replay_aux_strict_sequence_outputs_from_train_tokens expects flow_query_tokens "
+                    f"with shape (Tf, B, F), got {tuple(flow_query_tokens.shape)}"
+                )
+            if tuple(flow_query_tokens.shape[:2]) != (int(flow_query_stop - flow_query_start), total_batch):
+                raise ValueError(
+                    "flow_query_tokens must align with flow query range and batch, "
+                    f"got {tuple(flow_query_tokens.shape)} for [{flow_query_start}, {flow_query_stop}) and batch {total_batch}"
+                )
+        if flow_action_query is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_action_query requires flow_query_tokens")
+            if tuple(flow_action_query.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_action_query must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_action_query.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_xt is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_xt requires flow_query_tokens")
+            if tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_xt must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+        if flow_matching_t is not None:
+            if flow_query_tokens is None:
+                raise ValueError("flow_matching_t requires flow_query_tokens")
+            if tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+                raise ValueError(
+                    "flow_matching_t must align with flow_query_tokens leading shape, "
+                    f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+                )
+
+        q_query_enc = None if q_query_tokens is None else self._encode_query_token(q_query_tokens)
+        flow_query_enc = None if flow_query_tokens is None else self._encode_query_token(flow_query_tokens)
+
+        def _run_query_range(
+            *,
+            section_name: str,
+            query_enc,
+            query_start: int,
+            query_stop: int,
+            action_query,
+            include_normalized_q_logits: bool,
+            flow_matching_xt_local,
+            flow_matching_t_local,
+        ):
+            if query_enc is None:
+                return {}
+            query_outputs: dict[str, list[torch.Tensor]] = {}
+            for query_idx, token_idx in enumerate(range(int(query_start), int(query_stop))):
+                seq_len = int(token_idx + 2)
+                batch_chunk_size = self.resolve_replay_batch_chunk_size(
+                    seq_len=seq_len,
+                    total_batch=total_batch,
+                )
+                if batch_chunk_size < total_batch and self.input_ln is not None:
+                    raise RuntimeError(
+                        "RWKV strict aux sequence replay batch microbatching requires input_normalization=False "
+                        "to preserve exact BatchNorm semantics."
+                    )
+                per_step_chunks: dict[str, list[torch.Tensor]] = {}
+                for start in range(0, total_batch, int(batch_chunk_size)):
+                    end = min(total_batch, start + int(batch_chunk_size))
+                    seq_tokens = torch.cat(
+                        [
+                            train_tokens[: token_idx + 1, start:end],
+                            query_enc[query_idx : query_idx + 1, start:end],
+                        ],
+                        dim=0,
+                    )
+                    seq_tokens = self._cast_token_for_rwkv_core(seq_tokens)
+                    hidden_all = self.rwkv_core.forward_tokens_sequence_only(seq_tokens)
+                    step_outputs = self._decode_aux_replay_outputs(
+                        hidden_all[-1:],
+                        action_query=(
+                            None
+                            if action_query is None
+                            else action_query[query_idx : query_idx + 1, start:end]
+                        ),
+                        include_normalized_q_logits=include_normalized_q_logits,
+                        flow_matching_xt=(
+                            None
+                            if flow_matching_xt_local is None
+                            else flow_matching_xt_local[query_idx : query_idx + 1, start:end]
+                        ),
+                        flow_matching_t=(
+                            None
+                            if flow_matching_t_local is None
+                            else flow_matching_t_local[query_idx : query_idx + 1, start:end]
+                        ),
+                    )
+                    for key, value in step_outputs.items():
+                        per_step_chunks.setdefault(key, []).append(value)
+                per_step_outputs = self._concat_replay_output_chunks(per_step_chunks, dim=1)
+                if callable(output_chunk_sink):
+                    output_chunk_sink(
+                        section_name,
+                        int(query_idx),
+                        int(query_idx + 1),
+                        per_step_outputs,
+                    )
+                else:
+                    for key, value in per_step_outputs.items():
+                        query_outputs.setdefault(key, []).append(value)
+            if callable(output_chunk_sink):
+                return {}
+            return self._concat_replay_output_chunks(query_outputs, dim=0)
+
+        outputs = {
+            "q": _run_query_range(
+                section_name="q",
+                query_enc=q_query_enc,
+                query_start=q_query_start,
+                query_stop=q_query_stop,
+                action_query=q_action_query,
+                include_normalized_q_logits=True,
+                flow_matching_xt_local=None,
+                flow_matching_t_local=None,
+            ),
+            "flow": _run_query_range(
+                section_name="flow",
+                query_enc=flow_query_enc,
+                query_start=flow_query_start,
+                query_stop=flow_query_stop,
+                action_query=flow_action_query,
+                include_normalized_q_logits=False,
+                flow_matching_xt_local=flow_matching_xt,
+                flow_matching_t_local=flow_matching_t,
+            ),
+        }
+        if callable(output_chunk_sink):
+            outputs["_streamed_via_sink"] = True
+        return outputs
 
     def replay_policy_sequence_tokens(
         self,
@@ -1441,10 +3099,27 @@ class RWKV7PFN(nn.Module):
         eval_start: int = 0,
         policy_action_head_params_override=None,
     ):
-        return self.replay_policy_sequence_outputs(
-            x_tokens,
-            y_tokens,
-            eval_start=eval_start,
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_sequence_tokens requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_policy_sequence_tokens expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_policy_sequence_tokens expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        eval_start = int(max(0, min(int(x_tokens.shape[0]), int(eval_start))))
+        tokens = self._encode_train_token(x_tokens, y_tokens)
+        tokens = self._cast_token_for_rwkv_core(tokens)
+        hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+        return self._decode_policy_actor_outputs(
+            hidden_all[eval_start:],
             policy_action_head_params_override=policy_action_head_params_override,
         )["action_mean"]
 
@@ -1454,6 +3129,7 @@ class RWKV7PFN(nn.Module):
         y_tokens,
         *,
         eval_start: int = 0,
+        action_query=None,
         policy_action_head_params_override=None,
         flow_matching_xt=None,
         flow_matching_t=None,
@@ -1499,6 +3175,7 @@ class RWKV7PFN(nn.Module):
             hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
             return self._decode_replay_outputs(
                 hidden_all[eval_start:],
+                action_query=action_query,
                 policy_action_head_params_override=policy_action_head_params_override,
                 flow_matching_xt=flow_matching_xt,
                 flow_matching_t=flow_matching_t,
@@ -1522,9 +3199,193 @@ class RWKV7PFN(nn.Module):
             output_chunks.append(
                 self._decode_replay_outputs(
                     hidden_chunk[eval_start:],
+                    action_query=None if action_query is None else action_query[:, start:end],
                     policy_action_head_params_override=policy_action_head_params_override,
                     flow_matching_xt=flow_xt_chunk,
                     flow_matching_t=flow_t_chunk,
+                )
+            )
+        merged = {}
+        for key in output_chunks[0].keys():
+            merged[key] = torch.cat([chunk[key] for chunk in output_chunks], dim=1)
+        return merged
+
+    def replay_policy_actor_outputs(
+        self,
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start: int = 0,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_actor_outputs requires single_eval_causal=True.")
+        if x_tokens.ndim != 3:
+            raise ValueError(
+                f"replay_policy_actor_outputs expects x_tokens with shape (T, B, F), got {tuple(x_tokens.shape)}"
+            )
+        if y_tokens.ndim != 2:
+            raise ValueError(
+                f"replay_policy_actor_outputs expects y_tokens with shape (T, B), got {tuple(y_tokens.shape)}"
+            )
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "replay_policy_actor_outputs expects matching leading dims, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        eval_start = int(max(0, min(int(x_tokens.shape[0]), int(eval_start))))
+        total_batch = int(x_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=int(x_tokens.shape[0]),
+            total_batch=total_batch,
+        )
+        if batch_chunk_size >= total_batch:
+            tokens = self._encode_train_token(x_tokens, y_tokens)
+            tokens = self._cast_token_for_rwkv_core(tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+            return self._decode_policy_replay_outputs(
+                hidden_all[eval_start:],
+                policy_action_head_params_override=policy_action_head_params_override,
+            )
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+        output_chunks = []
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            tokens_chunk = self._encode_train_token(
+                x_tokens[:, start:end],
+                y_tokens[:, start:end],
+            )
+            tokens_chunk = self._cast_token_for_rwkv_core(tokens_chunk)
+            hidden_chunk = self.rwkv_core.forward_tokens_sequence_only(tokens_chunk)
+            output_chunks.append(
+                self._decode_policy_replay_outputs(
+                    hidden_chunk[eval_start:],
+                    policy_action_head_params_override=policy_action_head_params_override,
+                )
+            )
+        merged = {}
+        for key in output_chunks[0].keys():
+            merged[key] = torch.cat([chunk[key] for chunk in output_chunks], dim=1)
+        return merged
+
+    def replay_policy_sequence_outputs_from_train_tokens(
+        self,
+        train_tokens,
+        *,
+        eval_start: int = 0,
+        action_query=None,
+        policy_action_head_params_override=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_sequence_outputs_from_train_tokens requires single_eval_causal=True.")
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "replay_policy_sequence_outputs_from_train_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+        eval_start = int(max(0, min(int(train_tokens.shape[0]), int(eval_start))))
+        if flow_matching_xt is not None:
+            expected_shape = (int(train_tokens.shape[0]) - eval_start, int(train_tokens.shape[1]))
+            if tuple(flow_matching_xt.shape[:2]) != expected_shape:
+                raise ValueError(
+                    "flow_matching_xt must match replay query shape, "
+                    f"expected {expected_shape + (int(flow_matching_xt.shape[-1]),)}, got {tuple(flow_matching_xt.shape)}"
+                )
+        if flow_matching_t is not None:
+            expected_shape = (int(train_tokens.shape[0]) - eval_start, int(train_tokens.shape[1]))
+            if tuple(flow_matching_t.shape[:2]) != expected_shape:
+                raise ValueError(
+                    "flow_matching_t must match replay query leading shape, "
+                    f"expected {expected_shape + (1,)}, got {tuple(flow_matching_t.shape)}"
+                )
+        total_batch = int(train_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=int(train_tokens.shape[0]),
+            total_batch=total_batch,
+        )
+        if batch_chunk_size >= total_batch:
+            tokens = self._cast_token_for_rwkv_core(train_tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+            return self._decode_replay_outputs(
+                hidden_all[eval_start:],
+                action_query=action_query,
+                policy_action_head_params_override=policy_action_head_params_override,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+        output_chunks = []
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            tokens_chunk = self._cast_token_for_rwkv_core(train_tokens[:, start:end])
+            hidden_chunk = self.rwkv_core.forward_tokens_sequence_only(tokens_chunk)
+            flow_xt_chunk = None if flow_matching_xt is None else flow_matching_xt[:, start:end]
+            flow_t_chunk = None if flow_matching_t is None else flow_matching_t[:, start:end]
+            output_chunks.append(
+                self._decode_replay_outputs(
+                    hidden_chunk[eval_start:],
+                    action_query=None if action_query is None else action_query[:, start:end],
+                    policy_action_head_params_override=policy_action_head_params_override,
+                    flow_matching_xt=flow_xt_chunk,
+                    flow_matching_t=flow_t_chunk,
+                )
+            )
+        merged = {}
+        for key in output_chunks[0].keys():
+            merged[key] = torch.cat([chunk[key] for chunk in output_chunks], dim=1)
+        return merged
+
+    def replay_policy_actor_outputs_from_train_tokens(
+        self,
+        train_tokens,
+        *,
+        eval_start: int = 0,
+        policy_action_head_params_override=None,
+    ):
+        if not self.single_eval_causal:
+            raise ValueError("replay_policy_actor_outputs_from_train_tokens requires single_eval_causal=True.")
+        if train_tokens.ndim != 3:
+            raise ValueError(
+                "replay_policy_actor_outputs_from_train_tokens expects train_tokens with shape (T, B, C), "
+                f"got {tuple(train_tokens.shape)}"
+            )
+        eval_start = int(max(0, min(int(train_tokens.shape[0]), int(eval_start))))
+        total_batch = int(train_tokens.shape[1])
+        batch_chunk_size = self.resolve_replay_batch_chunk_size(
+            seq_len=int(train_tokens.shape[0]),
+            total_batch=total_batch,
+        )
+        if batch_chunk_size >= total_batch:
+            tokens = self._cast_token_for_rwkv_core(train_tokens)
+            hidden_all = self.rwkv_core.forward_tokens_sequence_only(tokens)
+            return self._decode_policy_replay_outputs(
+                hidden_all[eval_start:],
+                policy_action_head_params_override=policy_action_head_params_override,
+            )
+        if self.input_ln is not None:
+            raise RuntimeError(
+                "RWKV sequence replay batch microbatching requires input_normalization=False "
+                "to preserve exact BatchNorm semantics."
+            )
+        output_chunks = []
+        for start in range(0, total_batch, int(batch_chunk_size)):
+            end = min(total_batch, start + int(batch_chunk_size))
+            tokens_chunk = self._cast_token_for_rwkv_core(train_tokens[:, start:end])
+            hidden_chunk = self.rwkv_core.forward_tokens_sequence_only(tokens_chunk)
+            output_chunks.append(
+                self._decode_policy_replay_outputs(
+                    hidden_chunk[eval_start:],
+                    policy_action_head_params_override=policy_action_head_params_override,
                 )
             )
         merged = {}

@@ -4456,6 +4456,89 @@ class EnvironmentPrior:
         return float(max(0.0, v))
 
     @staticmethod
+    def _resolve_reinforce_sequence_replay_store_legacy_targets(h):
+        return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_sequence_replay_store_legacy_targets", False)))
+
+    @staticmethod
+    def _resolve_reinforce_sequence_replay_share_train_token_encoding(h):
+        return bool(
+            EnvironmentPrior._coerce_bool(
+                h.get("reinforce_sequence_replay_share_train_token_encoding", True),
+            ),
+        )
+
+    @staticmethod
+    def _resolve_reinforce_sequence_replay_share_context_forward(h):
+        return bool(
+            EnvironmentPrior._coerce_bool(
+                h.get("reinforce_sequence_replay_share_context_forward", True),
+            ),
+        )
+
+    @staticmethod
+    def _resolve_dim_upper_bound(spec, default=0):
+        if spec is None:
+            return int(default)
+        if isinstance(spec, bool):
+            return int(spec)
+        if isinstance(spec, (int, float)):
+            return int(spec)
+        max_value = getattr(spec, "max", None)
+        if max_value is not None:
+            return int(max_value)
+        upper = getattr(spec, "upper", None)
+        if upper is not None:
+            return int(upper)
+        value = getattr(spec, "value", None)
+        if value is not None:
+            return int(value)
+        choices = getattr(spec, "choices", None)
+        if isinstance(choices, (list, tuple)) and len(choices) > 0:
+            return int(max(choices))
+        if isinstance(spec, dict):
+            if "max" in spec:
+                return int(spec["max"])
+            if "value" in spec:
+                return int(spec["value"])
+            choice_values = spec.get("choice_values", None)
+            if isinstance(choice_values, (list, tuple)) and len(choice_values) > 0:
+                return int(max(choice_values))
+        return int(default)
+
+    @staticmethod
+    def _align_replay_state_targets_to_dim(state_steps, state_mask, *, target_dim: int, name: str):
+        if not torch.is_tensor(state_steps) or not torch.is_tensor(state_mask):
+            return state_steps, state_mask
+        target_dim = int(target_dim)
+        if target_dim <= 0:
+            return state_steps, state_mask
+        state_dim = int(state_steps.shape[-1])
+        mask_dim = int(state_mask.shape[-1])
+        if state_dim != mask_dim:
+            raise RuntimeError(
+                f"{name} payload state/mask width mismatch: {state_dim} vs {mask_dim}"
+            )
+        if state_dim == target_dim:
+            return state_steps, state_mask
+        if state_dim > target_dim:
+            raise RuntimeError(
+                f"{name} payload width {state_dim} exceeds target width {target_dim}"
+            )
+        aligned_steps = torch.zeros(
+            (*state_steps.shape[:-1], target_dim),
+            device=state_steps.device,
+            dtype=state_steps.dtype,
+        )
+        aligned_steps[..., :state_dim] = state_steps
+        aligned_mask = torch.zeros(
+            (int(state_mask.shape[0]), target_dim),
+            device=state_mask.device,
+            dtype=state_mask.dtype,
+        )
+        aligned_mask[..., :state_dim] = state_mask
+        return aligned_steps, aligned_mask
+
+    @staticmethod
     def _resolve_first_policy_gradient_state_grad_clip_norm(h):
         v = EnvironmentPrior._resolve_scalar(h.get("first_policy_gradient_state_grad_clip_norm", 0.0))
         if not math.isfinite(v):
@@ -12674,6 +12757,8 @@ class EnvironmentPrior:
                 "action_mask": locals().get("replay_action_mask", None),
                 "next_obs": locals().get("replay_next_obs_steps", None),
                 "obs_mask": locals().get("replay_obs_mask", None),
+                "next_state": locals().get("replay_next_state_steps", None),
+                "state_mask": locals().get("replay_state_mask", None),
                 "eval_start": int(locals().get("replay_eval_start", 0) or 0),
                 "full_length": int(n_samples),
             }
@@ -13360,10 +13445,20 @@ class EnvironmentPrior:
         replay_eval_steps = int(max(0, int(n_samples) - replay_eval_start))
         normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
         next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
+        store_legacy_replay_targets = self._resolve_reinforce_sequence_replay_store_legacy_targets(self.config)
         collect_reinforce_flow_matching = bool(
             collect_reinforce_replay and (next_state_flow_matching_weight > 0.0)
         )
         replay_next_obs_dim = int(self._resolve_scalar(self.config.get("obs_slot_dim", max_obs_dim)))
+        replay_next_state_dim = int(
+            max(
+                int(max_state_dim),
+                self._resolve_dim_upper_bound(
+                    self.config.get("state_dim", None),
+                    default=max_state_dim,
+                ),
+            )
+        )
         replay_reward_in_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_reinforce_replay
@@ -13380,9 +13475,21 @@ class EnvironmentPrior:
             else None
         )
         replay_action_mask = action_mask.to(device=device, dtype=torch.bool) if collect_reinforce_replay else None
+        replay_action_query_cols = None
+        replay_flow_steps = int(replay_eval_start) if collect_reinforce_flow_matching else 0
+        replay_flow_action_steps = (
+            torch.empty((replay_flow_steps, batch_size, max_action_dim), device=device, dtype=torch.float32)
+            if collect_reinforce_flow_matching
+            else None
+        )
         replay_next_obs_steps = (
             torch.zeros((replay_eval_steps, batch_size, replay_next_obs_dim), device=device, dtype=torch.float32)
-            if collect_reinforce_flow_matching
+            if (collect_reinforce_flow_matching and store_legacy_replay_targets)
+            else None
+        )
+        replay_next_state_steps = (
+            torch.zeros((replay_eval_steps, batch_size, replay_next_state_dim), device=device, dtype=torch.float32)
+            if (collect_reinforce_flow_matching and store_legacy_replay_targets)
             else None
         )
         replay_obs_mask = (
@@ -13390,9 +13497,50 @@ class EnvironmentPrior:
                 torch.arange(replay_next_obs_dim, device=device, dtype=torch.long).unsqueeze(0)
                 < obs_dims.unsqueeze(1)
             ).to(dtype=torch.bool)
+            if (collect_reinforce_flow_matching and store_legacy_replay_targets)
+            else None
+        )
+        replay_state_mask = (
+            (
+                torch.arange(replay_next_state_dim, device=device, dtype=torch.long).unsqueeze(0)
+                < state_dims.unsqueeze(1)
+            ).to(dtype=torch.bool)
+            if (collect_reinforce_flow_matching and store_legacy_replay_targets)
+            else None
+        )
+        replay_flow_state_steps = (
+            torch.zeros((replay_flow_steps, batch_size, replay_next_state_dim), device=device, dtype=torch.float32)
             if collect_reinforce_flow_matching
             else None
         )
+        replay_flow_state_mask = (
+            (
+                torch.arange(replay_next_state_dim, device=device, dtype=torch.long).unsqueeze(0)
+                < state_dims.unsqueeze(1)
+            ).to(dtype=torch.bool)
+            if collect_reinforce_flow_matching
+            else None
+        )
+        if collect_reinforce_replay and max_action_dim > 0:
+            replay_action_query_cols = torch.full(
+                (batch_size, max_action_dim),
+                -1,
+                device=device,
+                dtype=torch.long,
+            )
+            action_query_cap = int(min(max_action_dim, num_features))
+            if action_query_cap > 0:
+                terminal_token_offset_local = terminal_reset_enabled.to(dtype=torch.long)
+                action_positions = torch.arange(action_query_cap, device=device, dtype=torch.long).unsqueeze(0)
+                action_start = (obs_slot_dims + 3 + terminal_token_offset_local).unsqueeze(1)
+                action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
+                action_cols = action_start + action_positions
+                action_valid = (action_positions < action_cap) & (action_cols < num_features)
+                replay_action_query_cols[:, :action_query_cap] = torch.where(
+                    action_valid,
+                    action_cols,
+                    torch.full_like(action_cols, -1),
+                )
         state_abs_max = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
             if collect_runtime_info
@@ -14649,6 +14797,8 @@ class EnvironmentPrior:
                     replay_sampled_action_steps[replay_t] = action_next.detach()
                     if sampled_action["action_std_for_storage"] is not None:
                         replay_action_std_steps[replay_t] = sampled_action["action_std_for_storage"]
+                if collect_reinforce_flow_matching and t < replay_eval_start:
+                    replay_flow_action_steps[t] = action_next.detach()
                 reinforce_log_prob_t = sampled_action["log_prob"]
                 reinforce_log_prob_score_t = sampled_action["log_prob_score"]
             else:
@@ -15235,13 +15385,30 @@ class EnvironmentPrior:
                 state_abs_max[t] = state_next.detach().abs().amax(dim=1)
             if collect_reinforce_flow_matching and t >= replay_eval_start:
                 replay_t = int(t - replay_eval_start)
-                if replay_next_obs_dim > 0:
+                if replay_next_obs_steps is not None and replay_obs_mask is not None and replay_next_obs_dim > 0:
                     replay_next_obs_steps[replay_t].zero_()
                     obs_copy = int(min(replay_next_obs_dim, int(state_next.shape[-1])))
                     if obs_copy > 0:
                         replay_next_obs_steps[replay_t, :, :obs_copy] = (
                             state_next[:, :obs_copy].detach()
                             * replay_obs_mask[:, :obs_copy].to(dtype=state_next.dtype)
+                        )
+                if replay_next_state_steps is not None and replay_state_mask is not None and replay_next_state_dim > 0:
+                    replay_next_state_steps[replay_t].zero_()
+                    state_copy = int(min(replay_next_state_dim, int(state_next.shape[-1])))
+                    if state_copy > 0:
+                        replay_next_state_steps[replay_t, :, :state_copy] = (
+                            state_next[:, :state_copy].detach()
+                            * replay_state_mask[:, :state_copy].to(dtype=state_next.dtype)
+                        )
+            if collect_reinforce_flow_matching and t < replay_eval_start:
+                if replay_next_state_dim > 0:
+                    replay_flow_state_steps[t].zero_()
+                    state_copy = int(min(replay_next_state_dim, int(state_next.shape[-1])))
+                    if state_copy > 0:
+                        replay_flow_state_steps[t, :, :state_copy] = (
+                            state_next[:, :state_copy].detach()
+                            * replay_flow_state_mask[:, :state_copy].to(dtype=state_next.dtype)
                         )
 
             state_t = state_next
@@ -15394,6 +15561,28 @@ class EnvironmentPrior:
                 log_prob_steps = log_prob_steps.index_select(1, inv_perm)
             if log_prob_score_steps is not None:
                 log_prob_score_steps = log_prob_score_steps.index_select(1, inv_perm)
+            if replay_sampled_action_steps is not None:
+                replay_sampled_action_steps = replay_sampled_action_steps.index_select(1, inv_perm)
+            if replay_action_std_steps is not None:
+                replay_action_std_steps = replay_action_std_steps.index_select(1, inv_perm)
+            if replay_action_mask is not None:
+                replay_action_mask = replay_action_mask.index_select(0, inv_perm)
+            if replay_action_query_cols is not None:
+                replay_action_query_cols = replay_action_query_cols.index_select(0, inv_perm)
+            if replay_next_obs_steps is not None:
+                replay_next_obs_steps = replay_next_obs_steps.index_select(1, inv_perm)
+            if replay_obs_mask is not None:
+                replay_obs_mask = replay_obs_mask.index_select(0, inv_perm)
+            if replay_next_state_steps is not None:
+                replay_next_state_steps = replay_next_state_steps.index_select(1, inv_perm)
+            if replay_state_mask is not None:
+                replay_state_mask = replay_state_mask.index_select(0, inv_perm)
+            if replay_flow_action_steps is not None:
+                replay_flow_action_steps = replay_flow_action_steps.index_select(1, inv_perm)
+            if replay_flow_state_steps is not None:
+                replay_flow_state_steps = replay_flow_state_steps.index_select(1, inv_perm)
+            if replay_flow_state_mask is not None:
+                replay_flow_state_mask = replay_flow_state_mask.index_select(0, inv_perm)
             if reward_component_eval_steps is not None:
                 reward_component_eval_steps = {
                     key: value.index_select(1, inv_perm)
@@ -15630,8 +15819,16 @@ class EnvironmentPrior:
                 "sampled_action": replay_sampled_action_steps,
                 "action_std": replay_action_std_steps,
                 "action_mask": replay_action_mask,
+                "action_query_cols": replay_action_query_cols,
                 "next_obs": replay_next_obs_steps,
                 "obs_mask": replay_obs_mask,
+                "next_state": replay_next_state_steps,
+                "state_mask": replay_state_mask,
+                "flow_action": replay_flow_action_steps,
+                "flow_next_state": replay_flow_state_steps,
+                "flow_state_mask": replay_flow_state_mask,
+                "flow_query_start": 0,
+                "flow_query_stop": int(replay_eval_start),
                 "eval_start": int(replay_eval_start),
                 "full_length": int(n_samples),
             }
@@ -17465,6 +17662,753 @@ class EnvironmentPrior:
         dx_t = x_1 - x_0
         return x_t, t, dx_t
 
+    def _resolve_transition_replay_layout(self, x_tokens: torch.Tensor):
+        obs_slot_dim = int(self._resolve_scalar(self.config.get("obs_slot_dim", 0)))
+        action_slot_dim = int(self._resolve_scalar(self.config.get("action_slot_dim", 0)))
+        terminal_enabled = bool(self.config.get("terminal_reset_enabled", False))
+        x_obs_dim = int(obs_slot_dim + 3 + int(terminal_enabled))
+        total_features = int(x_tokens.shape[-1])
+        x_obs_dim = int(max(0, min(x_obs_dim, total_features)))
+        x_action_dim = int(max(0, min(action_slot_dim, total_features - x_obs_dim)))
+        return {
+            "obs_slot_dim": int(max(0, min(obs_slot_dim, x_obs_dim))),
+            "x_obs_dim": int(x_obs_dim),
+            "x_action_dim": int(x_action_dim),
+        }
+
+    def _build_action_query_tokens(
+        self,
+        x_tokens: torch.Tensor,
+        sampled_action: torch.Tensor,
+        *,
+        query_start: int = 0,
+        query_stop: int | None = None,
+        action_query_cols: torch.Tensor | None = None,
+    ):
+        if not torch.is_tensor(x_tokens) or x_tokens.ndim != 3:
+            raise ValueError("action-query replay requires x_tokens with shape (T, B, F)")
+        if not torch.is_tensor(sampled_action) or sampled_action.ndim != 3:
+            raise ValueError("action-query replay requires sampled_action with shape (T_eval, B, A)")
+        query_start = int(max(0, min(int(x_tokens.shape[0]), int(query_start))))
+        if query_stop is None:
+            query_stop = int(x_tokens.shape[0])
+        query_stop = int(max(query_start, min(int(x_tokens.shape[0]), int(query_stop))))
+        eval_steps = int(query_stop - query_start)
+        if int(sampled_action.shape[0]) != eval_steps or int(sampled_action.shape[1]) != int(x_tokens.shape[1]):
+            raise ValueError(
+                "action-query replay sampled_action must align with the query range, "
+                f"got {tuple(sampled_action.shape)} for x_tokens {tuple(x_tokens.shape)} "
+                f"and query range [{query_start}, {query_stop})"
+            )
+        query_tokens = torch.zeros(
+            (eval_steps, int(x_tokens.shape[1]), int(x_tokens.shape[-1])),
+            device=x_tokens.device,
+            dtype=x_tokens.dtype,
+        )
+        if eval_steps <= 0:
+            return query_tokens
+        if torch.is_tensor(action_query_cols):
+            if action_query_cols.ndim != 2 or int(action_query_cols.shape[0]) != int(x_tokens.shape[1]):
+                raise ValueError(
+                    "action_query_cols must have shape (B, A_cols), "
+                    f"got {tuple(action_query_cols.shape)} for batch {int(x_tokens.shape[1])}"
+                )
+            action_keep = int(min(int(sampled_action.shape[-1]), int(action_query_cols.shape[-1])))
+            if action_keep > 0:
+                action_query_cols = action_query_cols[:, :action_keep].to(device=x_tokens.device, dtype=torch.long)
+                valid = (action_query_cols >= 0) & (action_query_cols < int(x_tokens.shape[-1]))
+                if torch.any(valid):
+                    assign = torch.nonzero(valid, as_tuple=False)
+                    batch_rows = assign[:, 0]
+                    action_src_cols = assign[:, 1]
+                    token_dst_cols = action_query_cols[valid]
+                    query_tokens[:, batch_rows, token_dst_cols] = sampled_action[:, batch_rows, action_src_cols]
+            return query_tokens
+        layout = self._resolve_transition_replay_layout(x_tokens)
+        action_start = int(layout["x_obs_dim"])
+        action_keep = int(
+            min(
+                int(layout["x_action_dim"]),
+                int(sampled_action.shape[-1]),
+                max(0, int(x_tokens.shape[-1]) - action_start),
+            )
+        )
+        if action_keep > 0:
+            query_tokens[:, :, action_start : action_start + action_keep] = sampled_action[:, :, :action_keep]
+        return query_tokens
+
+    def _prepare_replay_aux_query_tokens(
+        self,
+        *,
+        x_tokens: torch.Tensor,
+        full_length: int,
+        sampled_action: torch.Tensor | None = None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        flow_action: torch.Tensor | None = None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        action_query_cols: torch.Tensor | None = None,
+    ):
+        q_query_tokens = None
+        q_steps = 0 if sampled_action is None else int(sampled_action.shape[0])
+        q_query_start = int(max(0, min(int(full_length), int(q_query_start))))
+        if q_query_stop is None:
+            q_query_stop = int(q_query_start + q_steps)
+        q_query_stop = int(max(q_query_start, min(int(full_length), int(q_query_stop))))
+        if sampled_action is not None:
+            if (not torch.is_tensor(sampled_action)) or sampled_action.ndim != 3:
+                raise ValueError("shared aux replay requires sampled_action with shape (T_eval, B, A)")
+            if int(sampled_action.shape[0]) != int(q_query_stop - q_query_start):
+                raise ValueError(
+                    "shared aux replay sampled_action must align with q query range, "
+                    f"got {tuple(sampled_action.shape)} for [{q_query_start}, {q_query_stop})"
+                )
+            if int(sampled_action.shape[1]) != int(x_tokens.shape[1]):
+                raise ValueError(
+                    "shared aux replay sampled_action batch must match x_tokens batch, "
+                    f"got {tuple(sampled_action.shape)} and {tuple(x_tokens.shape)}"
+                )
+            q_query_tokens = self._build_action_query_tokens(
+                x_tokens,
+                sampled_action,
+                query_start=q_query_start,
+                query_stop=q_query_stop,
+                action_query_cols=action_query_cols,
+            )
+
+        flow_query_tokens = None
+        flow_steps = 0 if flow_action is None else int(flow_action.shape[0])
+        if flow_query_stop is None:
+            flow_query_stop = int(flow_query_start + flow_steps)
+        flow_query_start = int(max(0, min(int(full_length), int(flow_query_start))))
+        flow_query_stop = int(max(flow_query_start, min(int(full_length), int(flow_query_stop))))
+        if flow_action is not None:
+            if (not torch.is_tensor(flow_action)) or flow_action.ndim != 3:
+                raise ValueError("shared aux replay requires flow_action with shape (T_flow, B, A)")
+            if int(flow_action.shape[0]) != int(flow_query_stop - flow_query_start):
+                raise ValueError(
+                    "shared aux replay flow_action must align with flow query range, "
+                    f"got {tuple(flow_action.shape)} for [{flow_query_start}, {flow_query_stop})"
+                )
+            if int(flow_action.shape[1]) != int(x_tokens.shape[1]):
+                raise ValueError(
+                    "shared aux replay flow_action batch must match x_tokens batch, "
+                    f"got {tuple(flow_action.shape)} and {tuple(x_tokens.shape)}"
+                )
+            flow_query_tokens = self._build_action_query_tokens(
+                x_tokens,
+                flow_action,
+                query_start=flow_query_start,
+                query_stop=flow_query_stop,
+                action_query_cols=action_query_cols,
+            )
+
+        return {
+            "q_query_tokens": q_query_tokens,
+            "q_query_start": int(q_query_start),
+            "q_query_stop": int(q_query_stop),
+            "flow_query_tokens": flow_query_tokens,
+            "flow_query_start": int(flow_query_start),
+            "flow_query_stop": int(flow_query_stop),
+        }
+
+    def _resolve_action_query_replay_fns(self, policy_step_fn):
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        init_kv_cache_fn = getattr(policy_step_fn, "_reinforce_sequence_init_kv_cache_fn", None)
+        append_train_token_to_kv_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_append_train_token_to_kv_fn",
+            None,
+        )
+        predict_query_outputs_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_predict_query_outputs_with_kv_fn",
+            None,
+        )
+        if model_ref is not None:
+            if not callable(init_kv_cache_fn):
+                init_kv_cache_fn = getattr(model_ref, "init_kv_cache", None)
+            if not callable(append_train_token_to_kv_fn):
+                append_train_token_to_kv_fn = getattr(model_ref, "append_train_token_to_kv", None)
+            if not callable(predict_query_outputs_fn):
+                predict_query_outputs_fn = getattr(model_ref, "predict_query_replay_outputs_with_kv", None)
+        return (
+            init_kv_cache_fn,
+            append_train_token_to_kv_fn,
+            predict_query_outputs_fn,
+        )
+
+    def _resolve_stream_replay_aux_outputs_with_kv_fn(self, policy_step_fn):
+        stream_replay_aux_outputs_with_kv_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_stream_replay_aux_outputs_with_kv_fn",
+            None,
+        )
+        if callable(stream_replay_aux_outputs_with_kv_fn):
+            return stream_replay_aux_outputs_with_kv_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        stream_replay_aux_outputs_with_kv_fn = getattr(
+            model_ref,
+            "stream_replay_aux_outputs_with_kv",
+            None,
+        )
+        return stream_replay_aux_outputs_with_kv_fn if callable(stream_replay_aux_outputs_with_kv_fn) else None
+
+    def _resolve_replay_aux_sequence_outputs_fn(self, policy_step_fn):
+        replay_aux_sequence_outputs_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_aux_sequence_outputs_fn",
+            None,
+        )
+        if callable(replay_aux_sequence_outputs_fn):
+            return replay_aux_sequence_outputs_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_aux_sequence_outputs_fn = getattr(
+            model_ref,
+            "replay_aux_sequence_outputs",
+            None,
+        )
+        return replay_aux_sequence_outputs_fn if callable(replay_aux_sequence_outputs_fn) else None
+
+    def _resolve_replay_aux_strict_sequence_outputs_fn(self, policy_step_fn):
+        replay_aux_strict_sequence_outputs_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_aux_strict_sequence_outputs_fn",
+            None,
+        )
+        if callable(replay_aux_strict_sequence_outputs_fn):
+            return replay_aux_strict_sequence_outputs_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_aux_strict_sequence_outputs_fn = getattr(
+            model_ref,
+            "replay_aux_strict_sequence_outputs",
+            None,
+        )
+        return (
+            replay_aux_strict_sequence_outputs_fn
+            if callable(replay_aux_strict_sequence_outputs_fn) else None
+        )
+
+    def _resolve_encode_train_sequence_tokens_fn(self, policy_step_fn):
+        encode_train_sequence_tokens_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_encode_train_tokens_fn",
+            None,
+        )
+        if callable(encode_train_sequence_tokens_fn):
+            return encode_train_sequence_tokens_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        encode_train_sequence_tokens_fn = getattr(
+            model_ref,
+            "encode_train_sequence_tokens",
+            None,
+        )
+        return encode_train_sequence_tokens_fn if callable(encode_train_sequence_tokens_fn) else None
+
+    def _resolve_replay_outputs_from_train_tokens_fn(self, policy_step_fn):
+        replay_outputs_from_train_tokens_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_outputs_from_train_tokens_fn",
+            None,
+        )
+        if callable(replay_outputs_from_train_tokens_fn):
+            return replay_outputs_from_train_tokens_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_policy_sequence_outputs_from_train_tokens",
+            None,
+        )
+        return (
+            replay_outputs_from_train_tokens_fn
+            if callable(replay_outputs_from_train_tokens_fn) else None
+        )
+
+    def _resolve_replay_aux_sequence_outputs_from_train_tokens_fn(self, policy_step_fn):
+        replay_aux_sequence_outputs_from_train_tokens_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn",
+            None,
+        )
+        if callable(replay_aux_sequence_outputs_from_train_tokens_fn):
+            return replay_aux_sequence_outputs_from_train_tokens_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_aux_sequence_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_aux_sequence_outputs_from_train_tokens",
+            None,
+        )
+        return (
+            replay_aux_sequence_outputs_from_train_tokens_fn
+            if callable(replay_aux_sequence_outputs_from_train_tokens_fn) else None
+        )
+
+    def _resolve_replay_aux_strict_sequence_outputs_from_train_tokens_fn(self, policy_step_fn):
+        replay_aux_strict_sequence_outputs_from_train_tokens_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_aux_strict_sequence_outputs_from_train_tokens_fn",
+            None,
+        )
+        if callable(replay_aux_strict_sequence_outputs_from_train_tokens_fn):
+            return replay_aux_strict_sequence_outputs_from_train_tokens_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_aux_strict_sequence_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_aux_strict_sequence_outputs_from_train_tokens",
+            None,
+        )
+        return (
+            replay_aux_strict_sequence_outputs_from_train_tokens_fn
+            if callable(replay_aux_strict_sequence_outputs_from_train_tokens_fn) else None
+        )
+
+    def _resolve_replay_policy_and_aux_sequence_outputs_fn(self, policy_step_fn):
+        replay_policy_and_aux_sequence_outputs_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_policy_and_aux_sequence_outputs_fn",
+            None,
+        )
+        if callable(replay_policy_and_aux_sequence_outputs_fn):
+            return replay_policy_and_aux_sequence_outputs_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_policy_and_aux_sequence_outputs_fn = getattr(
+            model_ref,
+            "replay_policy_and_aux_sequence_outputs",
+            None,
+        )
+        return (
+            replay_policy_and_aux_sequence_outputs_fn
+            if callable(replay_policy_and_aux_sequence_outputs_fn) else None
+        )
+
+    def _resolve_replay_policy_and_aux_sequence_outputs_from_train_tokens_fn(self, policy_step_fn):
+        replay_policy_and_aux_sequence_outputs_from_train_tokens_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_replay_policy_and_aux_sequence_outputs_from_train_tokens_fn",
+            None,
+        )
+        if callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn):
+            return replay_policy_and_aux_sequence_outputs_from_train_tokens_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        replay_policy_and_aux_sequence_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_policy_and_aux_sequence_outputs_from_train_tokens",
+            None,
+        )
+        return (
+            replay_policy_and_aux_sequence_outputs_from_train_tokens_fn
+            if callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn) else None
+        )
+
+    def _resolve_stream_replay_policy_and_aux_outputs_with_kv_fn(self, policy_step_fn):
+        stream_replay_policy_and_aux_outputs_with_kv_fn = getattr(
+            policy_step_fn,
+            "_reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn",
+            None,
+        )
+        if callable(stream_replay_policy_and_aux_outputs_with_kv_fn):
+            return stream_replay_policy_and_aux_outputs_with_kv_fn
+        model_ref = getattr(policy_step_fn, "_model_ref", None)
+        if model_ref is None:
+            return None
+        stream_replay_policy_and_aux_outputs_with_kv_fn = getattr(
+            model_ref,
+            "stream_replay_policy_and_aux_outputs_with_kv",
+            None,
+        )
+        return (
+            stream_replay_policy_and_aux_outputs_with_kv_fn
+            if callable(stream_replay_policy_and_aux_outputs_with_kv_fn) else None
+        )
+
+    @staticmethod
+    def _call_with_optional_keyword(fn, *args, keyword_name: str, keyword_value, **kwargs):
+        if not callable(fn):
+            raise TypeError("fn must be callable")
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            sig = None
+        if sig is not None:
+            params = sig.parameters
+            if (
+                keyword_name in params
+                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+            ):
+                kwargs[keyword_name] = keyword_value
+        return fn(*args, **kwargs)
+
+    @staticmethod
+    def _concat_output_chunks(output_chunks: dict[str, list[torch.Tensor]]):
+        return {
+            key: torch.cat(value_list, dim=0)
+            for key, value_list in output_chunks.items()
+            if len(value_list) > 0
+        }
+
+    def _replay_aux_outputs_with_kv(
+        self,
+        *,
+        policy_step_fn,
+        x_tokens: torch.Tensor,
+        y_tokens: torch.Tensor,
+        train_tokens: torch.Tensor | None = None,
+        full_length: int,
+        sampled_action: torch.Tensor | None = None,
+        q_query_start: int = 0,
+        q_query_stop: int | None = None,
+        flow_action: torch.Tensor | None = None,
+        flow_query_start: int = 0,
+        flow_query_stop: int | None = None,
+        action_query_cols: torch.Tensor | None = None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        prefer_streaming: bool = False,
+        output_chunk_sink=None,
+    ):
+        if not torch.is_tensor(x_tokens) or x_tokens.ndim != 3:
+            raise ValueError("shared replay requires x_tokens with shape (T, B, F)")
+        if not torch.is_tensor(y_tokens) or y_tokens.ndim != 2:
+            raise ValueError("shared replay requires y_tokens with shape (T, B)")
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "shared replay x/y leading dims must match, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        query_bundle = self._prepare_replay_aux_query_tokens(
+            x_tokens=x_tokens,
+            full_length=full_length,
+            sampled_action=sampled_action,
+            q_query_start=q_query_start,
+            q_query_stop=q_query_stop,
+            flow_action=flow_action,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            action_query_cols=action_query_cols,
+        )
+        q_query_tokens = query_bundle["q_query_tokens"]
+        q_query_start = query_bundle["q_query_start"]
+        q_query_stop = query_bundle["q_query_stop"]
+        flow_query_tokens = query_bundle["flow_query_tokens"]
+        flow_query_start = query_bundle["flow_query_start"]
+        flow_query_stop = query_bundle["flow_query_stop"]
+        stream_replay_aux_outputs_with_kv_fn = self._resolve_stream_replay_aux_outputs_with_kv_fn(policy_step_fn)
+        replay_aux_strict_sequence_outputs_from_train_tokens_fn = (
+            self._resolve_replay_aux_strict_sequence_outputs_from_train_tokens_fn(policy_step_fn)
+        )
+        replay_aux_sequence_outputs_from_train_tokens_fn = (
+            self._resolve_replay_aux_sequence_outputs_from_train_tokens_fn(policy_step_fn)
+        )
+        replay_aux_sequence_outputs_fn = self._resolve_replay_aux_sequence_outputs_fn(policy_step_fn)
+        if prefer_streaming:
+            if train_tokens is not None and callable(replay_aux_sequence_outputs_from_train_tokens_fn):
+                return replay_aux_sequence_outputs_from_train_tokens_fn(
+                    train_tokens,
+                    full_length=full_length,
+                    q_query_tokens=q_query_tokens,
+                    q_query_start=q_query_start,
+                    q_query_stop=q_query_stop,
+                    q_action_query=sampled_action,
+                    flow_query_tokens=flow_query_tokens,
+                    flow_query_start=flow_query_start,
+                    flow_query_stop=flow_query_stop,
+                    flow_action_query=flow_action,
+                    flow_matching_xt=flow_matching_xt,
+                    flow_matching_t=flow_matching_t,
+                )
+            if callable(replay_aux_sequence_outputs_fn):
+                return replay_aux_sequence_outputs_fn(
+                    x_tokens,
+                    y_tokens,
+                    full_length=full_length,
+                    q_query_tokens=q_query_tokens,
+                    q_query_start=q_query_start,
+                    q_query_stop=q_query_stop,
+                    q_action_query=sampled_action,
+                    flow_query_tokens=flow_query_tokens,
+                    flow_query_start=flow_query_start,
+                    flow_query_stop=flow_query_stop,
+                    flow_action_query=flow_action,
+                    flow_matching_xt=flow_matching_xt,
+                    flow_matching_t=flow_matching_t,
+                )
+        if train_tokens is not None and callable(replay_aux_strict_sequence_outputs_from_train_tokens_fn):
+            return self._call_with_optional_keyword(
+                replay_aux_strict_sequence_outputs_from_train_tokens_fn,
+                train_tokens,
+                keyword_name="output_chunk_sink",
+                keyword_value=output_chunk_sink,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=sampled_action,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        if train_tokens is not None and callable(replay_aux_sequence_outputs_from_train_tokens_fn):
+            return replay_aux_sequence_outputs_from_train_tokens_fn(
+                train_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=sampled_action,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        replay_aux_strict_sequence_outputs_fn = self._resolve_replay_aux_strict_sequence_outputs_fn(policy_step_fn)
+        if callable(replay_aux_strict_sequence_outputs_fn):
+            return self._call_with_optional_keyword(
+                replay_aux_strict_sequence_outputs_fn,
+                x_tokens,
+                y_tokens,
+                keyword_name="output_chunk_sink",
+                keyword_value=output_chunk_sink,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=sampled_action,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        if callable(replay_aux_sequence_outputs_fn):
+            return replay_aux_sequence_outputs_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=sampled_action,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        if callable(stream_replay_aux_outputs_with_kv_fn):
+            return stream_replay_aux_outputs_with_kv_fn(
+                x_tokens,
+                y_tokens,
+                full_length=full_length,
+                q_query_tokens=q_query_tokens,
+                q_query_start=q_query_start,
+                q_query_stop=q_query_stop,
+                q_action_query=sampled_action,
+                flow_query_tokens=flow_query_tokens,
+                flow_query_start=flow_query_start,
+                flow_query_stop=flow_query_stop,
+                flow_action_query=flow_action,
+                flow_matching_xt=flow_matching_xt,
+                flow_matching_t=flow_matching_t,
+            )
+        (
+            init_kv_cache_fn,
+            append_train_token_to_kv_fn,
+            predict_query_outputs_fn,
+        ) = self._resolve_action_query_replay_fns(policy_step_fn)
+        if not callable(append_train_token_to_kv_fn):
+            raise RuntimeError(
+                "shared aux replay requires policy_step_fn/model_ref.append_train_token_to_kv()"
+            )
+        if not callable(predict_query_outputs_fn):
+            raise RuntimeError(
+                "shared aux replay requires policy_step_fn/model_ref.predict_query_replay_outputs_with_kv()"
+            )
+        full_length = int(max(0, min(int(x_tokens.shape[0]), int(full_length))))
+        if flow_matching_xt is not None and tuple(flow_matching_xt.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+            raise ValueError(
+                "shared aux replay flow_matching_xt must align with flow query tokens, "
+                f"got {tuple(flow_matching_xt.shape)} and {tuple(flow_query_tokens.shape)}"
+            )
+        if flow_matching_t is not None and tuple(flow_matching_t.shape[:2]) != tuple(flow_query_tokens.shape[:2]):
+            raise ValueError(
+                "shared aux replay flow_matching_t must align with flow query tokens, "
+                f"got {tuple(flow_matching_t.shape)} and {tuple(flow_query_tokens.shape)}"
+            )
+
+        stream_start = int(full_length)
+        if q_query_tokens is not None:
+            stream_start = min(stream_start, int(q_query_start))
+        if flow_action is not None:
+            stream_start = min(stream_start, int(flow_query_start))
+        stream_start = int(max(0, min(full_length, stream_start)))
+        kv_cache = None
+        if stream_start > 0 and callable(init_kv_cache_fn):
+            kv_cache = init_kv_cache_fn(x_tokens[:stream_start], y_tokens[:stream_start])
+        elif stream_start > 0:
+            for prefix_idx in range(stream_start):
+                kv_cache = append_train_token_to_kv_fn(
+                    x_tokens[prefix_idx : prefix_idx + 1],
+                    y_tokens[prefix_idx : prefix_idx + 1],
+                    kv_cache,
+                )
+
+        q_chunks = {}
+        flow_chunks = {}
+        for token_idx in range(stream_start, full_length):
+            kv_cache = append_train_token_to_kv_fn(
+                x_tokens[token_idx : token_idx + 1],
+                y_tokens[token_idx : token_idx + 1],
+                kv_cache,
+            )
+            if q_query_tokens is not None and q_query_start <= token_idx < q_query_stop:
+                q_idx = int(token_idx - q_query_start)
+                q_step_outputs = predict_query_outputs_fn(
+                    q_query_tokens[q_idx : q_idx + 1],
+                    kv_cache,
+                    action_query=sampled_action[q_idx : q_idx + 1],
+                )
+                for key, value in q_step_outputs.items():
+                    q_chunks.setdefault(key, []).append(value)
+            if flow_query_tokens is not None and flow_query_start <= token_idx < flow_query_stop:
+                flow_idx = int(token_idx - flow_query_start)
+                flow_step_outputs = predict_query_outputs_fn(
+                    flow_query_tokens[flow_idx : flow_idx + 1],
+                    kv_cache,
+                    action_query=flow_action[flow_idx : flow_idx + 1],
+                    flow_matching_xt=(
+                        None if flow_matching_xt is None else flow_matching_xt[flow_idx : flow_idx + 1]
+                    ),
+                    flow_matching_t=(
+                        None if flow_matching_t is None else flow_matching_t[flow_idx : flow_idx + 1]
+                    ),
+                )
+                for key, value in flow_step_outputs.items():
+                    flow_chunks.setdefault(key, []).append(value)
+        return {
+            "q": self._concat_output_chunks(q_chunks),
+            "flow": self._concat_output_chunks(flow_chunks),
+        }
+
+    def _predict_action_query_replay_outputs_with_kv(
+        self,
+        *,
+        policy_step_fn,
+        x_tokens: torch.Tensor,
+        y_tokens: torch.Tensor,
+        sampled_action: torch.Tensor,
+        query_start: int = 0,
+        query_stop: int | None = None,
+        action_query_cols: torch.Tensor | None = None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        if not torch.is_tensor(x_tokens) or x_tokens.ndim != 3:
+            raise ValueError("action-query replay requires x_tokens with shape (T, B, F)")
+        if not torch.is_tensor(y_tokens) or y_tokens.ndim != 2:
+            raise ValueError("action-query replay requires y_tokens with shape (T, B)")
+        if tuple(x_tokens.shape[:2]) != tuple(y_tokens.shape):
+            raise ValueError(
+                "action-query replay x/y leading dims must match, "
+                f"got {tuple(x_tokens.shape[:2])} and {tuple(y_tokens.shape)}"
+            )
+        query_tokens = self._build_action_query_tokens(
+            x_tokens,
+            sampled_action,
+            query_start=query_start,
+            query_stop=query_stop,
+            action_query_cols=action_query_cols,
+        )
+        eval_steps = int(query_tokens.shape[0])
+        if eval_steps <= 0:
+            return {}
+        if flow_matching_xt is not None and tuple(flow_matching_xt.shape[:2]) != tuple(query_tokens.shape[:2]):
+            raise ValueError(
+                "flow_matching_xt must align with action-query replay steps, "
+                f"got {tuple(flow_matching_xt.shape)} and {tuple(query_tokens.shape)}"
+            )
+        if flow_matching_t is not None and tuple(flow_matching_t.shape[:2]) != tuple(query_tokens.shape[:2]):
+            raise ValueError(
+                "flow_matching_t must align with action-query replay steps, "
+                f"got {tuple(flow_matching_t.shape)} and {tuple(query_tokens.shape)}"
+            )
+        (
+            init_kv_cache_fn,
+            append_train_token_to_kv_fn,
+            predict_query_outputs_fn,
+        ) = self._resolve_action_query_replay_fns(policy_step_fn)
+        if not callable(append_train_token_to_kv_fn):
+            raise RuntimeError(
+                "action-query replay requires policy_step_fn/model_ref.append_train_token_to_kv()"
+            )
+        if not callable(predict_query_outputs_fn):
+            raise RuntimeError(
+                "action-query replay requires policy_step_fn/model_ref.predict_query_replay_outputs_with_kv()"
+            )
+        kv_cache = None
+        query_start = int(max(0, min(int(x_tokens.shape[0]), int(query_start))))
+        if query_stop is None:
+            query_stop = int(x_tokens.shape[0])
+        query_stop = int(max(query_start, min(int(x_tokens.shape[0]), int(query_stop))))
+        if int(query_stop - query_start) != eval_steps:
+            raise RuntimeError("action-query replay internal query-length mismatch")
+        if int(query_start) > 0 and callable(init_kv_cache_fn):
+            kv_cache = init_kv_cache_fn(x_tokens[:query_start], y_tokens[:query_start])
+        elif int(query_start) > 0:
+            for prefix_idx in range(int(query_start)):
+                kv_cache = append_train_token_to_kv_fn(
+                    x_tokens[prefix_idx : prefix_idx + 1],
+                    y_tokens[prefix_idx : prefix_idx + 1],
+                    kv_cache,
+                )
+        output_chunks = {}
+        for step_idx in range(eval_steps):
+            token_idx = int(query_start + step_idx)
+            kv_cache = append_train_token_to_kv_fn(
+                x_tokens[token_idx : token_idx + 1],
+                y_tokens[token_idx : token_idx + 1],
+                kv_cache,
+            )
+            step_outputs = predict_query_outputs_fn(
+                query_tokens[step_idx : step_idx + 1],
+                kv_cache,
+                action_query=sampled_action[step_idx : step_idx + 1],
+                flow_matching_xt=(
+                    None if flow_matching_xt is None else flow_matching_xt[step_idx : step_idx + 1]
+                ),
+                flow_matching_t=(
+                    None if flow_matching_t is None else flow_matching_t[step_idx : step_idx + 1]
+                ),
+            )
+            for key, value in step_outputs.items():
+                output_chunks.setdefault(key, []).append(value)
+        return self._concat_output_chunks(output_chunks)
+
     @staticmethod
     def _masked_mean_squared_error(pred, target, *, mask=None, eps=1e-6):
         sq_err = (pred - target).square()
@@ -17866,12 +18810,33 @@ class EnvironmentPrior:
         sampled_action = replay_payload.get("sampled_action", None)
         action_std = replay_payload.get("action_std", None)
         action_mask = replay_payload.get("action_mask", None)
-        next_obs = replay_payload.get("next_obs", None)
-        obs_mask = replay_payload.get("obs_mask", None)
+        action_query_cols = replay_payload.get("action_query_cols", None)
+        next_state = replay_payload.get("next_state", None)
+        state_mask = replay_payload.get("state_mask", None)
+        flow_action = replay_payload.get("flow_action", None)
+        flow_next_state = replay_payload.get("flow_next_state", None)
+        flow_state_mask = replay_payload.get("flow_state_mask", None)
         eval_start = int(replay_payload.get("eval_start", int(single_eval_pos) or 0) or 0)
         full_length = int(replay_payload.get("full_length", int(x_tokens.shape[0])) or int(x_tokens.shape[0]))
         if not all(torch.is_tensor(t) for t in (reward_in, sampled_action, action_mask)):
             raise RuntimeError("reinforce sequence replay tensors are incomplete")
+        flow_query_start = int(replay_payload.get("flow_query_start", 0) or 0)
+        flow_query_stop = int(replay_payload.get("flow_query_stop", eval_start) or eval_start)
+        if (
+            (flow_action is None)
+            and (flow_next_state is None)
+            and torch.is_tensor(next_state)
+            and torch.is_tensor(state_mask)
+        ):
+            # Backward-compatible fallback for older replay payloads that used the
+            # eval suffix for flow matching as well.
+            flow_action = sampled_action
+            flow_next_state = next_state
+            flow_state_mask = state_mask
+            flow_query_start = int(eval_start)
+            flow_query_stop = int(eval_start + int(next_state.shape[0]))
+        if flow_state_mask is None and torch.is_tensor(flow_next_state) and torch.is_tensor(state_mask):
+            flow_state_mask = state_mask
 
         rewards_eval = rewards[eval_start:]
         reward_components_eval = None
@@ -17908,11 +18873,98 @@ class EnvironmentPrior:
         use_aux_outputs = bool(
             (normalized_q_value_weight > 0.0) or (next_state_flow_matching_weight > 0.0)
         )
-        if use_aux_outputs and not callable(replay_outputs_fn):
-            raise RuntimeError(
-                "replay auxiliary heads were enabled, but policy_step_fn does not expose replay_policy_sequence_outputs"
-            )
+        q_aux_enabled = bool(normalized_q_value_weight > 0.0)
+        flow_aux_enabled = bool(next_state_flow_matching_weight > 0.0)
         model_ref = getattr(policy_step_fn, "_model_ref", None)
+        replay_flow_target_dim = int(
+            max(
+                int(getattr(model_ref, "next_state_flow_dim", 0) or 0),
+                self._resolve_dim_upper_bound(
+                    self.config.get("state_dim", None),
+                    default=(
+                        int(flow_next_state.shape[-1])
+                        if torch.is_tensor(flow_next_state)
+                        else 0
+                    ),
+                ),
+            )
+        )
+        if torch.is_tensor(flow_next_state) and torch.is_tensor(flow_state_mask):
+            flow_next_state, flow_state_mask = self._align_replay_state_targets_to_dim(
+                flow_next_state,
+                flow_state_mask,
+                target_dim=replay_flow_target_dim,
+                name="replay flow-state",
+            )
+        stream_policy_and_aux_outputs_with_kv_fn = (
+            self._resolve_stream_replay_policy_and_aux_outputs_with_kv_fn(policy_step_fn)
+        )
+        stream_replay_aux_outputs_with_kv_fn = self._resolve_stream_replay_aux_outputs_with_kv_fn(policy_step_fn)
+        replay_policy_and_aux_sequence_outputs_from_train_tokens_fn = (
+            self._resolve_replay_policy_and_aux_sequence_outputs_from_train_tokens_fn(policy_step_fn)
+        )
+        replay_policy_and_aux_sequence_outputs_fn = (
+            self._resolve_replay_policy_and_aux_sequence_outputs_fn(policy_step_fn)
+        )
+        policy_aux_shared_context_forward = bool(
+            use_aux_outputs
+            and self._resolve_reinforce_sequence_replay_share_context_forward(self.config)
+            and (
+                callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn)
+                or callable(replay_policy_and_aux_sequence_outputs_fn)
+                or callable(stream_policy_and_aux_outputs_with_kv_fn)
+            )
+        )
+        encode_train_tokens_fn = self._resolve_encode_train_sequence_tokens_fn(policy_step_fn)
+        replay_outputs_from_train_tokens_fn = self._resolve_replay_outputs_from_train_tokens_fn(policy_step_fn)
+        replay_aux_strict_sequence_outputs_from_train_tokens_fn = (
+            self._resolve_replay_aux_strict_sequence_outputs_from_train_tokens_fn(policy_step_fn)
+        )
+        replay_aux_sequence_outputs_from_train_tokens_fn = (
+            self._resolve_replay_aux_sequence_outputs_from_train_tokens_fn(policy_step_fn)
+        )
+        share_train_token_encoding = bool(
+            (not policy_aux_shared_context_forward)
+            and use_aux_outputs
+            and callable(replay_outputs_fn)
+            and self._resolve_reinforce_sequence_replay_share_train_token_encoding(self.config)
+            and callable(encode_train_tokens_fn)
+            and callable(replay_outputs_from_train_tokens_fn)
+            and (
+                callable(replay_aux_strict_sequence_outputs_from_train_tokens_fn)
+                or callable(replay_aux_sequence_outputs_from_train_tokens_fn)
+            )
+        )
+        loss_sink_accepts_replay_payload = bool(
+            callable(loss_sink) and bool(getattr(loss_sink, "_ticl_accepts_replay_payload", False))
+        )
+        split_replay_graphs = bool(callable(loss_sink) and use_aux_outputs)
+        if split_replay_graphs and (not (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload)):
+            # Shared policy+aux replay roots all losses in one forward graph. Keep
+            # streamed training on separate graphs so single-batch feasibility is
+            # determined by each loss path independently.
+            policy_aux_shared_context_forward = False
+            share_train_token_encoding = False
+        if use_aux_outputs and (not policy_aux_shared_context_forward):
+            (
+                _init_kv_cache_fn,
+                append_train_token_to_kv_fn,
+                predict_query_outputs_fn,
+            ) = (
+                self._resolve_action_query_replay_fns(policy_step_fn)
+            )
+            aux_replay_path_available = bool(
+                callable(self._resolve_replay_aux_strict_sequence_outputs_from_train_tokens_fn(policy_step_fn))
+                or callable(self._resolve_replay_aux_strict_sequence_outputs_fn(policy_step_fn))
+                or callable(stream_replay_aux_outputs_with_kv_fn)
+                or callable(replay_aux_sequence_outputs_from_train_tokens_fn)
+                or callable(self._resolve_replay_aux_sequence_outputs_fn(policy_step_fn))
+                or (callable(append_train_token_to_kv_fn) and callable(predict_query_outputs_fn))
+            )
+            if not aux_replay_path_available:
+                raise RuntimeError(
+                    "replay auxiliary heads require KV replay helpers on policy_step_fn/model_ref"
+                )
         normalized_q_targets = None
         normalized_q_bardist = None
         if normalized_q_value_weight > 0.0:
@@ -17927,19 +18979,32 @@ class EnvironmentPrior:
                     "normalized_q_value_weight requires model_ref.get_normalized_q_value_bardist()"
                 )
             normalized_q_bardist = model_ref.get_normalized_q_value_bardist()
+        flow_steps = int(max(0, flow_query_stop - flow_query_start))
         if next_state_flow_matching_weight > 0.0:
-            if not all(torch.is_tensor(t) for t in (next_obs, obs_mask)):
+            if not all(torch.is_tensor(t) for t in (flow_action, flow_next_state, flow_state_mask)):
                 raise RuntimeError(
-                    "next-state flow matching requires replay next_obs and obs_mask tensors"
+                    "next-state flow matching requires replay flow_action, flow_next_state and flow_state_mask tensors"
+                )
+            if int(flow_action.shape[0]) != flow_steps:
+                raise RuntimeError(
+                    "flow-action replay query range mismatch: "
+                    f"{tuple(flow_action.shape)} vs [{flow_query_start}, {flow_query_stop})"
+                )
+            if int(flow_next_state.shape[0]) != flow_steps:
+                raise RuntimeError(
+                    "flow-state replay query range mismatch: "
+                    f"{tuple(flow_next_state.shape)} vs [{flow_query_start}, {flow_query_stop})"
                 )
             flow_total_elements = float(
                 max(
                     1.0,
-                    int(next_obs.shape[0]) * float(obs_mask.to(dtype=torch.float32).sum().detach().cpu()),
+                    int(flow_next_state.shape[0]) * float(flow_state_mask.to(dtype=torch.float32).sum().detach().cpu()),
                 )
-            )
+                )
         else:
             flow_total_elements = 1.0
+        aux_query_pass_enabled = bool(q_aux_enabled or (flow_aux_enabled and flow_steps > 0))
+        q_flow_shared_aux_query_pass = bool(q_aux_enabled and flow_aux_enabled and flow_steps > 0)
         batch_size = int(x_tokens.shape[1])
         if model_ref is not None and hasattr(model_ref, "resolve_replay_batch_chunk_size"):
             replay_batch_chunk = int(
@@ -17978,27 +19043,139 @@ class EnvironmentPrior:
 
         for start in range(0, batch_size, replay_batch_chunk):
             end = min(batch_size, start + replay_batch_chunk)
+            sampled_action_chunk = sampled_action[:, start:end]
+            action_query_cols_chunk = (
+                None
+                if (not torch.is_tensor(action_query_cols))
+                else action_query_cols[start:end]
+            )
             flow_matching_xt_chunk = None
             flow_matching_t_chunk = None
             flow_matching_dx_chunk = None
-            if next_state_flow_matching_weight > 0.0:
-                flow_matching_xt_chunk, flow_matching_t_chunk, flow_matching_dx_chunk = (
-                    self._sample_condot_flow_matching_path(next_obs[:, start:end])
+            flow_mask_chunk_full = None
+            if flow_aux_enabled and flow_steps > 0:
+                if next_state_flow_matching_weight > 0.0:
+                    flow_matching_xt_chunk, flow_matching_t_chunk, flow_matching_dx_chunk = (
+                        self._sample_condot_flow_matching_path(flow_next_state[:, start:end])
+                    )
+                    flow_mask_chunk_full = flow_state_mask[start:end].to(
+                        device=flow_matching_dx_chunk.device,
+                        dtype=flow_matching_dx_chunk.dtype,
+                    ).unsqueeze(0)
+                flow_action_chunk = flow_action[:, start:end]
+            else:
+                flow_action_chunk = None
+            q_query_tokens_chunk = None
+            q_query_start_chunk = int(eval_start)
+            q_query_stop_chunk = int(full_length)
+            flow_query_tokens_chunk = None
+            flow_query_start_chunk = int(flow_query_start)
+            flow_query_stop_chunk = int(flow_query_stop)
+            if policy_aux_shared_context_forward:
+                query_bundle = self._prepare_replay_aux_query_tokens(
+                    x_tokens=x_tokens[:, start:end],
+                    full_length=full_length,
+                    sampled_action=(sampled_action_chunk if q_aux_enabled else None),
+                    q_query_start=eval_start,
+                    q_query_stop=full_length,
+                    flow_action=flow_action_chunk,
+                    flow_query_start=flow_query_start,
+                    flow_query_stop=flow_query_stop,
+                    action_query_cols=action_query_cols_chunk,
                 )
-            if callable(replay_outputs_fn):
-                replay_outputs = replay_outputs_fn(
+                q_query_tokens_chunk = query_bundle["q_query_tokens"]
+                q_query_start_chunk = query_bundle["q_query_start"]
+                q_query_stop_chunk = query_bundle["q_query_stop"]
+                flow_query_tokens_chunk = query_bundle["flow_query_tokens"]
+                flow_query_start_chunk = query_bundle["flow_query_start"]
+                flow_query_stop_chunk = query_bundle["flow_query_stop"]
+            train_tokens_chunk = None
+            if share_train_token_encoding or (
+                policy_aux_shared_context_forward
+                and callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn)
+                and callable(encode_train_tokens_fn)
+            ):
+                train_tokens_chunk = encode_train_tokens_fn(
                     x_tokens[:, start:end],
                     reward_in[:, start:end],
-                    eval_start=eval_start,
-                    flow_matching_xt=flow_matching_xt_chunk,
-                    flow_matching_t=flow_matching_t_chunk,
                 )
+            if policy_aux_shared_context_forward:
+                if (
+                    train_tokens_chunk is not None
+                    and callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn)
+                ):
+                    shared_replay_outputs = replay_policy_and_aux_sequence_outputs_from_train_tokens_fn(
+                        train_tokens_chunk,
+                        full_length=full_length,
+                        eval_start=eval_start,
+                        q_query_tokens=q_query_tokens_chunk,
+                        q_query_start=q_query_start_chunk,
+                        q_query_stop=q_query_stop_chunk,
+                        q_action_query=(sampled_action_chunk if q_aux_enabled else None),
+                        flow_query_tokens=flow_query_tokens_chunk,
+                        flow_query_start=flow_query_start_chunk,
+                        flow_query_stop=flow_query_stop_chunk,
+                        flow_action_query=flow_action_chunk,
+                        flow_matching_xt=flow_matching_xt_chunk,
+                        flow_matching_t=flow_matching_t_chunk,
+                    )
+                elif callable(replay_policy_and_aux_sequence_outputs_fn):
+                    shared_replay_outputs = replay_policy_and_aux_sequence_outputs_fn(
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        full_length=full_length,
+                        eval_start=eval_start,
+                        q_query_tokens=q_query_tokens_chunk,
+                        q_query_start=q_query_start_chunk,
+                        q_query_stop=q_query_stop_chunk,
+                        q_action_query=(sampled_action_chunk if q_aux_enabled else None),
+                        flow_query_tokens=flow_query_tokens_chunk,
+                        flow_query_start=flow_query_start_chunk,
+                        flow_query_stop=flow_query_stop_chunk,
+                        flow_action_query=flow_action_chunk,
+                        flow_matching_xt=flow_matching_xt_chunk,
+                        flow_matching_t=flow_matching_t_chunk,
+                    )
+                else:
+                    shared_replay_outputs = stream_policy_and_aux_outputs_with_kv_fn(
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        full_length=full_length,
+                        eval_start=eval_start,
+                        q_query_tokens=q_query_tokens_chunk,
+                        q_query_start=q_query_start_chunk,
+                        q_query_stop=q_query_stop_chunk,
+                        q_action_query=(sampled_action_chunk if q_aux_enabled else None),
+                        flow_query_tokens=flow_query_tokens_chunk,
+                        flow_query_start=flow_query_start_chunk,
+                        flow_query_stop=flow_query_stop_chunk,
+                        flow_action_query=flow_action_chunk,
+                        flow_matching_xt=flow_matching_xt_chunk,
+                        flow_matching_t=flow_matching_t_chunk,
+                    )
+                replay_outputs = shared_replay_outputs.get("policy", {})
                 action_mean_replay = replay_outputs["action_mean"]
                 action_std_replay = replay_outputs.get("action_std", None)
                 action_log_std_replay = replay_outputs.get("action_log_std", None)
-                normalized_q_pred = replay_outputs.get("normalized_q", None)
-                normalized_q_logits = replay_outputs.get("normalized_q_logits", None)
-                next_state_flow_pred = replay_outputs.get("next_state_flow", None)
+                normalized_q_logits = shared_replay_outputs.get("q", {}).get("normalized_q_logits", None)
+                next_state_flow_pred = shared_replay_outputs.get("flow", {}).get("next_state_flow", None)
+            elif callable(replay_outputs_fn):
+                if train_tokens_chunk is not None:
+                    replay_outputs = replay_outputs_from_train_tokens_fn(
+                        train_tokens_chunk,
+                        eval_start=eval_start,
+                    )
+                else:
+                    replay_outputs = replay_outputs_fn(
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        eval_start=eval_start,
+                    )
+                action_mean_replay = replay_outputs["action_mean"]
+                action_std_replay = replay_outputs.get("action_std", None)
+                action_log_std_replay = replay_outputs.get("action_log_std", None)
+                normalized_q_logits = None
+                next_state_flow_pred = None
             else:
                 action_mean_replay = replay_fn(
                     x_tokens[:, start:end],
@@ -18007,7 +19184,6 @@ class EnvironmentPrior:
                 )
                 action_std_replay = None
                 action_log_std_replay = None
-                normalized_q_pred = None
                 normalized_q_logits = None
                 next_state_flow_pred = None
             if int(sampled_action.shape[0]) != int(action_mean_replay.shape[0]):
@@ -18026,7 +19202,6 @@ class EnvironmentPrior:
                 action_mean_replay = action_mean_replay[..., :replay_action_dim]
             action_mean_replay = action_mean_replay.to(dtype=sampled_action.dtype)
             action_mask_chunk = action_mask[start:end]
-            sampled_action_chunk = sampled_action[:, start:end]
             if torch.is_tensor(action_std_replay):
                 if int(action_std_replay.shape[-1]) != replay_action_dim:
                     action_std_replay = action_std_replay[..., :replay_action_dim]
@@ -18094,7 +19269,91 @@ class EnvironmentPrior:
                 advantages[:, start:end] * log_probs_chunk
             ).sum() / total_elements
             chunk_loss = float(policy_gradient_weight) * reinforce_loss_chunk
-            if normalized_q_value_weight > 0.0:
+            if callable(loss_sink) and not (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload):
+                loss_sink(chunk_loss)
+                chunk_loss = None
+            aux_chunk_loss = None
+            aux_outputs_streamed = False
+            aux_output_chunk_sink = None
+            if callable(loss_sink) and (not policy_aux_shared_context_forward) and aux_query_pass_enabled:
+                def _aux_output_chunk_sink(section_name, query_local_start, query_local_stop, chunk_outputs):
+                    nonlocal aux_outputs_streamed
+                    nonlocal normalized_q_loss_total
+                    nonlocal next_state_flow_loss_total
+                    aux_outputs_streamed = True
+                    local_start = int(query_local_start)
+                    local_stop = int(query_local_stop)
+                    if section_name == "q" and normalized_q_value_weight > 0.0:
+                        normalized_q_logits_chunk = chunk_outputs.get("normalized_q_logits", None)
+                        if normalized_q_logits_chunk is None:
+                            raise RuntimeError(
+                                "normalized_q_value_head was enabled, but replay outputs omitted normalized_q_logits"
+                            )
+                        target_chunk = normalized_q_targets[local_start:local_stop, start:end]
+                        if tuple(normalized_q_logits_chunk.shape[:-1]) != tuple(target_chunk.shape):
+                            raise RuntimeError(
+                                "normalized Q replay logits shape mismatch: "
+                                f"{tuple(normalized_q_logits_chunk.shape)} vs {tuple(target_chunk.shape)}"
+                            )
+                        normalized_q_logits_chunk = normalized_q_logits_chunk.to(dtype=torch.float32)
+                        normalized_q_loss_chunk = (
+                            normalized_q_bardist(
+                                normalized_q_logits_chunk,
+                                target_chunk.to(
+                                    device=normalized_q_logits_chunk.device,
+                                    dtype=normalized_q_logits_chunk.dtype,
+                                ),
+                            ).sum()
+                            / total_elements
+                        )
+                        normalized_q_loss_total = normalized_q_loss_total + normalized_q_loss_chunk.detach()
+                        loss_sink(float(normalized_q_value_weight) * normalized_q_loss_chunk)
+                    elif section_name == "flow" and next_state_flow_matching_weight > 0.0:
+                        next_state_flow_pred_chunk = chunk_outputs.get("next_state_flow", None)
+                        if next_state_flow_pred_chunk is None:
+                            raise RuntimeError(
+                                "next_state_flow_head was enabled, but replay outputs omitted next_state_flow"
+                            )
+                        flow_dx_local = flow_matching_dx_chunk[local_start:local_stop]
+                        flow_loss_chunk = (
+                            (
+                                (
+                                    next_state_flow_pred_chunk.to(dtype=flow_matching_dx_chunk.dtype)
+                                    - flow_dx_local
+                                ).square() * flow_mask_chunk_full
+                            ).sum()
+                            / flow_total_elements
+                        )
+                        next_state_flow_loss_total = next_state_flow_loss_total + flow_loss_chunk.detach()
+                        loss_sink(float(next_state_flow_matching_weight) * flow_loss_chunk)
+
+                aux_output_chunk_sink = _aux_output_chunk_sink
+            if (not policy_aux_shared_context_forward) and aux_query_pass_enabled:
+                aux_replay_outputs = self._replay_aux_outputs_with_kv(
+                    policy_step_fn=policy_step_fn,
+                    x_tokens=x_tokens[:, start:end],
+                    y_tokens=reward_in[:, start:end],
+                    train_tokens=train_tokens_chunk,
+                    full_length=full_length,
+                    sampled_action=sampled_action_chunk if q_aux_enabled else None,
+                    q_query_start=eval_start,
+                    q_query_stop=full_length,
+                    flow_action=flow_action_chunk,
+                    flow_query_start=flow_query_start,
+                    flow_query_stop=flow_query_stop,
+                    action_query_cols=action_query_cols_chunk,
+                    flow_matching_xt=flow_matching_xt_chunk,
+                    flow_matching_t=flow_matching_t_chunk,
+                    prefer_streaming=split_replay_graphs,
+                    output_chunk_sink=aux_output_chunk_sink,
+                )
+                aux_outputs_streamed = bool(aux_outputs_streamed or aux_replay_outputs.get("_streamed_via_sink", False))
+                normalized_q_logits = aux_replay_outputs.get("q", {}).get("normalized_q_logits", None)
+                next_state_flow_pred = aux_replay_outputs.get("flow", {}).get("next_state_flow", None)
+            elif not policy_aux_shared_context_forward:
+                normalized_q_logits = None
+                next_state_flow_pred = None
+            if (normalized_q_value_weight > 0.0) and (not aux_outputs_streamed):
                 if normalized_q_logits is None:
                     raise RuntimeError(
                         "normalized_q_value_head was enabled, but replay outputs omitted normalized_q_logits"
@@ -18105,7 +19364,6 @@ class EnvironmentPrior:
                         f"{tuple(normalized_q_logits.shape)} vs {tuple(normalized_q_targets[:, start:end].shape)}"
                     )
                 normalized_q_logits = normalized_q_logits.to(dtype=torch.float32)
-                normalized_q_pred = normalized_q_bardist.mean(normalized_q_logits)
                 normalized_q_loss_chunk = (
                     normalized_q_bardist(
                         normalized_q_logits,
@@ -18117,25 +19375,44 @@ class EnvironmentPrior:
                     / total_elements
                 )
                 normalized_q_loss_total = normalized_q_loss_total + normalized_q_loss_chunk.detach()
-                chunk_loss = chunk_loss + (float(normalized_q_value_weight) * normalized_q_loss_chunk)
-            if next_state_flow_matching_weight > 0.0:
+                q_loss_contrib = float(normalized_q_value_weight) * normalized_q_loss_chunk
+                if callable(loss_sink):
+                    aux_chunk_loss = q_loss_contrib if aux_chunk_loss is None else (aux_chunk_loss + q_loss_contrib)
+                else:
+                    chunk_loss = chunk_loss + q_loss_contrib
+            else:
+                normalized_q_loss_chunk = None
+            if (next_state_flow_matching_weight > 0.0) and (not aux_outputs_streamed):
                 if next_state_flow_pred is None:
                     raise RuntimeError(
                         "next_state_flow_head was enabled, but replay outputs omitted next_state_flow"
                     )
-                flow_mask_chunk = obs_mask[start:end].to(
-                    device=flow_matching_dx_chunk.device,
-                    dtype=flow_matching_dx_chunk.dtype,
-                ).unsqueeze(0)
                 flow_loss_chunk = (
-                    ((next_state_flow_pred.to(dtype=flow_matching_dx_chunk.dtype) - flow_matching_dx_chunk).square() * flow_mask_chunk).sum()
+                    ((next_state_flow_pred.to(dtype=flow_matching_dx_chunk.dtype) - flow_matching_dx_chunk).square() * flow_mask_chunk_full).sum()
                     / flow_total_elements
                 )
                 next_state_flow_loss_total = next_state_flow_loss_total + flow_loss_chunk.detach()
-                chunk_loss = chunk_loss + (float(next_state_flow_matching_weight) * flow_loss_chunk)
+                flow_loss_contrib = float(next_state_flow_matching_weight) * flow_loss_chunk
+                if callable(loss_sink):
+                    aux_chunk_loss = flow_loss_contrib if aux_chunk_loss is None else (aux_chunk_loss + flow_loss_contrib)
+                else:
+                    chunk_loss = chunk_loss + flow_loss_contrib
+            if callable(loss_sink) and (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload):
+                shared_chunk_loss = chunk_loss
+                if aux_chunk_loss is not None:
+                    shared_chunk_loss = shared_chunk_loss + aux_chunk_loss
+                    aux_chunk_loss = None
+                loss_sink(
+                    {
+                        "loss": shared_chunk_loss,
+                        "retain_graph": False,
+                    }
+                )
+                chunk_loss = None
             if callable(loss_sink):
-                loss_sink(chunk_loss)
-            else:
+                if aux_chunk_loss is not None:
+                    loss_sink(aux_chunk_loss)
+            elif not callable(loss_sink):
                 loss_total = loss_total + chunk_loss
 
         stats_loss, stats = self.reinforce_loss_from_rewards(
@@ -18152,6 +19429,16 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_chunk_count"] = int(replay_chunk_count)
         stats["reinforce_sequence_replay_full_length"] = int(full_length)
         stats["reinforce_sequence_replay_eval_steps"] = int(sampled_action.shape[0])
+        stats["reinforce_sequence_replay_flow_steps"] = int(flow_steps)
+        stats["reinforce_sequence_replay_policy_aux_shared_context_forward"] = int(
+            policy_aux_shared_context_forward
+        )
+        stats["reinforce_sequence_replay_aux_query_pass_enabled"] = int(aux_query_pass_enabled)
+        stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"] = int(
+            q_flow_shared_aux_query_pass
+        )
+        # This metric refers only to encoder output reuse, not shared backbone traversal.
+        stats["reinforce_sequence_replay_shared_train_token_encoding"] = int(share_train_token_encoding)
         stats["policy_gradient_weight"] = float(policy_gradient_weight)
         stats["normalized_q_value_weight"] = float(normalized_q_value_weight)
         stats["next_state_flow_matching_weight"] = float(next_state_flow_matching_weight)

@@ -1050,6 +1050,9 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_store_legacy_targets"] is False
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_train_token_encoding"] is True
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_context_forward"] is True
     assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
         "distribution": "log_uniform",
         "min": 1e-3,

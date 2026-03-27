@@ -391,10 +391,18 @@ def dispatch_policy_rollout(prior, ctx):
                 sampled_action_group = group_replay.get("sampled_action", None)
                 action_std_group = group_replay.get("action_std", None)
                 action_mask_group = group_replay.get("action_mask", None)
+                action_query_cols_group = group_replay.get("action_query_cols", None)
                 next_obs_group = group_replay.get("next_obs", None)
                 obs_mask_group = group_replay.get("obs_mask", None)
+                next_state_group = group_replay.get("next_state", None)
+                state_mask_group = group_replay.get("state_mask", None)
+                flow_action_group = group_replay.get("flow_action", None)
+                flow_next_state_group = group_replay.get("flow_next_state", None)
+                flow_state_mask_group = group_replay.get("flow_state_mask", None)
                 eval_start_group = int(group_replay.get("eval_start", 0) or 0)
                 full_length_group = int(group_replay.get("full_length", int(n_samples)) or int(n_samples))
+                flow_query_start_group = int(group_replay.get("flow_query_start", 0) or 0)
+                flow_query_stop_group = int(group_replay.get("flow_query_stop", eval_start_group) or eval_start_group)
                 if all(
                     torch.is_tensor(t)
                     for t in (
@@ -404,10 +412,29 @@ def dispatch_policy_rollout(prior, ctx):
                         action_mask_group,
                     )
                 ):
-                    has_flow_targets = bool(
+                    has_next_obs_targets = bool(
                         torch.is_tensor(next_obs_group) and torch.is_tensor(obs_mask_group)
                     )
-                    if has_flow_targets != bool(torch.is_tensor(next_obs_group) or torch.is_tensor(obs_mask_group)):
+                    if has_next_obs_targets != bool(torch.is_tensor(next_obs_group) or torch.is_tensor(obs_mask_group)):
+                        raise RuntimeError("reinforce replay next_obs payload was only partially populated")
+                    has_next_state_targets = bool(
+                        torch.is_tensor(next_state_group) and torch.is_tensor(state_mask_group)
+                    )
+                    if has_next_state_targets != bool(
+                        torch.is_tensor(next_state_group) or torch.is_tensor(state_mask_group)
+                    ):
+                        raise RuntimeError("reinforce replay next_state payload was only partially populated")
+                    has_action_query_cols = bool(torch.is_tensor(action_query_cols_group))
+                    has_flow_targets = bool(
+                        torch.is_tensor(flow_action_group)
+                        and torch.is_tensor(flow_next_state_group)
+                        and torch.is_tensor(flow_state_mask_group)
+                    )
+                    if has_flow_targets != bool(
+                        torch.is_tensor(flow_action_group)
+                        or torch.is_tensor(flow_next_state_group)
+                        or torch.is_tensor(flow_state_mask_group)
+                    ):
                         raise RuntimeError("reinforce replay flow payload was only partially populated")
                     replay_steps = int(sampled_action_group.shape[0])
                     action_dim_group = int(sampled_action_group.shape[-1])
@@ -436,7 +463,13 @@ def dispatch_policy_rollout(prior, ctx):
                             "eval_start": int(eval_start_group),
                             "full_length": int(full_length_group),
                         }
-                        if has_flow_targets:
+                        if has_action_query_cols:
+                            reinforce_replay_payload["action_query_cols"] = torch.empty(
+                                (batch_size, int(action_query_cols_group.shape[-1])),
+                                device=action_query_cols_group.device,
+                                dtype=action_query_cols_group.dtype,
+                            )
+                        if has_next_obs_targets:
                             next_obs_dim_group = int(next_obs_group.shape[-1])
                             reinforce_replay_payload["next_obs"] = torch.empty(
                                 (replay_steps, batch_size, next_obs_dim_group),
@@ -448,10 +481,55 @@ def dispatch_policy_rollout(prior, ctx):
                                 device=obs_mask_group.device,
                                 dtype=obs_mask_group.dtype,
                             )
+                        if has_next_state_targets:
+                            next_state_dim_group = int(next_state_group.shape[-1])
+                            reinforce_replay_payload["next_state"] = torch.empty(
+                                (replay_steps, batch_size, next_state_dim_group),
+                                device=next_state_group.device,
+                                dtype=next_state_group.dtype,
+                            )
+                            reinforce_replay_payload["state_mask"] = torch.empty(
+                                (batch_size, int(state_mask_group.shape[-1])),
+                                device=state_mask_group.device,
+                                dtype=state_mask_group.dtype,
+                            )
+                        if has_flow_targets:
+                            flow_steps_group = int(flow_action_group.shape[0])
+                            flow_action_dim_group = int(flow_action_group.shape[-1])
+                            flow_state_dim_group = int(flow_next_state_group.shape[-1])
+                            reinforce_replay_payload["flow_action"] = torch.empty(
+                                (flow_steps_group, batch_size, flow_action_dim_group),
+                                device=flow_action_group.device,
+                                dtype=flow_action_group.dtype,
+                            )
+                            reinforce_replay_payload["flow_next_state"] = torch.empty(
+                                (flow_steps_group, batch_size, flow_state_dim_group),
+                                device=flow_next_state_group.device,
+                                dtype=flow_next_state_group.dtype,
+                            )
+                            reinforce_replay_payload["flow_state_mask"] = torch.empty(
+                                (batch_size, int(flow_state_mask_group.shape[-1])),
+                                device=flow_state_mask_group.device,
+                                dtype=flow_state_mask_group.dtype,
+                            )
+                            reinforce_replay_payload["flow_query_start"] = int(flow_query_start_group)
+                            reinforce_replay_payload["flow_query_stop"] = int(flow_query_stop_group)
                     else:
-                        payload_has_flow_targets = bool(
+                        payload_has_action_query_cols = bool(
+                            torch.is_tensor(reinforce_replay_payload.get("action_query_cols", None))
+                        )
+                        payload_has_next_obs_targets = bool(
                             torch.is_tensor(reinforce_replay_payload.get("next_obs", None))
                             and torch.is_tensor(reinforce_replay_payload.get("obs_mask", None))
+                        )
+                        payload_has_next_state_targets = bool(
+                            torch.is_tensor(reinforce_replay_payload.get("next_state", None))
+                            and torch.is_tensor(reinforce_replay_payload.get("state_mask", None))
+                        )
+                        payload_has_flow_targets = bool(
+                            torch.is_tensor(reinforce_replay_payload.get("flow_action", None))
+                            and torch.is_tensor(reinforce_replay_payload.get("flow_next_state", None))
+                            and torch.is_tensor(reinforce_replay_payload.get("flow_state_mask", None))
                         )
                         if (
                             int(reinforce_replay_payload["eval_start"]) != int(eval_start_group)
@@ -460,22 +538,65 @@ def dispatch_policy_rollout(prior, ctx):
                             != (replay_steps, action_dim_group)
                         ):
                             raise RuntimeError("reinforce replay payload shapes were inconsistent across rollout groups")
+                        if payload_has_action_query_cols != has_action_query_cols:
+                            raise RuntimeError("reinforce replay action_query_cols availability was inconsistent across rollout groups")
+                        if payload_has_next_obs_targets != has_next_obs_targets:
+                            raise RuntimeError("reinforce replay next_obs payload availability was inconsistent across rollout groups")
+                        if payload_has_next_state_targets != has_next_state_targets:
+                            raise RuntimeError("reinforce replay next_state payload availability was inconsistent across rollout groups")
                         if payload_has_flow_targets != has_flow_targets:
                             raise RuntimeError("reinforce replay flow payload availability was inconsistent across rollout groups")
-                        if has_flow_targets:
+                        if has_action_query_cols:
+                            if int(reinforce_replay_payload["action_query_cols"].shape[-1]) != int(action_query_cols_group.shape[-1]):
+                                raise RuntimeError("reinforce replay action_query_cols shapes were inconsistent across rollout groups")
+                        if has_next_obs_targets:
                             next_obs_dim_group = int(next_obs_group.shape[-1])
                             if tuple(reinforce_replay_payload["next_obs"].shape[:1] + reinforce_replay_payload["next_obs"].shape[2:]) != (
                                 replay_steps,
                                 next_obs_dim_group,
                             ):
                                 raise RuntimeError("reinforce replay next_obs shapes were inconsistent across rollout groups")
+                        if has_next_state_targets:
+                            next_state_dim_group = int(next_state_group.shape[-1])
+                            if tuple(reinforce_replay_payload["next_state"].shape[:1] + reinforce_replay_payload["next_state"].shape[2:]) != (
+                                replay_steps,
+                                next_state_dim_group,
+                            ):
+                                raise RuntimeError("reinforce replay next_state shapes were inconsistent across rollout groups")
+                        if has_flow_targets:
+                            flow_steps_group = int(flow_action_group.shape[0])
+                            flow_action_dim_group = int(flow_action_group.shape[-1])
+                            flow_state_dim_group = int(flow_next_state_group.shape[-1])
+                            if (
+                                tuple(reinforce_replay_payload["flow_action"].shape[:1] + reinforce_replay_payload["flow_action"].shape[2:])
+                                != (flow_steps_group, flow_action_dim_group)
+                            ):
+                                raise RuntimeError("reinforce replay flow_action shapes were inconsistent across rollout groups")
+                            if (
+                                tuple(reinforce_replay_payload["flow_next_state"].shape[:1] + reinforce_replay_payload["flow_next_state"].shape[2:])
+                                != (flow_steps_group, flow_state_dim_group)
+                            ):
+                                raise RuntimeError("reinforce replay flow_next_state shapes were inconsistent across rollout groups")
+                            if int(reinforce_replay_payload["flow_query_start"]) != int(flow_query_start_group):
+                                raise RuntimeError("reinforce replay flow_query_start was inconsistent across rollout groups")
+                            if int(reinforce_replay_payload["flow_query_stop"]) != int(flow_query_stop_group):
+                                raise RuntimeError("reinforce replay flow_query_stop was inconsistent across rollout groups")
                     reinforce_replay_payload["reward_in"][:, group_indices] = reward_in_group
                     reinforce_replay_payload["sampled_action"][:, group_indices] = sampled_action_group
                     reinforce_replay_payload["action_std"][:, group_indices] = action_std_group
                     reinforce_replay_payload["action_mask"][group_indices] = action_mask_group
-                    if has_flow_targets:
+                    if has_action_query_cols:
+                        reinforce_replay_payload["action_query_cols"][group_indices] = action_query_cols_group
+                    if has_next_obs_targets:
                         reinforce_replay_payload["next_obs"][:, group_indices] = next_obs_group
                         reinforce_replay_payload["obs_mask"][group_indices] = obs_mask_group
+                    if has_next_state_targets:
+                        reinforce_replay_payload["next_state"][:, group_indices] = next_state_group
+                        reinforce_replay_payload["state_mask"][group_indices] = state_mask_group
+                    if has_flow_targets:
+                        reinforce_replay_payload["flow_action"][:, group_indices] = flow_action_group
+                        reinforce_replay_payload["flow_next_state"][:, group_indices] = flow_next_state_group
+                        reinforce_replay_payload["flow_state_mask"][group_indices] = flow_state_mask_group
             group_log_probs = None
             if policy_collect_reinforce_replay and (not policy_defer_reinforce_replay):
                 group_log_probs = _maybe_replay_reinforce_log_probs(

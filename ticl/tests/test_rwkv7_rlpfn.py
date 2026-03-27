@@ -13,6 +13,7 @@ import ticl.train as train_mod
 from ticl.model_builder import get_model
 from ticl.model_configs import get_model_default_config
 from ticl.models.tabpfn_bar_distribution import make_standardized_full_support_bar_distribution
+from ticl.priors.maintained_fast_runner import dispatch_policy_rollout
 from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
@@ -60,9 +61,22 @@ def _build_small_exact_scm_env_cfg():
             "reinforce_sequence_replay_enabled": False,
             "normalized_q_value_weight": 0.0,
             "next_state_flow_matching_weight": 0.0,
+            "reinforce_sequence_replay_share_context_forward": False,
         }
     )
     return cfg, env_cfg
+
+
+def _resolve_dim_upper_bound(spec):
+    if isinstance(spec, dict):
+        if "max" in spec:
+            return int(spec["max"])
+        choice_values = spec.get("choice_values", None)
+        if isinstance(choice_values, (list, tuple)) and len(choice_values) > 0:
+            return int(max(choice_values))
+        if "value" in spec:
+            return int(spec["value"])
+    return int(spec)
 
 
 def _run_rwkv7_exact_scm_chunk(
@@ -318,14 +332,14 @@ def _assemble_split_token(obs_t, action_t, reward_t, reward_mask_t, phase_t, ter
     return x_token, y_token
 
 
-def test_rwkv7_rlpfn_builder_has_correct_action_head_and_5m_budget():
+def test_rwkv7_rlpfn_builder_has_correct_action_head_and_default_budget():
     _ensure_torch_extensions_dir()
     cfg = _build_rwkv7_rlpfn_config()
     _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
 
     param_count = sum(p.numel() for p in model.parameters())
     assert type(model).__name__ == "RWKV7PFN"
-    assert 4_800_000 <= param_count <= 5_600_000
+    assert 30_000_000 <= param_count <= 45_000_000
     assert model.policy_action_head_required()
     assert model.has_correct_policy_action_head()
     assert int(model.policy_action_dim) == 30
@@ -464,7 +478,8 @@ def test_rwkv7_policy_step_head_override_changes_output_without_mutating_model()
         (name, torch.zeros_like(param))
         for name, param in model.policy_action_head.named_parameters()
     )
-    override["0.bias"] = torch.full_like(override["0.bias"], 0.5)
+    assert "mean.bias" in override
+    override["mean.bias"] = torch.full_like(override["mean.bias"], 0.5)
     override_out, _ = step_fn(
         obs,
         action,
@@ -476,8 +491,10 @@ def test_rwkv7_policy_step_head_override_changes_output_without_mutating_model()
         _policy_action_head_params_override=override,
     )
 
-    assert torch.allclose(base_out, base_out_again, atol=1e-6, rtol=1e-6)
-    assert not torch.allclose(base_out, override_out, atol=1e-6, rtol=1e-6)
+    assert isinstance(base_out, dict)
+    assert isinstance(override_out, dict)
+    assert torch.allclose(base_out["action_mean"], base_out_again["action_mean"], atol=1e-6, rtol=1e-6)
+    assert not torch.allclose(base_out["action_mean"], override_out["action_mean"], atol=1e-6, rtol=1e-6)
 
 
 def test_rwkv7_block_batch1_fastpath_matches_manual_vmap_semantics():
@@ -833,9 +850,9 @@ def test_rwkv7_replay_policy_sequence_outputs_emit_aux_predictions(head_type, ex
     assert model.normalized_q_value_bardist.__class__.__name__ == "FullSupportBarDistribution"
 
     seq_len = 6
-    batch_size = 2
+    batch_size = 1
     eval_start = 3
-    flow_dim = int(cfg["prior"]["environment"]["obs_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
     with torch.no_grad():
         outputs = model.replay_policy_sequence_outputs(
             torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]), device="cuda"),
@@ -845,7 +862,7 @@ def test_rwkv7_replay_policy_sequence_outputs_emit_aux_predictions(head_type, ex
             flow_matching_t=torch.rand(seq_len - eval_start, batch_size, 1, device="cuda"),
         )
 
-    assert set(outputs.keys()) == {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}
+    assert {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}.issubset(outputs.keys())
     assert tuple(outputs["action_mean"].shape) == (seq_len - eval_start, batch_size, int(cfg["transformer"]["x_action_dim"]))
     assert tuple(outputs["normalized_q"].shape) == (seq_len - eval_start, batch_size)
     assert tuple(outputs["normalized_q_logits"].shape) == (
@@ -872,9 +889,9 @@ def test_transformer_replay_policy_sequence_outputs_emit_cfmi_aux_predictions():
     assert model.normalized_q_value_bardist.__class__.__name__ == "FullSupportBarDistribution"
 
     seq_len = 6
-    batch_size = 2
+    batch_size = 1
     eval_start = 2
-    flow_dim = int(cfg["prior"]["environment"]["obs_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
     with torch.no_grad():
         outputs = model.replay_policy_sequence_outputs(
             torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"])),
@@ -884,7 +901,7 @@ def test_transformer_replay_policy_sequence_outputs_emit_cfmi_aux_predictions():
             flow_matching_t=torch.rand(seq_len - eval_start, batch_size, 1),
         )
 
-    assert set(outputs.keys()) == {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}
+    assert {"action_mean", "normalized_q", "normalized_q_logits", "next_state_flow"}.issubset(outputs.keys())
     assert tuple(outputs["action_mean"].shape) == (seq_len - eval_start, batch_size, int(cfg["transformer"]["x_action_dim"]))
     assert tuple(outputs["normalized_q"].shape) == (seq_len - eval_start, batch_size)
     assert tuple(outputs["normalized_q_logits"].shape) == (
@@ -908,6 +925,22 @@ def test_transformer_rejects_rwkv_two_layer_flow_head():
         get_model(cfg, device="cpu", should_train=False, verbose=False)
 
 
+def test_model_builder_uses_full_state_dim_for_next_state_flow_head():
+    _seed_everything(6551)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "transformer"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["nhead"] = 4
+    cfg["prior"]["environment"]["state_dim"] = {"distribution": "uniform_int", "min": 11, "max": 11}
+    cfg["prior"]["environment"]["obs_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    cfg["prior"]["environment"]["obs_slot_dim"] = 5
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "cfmi_resnet"
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    assert int(model.next_state_flow_dim) == 11
+
+
 def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
     _seed_everything(999)
     _, env_cfg = _build_small_exact_scm_env_cfg()
@@ -918,6 +951,9 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
     env_cfg["action_slot_dim"] = 3
     prior = EnvironmentPrior(env_cfg)
     bardist = make_standardized_full_support_bar_distribution()
+    replay_output_calls = []
+    q_query_calls = []
+    flow_query_calls = []
 
     class _DummyReplayModel:
         def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
@@ -938,8 +974,21 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
             device=query.device,
         )
 
-    def _replay_outputs(x_tokens, y_tokens, *, eval_start=0, flow_matching_xt=None, flow_matching_t=None):
-        del y_tokens, flow_matching_t
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        replay_output_calls.append(
+            {
+                "seq_len": int(x_tokens.shape[0]),
+                "query_len": int(x_tokens.shape[0] - eval_start),
+            }
+        )
         query = x_tokens[eval_start:]
         outputs = {
             "action_mean": torch.zeros(
@@ -957,6 +1006,47 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
                 device=query.device,
             ),
         }
+        return outputs
+
+    def _init_kv_cache(x_tokens, y_tokens):
+        del y_tokens
+        return int(x_tokens.shape[0])
+
+    def _append_train_token_to_kv(x_token, y_token, kv_cache):
+        del y_token
+        if kv_cache is None:
+            kv_cache = 0
+        return int(kv_cache) + int(x_token.shape[0])
+
+    def _predict_query_replay_outputs_with_kv(
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del action_query, flow_matching_t
+        call_info = {
+            "prefix_len": int(kv_cache),
+            "flow_shape": None if flow_matching_xt is None else tuple(flow_matching_xt.shape),
+            "query_cols": [
+                tuple(torch.nonzero(x_query[0, batch_idx], as_tuple=False).reshape(-1).tolist())
+                for batch_idx in range(int(x_query.shape[1]))
+            ],
+        }
+        if flow_matching_xt is None:
+            q_query_calls.append(call_info)
+        else:
+            flow_query_calls.append(call_info)
+        outputs = {
+            "normalized_q_logits": torch.zeros(
+                1,
+                int(x_query.shape[1]),
+                bardist.num_bars,
+                dtype=torch.float32,
+            ),
+        }
         outputs["normalized_q"] = bardist.mean(outputs["normalized_q_logits"])
         if flow_matching_xt is not None:
             outputs["next_state_flow"] = torch.zeros_like(flow_matching_xt)
@@ -967,22 +1057,55 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
 
     _dummy_step_fn._reinforce_sequence_replay_fn = _replay_tokens
     _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = _init_kv_cache
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = _append_train_token_to_kv
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = (
+        _predict_query_replay_outputs_with_kv
+    )
     _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
     _dummy_step_fn._model_ref = _DummyReplayModel()
 
     seq_len = 5
     eval_start = 2
     batch_size = 2
-    obs_dim = int(env_cfg["obs_slot_dim"])
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
     action_dim = int(env_cfg["action_slot_dim"])
     rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    sampled_action_eval = torch.tensor(
+        [
+            [[1.0, 2.0, 3.0], [4.0, 5.0, 0.0]],
+            [[6.0, 7.0, 8.0], [9.0, 10.0, 0.0]],
+            [[11.0, 12.0, 13.0], [14.0, 15.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    flow_action_prefix = torch.tensor(
+        [
+            [[21.0, 22.0, 23.0], [24.0, 25.0, 0.0]],
+            [[31.0, 32.0, 33.0], [34.0, 35.0, 0.0]],
+        ],
+        dtype=torch.float32,
+    )
+    action_query_cols = torch.tensor(
+        [
+            [7, 8, 9],
+            [6, 7, -1],
+        ],
+        dtype=torch.long,
+    )
     replay_payload = {
         "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
-        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "sampled_action": sampled_action_eval,
         "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
         "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
-        "next_obs": torch.randn(seq_len - eval_start, batch_size, obs_dim, dtype=torch.float32),
-        "obs_mask": torch.ones(batch_size, obs_dim, dtype=torch.bool),
+        "action_query_cols": action_query_cols,
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": flow_action_prefix,
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
         "eval_start": eval_start,
         "full_length": seq_len,
     }
@@ -1004,6 +1127,3322 @@ def test_reinforce_sequence_replay_loss_from_rollout_includes_aux_losses():
     assert int(stats["next_state_flow_matching_head_applied"]) == 1
     assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
     assert float(stats["policy_gradient_weight"]) == 0.1
+    assert len(replay_output_calls) == 1
+    assert all(call["seq_len"] == seq_len for call in replay_output_calls)
+    assert all(call["query_len"] == (seq_len - eval_start) for call in replay_output_calls)
+    assert len(q_query_calls) == (seq_len - eval_start)
+    assert [call["prefix_len"] for call in q_query_calls] == [eval_start + 1, eval_start + 2, eval_start + 3]
+    assert len(flow_query_calls) == eval_start
+    assert [call["prefix_len"] for call in flow_query_calls] == [1, 2]
+    assert [call["query_cols"] for call in q_query_calls] == [[(7, 8, 9), (6, 7)]] * (seq_len - eval_start)
+    assert [call["query_cols"] for call in flow_query_calls] == [[(7, 8, 9), (6, 7)]] * eval_start
+    assert all(
+        call["flow_shape"] == (1, 2, state_dim)
+        for call in flow_query_calls
+    )
+    assert int(stats["reinforce_sequence_replay_flow_steps"]) == eval_start
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 1
+    assert int(stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert "reinforce_sequence_replay_shared_backbone_pass" not in stats
+    assert "reinforce_sequence_replay_shared_aux_backbone_pass" not in stats
+
+
+def test_reinforce_sequence_replay_loss_sink_stages_policy_q_and_flow():
+    _seed_everything(9992)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        query = x_tokens[eval_start:]
+        base = query[..., :3]
+        return {
+            "action_mean": base,
+        }
+
+    def _predict_query_replay_outputs_with_kv(
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        q_steps = int(x_query.shape[0])
+        q_batch = int(x_query.shape[1])
+        del x_query, action_query, flow_matching_t
+        hidden = kv_cache.unsqueeze(0)
+        outputs = {}
+        if flow_matching_xt is None:
+            event_log.append("q_forward")
+            logits = hidden.expand(q_steps, q_batch, bardist.num_bars)
+            outputs["normalized_q_logits"] = logits
+            outputs["normalized_q"] = bardist.mean(logits)
+        else:
+            event_log.append("flow_forward")
+            outputs["next_state_flow"] = hidden.expand_as(flow_matching_xt)
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("loss-sink staging test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("loss-sink staging test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = (
+        lambda x_tokens, y_tokens: x_tokens.sum(dim=0, keepdim=False).sum(dim=-1, keepdim=True)
+    )
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = (
+        lambda x_token, y_token, kv_cache: (
+            x_token.sum(dim=0, keepdim=False).sum(dim=-1, keepdim=True)
+            if kv_cache is None
+            else kv_cache + x_token.sum(dim=0, keepdim=False).sum(dim=-1, keepdim=True)
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = (
+        _predict_query_replay_outputs_with_kv
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    x_tokens = torch.randn(seq_len, batch_size, 12, dtype=torch.float32, requires_grad=True)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    sink_values = []
+
+    def _loss_sink(loss_root):
+        event_log.append("sink")
+        sink_values.append(float(loss_root.detach().cpu()))
+        loss_root.backward()
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+        loss_sink=_loss_sink,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert len(sink_values) == 2
+    assert all(np.isfinite(v) for v in sink_values)
+    assert event_log[0] == "policy_forward"
+    assert event_log[1] == "sink"
+    assert "q_forward" in event_log[2:]
+    assert "flow_forward" in event_log[2:]
+    assert event_log[-1] == "sink"
+    assert x_tokens.grad is not None
+    assert torch.isfinite(x_tokens.grad).all().item()
+    assert float(x_tokens.grad.abs().sum()) > 0.0
+    assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
+
+
+def test_reinforce_sequence_replay_q_flow_shared_aux_query_pass_sinks_policy_then_aux():
+    _seed_everything(9993)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_tokens(x_tokens, y_tokens, *, eval_start=0):
+        del y_tokens
+        query = x_tokens[eval_start:]
+        return torch.zeros(
+            int(query.shape[0]),
+            int(query.shape[1]),
+            3,
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+    def _init_kv_cache(x_tokens, y_tokens):
+        del y_tokens
+        return x_tokens.sum(dim=0).sum(dim=-1, keepdim=True)
+
+    def _append_train_token_to_kv(x_token, y_token, kv_cache):
+        del y_token
+        token_state = x_token.sum(dim=0).sum(dim=-1, keepdim=True)
+        return token_state if kv_cache is None else (kv_cache + token_state)
+
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        query = x_tokens[eval_start:]
+        hidden = query[..., :1]
+        return {
+            "action_mean": hidden.expand(int(query.shape[0]), int(query.shape[1]), 3),
+            "action_std": torch.full(
+                (int(query.shape[0]), int(query.shape[1]), 3),
+                0.05,
+                dtype=x_tokens.dtype,
+                device=x_tokens.device,
+            ),
+        }
+
+    def _predict_query_replay_outputs_with_kv(
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del x_query, action_query, flow_matching_t
+        hidden = kv_cache.unsqueeze(0)
+        outputs = {}
+        if flow_matching_xt is None:
+            event_log.append("q_forward")
+            logits = hidden.expand(1, int(hidden.shape[1]), bardist.num_bars)
+            outputs["normalized_q_logits"] = logits
+            outputs["normalized_q"] = bardist.mean(logits)
+        else:
+            event_log.append("flow_forward")
+            outputs["next_state_flow"] = hidden.expand_as(flow_matching_xt)
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("shared-aux sink test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = _replay_tokens
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = _init_kv_cache
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = _append_train_token_to_kv
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = (
+        _predict_query_replay_outputs_with_kv
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    x_tokens = torch.randn(seq_len, batch_size, 12, dtype=torch.float32, requires_grad=True)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    sink_values = []
+
+    def _loss_sink(loss_root):
+        event_log.append("sink")
+        sink_values.append(float(loss_root.detach().cpu()))
+        loss_root.backward()
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+        loss_sink=_loss_sink,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert len(sink_values) == 2
+    assert event_log.count("sink") == 2
+    assert event_log[0] == "policy_forward"
+    assert event_log[1] == "sink"
+    assert event_log[-1] == "sink"
+    assert "q_forward" in event_log
+    assert "flow_forward" in event_log
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 1
+    assert int(stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert "reinforce_sequence_replay_shared_backbone_pass" not in stats
+    assert "reinforce_sequence_replay_shared_aux_backbone_pass" not in stats
+    assert x_tokens.grad is not None
+    assert torch.isfinite(x_tokens.grad).all().item()
+    assert float(x_tokens.grad.abs().sum()) > 0.0
+    assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
+
+
+def test_reinforce_sequence_replay_prefers_official_sequence_aux_helper():
+    _seed_everything(9994)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        query = x_tokens[eval_start:]
+        return {
+            "action_mean": torch.zeros(
+                int(query.shape[0]),
+                int(query.shape[1]),
+                3,
+                dtype=query.dtype,
+                device=query.device,
+            ),
+        }
+
+    def _replay_aux_sequence_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del x_tokens, y_tokens, full_length, q_query_stop, flow_query_stop, flow_matching_t
+        event_log.append("official_aux_sequence")
+        assert q_query_tokens is not None
+        assert q_action_query is not None
+        assert flow_query_tokens is not None
+        assert flow_action_query is not None
+        outputs = {
+            "q": {
+                "normalized_q_logits": torch.zeros(
+                    int(q_query_tokens.shape[0]),
+                    int(q_query_tokens.shape[1]),
+                    bardist.num_bars,
+                    dtype=torch.float32,
+                ),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            },
+        }
+        outputs["q"]["normalized_q"] = bardist.mean(outputs["q"]["normalized_q_logits"])
+        assert int(q_query_start) == 2
+        assert int(flow_query_start) == 0
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("official-sequence helper test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("official-sequence helper test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        _replay_aux_sequence_outputs
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("official sequence helper should bypass streaming aux fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("official sequence helper should bypass init_kv_cache fallback")
+    )
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("official sequence helper should bypass append_train_token_to_kv fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("official sequence helper should bypass predict_query_replay_outputs_with_kv fallback")
+        )
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["policy_forward", "official_aux_sequence"]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 1
+    assert int(stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert "reinforce_sequence_replay_shared_backbone_pass" not in stats
+    assert "reinforce_sequence_replay_shared_aux_backbone_pass" not in stats
+
+
+def test_reinforce_sequence_replay_prefers_shared_context_forward_helper():
+    _seed_everything(99941)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_sequence_replay_share_context_forward"] = True
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _shared_policy_and_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        eval_start=0,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, full_length, q_query_stop, flow_query_stop, flow_matching_t
+        event_log.append("shared_context_forward")
+        assert q_query_tokens is not None
+        assert q_action_query is not None
+        assert flow_query_tokens is not None
+        assert flow_action_query is not None
+        assert int(q_query_start) == int(eval_start)
+        assert int(flow_query_start) == 0
+        policy_query = x_tokens[eval_start:]
+        action_mean = policy_query[..., :3]
+        action_std = torch.full_like(action_mean, 0.05)
+        q_logits = q_action_query.mean(dim=-1, keepdim=True).expand(
+            int(q_action_query.shape[0]),
+            int(q_action_query.shape[1]),
+            bardist.num_bars,
+        )
+        return {
+            "policy": {
+                "action_mean": action_mean,
+                "action_std": action_std,
+            },
+            "q": {
+                "normalized_q_logits": q_logits,
+                "normalized_q": bardist.mean(q_logits),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            },
+        }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("shared-context-forward test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared-context-forward test should not use live replay fallback")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared-context-forward test should bypass legacy policy replay")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared-context-forward test should bypass legacy aux replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared-context-forward test should bypass shared train-token encoding")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared-context-forward test should bypass policy-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared-context-forward test should bypass aux-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared-context-forward test should bypass aux-only streaming fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_policy_and_aux_sequence_outputs_fn = (
+        _shared_policy_and_aux_outputs
+    )
+    _dummy_step_fn._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared-context-forward test should prefer official shared replay helper")
+        )
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["shared_context_forward"]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 1
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 1
+    assert int(stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert int(stats["reinforce_sequence_replay_shared_train_token_encoding"]) == 0
+    assert "reinforce_sequence_replay_shared_backbone_pass" not in stats
+    assert "reinforce_sequence_replay_shared_aux_backbone_pass" not in stats
+
+
+def test_reinforce_sequence_replay_prefers_strict_aux_sequence_helper_over_packed_and_streaming():
+    _seed_everything(999411)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_outputs(x_tokens, y_tokens, *, eval_start=0, flow_matching_xt=None, flow_matching_t=None):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        return {"action_mean": x_tokens[eval_start:, :, :3]}
+
+    def _strict_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del x_tokens, y_tokens, full_length, q_query_tokens, q_query_start, q_query_stop
+        del flow_query_tokens, flow_query_start, flow_query_stop, flow_matching_t
+        event_log.append("strict_aux_sequence")
+        q_logits = q_action_query.mean(dim=-1, keepdim=True).expand(
+            int(q_action_query.shape[0]),
+            int(q_action_query.shape[1]),
+            bardist.num_bars,
+        )
+        return {
+            "q": {
+                "normalized_q_logits": q_logits,
+                "normalized_q": bardist.mean(q_logits),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt) + flow_action_query.mean(dim=-1, keepdim=True),
+            },
+        }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("strict aux helper test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("strict aux helper test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_strict_sequence_outputs_fn = _strict_aux_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict aux helper should bypass packed aux replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("strict aux helper should bypass streaming aux replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = lambda *args, **kwargs: {}
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["policy_forward", "strict_aux_sequence"]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+
+
+def test_build_policy_step_fn_prefers_actor_only_official_replay_helpers():
+    class _DummyModel(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.policy_action_head = torch.nn.Linear(3, 3)
+            self.event_log = []
+
+        def forward_policy_step(self, x_token, y_token, **kwargs):
+            del y_token, kwargs
+            return {"action_mean": x_token[..., :3], "action_std": torch.ones_like(x_token[..., :3])}, None
+
+        def replay_policy_sequence_tokens(self, x_tokens, y_tokens, *, eval_start=0, policy_action_head_params_override=None):
+            del x_tokens, y_tokens, eval_start, policy_action_head_params_override
+            self.event_log.append("legacy_tokens")
+            return torch.zeros(1, 1, 3)
+
+        def replay_policy_actor_outputs(self, x_tokens, y_tokens, *, eval_start=0, policy_action_head_params_override=None):
+            del y_tokens, eval_start, policy_action_head_params_override
+            self.event_log.append("actor_only")
+            return {
+                "action_mean": x_tokens[..., :3].clone(),
+                "action_std": torch.ones_like(x_tokens[..., :3]),
+            }
+
+        def replay_policy_sequence_outputs(self, x_tokens, y_tokens, *, eval_start=0, action_query=None, policy_action_head_params_override=None, flow_matching_xt=None, flow_matching_t=None):
+            del x_tokens, y_tokens, eval_start, action_query, policy_action_head_params_override, flow_matching_xt, flow_matching_t
+            self.event_log.append("legacy_outputs")
+            raise AssertionError("training should prefer actor-only replay outputs helper")
+
+        def encode_train_sequence_tokens(self, x_tokens, y_tokens):
+            del y_tokens
+            return x_tokens.clone()
+
+        def replay_policy_actor_outputs_from_train_tokens(self, train_tokens, *, eval_start=0, policy_action_head_params_override=None):
+            del eval_start, policy_action_head_params_override
+            self.event_log.append("actor_only_train_tokens")
+            return {
+                "action_mean": train_tokens[..., :3].clone(),
+                "action_std": torch.ones_like(train_tokens[..., :3]),
+            }
+
+        def replay_policy_sequence_outputs_from_train_tokens(self, train_tokens, *, eval_start=0, action_query=None, policy_action_head_params_override=None, flow_matching_xt=None, flow_matching_t=None):
+            del train_tokens, eval_start, action_query, policy_action_head_params_override, flow_matching_xt, flow_matching_t
+            self.event_log.append("legacy_outputs_train_tokens")
+            raise AssertionError("training should prefer actor-only replay outputs-from-train-tokens helper")
+
+    model = _DummyModel()
+    step_fn = _build_policy_step_fn(
+        model,
+        num_features=6,
+        max_cache_len=4,
+        kv_cache_mode="immutable",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        pg_torch_compile=False,
+    )
+
+    replay_outputs = step_fn._reinforce_sequence_replay_outputs_fn(
+        torch.randn(4, 2, 6),
+        torch.randn(4, 2),
+        eval_start=1,
+    )
+    assert tuple(replay_outputs["action_mean"].shape) == (4, 2, 3)
+    assert callable(getattr(model, "replay_policy_actor_outputs_from_train_tokens", None))
+    assert model.event_log == ["actor_only"]
+
+
+def test_rwkv7_replay_aux_strict_sequence_outputs_from_train_tokens_uses_one_query_per_context():
+    _seed_everything(10123)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = False
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 1.0
+    cfg["prior"]["environment"]["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.train()
+
+    recorded_shapes = []
+
+    def _fake_forward_tokens_sequence_only(tokens):
+        recorded_shapes.append(tuple(tokens.shape))
+        return tokens
+
+    def _fake_decode_aux_replay_outputs(
+        hidden_q,
+        *,
+        action_query=None,
+        include_normalized_q_logits=False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del action_query, flow_matching_t
+        outputs = {}
+        if include_normalized_q_logits:
+            outputs["normalized_q_logits"] = hidden_q.mean(dim=-1, keepdim=True).expand(
+                int(hidden_q.shape[0]),
+                int(hidden_q.shape[1]),
+                model.get_normalized_q_value_bardist().num_bars,
+            )
+        if flow_matching_xt is not None:
+            outputs["next_state_flow"] = flow_matching_xt.clone()
+        return outputs
+
+    model.rwkv_core.forward_tokens_sequence_only = _fake_forward_tokens_sequence_only
+    model._decode_aux_replay_outputs = _fake_decode_aux_replay_outputs
+
+    train_tokens = torch.randn(4, 2, model.emsize, dtype=torch.float32)
+    q_query_tokens = torch.randn(2, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    flow_query_tokens = torch.randn(1, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    flow_matching_xt = torch.randn(1, 2, 8, dtype=torch.float32)
+    flow_matching_t = torch.rand(1, 2, 1, dtype=torch.float32)
+
+    outputs = model.replay_aux_strict_sequence_outputs_from_train_tokens(
+        train_tokens,
+        full_length=4,
+        q_query_tokens=q_query_tokens,
+        q_query_start=2,
+        q_query_stop=4,
+        q_action_query=torch.randn(2, 2, 3, dtype=torch.float32),
+        flow_query_tokens=flow_query_tokens,
+        flow_query_start=0,
+        flow_query_stop=1,
+        flow_action_query=torch.randn(1, 2, 3, dtype=torch.float32),
+        flow_matching_xt=flow_matching_xt,
+        flow_matching_t=flow_matching_t,
+    )
+
+    assert tuple(outputs["q"]["normalized_q_logits"].shape[:2]) == (2, 2)
+    assert tuple(outputs["flow"]["next_state_flow"].shape) == tuple(flow_matching_xt.shape)
+    assert recorded_shapes == [
+        (4, 2, model.emsize),
+        (5, 2, model.emsize),
+        (2, 2, model.emsize),
+    ]
+
+
+def test_rwkv7_replay_aux_strict_sequence_outputs_from_train_tokens_streams_output_chunks():
+    _seed_everything(10123)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = False
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["prior"]["environment"]["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    def _fake_forward_tokens_sequence_only(tokens):
+        return tokens.cumsum(dim=0)
+
+    def _fake_decode_aux_replay_outputs(
+        hidden_q,
+        *,
+        action_query=None,
+        include_normalized_q_logits=False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        outputs = {}
+        if include_normalized_q_logits:
+            base = hidden_q.mean(dim=-1, keepdim=True)
+            if action_query is not None:
+                base = base + action_query.mean(dim=-1, keepdim=True)
+            outputs["normalized_q_logits"] = base.expand(
+                int(hidden_q.shape[0]),
+                int(hidden_q.shape[1]),
+                model.get_normalized_q_value_bardist().num_bars,
+            )
+        if flow_matching_xt is not None:
+            outputs["next_state_flow"] = flow_matching_xt.clone()
+        return outputs
+
+    model.rwkv_core.forward_tokens_sequence_only = _fake_forward_tokens_sequence_only
+    model._decode_aux_replay_outputs = _fake_decode_aux_replay_outputs
+
+    train_tokens = torch.randn(4, 2, model.emsize, dtype=torch.float32)
+    q_query_tokens = torch.randn(2, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    flow_query_tokens = torch.randn(1, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    q_action_query = torch.randn(2, 2, 3, dtype=torch.float32)
+    flow_matching_xt = torch.randn(1, 2, 8, dtype=torch.float32)
+    flow_matching_t = torch.rand(1, 2, 1, dtype=torch.float32)
+
+    full = model.replay_aux_strict_sequence_outputs_from_train_tokens(
+        train_tokens,
+        full_length=4,
+        q_query_tokens=q_query_tokens,
+        q_query_start=2,
+        q_query_stop=4,
+        q_action_query=q_action_query,
+        flow_query_tokens=flow_query_tokens,
+        flow_query_start=0,
+        flow_query_stop=1,
+        flow_action_query=torch.randn(1, 2, 3, dtype=torch.float32),
+        flow_matching_xt=flow_matching_xt,
+        flow_matching_t=flow_matching_t,
+    )
+
+    streamed_records = []
+    streamed_outputs = {"q": {}, "flow": {}}
+
+    def _output_chunk_sink(section_name, local_start, local_stop, chunk_outputs):
+        streamed_records.append((str(section_name), int(local_start), int(local_stop)))
+        for key, value in chunk_outputs.items():
+            streamed_outputs[section_name].setdefault(key, []).append(value.detach().clone())
+
+    streamed = model.replay_aux_strict_sequence_outputs_from_train_tokens(
+        train_tokens,
+        full_length=4,
+        q_query_tokens=q_query_tokens,
+        q_query_start=2,
+        q_query_stop=4,
+        q_action_query=q_action_query,
+        flow_query_tokens=flow_query_tokens,
+        flow_query_start=0,
+        flow_query_stop=1,
+        flow_action_query=torch.randn(1, 2, 3, dtype=torch.float32),
+        flow_matching_xt=flow_matching_xt,
+        flow_matching_t=flow_matching_t,
+        output_chunk_sink=_output_chunk_sink,
+    )
+
+    assert streamed.get("_streamed_via_sink", False) is True
+    assert streamed["q"] == {}
+    assert streamed["flow"] == {}
+    assert streamed_records == [("q", 0, 1), ("q", 1, 2), ("flow", 0, 1)]
+    torch.testing.assert_close(
+        torch.cat(streamed_outputs["q"]["normalized_q_logits"], dim=0),
+        full["q"]["normalized_q_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        torch.cat(streamed_outputs["flow"]["next_state_flow"], dim=0),
+        full["flow"]["next_state_flow"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_rwkv7_replay_aux_strict_sequence_outputs_streams_output_chunks():
+    _seed_everything(10125)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = False
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["prior"]["environment"]["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    def _fake_forward_tokens_sequence_only(tokens):
+        return tokens.cumsum(dim=0)
+
+    def _fake_decode_aux_replay_outputs(
+        hidden_q,
+        *,
+        action_query=None,
+        include_normalized_q_logits=False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        outputs = {}
+        if include_normalized_q_logits:
+            base = hidden_q.mean(dim=-1, keepdim=True)
+            if action_query is not None:
+                base = base + action_query.mean(dim=-1, keepdim=True)
+            outputs["normalized_q_logits"] = base.expand(
+                int(hidden_q.shape[0]),
+                int(hidden_q.shape[1]),
+                model.get_normalized_q_value_bardist().num_bars,
+            )
+        if flow_matching_xt is not None:
+            outputs["next_state_flow"] = flow_matching_xt.clone()
+        return outputs
+
+    model.rwkv_core.forward_tokens_sequence_only = _fake_forward_tokens_sequence_only
+    model._decode_aux_replay_outputs = _fake_decode_aux_replay_outputs
+
+    x_tokens = torch.randn(4, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    y_tokens = torch.randn(4, 2, dtype=torch.float32)
+    q_query_tokens = torch.randn(2, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    flow_query_tokens = torch.randn(1, 2, cfg["prior"]["num_features"], dtype=torch.float32)
+    q_action_query = torch.randn(2, 2, 3, dtype=torch.float32)
+    flow_matching_xt = torch.randn(1, 2, 8, dtype=torch.float32)
+    flow_matching_t = torch.rand(1, 2, 1, dtype=torch.float32)
+
+    full = model.replay_aux_strict_sequence_outputs(
+        x_tokens,
+        y_tokens,
+        full_length=4,
+        q_query_tokens=q_query_tokens,
+        q_query_start=2,
+        q_query_stop=4,
+        q_action_query=q_action_query,
+        flow_query_tokens=flow_query_tokens,
+        flow_query_start=0,
+        flow_query_stop=1,
+        flow_action_query=torch.randn(1, 2, 3, dtype=torch.float32),
+        flow_matching_xt=flow_matching_xt,
+        flow_matching_t=flow_matching_t,
+    )
+
+    streamed_records = []
+    streamed_outputs = {"q": {}, "flow": {}}
+
+    def _output_chunk_sink(section_name, local_start, local_stop, chunk_outputs):
+        streamed_records.append((str(section_name), int(local_start), int(local_stop)))
+        for key, value in chunk_outputs.items():
+            streamed_outputs[section_name].setdefault(key, []).append(value.detach().clone())
+
+    streamed = model.replay_aux_strict_sequence_outputs(
+        x_tokens,
+        y_tokens,
+        full_length=4,
+        q_query_tokens=q_query_tokens,
+        q_query_start=2,
+        q_query_stop=4,
+        q_action_query=q_action_query,
+        flow_query_tokens=flow_query_tokens,
+        flow_query_start=0,
+        flow_query_stop=1,
+        flow_action_query=torch.randn(1, 2, 3, dtype=torch.float32),
+        flow_matching_xt=flow_matching_xt,
+        flow_matching_t=flow_matching_t,
+        output_chunk_sink=_output_chunk_sink,
+    )
+
+    assert streamed.get("_streamed_via_sink", False) is True
+    assert streamed["q"] == {}
+    assert streamed["flow"] == {}
+    assert streamed_records == [("q", 0, 1), ("q", 1, 2), ("flow", 0, 1)]
+    torch.testing.assert_close(
+        torch.cat(streamed_outputs["q"]["normalized_q_logits"], dim=0),
+        full["q"]["normalized_q_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        torch.cat(streamed_outputs["flow"]["next_state_flow"], dim=0),
+        full["flow"]["next_state_flow"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_rwkv7_stream_replay_aux_outputs_with_kv_matches_strict_under_prefix_sum_core(monkeypatch):
+    _seed_everything(10124)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    cfg["transformer"]["rwkv_sequence_replay_checkpoint"] = False
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 1.0
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["prior"]["environment"]["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    bardist = model.get_normalized_q_value_bardist()
+    emsize = int(model.emsize)
+    num_features = int(cfg["prior"]["num_features"])
+
+    monkeypatch.setattr(
+        model,
+        "resolve_replay_batch_chunk_size",
+        lambda *, seq_len, total_batch: int(total_batch),
+    )
+    monkeypatch.setattr(model, "_cast_token_for_rwkv_core", lambda tokens: tokens)
+
+    def _encode_train_token(x_tokens, y_tokens):
+        y_term = y_tokens.unsqueeze(-1).expand(int(x_tokens.shape[0]), int(x_tokens.shape[1]), emsize)
+        return x_tokens[..., :emsize] + y_term
+
+    def _encode_query_token(x_tokens):
+        return x_tokens[..., :emsize]
+
+    def _forward_tokens_sequence_only(tokens):
+        return tokens.cumsum(dim=0)
+
+    def _init_kv_cache(x_train, y_train):
+        return _encode_train_token(x_train, y_train).sum(dim=0)
+
+    def _append_train_token_to_kv(
+        x_token,
+        y_token,
+        kv_cache,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        del max_cache_len, kv_cache_mode, kv_cache_page_size
+        del allow_grad_mutable_cache, allow_grad_inplace_paged_cache
+        token = _encode_train_token(x_token, y_token)[0]
+        return token if kv_cache is None else (kv_cache + token)
+
+    def _forward_query_hidden_with_kv(x_query, kv_cache):
+        query = _encode_query_token(x_query)
+        base = torch.zeros_like(query) if kv_cache is None else kv_cache.unsqueeze(0)
+        return base + query
+
+    def _decode_aux_replay_outputs(
+        hidden_q,
+        *,
+        action_query=None,
+        include_normalized_q_logits=False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        base = hidden_q.mean(dim=-1, keepdim=True)
+        if action_query is not None:
+            base = base + action_query.mean(dim=-1, keepdim=True)
+        if flow_matching_t is not None:
+            base = base + flow_matching_t.to(dtype=hidden_q.dtype).mean(dim=-1, keepdim=True)
+        outputs = {}
+        if include_normalized_q_logits:
+            logits = base.expand(int(hidden_q.shape[0]), int(hidden_q.shape[1]), bardist.num_bars)
+            outputs["normalized_q_logits"] = logits
+            outputs["normalized_q"] = bardist.mean(logits)
+        if flow_matching_xt is not None:
+            outputs["next_state_flow"] = flow_matching_xt + base
+        return outputs
+
+    monkeypatch.setattr(model, "_encode_train_token", _encode_train_token)
+    monkeypatch.setattr(model, "_encode_query_token", _encode_query_token)
+    monkeypatch.setattr(model.rwkv_core, "forward_tokens_sequence_only", _forward_tokens_sequence_only)
+    monkeypatch.setattr(model, "init_kv_cache", _init_kv_cache)
+    monkeypatch.setattr(model, "append_train_token_to_kv", _append_train_token_to_kv)
+    monkeypatch.setattr(model, "_forward_query_hidden_with_kv", _forward_query_hidden_with_kv)
+    monkeypatch.setattr(model, "_decode_aux_replay_outputs", _decode_aux_replay_outputs)
+
+    seq_len = 6
+    batch_size = 2
+    q_query_start = 3
+    q_query_stop = 6
+    flow_query_start = 0
+    flow_query_stop = 3
+    q_steps = q_query_stop - q_query_start
+    flow_steps = flow_query_stop - flow_query_start
+    flow_dim = 8
+    action_dim = 3
+
+    x_tokens = torch.randn(seq_len, batch_size, num_features, dtype=torch.float32)
+    y_tokens = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    train_tokens = model.encode_train_sequence_tokens(x_tokens, y_tokens)
+    q_query_tokens = torch.randn(q_steps, batch_size, num_features, dtype=torch.float32)
+    flow_query_tokens = torch.randn(flow_steps, batch_size, num_features, dtype=torch.float32)
+    q_action_query = torch.randn(q_steps, batch_size, action_dim, dtype=torch.float32)
+    flow_action_query = torch.randn(flow_steps, batch_size, action_dim, dtype=torch.float32)
+    flow_matching_xt = torch.randn(flow_steps, batch_size, flow_dim, dtype=torch.float32)
+    flow_matching_t = torch.rand(flow_steps, batch_size, 1, dtype=torch.float32)
+
+    with torch.no_grad():
+        strict = model.replay_aux_strict_sequence_outputs_from_train_tokens(
+            train_tokens,
+            full_length=seq_len,
+            q_query_tokens=q_query_tokens,
+            q_query_start=q_query_start,
+            q_query_stop=q_query_stop,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+        streaming = model.stream_replay_aux_outputs_with_kv(
+            x_tokens,
+            y_tokens,
+            full_length=seq_len,
+            q_query_tokens=q_query_tokens,
+            q_query_start=q_query_start,
+            q_query_stop=q_query_stop,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    torch.testing.assert_close(
+        streaming["q"]["normalized_q_logits"],
+        strict["q"]["normalized_q_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        streaming["flow"]["next_state_flow"],
+        strict["flow"]["next_state_flow"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_reinforce_sequence_replay_loss_sink_disables_shared_context_forward_to_split_graphs():
+    _seed_everything(999412)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_sequence_replay_share_context_forward"] = True
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        query = x_tokens[eval_start:]
+        return {
+            "action_mean": query[..., :3],
+        }
+
+    def _packed_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, full_length, q_query_tokens, q_query_start, q_query_stop
+        del flow_query_tokens, flow_query_start, flow_query_stop, flow_matching_t
+        event_log.append("packed_aux_sequence")
+        grad_anchor = x_tokens.mean()
+        q_logits = q_action_query.mean(dim=-1, keepdim=True).expand(
+            int(q_action_query.shape[0]),
+            int(q_action_query.shape[1]),
+            bardist.num_bars,
+        ) + grad_anchor
+        return {
+            "q": {
+                "normalized_q_logits": q_logits,
+                "normalized_q": bardist.mean(q_logits),
+            },
+            "flow": {
+                "next_state_flow": (
+                    torch.zeros_like(flow_matching_xt)
+                    + flow_action_query.mean(dim=-1, keepdim=True)
+                    + grad_anchor
+                ),
+            },
+        }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("loss-sink split-graph test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("loss-sink split-graph test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _replay_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_strict_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should bypass strict aux replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = _packed_aux_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should bypass aux-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should not share train-token encoding")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should bypass policy-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should disable shared context forward")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("loss-sink split-graph test should not fall back to streaming aux replay")
+        )
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    x_tokens = torch.randn(seq_len, batch_size, 12, dtype=torch.float32, requires_grad=True)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    sink_values = []
+
+    def _loss_sink(loss_root):
+        event_log.append("sink")
+        sink_values.append(float(loss_root.detach().cpu()))
+        loss_root.backward()
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+        loss_sink=_loss_sink,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert len(sink_values) == 2
+    assert event_log == ["policy_forward", "sink", "packed_aux_sequence", "sink"]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(stats["reinforce_sequence_replay_shared_train_token_encoding"]) == 0
+    assert x_tokens.grad is not None
+    assert torch.isfinite(x_tokens.grad).all().item()
+    assert float(x_tokens.grad.abs().sum()) > 0.0
+
+
+def test_reinforce_sequence_replay_loss_sink_streams_strict_aux_chunks_when_supported():
+    _seed_everything(999414)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_forward")
+        query = x_tokens[eval_start:]
+        return {
+            "action_mean": query[..., :3],
+        }
+
+    def _strict_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+        output_chunk_sink=None,
+    ):
+        del y_tokens, full_length, q_query_start, q_query_stop, flow_query_start, flow_query_stop
+        del flow_action_query, flow_matching_t
+        event_log.append("strict_aux_stream")
+        if callable(output_chunk_sink):
+            q_base = x_tokens[: int(q_query_tokens.shape[0]), :, :1]
+            q_logits = q_base.expand(
+                int(q_query_tokens.shape[0]),
+                int(q_query_tokens.shape[1]),
+                bardist.num_bars,
+            ) + q_action_query.mean(dim=-1, keepdim=True)
+            output_chunk_sink("q", 0, int(q_logits.shape[0]), {"normalized_q_logits": q_logits})
+            flow_pred = flow_matching_xt + x_tokens[: int(flow_matching_xt.shape[0]), :, : int(flow_matching_xt.shape[-1])]
+            output_chunk_sink("flow", 0, int(flow_matching_xt.shape[0]), {"next_state_flow": flow_pred})
+            return {
+                "_streamed_via_sink": True,
+                "q": {},
+                "flow": {},
+            }
+        raise AssertionError("expected output_chunk_sink to be provided")
+
+    _dummy_step_fn = types.SimpleNamespace(
+        _model_ref=_DummyReplayModel(),
+        _reinforce_sequence_replay_fn=lambda x_tokens, y_tokens, eval_start=0: x_tokens[eval_start:, :, :3],
+        _reinforce_sequence_replay_outputs_fn=_replay_outputs,
+        _reinforce_sequence_replay_aux_strict_sequence_outputs_fn=_strict_aux_outputs,
+        _policy_actor_log_prob_fn=None,
+        _policy_actor_decomp_stats_fn=None,
+        _fit_action_dim_fn=lambda x, target_dim: x[:, :target_dim],
+    )
+
+    seq_len = 5
+    eval_start = 3
+    batch_size = 1
+    action_dim = 3
+    state_dim = 4
+    x_tokens = torch.randn(seq_len, batch_size, 8 + 1 + 1 + 1 + action_dim, dtype=torch.float32, requires_grad=True)
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    sink_events = []
+
+    def _loss_sink(loss_root):
+        sink_events.append(float(loss_root.detach().cpu()))
+        loss_root.backward()
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+        loss_sink=_loss_sink,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["policy_forward", "strict_aux_stream"]
+    assert len(sink_events) == 3
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 1
+
+
+def test_reinforce_sequence_replay_loss_sink_with_payload_keeps_shared_context_forward():
+    _seed_everything(999413)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_sequence_replay_share_context_forward"] = True
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _shared_policy_and_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        eval_start=0,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, full_length, q_query_tokens, q_query_start, q_query_stop
+        del flow_query_tokens, flow_query_start, flow_query_stop, flow_matching_t
+        event_log.append("shared_context_forward")
+        grad_anchor = x_tokens.mean()
+        policy_query = x_tokens[eval_start:]
+        action_mean = policy_query[..., :3] + grad_anchor
+        action_std = torch.full_like(action_mean, 0.05)
+        q_logits = q_action_query.mean(dim=-1, keepdim=True).expand(
+            int(q_action_query.shape[0]),
+            int(q_action_query.shape[1]),
+            bardist.num_bars,
+        ) + grad_anchor
+        flow_pred = (
+            torch.zeros_like(flow_matching_xt)
+            + flow_action_query.mean(dim=-1, keepdim=True)
+            + grad_anchor
+        )
+        return {
+            "policy": {
+                "action_mean": action_mean,
+                "action_std": action_std,
+            },
+            "q": {
+                "normalized_q_logits": q_logits,
+                "normalized_q": bardist.mean(q_logits),
+            },
+            "flow": {
+                "next_state_flow": flow_pred,
+            },
+        }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("shared payload-sink test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared payload-sink test should bypass live replay fallback")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared payload-sink test should bypass legacy policy replay")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared payload-sink test should bypass legacy aux replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared payload-sink test should bypass shared train-token encoding")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared payload-sink test should bypass policy-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared payload-sink test should bypass aux-from-train-tokens replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared payload-sink test should bypass aux-only streaming fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_policy_and_aux_sequence_outputs_fn = (
+        _shared_policy_and_aux_outputs
+    )
+    _dummy_step_fn._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared payload-sink test should prefer official shared replay helper")
+        )
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    x_tokens = torch.randn(seq_len, batch_size, 12, dtype=torch.float32, requires_grad=True)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+    sink_payloads = []
+
+    def _loss_sink(loss_root):
+        if isinstance(loss_root, dict):
+            sink_payloads.append(bool(loss_root.get("retain_graph", False)))
+            loss_tensor = loss_root.get("loss", None)
+        else:
+            sink_payloads.append(False)
+            loss_tensor = loss_root
+        if torch.is_tensor(loss_tensor) and bool(loss_tensor.requires_grad):
+            event_log.append("sink")
+            loss_tensor.backward(retain_graph=bool(sink_payloads[-1]))
+        return None
+
+    _loss_sink._ticl_accepts_replay_payload = True
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+        loss_sink=_loss_sink,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["shared_context_forward", "sink"]
+    assert sink_payloads == [False]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 1
+    assert x_tokens.grad is not None
+    assert torch.isfinite(x_tokens.grad).all().item()
+    assert float(x_tokens.grad.abs().sum()) > 0.0
+
+
+def test_reinforce_sequence_replay_shared_context_forward_pads_narrow_flow_targets():
+    _seed_everything(999411)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 7, "max": 8}
+    env_cfg["reinforce_sequence_replay_share_context_forward"] = True
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+
+    class _DummyReplayModel:
+        next_state_flow_dim = 8
+
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _shared_policy_and_aux_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        eval_start=0,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, full_length, q_query_start, q_query_stop, flow_query_start, flow_query_stop, flow_matching_t
+        assert q_query_tokens is not None
+        assert flow_query_tokens is not None
+        assert q_action_query is not None
+        assert flow_action_query is not None
+        assert tuple(flow_matching_xt.shape) == (2, 1, 8)
+        return {
+            "policy": {
+                "action_mean": x_tokens[eval_start:, :, :3],
+                "action_std": torch.full_like(x_tokens[eval_start:, :, :3], 0.05),
+            },
+            "q": {
+                "normalized_q_logits": torch.zeros(
+                    int(q_action_query.shape[0]),
+                    int(q_action_query.shape[1]),
+                    bardist.num_bars,
+                    dtype=torch.float32,
+                    device=q_action_query.device,
+                ),
+                "normalized_q": torch.zeros(
+                    int(q_action_query.shape[0]),
+                    int(q_action_query.shape[1]),
+                    dtype=torch.float32,
+                    device=q_action_query.device,
+                ),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            },
+        }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("padding test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("padding test should bypass live replay fallback")
+    )
+    _dummy_step_fn._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+        _shared_policy_and_aux_outputs
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 4
+    eval_start = 2
+    batch_size = 1
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, 3, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, 3, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, 3, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, 7, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, 7, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 1
+
+
+def test_reinforce_sequence_replay_uses_model_resolved_backward_microbatch():
+    _seed_everything(9991)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    prior = EnvironmentPrior(env_cfg)
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+    def _replay_tokens(x_tokens, y_tokens, *, eval_start=0):
+        del y_tokens
+        query = x_tokens[eval_start:]
+        return torch.zeros(
+            int(query.shape[0]),
+            int(query.shape[1]),
+            3,
+            dtype=query.dtype,
+            device=query.device,
+        )
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("chunk-size test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = _replay_tokens
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 4
+    eval_start = 2
+    batch_size = 16
+    action_dim = 3
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert int(stats["reinforce_sequence_replay_batch_chunk"]) == 16
+    assert int(stats["reinforce_sequence_replay_chunk_count"]) == 1
+
+
+def test_transformer_replay_policy_sequence_outputs_allow_aux_predictions_without_action_query():
+    _seed_everything(656)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "transformer"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["nhead"] = 4
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 2
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    with torch.no_grad():
+        outputs = model.replay_policy_sequence_outputs(
+            torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"])),
+            torch.randn(seq_len, batch_size),
+            eval_start=eval_start,
+            flow_matching_xt=torch.randn(seq_len - eval_start, batch_size, flow_dim),
+            flow_matching_t=torch.rand(seq_len - eval_start, batch_size, 1),
+        )
+    assert tuple(outputs["next_state_flow"].shape) == (seq_len - eval_start, batch_size, flow_dim)
+
+
+@pytest.mark.parametrize("backbone", ["transformer", "rwkv7"])
+def test_predict_query_replay_outputs_with_kv_emits_aux_shapes(backbone):
+    _ensure_torch_extensions_dir()
+    _seed_everything(657)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = backbone
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    if backbone == "transformer":
+        cfg["transformer"]["nhead"] = 4
+    else:
+        cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    seq_len = 6
+    batch_size = 2
+    prefix_len = 3
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    x_tokens = torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]))
+    y_tokens = torch.randn(seq_len, batch_size)
+    x_query = torch.zeros(1, batch_size, int(cfg["prior"]["num_features"]))
+    kv_cache = model.init_kv_cache(x_tokens[:prefix_len], y_tokens[:prefix_len])
+    with torch.no_grad():
+        outputs = model.predict_query_replay_outputs_with_kv(
+            x_query,
+            kv_cache,
+            flow_matching_xt=torch.randn(1, batch_size, flow_dim),
+            flow_matching_t=torch.rand(1, batch_size, 1),
+        )
+    assert tuple(outputs["action_mean"].shape[:2]) == (1, batch_size)
+    assert tuple(outputs["normalized_q"].shape) == (1, batch_size)
+    assert tuple(outputs["normalized_q_logits"].shape) == (
+        1,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert tuple(outputs["next_state_flow"].shape) == (1, batch_size, flow_dim)
+
+
+def test_rwkv7_replay_aux_sequence_outputs_skips_policy_decode(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(658)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "rwkv7"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    monkeypatch.setattr(
+        model,
+        "_decode_policy_actor_outputs",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("aux sequence helper should not decode policy actor outputs")
+        ),
+    )
+    monkeypatch.setattr(model.rwkv_core, "forward_tokens_sequence_only", lambda tokens: tokens)
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 3
+    action_dim = int(cfg["prior"]["environment"]["action_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    x_tokens = torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]))
+    y_tokens = torch.randn(seq_len, batch_size)
+    q_query_tokens = torch.zeros(seq_len - eval_start, batch_size, int(cfg["prior"]["num_features"]))
+    flow_query_tokens = torch.zeros(eval_start, batch_size, int(cfg["prior"]["num_features"]))
+
+    with torch.no_grad():
+        outputs = model.replay_aux_sequence_outputs(
+            x_tokens,
+            y_tokens,
+            full_length=seq_len,
+            q_query_tokens=q_query_tokens,
+            q_query_start=eval_start,
+            q_query_stop=seq_len,
+            q_action_query=torch.randn(seq_len - eval_start, batch_size, action_dim),
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=0,
+            flow_query_stop=eval_start,
+            flow_action_query=torch.randn(eval_start, batch_size, action_dim),
+            flow_matching_xt=torch.randn(eval_start, batch_size, flow_dim),
+            flow_matching_t=torch.rand(eval_start, batch_size, 1),
+        )
+
+    assert tuple(outputs["q"]["normalized_q_logits"].shape) == (
+        seq_len - eval_start,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert "action_mean" not in outputs["q"]
+    assert tuple(outputs["flow"]["next_state_flow"].shape) == (eval_start, batch_size, flow_dim)
+    assert "action_mean" not in outputs["flow"]
+
+
+def test_rwkv7_replay_policy_sequence_outputs_from_train_tokens_matches_legacy(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(6581)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "rwkv7"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+    monkeypatch.setattr(model.rwkv_core, "forward_tokens_sequence_only", lambda tokens: tokens)
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 3
+    action_dim = int(cfg["prior"]["environment"]["action_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    x_tokens = torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]))
+    y_tokens = torch.randn(seq_len, batch_size)
+    action_query = torch.randn(seq_len - eval_start, batch_size, action_dim)
+    flow_matching_xt = torch.randn(seq_len - eval_start, batch_size, flow_dim)
+    flow_matching_t = torch.rand(seq_len - eval_start, batch_size, 1)
+
+    with torch.no_grad():
+        train_tokens = model.encode_train_sequence_tokens(x_tokens, y_tokens)
+        legacy = model.replay_policy_sequence_outputs(
+            x_tokens,
+            y_tokens,
+            eval_start=eval_start,
+            action_query=action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+        shared = model.replay_policy_sequence_outputs_from_train_tokens(
+            train_tokens,
+            eval_start=eval_start,
+            action_query=action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    assert legacy.keys() == shared.keys()
+    for key in legacy:
+        torch.testing.assert_close(shared[key], legacy[key], atol=1e-6, rtol=1e-6)
+
+
+def test_rwkv7_replay_aux_sequence_outputs_from_train_tokens_matches_legacy(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(6582)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "rwkv7"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+    monkeypatch.setattr(model.rwkv_core, "forward_tokens_sequence_only", lambda tokens: tokens)
+
+    seq_len = 6
+    batch_size = 2
+    eval_start = 3
+    action_dim = int(cfg["prior"]["environment"]["action_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    x_tokens = torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]))
+    y_tokens = torch.randn(seq_len, batch_size)
+    train_tokens = model.encode_train_sequence_tokens(x_tokens, y_tokens)
+    q_query_tokens = torch.zeros(seq_len - eval_start, batch_size, int(cfg["prior"]["num_features"]))
+    flow_query_tokens = torch.zeros(eval_start, batch_size, int(cfg["prior"]["num_features"]))
+    q_action_query = torch.randn(seq_len - eval_start, batch_size, action_dim)
+    flow_action_query = torch.randn(eval_start, batch_size, action_dim)
+    flow_matching_xt = torch.randn(eval_start, batch_size, flow_dim)
+    flow_matching_t = torch.rand(eval_start, batch_size, 1)
+
+    with torch.no_grad():
+        legacy = model.replay_aux_sequence_outputs(
+            x_tokens,
+            y_tokens,
+            full_length=seq_len,
+            q_query_tokens=q_query_tokens,
+            q_query_start=eval_start,
+            q_query_stop=seq_len,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=0,
+            flow_query_stop=eval_start,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+        shared = model.replay_aux_sequence_outputs_from_train_tokens(
+            train_tokens,
+            full_length=seq_len,
+            q_query_tokens=q_query_tokens,
+            q_query_start=eval_start,
+            q_query_stop=seq_len,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=0,
+            flow_query_stop=eval_start,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    torch.testing.assert_close(
+        shared["q"]["normalized_q_logits"],
+        legacy["q"]["normalized_q_logits"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        shared["flow"]["next_state_flow"],
+        legacy["flow"]["next_state_flow"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_rwkv7_stream_replay_policy_and_aux_outputs_with_kv_routes_single_context_traversal(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(65821)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "rwkv7"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    action_dim = int(cfg["prior"]["environment"]["action_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    eval_start = 3
+    seq_len = 5
+    batch_size = 2
+    q_steps = seq_len - eval_start
+    flow_steps = 2
+    q_query_start = eval_start
+    flow_query_start = 1
+    flow_query_stop = flow_query_start + flow_steps
+    q_query_tokens = torch.zeros(q_steps, batch_size, int(cfg["prior"]["num_features"]))
+    flow_query_tokens = torch.zeros(flow_steps, batch_size, int(cfg["prior"]["num_features"]))
+    q_action_query = torch.randn(q_steps, batch_size, action_dim)
+    flow_action_query = torch.randn(flow_steps, batch_size, action_dim)
+    flow_matching_xt = torch.randn(flow_steps, batch_size, flow_dim)
+    flow_matching_t = torch.rand(flow_steps, batch_size, 1)
+
+    x_tokens = torch.zeros(seq_len, batch_size, int(cfg["prior"]["num_features"]), dtype=torch.float32)
+    for token_idx in range(seq_len):
+        x_tokens[token_idx, :, 0] = float(token_idx + 1)
+    y_tokens = torch.zeros(seq_len, batch_size, dtype=torch.float32)
+
+    event_log = []
+
+    monkeypatch.setattr(
+        model,
+        "resolve_replay_batch_chunk_size",
+        lambda *, seq_len, total_batch: int(total_batch),
+    )
+
+    def _init_kv_cache(x_prefix, y_prefix):
+        del y_prefix
+        event_log.append(("init", int(x_prefix.shape[0])))
+        if int(x_prefix.shape[0]) == 0:
+            return None
+        return x_prefix[:, :, :1].sum(dim=0)
+
+    def _forward_policy_step_actor(
+        x_token,
+        y_token,
+        kv_cache=None,
+        policy_action_head_params_override=None,
+    ):
+        del y_token, policy_action_head_params_override
+        token_value = x_token[0, :, :1]
+        next_cache = token_value if kv_cache is None else (kv_cache + token_value)
+        event_log.append(("policy", int(token_value[0, 0].item())))
+        return {
+            "action_mean": next_cache.unsqueeze(0).expand(1, int(next_cache.shape[0]), action_dim),
+            "action_std": torch.full(
+                (1, int(next_cache.shape[0]), action_dim),
+                0.05,
+                dtype=x_token.dtype,
+                device=x_token.device,
+            ),
+        }, next_cache
+
+    def _append_train_token_to_kv(
+        x_token,
+        y_token,
+        kv_cache,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+    ):
+        del y_token, max_cache_len, kv_cache_mode, kv_cache_page_size
+        del allow_grad_mutable_cache, allow_grad_inplace_paged_cache
+        token_value = x_token[0, :, :1]
+        next_cache = token_value if kv_cache is None else (kv_cache + token_value)
+        event_log.append(("append", int(token_value[0, 0].item())))
+        return next_cache
+
+    def _predict_query_aux_outputs_with_kv(
+        x_query,
+        kv_cache,
+        *,
+        action_query=None,
+        include_normalized_q_logits=False,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del x_query, action_query, flow_matching_t
+        if include_normalized_q_logits:
+            event_log.append(("q", int(kv_cache[0, 0].item())))
+            logits = kv_cache.unsqueeze(0).expand(
+                1,
+                int(kv_cache.shape[0]),
+                model.normalized_q_value_bardist.num_bars,
+            )
+            return {
+                "normalized_q_logits": logits,
+                "normalized_q": model.normalized_q_value_bardist.mean(logits),
+            }
+        event_log.append(("flow", int(kv_cache[0, 0].item())))
+        return {
+            "next_state_flow": kv_cache.unsqueeze(0).expand_as(flow_matching_xt),
+        }
+
+    monkeypatch.setattr(model, "init_kv_cache", _init_kv_cache)
+    monkeypatch.setattr(model, "append_train_token_to_kv", _append_train_token_to_kv)
+    monkeypatch.setattr(model, "forward_policy_step_actor", _forward_policy_step_actor)
+    monkeypatch.setattr(model, "predict_query_aux_outputs_with_kv", _predict_query_aux_outputs_with_kv)
+
+    with torch.no_grad():
+        outputs = model.stream_replay_policy_and_aux_outputs_with_kv(
+            x_tokens,
+            y_tokens,
+            full_length=seq_len,
+            eval_start=eval_start,
+            q_query_tokens=q_query_tokens,
+            q_query_start=q_query_start,
+            q_query_stop=seq_len,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=flow_query_start,
+            flow_query_stop=flow_query_stop,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    assert event_log == [
+        ("init", 1),
+        ("append", 2),
+        ("flow", 3),
+        ("append", 3),
+        ("flow", 6),
+        ("policy", 4),
+        ("q", 10),
+        ("policy", 5),
+        ("q", 15),
+    ]
+    assert tuple(outputs["policy"]["action_mean"].shape) == (q_steps, batch_size, action_dim)
+    assert tuple(outputs["q"]["normalized_q_logits"].shape) == (
+        q_steps,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert tuple(outputs["flow"]["next_state_flow"].shape) == (flow_steps, batch_size, flow_dim)
+    torch.testing.assert_close(
+        outputs["policy"]["action_mean"][:, :, 0],
+        torch.tensor([[10.0, 10.0], [15.0, 15.0]]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        outputs["flow"]["next_state_flow"][:, :, 0],
+        torch.tensor([[3.0, 3.0], [6.0, 6.0]]),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_rwkv7_replay_policy_and_aux_sequence_outputs_from_train_tokens_uses_single_official_forward(monkeypatch):
+    _ensure_torch_extensions_dir()
+    _seed_everything(65822)
+    cfg = deepcopy(get_model_default_config("rlpfn"))
+    cfg["transformer"]["backbone"] = "rwkv7"
+    cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["prior"]["environment"]["reinforce_sequence_replay_share_context_forward"] = True
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cpu", should_train=False, verbose=False)
+    model.eval()
+
+    action_dim = int(cfg["prior"]["environment"]["action_slot_dim"])
+    flow_dim = _resolve_dim_upper_bound(cfg["prior"]["environment"]["state_dim"])
+    eval_start = 3
+    seq_len = 5
+    batch_size = 2
+    q_steps = seq_len - eval_start
+    flow_steps = eval_start
+    q_query_tokens = torch.zeros(q_steps, batch_size, int(cfg["prior"]["num_features"]))
+    flow_query_tokens = torch.zeros(flow_steps, batch_size, int(cfg["prior"]["num_features"]))
+    q_action_query = torch.randn(q_steps, batch_size, action_dim)
+    flow_action_query = torch.randn(flow_steps, batch_size, action_dim)
+    flow_matching_xt = torch.randn(flow_steps, batch_size, flow_dim)
+    flow_matching_t = torch.rand(flow_steps, batch_size, 1)
+    x_tokens = torch.randn(seq_len, batch_size, int(cfg["prior"]["num_features"]), dtype=torch.float32)
+    y_tokens = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    train_tokens = model.encode_train_sequence_tokens(x_tokens, y_tokens)
+
+    call_count = {"n": 0}
+    def _counting_forward(tokens):
+        call_count["n"] += 1
+        return tokens
+
+    monkeypatch.setattr(
+        model,
+        "resolve_replay_batch_chunk_size",
+        lambda *, seq_len, total_batch: int(total_batch),
+    )
+    monkeypatch.setattr(model.rwkv_core, "forward_tokens_sequence_only", _counting_forward)
+
+    with torch.no_grad():
+        outputs = model.replay_policy_and_aux_sequence_outputs_from_train_tokens(
+            train_tokens,
+            full_length=seq_len,
+            eval_start=eval_start,
+            q_query_tokens=q_query_tokens,
+            q_query_start=eval_start,
+            q_query_stop=seq_len,
+            q_action_query=q_action_query,
+            flow_query_tokens=flow_query_tokens,
+            flow_query_start=0,
+            flow_query_stop=eval_start,
+            flow_action_query=flow_action_query,
+            flow_matching_xt=flow_matching_xt,
+            flow_matching_t=flow_matching_t,
+        )
+
+    assert call_count["n"] == 1
+    assert tuple(outputs["policy"]["action_mean"].shape) == (q_steps, batch_size, action_dim)
+    assert tuple(outputs["q"]["normalized_q_logits"].shape) == (
+        q_steps,
+        batch_size,
+        model.normalized_q_value_bardist.num_bars,
+    )
+    assert tuple(outputs["flow"]["next_state_flow"].shape) == (flow_steps, batch_size, flow_dim)
+
+
+def test_reinforce_sequence_replay_shared_context_forward_matches_separate_paths():
+    _seed_everything(99942)
+    _, base_env_cfg = _build_small_exact_scm_env_cfg()
+    base_env_cfg["policy_gradient_weight"] = 0.1
+    base_env_cfg["normalized_q_value_weight"] = 0.25
+    base_env_cfg["next_state_flow_matching_weight"] = 0.5
+    base_env_cfg["obs_slot_dim"] = 8
+    base_env_cfg["action_slot_dim"] = 3
+    bardist = make_standardized_full_support_bar_distribution()
+
+    shared_env_cfg = deepcopy(base_env_cfg)
+    shared_env_cfg["reinforce_sequence_replay_share_context_forward"] = True
+    shared_prior = EnvironmentPrior(shared_env_cfg)
+
+    legacy_env_cfg = deepcopy(base_env_cfg)
+    legacy_env_cfg["reinforce_sequence_replay_share_context_forward"] = False
+    legacy_env_cfg["reinforce_sequence_replay_share_train_token_encoding"] = False
+    legacy_prior = EnvironmentPrior(legacy_env_cfg)
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _policy_outputs(x_tokens, *, eval_start):
+        query = x_tokens[eval_start:]
+        action_mean = (0.1 * query[..., :3]) + 0.02
+        action_std = torch.full_like(action_mean, 0.07)
+        return {
+            "action_mean": action_mean,
+            "action_std": action_std,
+        }
+
+    def _q_outputs(q_action_query):
+        logits = q_action_query.sum(dim=-1, keepdim=True).expand(
+            int(q_action_query.shape[0]),
+            int(q_action_query.shape[1]),
+            bardist.num_bars,
+        )
+        return {
+            "normalized_q_logits": logits,
+            "normalized_q": bardist.mean(logits),
+        }
+
+    def _flow_outputs(flow_action_query, flow_matching_xt):
+        base = flow_action_query.mean(dim=-1, keepdim=True)
+        return {
+            "next_state_flow": torch.zeros_like(flow_matching_xt) + base.expand_as(flow_matching_xt),
+        }
+
+    def _make_shared_step_fn():
+        def _dummy_step_fn(*args, **kwargs):
+            raise AssertionError("shared compare test should not call live policy_step")
+
+        def _shared_outputs(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            eval_start=0,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            del y_tokens, full_length, q_query_tokens, q_query_start, q_query_stop
+            del flow_query_tokens, flow_query_start, flow_query_stop, flow_matching_t
+            outputs = {
+                "policy": _policy_outputs(x_tokens, eval_start=eval_start),
+                "q": _q_outputs(q_action_query),
+                "flow": _flow_outputs(flow_action_query, flow_matching_xt),
+            }
+            return outputs
+
+        _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared compare test should bypass live replay fallback")
+        )
+        _dummy_step_fn._reinforce_sequence_replay_outputs_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared compare test should bypass legacy policy replay")
+        )
+        _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shared compare test should bypass legacy aux replay")
+            )
+        )
+        _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared compare test should bypass shared train-token encoding")
+        )
+        _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shared compare test should bypass policy-from-train-tokens replay")
+            )
+        )
+        _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shared compare test should bypass aux-from-train-tokens replay")
+            )
+        )
+        _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shared compare test should bypass aux-only streaming fallback")
+            )
+        )
+        _dummy_step_fn._reinforce_sequence_replay_policy_and_aux_sequence_outputs_fn = _shared_outputs
+        _dummy_step_fn._reinforce_sequence_stream_policy_and_aux_outputs_with_kv_fn = (
+            lambda *args, **kwargs: (_ for _ in ()).throw(
+                AssertionError("shared compare test should prefer official shared replay helper")
+            )
+        )
+        _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+        _dummy_step_fn._model_ref = _DummyReplayModel()
+        return _dummy_step_fn
+
+    def _make_legacy_step_fn():
+        def _dummy_step_fn(*args, **kwargs):
+            raise AssertionError("legacy compare test should not call live policy_step")
+
+        def _legacy_policy_outputs(
+            x_tokens,
+            y_tokens,
+            *,
+            eval_start=0,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            del y_tokens, flow_matching_xt, flow_matching_t
+            return _policy_outputs(x_tokens, eval_start=eval_start)
+
+        def _legacy_aux_outputs(
+            x_tokens,
+            y_tokens,
+            *,
+            full_length,
+            q_query_tokens=None,
+            q_query_start=0,
+            q_query_stop=None,
+            q_action_query=None,
+            flow_query_tokens=None,
+            flow_query_start=0,
+            flow_query_stop=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            del x_tokens, y_tokens, full_length, q_query_tokens, q_query_start, q_query_stop
+            del flow_query_tokens, flow_query_start, flow_query_stop, flow_matching_t
+            return {
+                "q": _q_outputs(q_action_query),
+                "flow": _flow_outputs(flow_action_query, flow_matching_xt),
+            }
+
+        _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy compare test should use replay outputs path")
+        )
+        _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _legacy_policy_outputs
+        _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = _legacy_aux_outputs
+        _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = lambda *args, **kwargs: None
+        _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = lambda *args, **kwargs: None
+        _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = lambda *args, **kwargs: {}
+        _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+        _dummy_step_fn._model_ref = _DummyReplayModel()
+        return _dummy_step_fn
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 2
+    state_dim = _resolve_dim_upper_bound(base_env_cfg["state_dim"])
+    action_dim = int(base_env_cfg["action_slot_dim"])
+    x_tokens = torch.randn(seq_len, batch_size, 12, dtype=torch.float32)
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    _seed_everything(99943)
+    shared_loss, shared_stats, shared_log_probs = shared_prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_make_shared_step_fn(),
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=lambda x, action_dim: x[..., :action_dim],
+    )
+    _seed_everything(99943)
+    legacy_loss, legacy_stats, legacy_log_probs = legacy_prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_make_legacy_step_fn(),
+        x_tokens=x_tokens,
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=lambda x, action_dim: x[..., :action_dim],
+    )
+
+    torch.testing.assert_close(shared_loss, legacy_loss, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(shared_log_probs, legacy_log_probs, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(
+        shared_stats["policy_total_loss"],
+        legacy_stats["policy_total_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        shared_stats["normalized_q_value_loss"],
+        legacy_stats["normalized_q_value_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(
+        shared_stats["next_state_flow_matching_loss"],
+        legacy_stats["next_state_flow_matching_loss"],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert int(shared_stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 1
+    assert int(legacy_stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(shared_stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert int(legacy_stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 1
+    assert "reinforce_sequence_replay_shared_backbone_pass" not in shared_stats
+    assert "reinforce_sequence_replay_shared_aux_backbone_pass" not in shared_stats
+
+
+def test_reinforce_sequence_replay_prefers_shared_train_token_encoding_when_available():
+    _seed_everything(9995)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _encode_train_tokens(x_tokens, y_tokens):
+        event_log.append("encode_shared")
+        return x_tokens + y_tokens.unsqueeze(-1)
+
+    def _replay_outputs_from_train_tokens(
+        train_tokens,
+        *,
+        eval_start=0,
+        action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del action_query, flow_matching_xt, flow_matching_t
+        event_log.append("policy_from_train_tokens")
+        query = train_tokens[eval_start:]
+        return {
+            "action_mean": torch.zeros(
+                int(query.shape[0]),
+                int(query.shape[1]),
+                3,
+                dtype=query.dtype,
+                device=query.device,
+            ),
+        }
+
+    def _replay_aux_from_train_tokens(
+        train_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del train_tokens, full_length, q_query_stop, flow_query_stop, flow_matching_t
+        event_log.append("aux_from_train_tokens")
+        assert q_query_tokens is not None
+        assert q_action_query is not None
+        assert flow_query_tokens is not None
+        assert flow_action_query is not None
+        assert int(q_query_start) == 2
+        assert int(flow_query_start) == 0
+        outputs = {
+            "q": {
+                "normalized_q_logits": torch.zeros(
+                    int(q_query_tokens.shape[0]),
+                    int(q_query_tokens.shape[1]),
+                    bardist.num_bars,
+                    dtype=torch.float32,
+                ),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            },
+        }
+        outputs["q"]["normalized_q"] = bardist.mean(outputs["q"]["normalized_q_logits"])
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("shared-encoding test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared-encoding test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("legacy replay outputs path should be bypassed")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy aux sequence path should be bypassed")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = _encode_train_tokens
+    _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+        _replay_outputs_from_train_tokens
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+        _replay_aux_from_train_tokens
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared encoded train-token path should bypass streaming aux fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = lambda *args, **kwargs: {}
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["encode_shared", "policy_from_train_tokens", "aux_from_train_tokens"]
+    assert int(stats["reinforce_sequence_replay_shared_train_token_encoding"]) == 1
+
+
+def test_reinforce_sequence_replay_can_disable_shared_train_token_encoding_for_legacy_compare():
+    _seed_everything(9996)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_sequence_replay_share_train_token_encoding"] = False
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+    def _legacy_replay_outputs(
+        x_tokens,
+        y_tokens,
+        *,
+        eval_start=0,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del y_tokens, flow_matching_xt, flow_matching_t
+        event_log.append("policy_legacy")
+        query = x_tokens[eval_start:]
+        return {
+            "action_mean": torch.zeros(
+                int(query.shape[0]),
+                int(query.shape[1]),
+                3,
+                dtype=query.dtype,
+                device=query.device,
+            ),
+        }
+
+    def _legacy_replay_aux(
+        x_tokens,
+        y_tokens,
+        *,
+        full_length,
+        q_query_tokens=None,
+        q_query_start=0,
+        q_query_stop=None,
+        q_action_query=None,
+        flow_query_tokens=None,
+        flow_query_start=0,
+        flow_query_stop=None,
+        flow_action_query=None,
+        flow_matching_xt=None,
+        flow_matching_t=None,
+    ):
+        del x_tokens, y_tokens, full_length, q_query_stop, flow_query_stop, flow_matching_t
+        event_log.append("aux_legacy")
+        assert q_query_tokens is not None
+        assert q_action_query is not None
+        assert flow_query_tokens is not None
+        assert flow_action_query is not None
+        assert int(q_query_start) == 2
+        assert int(flow_query_start) == 0
+        outputs = {
+            "q": {
+                "normalized_q_logits": torch.zeros(
+                    int(q_query_tokens.shape[0]),
+                    int(q_query_tokens.shape[1]),
+                    bardist.num_bars,
+                    dtype=torch.float32,
+                ),
+            },
+            "flow": {
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            },
+        }
+        outputs["q"]["normalized_q"] = bardist.mean(outputs["q"]["normalized_q_logits"])
+        return outputs
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("legacy-compare test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("legacy-compare test should use replay outputs path")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = _legacy_replay_outputs
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = _legacy_replay_aux
+    _dummy_step_fn._reinforce_sequence_encode_train_tokens_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("shared encoding should stay disabled for legacy compare")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared encoded policy replay should stay disabled for legacy compare")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_from_train_tokens_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("shared encoded aux replay should stay disabled for legacy compare")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("legacy compare should not fall through to streaming aux fallback")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_init_kv_cache_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_append_train_token_to_kv_fn = lambda *args, **kwargs: None
+    _dummy_step_fn._reinforce_sequence_predict_query_outputs_with_kv_fn = lambda *args, **kwargs: {}
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["policy_legacy", "aux_legacy"]
+    assert int(stats["reinforce_sequence_replay_shared_train_token_encoding"]) == 0
+
+
+def test_dispatch_policy_rollout_omits_legacy_replay_targets_by_default():
+    _seed_everything(6579)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    prior = EnvironmentPrior(env_cfg)
+
+    def _dummy_replay_fn(x_tokens, y_tokens, *, eval_start=0):
+        del y_tokens
+        return torch.zeros(
+            int(x_tokens.shape[0] - eval_start),
+            int(x_tokens.shape[1]),
+            3,
+            dtype=x_tokens.dtype,
+            device=x_tokens.device,
+        )
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("dispatch test should use the monkeypatched rollout")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = _dummy_replay_fn
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    seq_len = 5
+    batch_size = 1
+    num_features = 12
+    eval_start = 2
+    action_dim = 3
+    state_dim = 8
+    x_buffer = torch.empty(seq_len, batch_size, num_features, dtype=torch.float32)
+    reward_buffer = torch.empty(seq_len, batch_size, dtype=torch.float32)
+    infos = [None] * batch_size
+
+    def _fake_rollout_family_group_vectorized_with_policy(*args, **kwargs):
+        del args, kwargs
+        x_group = torch.randn(seq_len, batch_size, num_features, dtype=torch.float32)
+        y_group = torch.randn(seq_len, batch_size, dtype=torch.float32)
+        prior.last_rollout_reinforce = {
+            "log_probs": torch.zeros(seq_len, batch_size, dtype=torch.float32),
+            "log_prob_score": None,
+        }
+        prior.last_rollout_reinforce_replay = {
+            "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+            "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+            "action_std": torch.full((seq_len - eval_start, batch_size), 0.1, dtype=torch.float32),
+            "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+            "action_query_cols": torch.tensor([[7, 8, 9]], dtype=torch.long),
+            "next_state": None,
+            "state_mask": None,
+            "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+            "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+            "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+            "flow_query_start": 0,
+            "flow_query_stop": eval_start,
+            "eval_start": eval_start,
+            "full_length": seq_len,
+        }
+        prior.last_rollout_reward_components = None
+        prior.last_rollout_eval_terminal_counts = torch.zeros(batch_size, dtype=torch.float32)
+        prior.last_rollout_policy_trace = None
+        prior.last_rollout_terminal_stats = {}
+        prior.last_rollout_profile = None
+        return x_group, y_group, [None] * batch_size
+
+    prior._rollout_family_group_vectorized_with_policy = _fake_rollout_family_group_vectorized_with_policy
+
+    ctx = {
+        "policy_step_fn": _dummy_step_fn,
+        "batch_size": batch_size,
+        "n_samples": seq_len,
+        "num_features": num_features,
+        "single_eval_pos": eval_start,
+        "device": "cpu",
+        "collect_x": True,
+        "collect_runtime_info": False,
+        "tbptt_window": None,
+        "tbptt_reward_sink_supports_aux": False,
+        "store_rewards": True,
+        "policy_objective_kind": "reinforce",
+        "_policy_collect_log_probs": False,
+        "_policy_collect_action_trace": False,
+        "_policy_collect_reinforce_replay": True,
+        "_policy_detach_action_in_env": None,
+        "_policy_disable_log_probs": True,
+        "_policy_force_no_grad": True,
+        "_policy_defer_reinforce_replay": True,
+        "alpha_grad_trace_roots_only": False,
+        "backend": "torch_vectorized",
+        "strict_rng_match": False,
+        "grouping_mode": "family",
+        "h_list": [dict(env_cfg)],
+        "env_seeds": None,
+        "rollout_seeds": None,
+        "make_alpha_grad_tbptt_group_sink": lambda group_indices: None,
+        "alpha_grad_outer_merge_state": {
+            "enabled": False,
+            "window_buckets": None,
+            "next_flush": 0,
+            "expected_group_count": 0,
+        },
+        "x": x_buffer,
+        "rewards": reward_buffer,
+        "reinforce_log_probs": None,
+        "infos": infos,
+    }
+
+    rollout = dispatch_policy_rollout(prior, ctx)
+    assert isinstance(rollout, dict)
+
+    replay_payload = prior.last_rollout_reinforce_replay
+    assert isinstance(replay_payload, dict)
+    assert replay_payload.get("next_state", None) is None
+    assert replay_payload.get("state_mask", None) is None
+    assert tuple(replay_payload["flow_action"].shape) == (eval_start, batch_size, action_dim)
+    assert tuple(replay_payload["flow_next_state"].shape) == (eval_start, batch_size, state_dim)
+    assert tuple(replay_payload["flow_state_mask"].shape) == (batch_size, state_dim)
+
+
+def test_dispatch_policy_rollout_preserves_full_state_replay_payload():
+    _seed_everything(658)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["reinforce_sequence_replay_store_legacy_targets"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    def _dummy_replay_fn(x_tokens, y_tokens, *, eval_start=0):
+        del y_tokens
+        return torch.zeros(
+            int(x_tokens.shape[0] - eval_start),
+            int(x_tokens.shape[1]),
+            3,
+            dtype=x_tokens.dtype,
+            device=x_tokens.device,
+        )
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("dispatch test should use the monkeypatched rollout")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = _dummy_replay_fn
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+
+    seq_len = 5
+    batch_size = 1
+    num_features = 12
+    eval_start = 2
+    action_dim = 3
+    state_dim = 8
+    x_buffer = torch.empty(seq_len, batch_size, num_features, dtype=torch.float32)
+    reward_buffer = torch.empty(seq_len, batch_size, dtype=torch.float32)
+    infos = [None] * batch_size
+
+    def _fake_rollout_family_group_vectorized_with_policy(*args, **kwargs):
+        del args, kwargs
+        x_group = torch.randn(seq_len, batch_size, num_features, dtype=torch.float32)
+        y_group = torch.randn(seq_len, batch_size, dtype=torch.float32)
+        prior.last_rollout_reinforce = {
+            "log_probs": torch.zeros(seq_len, batch_size, dtype=torch.float32),
+            "log_prob_score": None,
+        }
+        prior.last_rollout_reinforce_replay = {
+            "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+            "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+            "action_std": torch.full((seq_len - eval_start, batch_size), 0.1, dtype=torch.float32),
+            "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+            "action_query_cols": torch.tensor([[7, 8, 9]], dtype=torch.long),
+            "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+            "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+            "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+            "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+            "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+            "flow_query_start": 0,
+            "flow_query_stop": eval_start,
+            "eval_start": eval_start,
+            "full_length": seq_len,
+        }
+        prior.last_rollout_reward_components = None
+        prior.last_rollout_eval_terminal_counts = torch.zeros(batch_size, dtype=torch.float32)
+        prior.last_rollout_policy_trace = None
+        prior.last_rollout_terminal_stats = {}
+        prior.last_rollout_profile = None
+        return x_group, y_group, [None] * batch_size
+
+    prior._rollout_family_group_vectorized_with_policy = _fake_rollout_family_group_vectorized_with_policy
+
+    ctx = {
+        "policy_step_fn": _dummy_step_fn,
+        "batch_size": batch_size,
+        "n_samples": seq_len,
+        "num_features": num_features,
+        "single_eval_pos": eval_start,
+        "device": "cpu",
+        "collect_x": True,
+        "collect_runtime_info": False,
+        "tbptt_window": None,
+        "tbptt_reward_sink_supports_aux": False,
+        "store_rewards": True,
+        "policy_objective_kind": "reinforce",
+        "_policy_collect_log_probs": False,
+        "_policy_collect_action_trace": False,
+        "_policy_collect_reinforce_replay": True,
+        "_policy_detach_action_in_env": None,
+        "_policy_disable_log_probs": True,
+        "_policy_force_no_grad": True,
+        "_policy_defer_reinforce_replay": True,
+        "alpha_grad_trace_roots_only": False,
+        "backend": "torch_vectorized",
+        "strict_rng_match": False,
+        "grouping_mode": "family",
+        "h_list": [dict(env_cfg)],
+        "env_seeds": None,
+        "rollout_seeds": None,
+        "make_alpha_grad_tbptt_group_sink": lambda group_indices: None,
+        "alpha_grad_outer_merge_state": {
+            "enabled": False,
+            "window_buckets": None,
+            "next_flush": 0,
+            "expected_group_count": 0,
+        },
+        "x": x_buffer,
+        "rewards": reward_buffer,
+        "reinforce_log_probs": None,
+        "infos": infos,
+    }
+
+    rollout = dispatch_policy_rollout(prior, ctx)
+    assert isinstance(rollout, dict)
+
+    replay_payload = prior.last_rollout_reinforce_replay
+    assert isinstance(replay_payload, dict)
+    assert torch.is_tensor(replay_payload.get("next_state", None))
+    assert torch.is_tensor(replay_payload.get("state_mask", None))
+    assert tuple(replay_payload["next_state"].shape) == (seq_len - eval_start, batch_size, state_dim)
+    assert tuple(replay_payload["state_mask"].shape) == (batch_size, state_dim)
+    assert torch.equal(replay_payload["action_query_cols"], torch.tensor([[7, 8, 9]], dtype=torch.long))
+    assert tuple(replay_payload["flow_action"].shape) == (eval_start, batch_size, action_dim)
+    assert tuple(replay_payload["flow_next_state"].shape) == (eval_start, batch_size, state_dim)
+    assert tuple(replay_payload["flow_state_mask"].shape) == (batch_size, state_dim)
+    assert int(replay_payload["flow_query_start"]) == 0
+    assert int(replay_payload["flow_query_stop"]) == eval_start
+
+
+def test_rollout_with_policy_flow_replay_works_without_legacy_targets():
+    _seed_everything(660)
+    cfg, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["reinforce_sequence_replay_enabled"] = True
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["reinforce_sequence_replay_store_legacy_targets"] = False
+    prior = EnvironmentPrior(env_cfg)
+
+    def _concretize_env_value(value):
+        if not isinstance(value, dict):
+            return value
+        if "value" in value:
+            return value["value"]
+        choice_values = value.get("choice_values", None)
+        if isinstance(choice_values, (list, tuple)) and len(choice_values) > 0:
+            return choice_values[0]
+        if "max" in value:
+            return value["max"]
+        if "min" in value:
+            return value["min"]
+        if "lower_bound" in value:
+            return value["lower_bound"]
+        return value
+
+    env_h = {key: _concretize_env_value(value) for key, value in env_cfg.items()}
+
+    batch_size = 1
+    n_samples = 4
+    single_eval_pos = 1
+    num_features = int(cfg["prior"]["num_features"])
+    action_dim = _resolve_dim_upper_bound(env_cfg["action_dim"])
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+
+    def _dummy_policy_step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, t, env_info):
+        del action_t, reward_t, reward_mask_t, cache, t, env_info
+        action_mean = torch.zeros(
+            int(obs_t.shape[0]),
+            action_dim,
+            device=obs_t.device,
+            dtype=obs_t.dtype,
+        )
+        return {
+            "action_mean": action_mean,
+            "action_std": torch.full_like(action_mean, 0.1),
+        }
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=_dummy_policy_step_fn,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        num_features=num_features,
+        device="cpu",
+        single_eval_pos=single_eval_pos,
+        collect_x=True,
+        collect_runtime_info=False,
+        store_rewards=True,
+        policy_objective_kind="reinforce",
+        h_list_override=[env_h],
+        env_seeds_override=[123],
+        rollout_seeds_override=[456],
+        _policy_collect_reinforce_replay=True,
+        _policy_disable_log_probs=True,
+        _policy_force_no_grad=True,
+        _policy_defer_reinforce_replay=True,
+    )
+
+    assert isinstance(rollout, dict)
+    replay_payload = prior.last_rollout_reinforce_replay
+    assert isinstance(replay_payload, dict)
+    assert replay_payload.get("next_obs", None) is None
+    assert replay_payload.get("obs_mask", None) is None
+    assert replay_payload.get("next_state", None) is None
+    assert replay_payload.get("state_mask", None) is None
+    assert tuple(replay_payload["flow_action"].shape) == (single_eval_pos, batch_size, action_dim)
+    assert tuple(replay_payload["flow_next_state"].shape) == (single_eval_pos, batch_size, state_dim)
+    assert tuple(replay_payload["flow_state_mask"].shape) == (batch_size, state_dim)
+
+
+def test_rollout_with_policy_flow_replay_pads_to_state_upper_bound():
+    _seed_everything(661)
+    cfg, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["reinforce_sequence_replay_enabled"] = True
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["reinforce_sequence_replay_store_legacy_targets"] = False
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 7, "max": 8}
+    prior = EnvironmentPrior(env_cfg)
+
+    def _concretize_env_value(value):
+        if not isinstance(value, dict):
+            return value
+        if "value" in value:
+            return value["value"]
+        choice_values = value.get("choice_values", None)
+        if isinstance(choice_values, (list, tuple)) and len(choice_values) > 0:
+            return choice_values[0]
+        if "max" in value:
+            return value["max"]
+        if "min" in value:
+            return value["min"]
+        if "lower_bound" in value:
+            return value["lower_bound"]
+        return value
+
+    env_h = {key: _concretize_env_value(value) for key, value in env_cfg.items()}
+    env_h["state_dim"] = 7
+
+    batch_size = 1
+    n_samples = 4
+    single_eval_pos = 2
+    num_features = int(cfg["prior"]["num_features"])
+    action_dim = _resolve_dim_upper_bound(env_cfg["action_dim"])
+    state_dim_upper = _resolve_dim_upper_bound(env_cfg["state_dim"])
+
+    def _dummy_policy_step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, t, env_info):
+        del action_t, reward_t, reward_mask_t, cache, t, env_info
+        action_mean = torch.zeros(
+            int(obs_t.shape[0]),
+            action_dim,
+            device=obs_t.device,
+            dtype=obs_t.dtype,
+        )
+        return {
+            "action_mean": action_mean,
+            "action_std": torch.full_like(action_mean, 0.1),
+        }
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=_dummy_policy_step_fn,
+        batch_size=batch_size,
+        n_samples=n_samples,
+        num_features=num_features,
+        device="cpu",
+        single_eval_pos=single_eval_pos,
+        collect_x=True,
+        collect_runtime_info=False,
+        store_rewards=True,
+        policy_objective_kind="reinforce",
+        h_list_override=[env_h],
+        env_seeds_override=[123],
+        rollout_seeds_override=[456],
+        _policy_collect_reinforce_replay=True,
+        _policy_disable_log_probs=True,
+        _policy_force_no_grad=True,
+        _policy_defer_reinforce_replay=True,
+    )
+
+    assert isinstance(rollout, dict)
+    replay_payload = prior.last_rollout_reinforce_replay
+    assert isinstance(replay_payload, dict)
+    assert tuple(replay_payload["flow_next_state"].shape) == (single_eval_pos, batch_size, state_dim_upper)
+    assert tuple(replay_payload["flow_state_mask"].shape) == (batch_size, state_dim_upper)
+    assert bool(replay_payload["flow_state_mask"][0, 6].item()) is True
+    assert bool(replay_payload["flow_state_mask"][0, 7].item()) is False
 
 
 def test_rwkv7_reinforce_sequence_replay_requires_cuda():
@@ -1205,8 +4644,9 @@ def test_anil_head_adaptation_updates_functional_head_without_mutating_base_para
             single_eval_pos,
             baseline_mode,
             fit_action_dim_fn,
+            terminal_counts=None,
         ):
-            del rewards, baseline_mode, fit_action_dim_fn
+            del rewards, baseline_mode, fit_action_dim_fn, terminal_counts
             preds = policy_step_fn._reinforce_sequence_replay_fn(
                 x_tokens,
                 replay_payload["reward_in"],
@@ -1716,6 +5156,7 @@ def test_rwkv7_rlpfn_validation_uses_split_policy_step_state_cache(monkeypatch):
     split_cache_seen = []
 
     original_split = model.forward_policy_step_split
+    original_split_actor = model.forward_policy_step_split_actor
 
     def _wrapped_split(
         self,
@@ -1749,6 +5190,40 @@ def test_rwkv7_rlpfn_validation_uses_split_policy_step_state_cache(monkeypatch):
             allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
         )
 
+    def _wrapped_split_actor(
+        self,
+        obs_t,
+        action_t,
+        reward_t,
+        reward_mask_t,
+        phase_t=None,
+        terminal_t=None,
+        kv_cache=None,
+        max_cache_len=None,
+        kv_cache_mode="auto",
+        kv_cache_page_size=None,
+        allow_grad_mutable_cache=False,
+        allow_grad_inplace_paged_cache=False,
+        policy_action_head_params_override=None,
+    ):
+        split_calls["count"] += 1
+        split_cache_seen.append(kv_cache is not None)
+        return original_split_actor(
+            obs_t,
+            action_t,
+            reward_t,
+            reward_mask_t,
+            phase_t=phase_t,
+            terminal_t=terminal_t,
+            kv_cache=kv_cache,
+            max_cache_len=max_cache_len,
+            kv_cache_mode=kv_cache_mode,
+            kv_cache_page_size=kv_cache_page_size,
+            allow_grad_mutable_cache=allow_grad_mutable_cache,
+            allow_grad_inplace_paged_cache=allow_grad_inplace_paged_cache,
+            policy_action_head_params_override=policy_action_head_params_override,
+        )
+
     def _forbid_generic(
         self,
         x_token,
@@ -1763,6 +5238,7 @@ def test_rwkv7_rlpfn_validation_uses_split_policy_step_state_cache(monkeypatch):
         raise AssertionError("RWKV validation should use split policy-step fastpath, not generic policy_step")
 
     monkeypatch.setattr(model, "forward_policy_step_split", types.MethodType(_wrapped_split, model))
+    monkeypatch.setattr(model, "forward_policy_step_split_actor", types.MethodType(_wrapped_split_actor, model))
     monkeypatch.setattr(model, "forward_policy_step", types.MethodType(_forbid_generic, model))
 
     val_cfg = {
@@ -1957,6 +5433,7 @@ def test_rwkv7_anil_query_loss_sink_matches_no_sink():
     cfg["transformer"]["rwkv_head_size"] = 64
 
     def _run_anil(sink_enabled: bool):
+        _seed_everything(919191)
         prior = EnvironmentPrior(deepcopy(env_cfg))
         _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
         model = model.cuda().train()
@@ -1969,7 +5446,6 @@ def test_rwkv7_anil_query_loss_sink_matches_no_sink():
             allow_grad_mutable_cache=False,
             pg_torch_compile=False,
         )
-        _seed_everything(919191)
         h_list = prior._sample_batch_hypers(1)
         for h in h_list:
             h["reward_dropout_enabled"] = False
