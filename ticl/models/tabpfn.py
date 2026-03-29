@@ -113,6 +113,7 @@ class TabPFN(nn.Module):
             )
         self.normalized_q_value_head = None
         self.normalized_q_value_bardist = None
+        self.normalized_q_value_action_proj = None
         if self.normalized_q_value_head_enabled:
             self.normalized_q_value_bardist = make_standardized_full_support_bar_distribution(
                 num_buckets=self.normalized_q_value_num_buckets,
@@ -123,8 +124,19 @@ class TabPFN(nn.Module):
                 if decoder is not None
                 else build_two_layer_mlp_head(emsize, nhid, self.normalized_q_value_bardist.num_bars)
             )
+            if self.policy_action_dim is not None and self.policy_action_dim > 0:
+                self.normalized_q_value_action_proj = nn.Linear(
+                    self.policy_action_dim,
+                    emsize,
+                )
         self.next_state_flow_head = None
+        self.next_state_flow_action_proj = None
         if self.next_state_flow_dim is not None and self.next_state_flow_dim > 0:
+            if self.policy_action_dim is not None and self.policy_action_dim > 0:
+                self.next_state_flow_action_proj = nn.Linear(
+                    self.policy_action_dim,
+                    emsize,
+                )
             if self.next_state_flow_head_type == "mlp":
                 self.next_state_flow_head = ConditionalFlowMatchingHead(
                     hidden_dim=emsize,
@@ -322,6 +334,30 @@ class TabPFN(nn.Module):
             hidden = hidden.to(dtype=head_param.dtype)
         return hidden
 
+    @staticmethod
+    def _condition_hidden_with_action(hidden, action, action_proj, *, head_name: str):
+        if action is None:
+            return hidden
+        if not isinstance(action_proj, nn.Module):
+            raise RuntimeError(f"{head_name} action conditioning is not initialized")
+        if tuple(hidden.shape[:-1]) != tuple(action.shape[:-1]):
+            raise ValueError(
+                f"{head_name} action_query must match hidden leading dims, "
+                f"got {tuple(action.shape)} for hidden {tuple(hidden.shape)}"
+            )
+        if int(action.shape[-1]) != int(action_proj.in_features):
+            raise ValueError(
+                f"{head_name} action_query last dim must be {int(action_proj.in_features)}, "
+                f"got {tuple(action.shape)}"
+            )
+        proj_param = next(action_proj.parameters())
+        action_cond = action_proj(
+            action.to(device=hidden.device, dtype=proj_param.dtype)
+        )
+        if action_cond.dtype != hidden.dtype:
+            action_cond = action_cond.to(dtype=hidden.dtype)
+        return hidden + action_cond
+
     def get_normalized_q_value_bardist(self):
         if not self.has_normalized_q_value_head():
             raise RuntimeError("normalized_q_value_head is not initialized")
@@ -330,12 +366,24 @@ class TabPFN(nn.Module):
     def _decode_normalized_q_value_logits(self, hidden, *, action=None):
         if not self.has_normalized_q_value_head():
             raise RuntimeError("normalized_q_value_head is not initialized")
+        hidden = self._condition_hidden_with_action(
+            hidden,
+            action,
+            self.normalized_q_value_action_proj,
+            head_name="normalized_q_value_head",
+        )
         hidden = self._cast_hidden_for_head(hidden, self.normalized_q_value_head)
         return self.normalized_q_value_head(hidden)
 
     def _decode_next_state_flow(self, hidden, x_t, t, *, action=None):
         if not self.has_next_state_flow_head():
             raise RuntimeError("next_state_flow_head is not initialized")
+        hidden = self._condition_hidden_with_action(
+            hidden,
+            action,
+            self.next_state_flow_action_proj,
+            head_name="next_state_flow_head",
+        )
         return self.next_state_flow_head(hidden, x_t, t)
 
     def _decode_replay_outputs(
@@ -343,16 +391,20 @@ class TabPFN(nn.Module):
         hidden_q,
         *,
         action_query=None,
+        q_action_query=None,
+        flow_action_query=None,
         flow_matching_xt=None,
         flow_matching_t=None,
         policy_action_head_params_override=None,
     ):
+        q_action_query = action_query if q_action_query is None else q_action_query
+        flow_action_query = action_query if flow_action_query is None else flow_action_query
         outputs = self._decode_policy_actor_outputs(
             hidden_q,
             policy_action_head_params_override=policy_action_head_params_override,
         )
         if self.has_normalized_q_value_head():
-            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q, action=action_query)
+            normalized_q_logits = self._decode_normalized_q_value_logits(hidden_q, action=q_action_query)
             outputs["normalized_q_logits"] = normalized_q_logits
             outputs["normalized_q"] = self.normalized_q_value_bardist.mean(
                 normalized_q_logits,
@@ -362,7 +414,7 @@ class TabPFN(nn.Module):
                 hidden_q,
                 flow_matching_xt,
                 flow_matching_t,
-                action=action_query,
+                action=flow_action_query,
             )
         return outputs
 
@@ -767,6 +819,8 @@ class TabPFN(nn.Module):
         *,
         eval_start: int = 0,
         action_query=None,
+        q_action_query=None,
+        flow_action_query=None,
         flow_matching_xt=None,
         flow_matching_t=None,
         policy_action_head_params_override=None,
@@ -797,6 +851,8 @@ class TabPFN(nn.Module):
         return self._decode_replay_outputs(
             hidden_q,
             action_query=action_query,
+            q_action_query=q_action_query,
+            flow_action_query=flow_action_query,
             flow_matching_xt=flow_matching_xt,
             flow_matching_t=flow_matching_t,
             policy_action_head_params_override=policy_action_head_params_override,

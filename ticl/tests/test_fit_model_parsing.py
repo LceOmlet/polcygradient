@@ -97,12 +97,23 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.optimizer.pg_saved_tensors_pin_memory is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_disable_when_safe is False
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_min_free_gb == 8.0
-    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 1024
+    assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_batch_size == 2048
     assert args.optimizer.pg_saved_tensors_cpu_offload_auto_max_n_samples == 1024
     assert args.orchestration.rl_validate_enabled is True
     assert args.orchestration.rl_validate_envs.split(",") == RLPFN_DEFAULT_OOP_ENVS
     assert args.orchestration.rl_validate_context_lower_bound == 2048
     assert args.orchestration.rl_validate_max_parallel_columns == 96
+
+
+def test_rlpfn_parser_defaults_match_current_perf_defaults():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(["rlpfn"])
+    cfg = get_model_default_config("rlpfn")
+
+    assert args.prior.n_samples == 2048
+    assert args.dataloader.num_steps == 4
+    assert args.orchestration.save_every == 1
+    assert cfg["optimizer"]["ppo_n_epochs"] == 4
 
 def test_rlpfn_parser_refreshes_split_dims_when_terminal_flag_changes():
     parser = make_model_level_argparser()
@@ -333,11 +344,14 @@ def test_rlpfn_parser_accepts_alpha_grad_coordinate_and_unit_options():
 def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
-    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["rl_objective"] == "ppo"
+    assert cfg["optimizer"]["ppo_n_epochs"] == 4
     assert cfg["transformer"]["backbone"] == "rwkv7"
     assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
     assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
     assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
+    assert cfg["prior"]["n_samples"] == 2048
+    assert cfg["dataloader"]["num_steps"] == 4
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],
@@ -400,18 +414,10 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["optimizer"]["train_host_rss_limit_try_rlimit_as"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 1024
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 2048
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
-    assert cfg["prior"]["environment"]["action_noise_train_std"] == {
-        "distribution": "log_uniform",
-        "min": 1e-2,
-        "max": 0.2,
-    }
-    assert cfg["prior"]["environment"]["action_noise_eval_std"] == {
-        "distribution": "log_uniform",
-        "min": 1e-2,
-        "max": 0.1,
-    }
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == 0.0
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == 0.0
 
 
 def test_rlpfn_parser_accepts_pg_grad_mutable_kv_cache_flag():

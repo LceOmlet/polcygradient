@@ -1047,12 +1047,14 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_clip"] == 10.0
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.4
+    assert cfg["prior"]["environment"]["reinforce_aux_enabled"] is True
+    assert cfg["prior"]["environment"]["reinforce_aux_backbone_query_pass_enabled"] is False
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_store_legacy_targets"] is False
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_train_token_encoding"] is True
-    assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_context_forward"] is True
+    assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_context_forward"] is False
     assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
         "distribution": "log_uniform",
         "min": 1e-3,
@@ -1061,7 +1063,7 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
     assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
-    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["rl_objective"] == "ppo"
     assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload"] is False
@@ -1075,6 +1077,8 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["transformer"]["x_obs_dim"] == 404
     assert cfg["transformer"]["x_action_dim"] == 30
     assert cfg["transformer"]["single_eval_causal"] is True
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == 0.0
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == 0.0
     assert layout["default_num_features"] == 434
     assert layout["x_obs_dim"] == 404
     assert layout["x_action_dim"] == 30

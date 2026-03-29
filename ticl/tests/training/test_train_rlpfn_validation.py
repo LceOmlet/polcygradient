@@ -70,6 +70,7 @@ def _install_fake_gym(monkeypatch):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
     spaces_mod.Box = _FakeBox
+    gym_mod.Env = object
     gym_mod.spaces = spaces_mod
     gym_mod.make = lambda env_name: _FastContinuousEnv(env_name)
     monkeypatch.setitem(sys.modules, "gymnasium", gym_mod)

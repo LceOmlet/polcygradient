@@ -23,7 +23,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
     assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["prior"]["classification"]["num_features_sampler"] == "fixed"
-    assert cfg["optimizer"]["rl_objective"] == "reinforce"
+    assert cfg["optimizer"]["rl_objective"] == "ppo"
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
         "choice_values": ["scm"],
@@ -41,12 +41,8 @@ def test_rlpfn_default_config_uses_split_encoder():
         "max": 3e-1,
     }
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
-    assert cfg["prior"]["environment"]["survival_reward_weight"] == {
-        "distribution": "uniform",
-        "min": 0.0,
-        "max": 0.1,
-    }
-    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.7
+    assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
+    assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
     assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
@@ -69,16 +65,8 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["alpha_grad_unit_grad_delta"] == 1e-6
     assert cfg["prior"]["environment"]["pg_one_hop_replay_enabled"] is True
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
-    assert cfg["prior"]["environment"]["action_noise_train_std"] == {
-        "distribution": "log_uniform",
-        "min": 1e-2,
-        "max": 0.2,
-    }
-    assert cfg["prior"]["environment"]["action_noise_eval_std"] == {
-        "distribution": "log_uniform",
-        "min": 1e-2,
-        "max": 0.1,
-    }
+    assert cfg["prior"]["environment"]["action_noise_train_std"] == 0.0
+    assert cfg["prior"]["environment"]["action_noise_eval_std"] == 0.0
     assert cfg["prior"]["environment"]["terminal_reset_enabled"] is True
     assert cfg["prior"]["environment"]["terminal_reset_count_target"] == {
         "distribution": "uniform",
@@ -98,7 +86,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
     assert cfg["optimizer"]["learning_rate"] == 4e-4
-    assert cfg["dataloader"]["batch_size"] == 512
+    assert cfg["dataloader"]["batch_size"] == 2048
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True
     assert cfg["optimizer"]["train_profiler_enabled"] is False
@@ -132,7 +120,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["pg_saved_tensors_pin_memory"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_min_free_gb"] == 8.0
-    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 512
+    assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_batch_size"] == 2048
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_max_n_samples"] == 1024
 
 

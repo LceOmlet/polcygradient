@@ -42,6 +42,19 @@ def get_optimizer_config():
         "pg_phase_log_file": None,
         "anil_inner_steps": 1,
         "anil_inner_learning_rate": 0.1,
+        "ppo_n_envs": None,
+        "ppo_n_steps": None,
+        "ppo_batch_size": None,
+        "ppo_n_epochs": 4,
+        "ppo_gamma": 1.0,
+        "ppo_gae_lambda": 0.95,
+        "ppo_clip_range": 0.2,
+        "ppo_clip_range_vf": None,
+        "ppo_normalize_advantage": True,
+        "ppo_ent_coef": 0.0,
+        "ppo_vf_coef": 0.5,
+        "ppo_max_grad_norm": 0.5,
+        "ppo_target_kl": None,
         "adamw_fused": True,
         "train_profiler_enabled": False,
         "train_profiler_output_path": None,
@@ -147,7 +160,7 @@ def get_linear_attention_config():
     return {'linear_attention': linear_attention}
 
 
-def get_prior_config(max_features=100, n_samples=1024+128):
+def get_prior_config(max_features=100, n_samples=2048):
     """"
     Returns the configuration parameters for the tabular multiclass wrapper.
     """
@@ -241,8 +254,8 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "init_state_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
         "init_action_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
         "state_noise_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
-        "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.2},
-        "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-4, "max": 0.1},
+        "action_noise_train_std": 0.0,
+        "action_noise_eval_std": 0.0,
         "reward_scale": {"distribution": "uniform", "min": 0.1, "max": 10.0},
         "reward_clip": 10.0,
         "state_clip": 8.0,
@@ -260,6 +273,12 @@ def get_prior_config(max_features=100, n_samples=1024+128):
         "reinforce_advantage_norm_eps": 1e-6,
         "reinforce_advantage_norm_clip": 10.0,
         "policy_gradient_weight": 0.4,
+        "reinforce_aux_enabled": True,
+        # Keep aux losses enabled by default, but route them through action-conditioned
+        # heads on the policy replay hidden states instead of a separate aux-only
+        # backbone/query pass. Legacy aux backbone replay remains opt-in for
+        # comparisons and ablations.
+        "reinforce_aux_backbone_query_pass_enabled": False,
         "normalized_q_value_weight": 1.0,
         "next_state_flow_matching_weight": 1.0,
         "next_state_flow_head_type": "cfmi_resnet",
@@ -316,7 +335,7 @@ def get_prior_config(max_features=100, n_samples=1024+128):
 
     dataloader = {
         "batch_size": 8 * 16* 2 ,
-        "num_steps": 8 ,
+        "num_steps": 4 ,
         'min_eval_pos': 2,
         'random_n_samples': 0,
         'n_test_samples': 0,
@@ -495,7 +514,7 @@ def get_rlpfn_default_config():
     config['optimizer']['pg_saved_tensors_pin_memory'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_disable_when_safe'] = False
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_min_free_gb'] = 8.0
-    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 16
+    config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_batch_size'] = 64 * 16 * 2
     config['optimizer']['pg_saved_tensors_cpu_offload_auto_max_n_samples'] = 1024
     # Official RWKV reinforce sequence replay currently requires no-TBPTT.
     config['optimizer']['pg_tbptt_window'] = None
@@ -514,7 +533,7 @@ def get_rlpfn_default_config():
     config['optimizer']['learning_rate'] = 4e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
-    config['dataloader']['batch_size'] = 64 * 16
+    config['dataloader']['batch_size'] = 64 * 16 * 2
     return config
 
 

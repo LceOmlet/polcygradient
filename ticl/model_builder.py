@@ -38,9 +38,24 @@ def get_criterion(max_num_classes):
 
 def save_model(model, optimizer, scheduler, path, filename, config_sample):
     optimizer_dict = optimizer.state_dict() if optimizer is not None else None
+    extra_state = {}
+    for candidate in (model, getattr(model, "module", None), getattr(model, "_orig_mod", None)):
+        if candidate is None:
+            continue
+        ppo_policy_state = candidate.__dict__.get("_validation_ppo_policy_state", None)
+        if isinstance(ppo_policy_state, dict):
+            extra_state["validation_ppo_policy_state"] = {
+                str(key): value.detach().cpu() if torch.is_tensor(value) else value
+                for key, value in ppo_policy_state.items()
+            }
+            break
 
     import cloudpickle
-    torch.save((model.state_dict(), optimizer_dict, scheduler, config_sample), os.path.join(path, filename), pickle_module=cloudpickle)
+    torch.save(
+        (model.state_dict(), optimizer_dict, scheduler, config_sample, extra_state),
+        os.path.join(path, filename),
+        pickle_module=cloudpickle,
+    )
 
 
 def get_gpu_memory():
@@ -53,7 +68,12 @@ def get_gpu_memory():
 def load_model(path, device, verbose=False):
     states = torch.load(path, map_location='cpu', weights_only=False)
     model_state = states[0]
-    config_sample = states[-1]
+    if isinstance(states, (list, tuple)) and len(states) >= 5 and isinstance(states[4], dict):
+        config_sample = states[3]
+        extra_state = states[4]
+    else:
+        config_sample = states[-1]
+        extra_state = {}
     if 'y_encoder' not in config_sample and 'onehot' in str(path):
         # workaround for the single model that was saved without y_encoder
         # that happens to be my reference model.
@@ -82,6 +102,9 @@ def load_model(path, device, verbose=False):
     model.load_state_dict(model_state)
     model.to(device)
     model.eval()
+    validation_ppo_policy_state = extra_state.get("validation_ppo_policy_state", None) if isinstance(extra_state, dict) else None
+    if isinstance(validation_ppo_policy_state, dict):
+        model.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
 
     return model, config_sample
 

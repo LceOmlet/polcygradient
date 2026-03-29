@@ -119,8 +119,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
     optimizer.add_argument('-E', '--epochs', type=int, help='number of epochs')
     optimizer.add_argument('-l', '--learning-rate', type=float, help='maximum learning rate')
     optimizer.add_argument('-k', '--aggregate_k_gradients', type=int, help='number steps to aggregate gradient over')
-    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'],
-                           help='Training objective for RL-style models.')
+    optimizer.add_argument('--rl-objective', type=str, choices=['supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil', 'ppo'],
+                           help='Training objective for RL-style models. PPO uses a strict official sb3-contrib + official RWKV bridge and rejects unsupported configs explicitly.')
     optimizer.add_argument('--anil-inner-steps', type=int,
                            help='Number of head-only support adaptation steps for ANIL.')
     optimizer.add_argument('--anil-inner-learning-rate', type=float,
@@ -496,7 +496,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--experiment', help="Name of mlflow experiment", default='Default')
     orchestration.add_argument('-R', '--create-new-run', help="Create as new MLFLow run, even if continuing", action='store_true')
     orchestration.add_argument('-B', '--base-path', default='.')
-    orchestration.add_argument('--save-every', default=10, type=int)
+    orchestration.add_argument('--save-every', default=1, type=int)
     orchestration.add_argument('--st_checkpoint_dir', help="checkpoint dir for synetune", type=str, default=None)
     orchestration.add_argument('--use-mlflow', help="whether to use mlflow", action='store_true')
     orchestration.add_argument('--use-wandb', help="whether to use wandb", action='store_true')

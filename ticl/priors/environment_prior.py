@@ -1458,8 +1458,8 @@ class EnvironmentPrior:
         cfg.setdefault("init_state_std", {"distribution": "log_uniform", "min": 1e-3, "max": 1.0})
         cfg.setdefault("init_action_std", {"distribution": "log_uniform", "min": 1e-3, "max": 1.0})
         cfg.setdefault("state_noise_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
-        cfg.setdefault("action_noise_train_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
-        cfg.setdefault("action_noise_eval_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.1})
+        cfg.setdefault("action_noise_train_std", 0.0)
+        cfg.setdefault("action_noise_eval_std", 0.0)
         # Reward-scale is sampled per environment; final rewards are clipped
         # to keep rollout targets in a stable bounded range.
         cfg.setdefault("reward_scale", {"distribution": "uniform", "min": 0.1, "max": 10.0})
@@ -1520,6 +1520,11 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_advantage_norm_eps", 1e-6)
         cfg.setdefault("reinforce_advantage_norm_clip", 10.0)
         cfg.setdefault("reinforce_scale_advantages_by_suffix_episode_count", False)
+        cfg.setdefault("reinforce_aux_enabled", True)
+        cfg.setdefault("reinforce_aux_backbone_query_pass_enabled", False)
+        cfg.setdefault("normalized_q_value_weight", 0.0)
+        cfg.setdefault("next_state_flow_matching_weight", 0.0)
+        cfg.setdefault("next_state_flow_head_type", "mlp")
         cfg.setdefault("discount", 1.0)
 
         # SCM-style knobs (aligned with names in priors/mlp.py).
@@ -1552,6 +1557,7 @@ class EnvironmentPrior:
         self.last_rollout_terminal_stats = None
         self.last_rollout_reinforce = None
         self.last_rollout_reinforce_replay = None
+        self.last_rollout_ppo_trace = None
         self.last_rollout_policy_trace = None
         self.last_rollout_env_semantics = None
         self._rollout_executor = None
@@ -1824,6 +1830,7 @@ class EnvironmentPrior:
         self.last_rollout_eval_terminal_counts = None
         self.last_rollout_reinforce = None
         self.last_rollout_reinforce_replay = None
+        self.last_rollout_ppo_trace = None
         self.last_rollout_reward_components = None
         self.last_rollout_policy_trace = None
         self.last_rollout_env_semantics = None
@@ -4435,7 +4442,23 @@ class EnvironmentPrior:
         return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_sequence_replay_enabled", False)))
 
     @staticmethod
+    def _resolve_reinforce_aux_enabled(h):
+        return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_aux_enabled", True)))
+
+    @staticmethod
+    def _resolve_reinforce_aux_backbone_query_pass_enabled(h):
+        if not EnvironmentPrior._resolve_reinforce_aux_enabled(h):
+            return False
+        return bool(
+            EnvironmentPrior._coerce_bool(
+                h.get("reinforce_aux_backbone_query_pass_enabled", False)
+            )
+        )
+
+    @staticmethod
     def _resolve_normalized_q_value_weight(h):
+        if not EnvironmentPrior._resolve_reinforce_aux_enabled(h):
+            return 0.0
         v = EnvironmentPrior._resolve_scalar(h.get("normalized_q_value_weight", 0.0))
         if not math.isfinite(v):
             return 0.0
@@ -4450,6 +4473,8 @@ class EnvironmentPrior:
 
     @staticmethod
     def _resolve_next_state_flow_matching_weight(h):
+        if not EnvironmentPrior._resolve_reinforce_aux_enabled(h):
+            return 0.0
         v = EnvironmentPrior._resolve_scalar(h.get("next_state_flow_matching_weight", 0.0))
         if not math.isfinite(v):
             return 0.0
@@ -10551,6 +10576,7 @@ class EnvironmentPrior:
         single_eval_pos,
         device,
         collect_x=True,
+        store_rewards=True,
         rng_seeds=None,
     ):
         if not collect_x:
@@ -12230,6 +12256,8 @@ class EnvironmentPrior:
                 policy_cuda_end.record()
                 policy_cuda_pairs.append((policy_cuda_start, policy_cuda_end))
             actor_outputs, action_next, cache_update = self._unpack_policy_step_output(policy_out)
+            if ppo_obs_steps is not None and token_row is not None:
+                ppo_obs_steps[t].copy_(token_row.detach(), non_blocking=False)
             if cache_update is not None:
                 cache = cache_update
 
@@ -12741,6 +12769,83 @@ class EnvironmentPrior:
                 "transition_reference_mode",
             )
         }
+        self.last_rollout_ppo_trace = None
+        if collect_ppo_trace:
+            final_obs = torch.zeros((batch_size, num_features), device=device, dtype=torch.float32)
+            final_obs_t = state_t[:, :max_obs_dim] * obs_mask
+            if num_features > 0:
+                if token_layout_prepack:
+                    if token_obs_valid is not None:
+                        final_obs[:, :token_obs_write_cap] = final_obs_t[:, :token_obs_write_cap].detach() * token_obs_valid
+                    if token_reward_rows is not None and token_reward_rows.numel() > 0:
+                        final_obs[token_reward_rows, token_reward_cols[token_reward_rows]] = reward_t[token_reward_rows].detach()
+                    if token_mask_rows is not None and token_mask_rows.numel() > 0:
+                        final_obs[token_mask_rows, token_mask_cols[token_mask_rows]] = reward_mask_t[token_mask_rows].detach()
+                    if token_phase_rows is not None and token_phase_rows.numel() > 0:
+                        final_obs[token_phase_rows, token_phase_cols[token_phase_rows]] = phase_eval_t.reshape(-1)[token_phase_rows]
+                    if token_terminal_rows is not None and token_terminal_rows.numel() > 0:
+                        final_obs[token_terminal_rows, token_terminal_cols[token_terminal_rows]] = terminal_t[token_terminal_rows].detach()
+                    if token_action_dst_rows is not None:
+                        final_action_src = action_t[:, :token_action_write_cap].detach()
+                        final_obs[token_action_dst_rows, token_action_dst_cols] = final_action_src[
+                            token_action_dst_rows,
+                            token_action_src_cols,
+                        ]
+                else:
+                    obs_cap = torch.minimum(obs_dims, obs_slot_dims)
+                    obs_write_cap = min(max_obs_dim, num_features)
+                    if obs_write_cap > 0:
+                        obs_cols = torch.arange(obs_write_cap, device=device).unsqueeze(0)
+                        obs_valid = (obs_cols < obs_cap.unsqueeze(1)).to(dtype=final_obs_t.dtype)
+                        final_obs[:, :obs_write_cap] = final_obs_t[:, :obs_write_cap].detach() * obs_valid
+
+                    reward_cols = obs_slot_dims
+                    reward_rows = torch.nonzero(reward_cols < num_features, as_tuple=False).squeeze(1)
+                    if reward_rows.numel() > 0:
+                        final_obs[reward_rows, reward_cols[reward_rows]] = reward_t[reward_rows].detach()
+
+                    mask_cols = obs_slot_dims + 1
+                    mask_rows = torch.nonzero(mask_cols < num_features, as_tuple=False).squeeze(1)
+                    if mask_rows.numel() > 0:
+                        final_obs[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
+
+                    phase_cols = obs_slot_dims + 2
+                    phase_rows = torch.nonzero(phase_cols < num_features, as_tuple=False).squeeze(1)
+                    if phase_rows.numel() > 0:
+                        final_obs[phase_rows, phase_cols[phase_rows]] = phase_eval_t.reshape(-1)[phase_rows]
+
+                    terminal_cols = obs_slot_dims + 3
+                    terminal_rows = torch.nonzero(
+                        terminal_reset_enabled & (terminal_cols < num_features),
+                        as_tuple=False,
+                    ).squeeze(1)
+                    if terminal_rows.numel() > 0:
+                        final_obs[terminal_rows, terminal_cols[terminal_rows]] = terminal_t[terminal_rows].detach()
+
+                    action_write_cap = min(max_action_dim, num_features)
+                    if action_write_cap > 0:
+                        action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
+                        action_start = (obs_slot_dims + 3 + terminal_token_offset).unsqueeze(1)
+                        action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
+                        action_cols = action_start + action_positions
+                        action_valid = (action_positions < action_cap) & (action_cols < num_features)
+                        if torch.any(action_valid):
+                            action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
+                            final_action_src = action_t[:, :action_write_cap].detach()
+                            final_obs[action_rows[action_valid], action_cols[action_valid]] = final_action_src[action_valid]
+
+            self.last_rollout_ppo_trace = {
+                "obs": ppo_obs_steps,
+                "values": ppo_value_steps,
+                "actions": ppo_sampled_action_steps,
+                "action_mask": action_mask.detach().to(device=torch.device("cpu"), dtype=torch.bool),
+                "terminal": ppo_terminal_steps,
+                "next_state": ppo_next_state_steps,
+                "state_mask": ppo_state_mask,
+                "final_obs": final_obs.detach().to(device=torch.device("cpu")),
+                "final_terminal": terminal_t.detach().to(device=torch.device("cpu"), dtype=torch.bool),
+                "single_eval_pos": int(single_eval_pos),
+            }
         self.last_rollout_reinforce = (
             {
                 "log_probs": log_prob_steps,
@@ -12799,6 +12904,8 @@ class EnvironmentPrior:
         _policy_detach_action_in_env=None,
         _policy_disable_log_probs=False,
         _policy_force_no_grad=False,
+        _policy_collect_ppo_trace=False,
+        _policy_ppo_step_sink=None,
         _policy_defer_reinforce_replay=False,
     ):
         n_samples = int(n_samples)
@@ -13414,12 +13521,15 @@ class EnvironmentPrior:
         )
         collect_log_prob_score = bool(objective_flags.get("alpha_grad", False))
         collect_action_trace = bool(_policy_collect_action_trace)
+        collect_ppo_trace = bool(_policy_collect_ppo_trace and sample_action and (not tbptt_window_active))
         collect_reinforce_replay = bool(
             _policy_collect_reinforce_replay
             and reinforce_enabled
             and sample_action
             and (not tbptt_window_active)
         )
+        ppo_step_sink = _policy_ppo_step_sink if callable(_policy_ppo_step_sink) else None
+        stream_ppo_steps = bool(ppo_step_sink is not None)
         detach_action_in_env = (
             bool(objective_flags["detach_action_in_env"])
             if _policy_detach_action_in_env is None
@@ -13431,12 +13541,47 @@ class EnvironmentPrior:
             raise RuntimeError("reinforce sequence replay requires collect_x=True to record rollout tokens")
         log_prob_steps = (
             torch.empty((n_samples, batch_size), device=device, dtype=torch.float32)
-            if collect_log_probs and (not tbptt_window_active)
+            if collect_log_probs and (not tbptt_window_active) and (not stream_ppo_steps)
             else None
         )
         log_prob_score_steps = (
             torch.empty((n_samples, batch_size, max_action_dim), device=device, dtype=torch.float32)
             if collect_log_prob_score and (not tbptt_window_active)
+            else None
+        )
+        ppo_obs_steps = (
+            torch.empty((n_samples, batch_size, num_features), device=torch.device("cpu"), dtype=torch.float32)
+            if (collect_ppo_trace and (not stream_ppo_steps) and num_features > 0)
+            else None
+        )
+        ppo_obs_row = (
+            torch.empty((batch_size, num_features), device=device, dtype=torch.float32)
+            if ((collect_ppo_trace or stream_ppo_steps) and (not collect_x) and num_features > 0)
+            else None
+        )
+        ppo_value_steps = (
+            torch.empty((n_samples, batch_size), device=torch.device("cpu"), dtype=torch.float32)
+            if (collect_ppo_trace and (not stream_ppo_steps))
+            else None
+        )
+        ppo_sampled_action_steps = (
+            torch.empty((n_samples, batch_size, max_action_dim), device=torch.device("cpu"), dtype=torch.float32)
+            if (collect_ppo_trace and (not stream_ppo_steps))
+            else None
+        )
+        ppo_terminal_steps = (
+            torch.empty((n_samples, batch_size), device=torch.device("cpu"), dtype=torch.bool)
+            if (collect_ppo_trace and (not stream_ppo_steps))
+            else None
+        )
+        ppo_next_state_steps = (
+            torch.zeros((n_samples, batch_size, max_state_dim), device=torch.device("cpu"), dtype=torch.float32)
+            if (collect_ppo_trace and (not stream_ppo_steps))
+            else None
+        )
+        ppo_state_mask = (
+            state_mask.detach().to(device=torch.device("cpu"), dtype=torch.bool)
+            if (collect_ppo_trace and (not stream_ppo_steps))
             else None
         )
         action_mean_steps = [] if (collect_action_trace and (not tbptt_window_active)) else None
@@ -14595,9 +14740,13 @@ class EnvironmentPrior:
                         include_terminal=tbptt_boundary_usage["include_terminal"],
                     )
             obs_t = state_t[:, :max_obs_dim] * obs_mask
+            token_row = None
             if collect_x:
+                token_row = x_steps[t]
+            elif ppo_obs_row is not None:
+                token_row = ppo_obs_row
+            if token_row is not None:
                 with torch.no_grad():
-                    token_row = x_steps[t]
                     token_row.zero_()
                     if num_features > 0:
                         if token_layout_prepack:
@@ -14741,6 +14890,13 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {max_action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
+            values_t = None
+            if stream_ppo_steps or (ppo_value_steps is not None):
+                values_t = None if actor_outputs is None else actor_outputs.get("values", None)
+                if values_t is None:
+                    raise RuntimeError("PPO rollout trace requires policy_step_fn to return per-step values.")
+            if ppo_value_steps is not None:
+                ppo_value_steps[t].copy_(values_t.detach().reshape(batch_size), non_blocking=False)
             action_transform_mode = env_info.get("reinforce_action_transform", "rms")
             action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
             reinforce_log_prob_t = None
@@ -14792,6 +14948,8 @@ class EnvironmentPrior:
                     legacy_action_std=legacy_action_std_t,
                 )
                 action_next = sampled_action["action_next"]
+                if ppo_sampled_action_steps is not None:
+                    ppo_sampled_action_steps[t].copy_(action_next.detach(), non_blocking=False)
                 if collect_reinforce_replay and t >= replay_eval_start:
                     replay_t = int(t - replay_eval_start)
                     replay_sampled_action_steps[replay_t] = action_next.detach()
@@ -14816,6 +14974,8 @@ class EnvironmentPrior:
                     legacy_action_std=(action_noise_train_std if t < single_eval_pos else action_noise_eval_std),
                 )
                 action_next = sampled_action["action_next"]
+                if ppo_sampled_action_steps is not None:
+                    ppo_sampled_action_steps[t].copy_(action_next.detach(), non_blocking=False)
                 # Preserve action-noise RNG draws for reproducible downstream
                 # transition/state noise, but keep the learned policy deterministic
                 # after the configured action transform.
@@ -15365,6 +15525,32 @@ class EnvironmentPrior:
                 if t >= int(single_eval_pos):
                     suffix_terminal_count = suffix_terminal_count + terminal_next.to(dtype=torch.float32)
             action_next = action_next * action_mask
+            if stream_ppo_steps:
+                if token_row is None:
+                    raise RuntimeError("PPO step sink requires rollout token_row when collect_x=False.")
+                if reinforce_log_prob_t is None:
+                    raise RuntimeError("PPO step sink requires rollout log_probs.")
+                ppo_step_continue = ppo_step_sink(
+                    {
+                        "step": int(t),
+                        "obs": token_row.detach(),
+                        "action": action_next.detach(),
+                        "reward": reward_next.detach(),
+                        "episode_starts": (
+                            torch.ones((batch_size,), device=device, dtype=torch.float32)
+                            if int(t) == 0
+                            else terminal_t.detach().to(dtype=torch.float32)
+                        ),
+                        "values": values_t.detach().reshape(batch_size),
+                        "log_probs": reinforce_log_prob_t.detach().reshape(batch_size),
+                        "action_mask": action_mask.detach(),
+                        "next_state": (state_next[:, :max_state_dim].detach() * state_mask.to(dtype=state_next.dtype)),
+                        "next_state_mask": state_mask.detach(),
+                        "dones": terminal_next.detach().to(dtype=torch.bool),
+                    }
+                )
+                if ppo_step_continue is False:
+                    break
             if tbptt_window_active:
                 if y_steps is not None:
                     y_steps[t] = reward_next.detach()
@@ -15805,6 +15991,82 @@ class EnvironmentPrior:
                 "transition_reference_mode",
             )
         }
+        self.last_rollout_ppo_trace = None
+        if collect_ppo_trace:
+            final_obs = torch.zeros((batch_size, num_features), device=device, dtype=torch.float32)
+            final_obs_t = state_t[:, :max_obs_dim] * obs_mask
+            if num_features > 0:
+                if token_layout_prepack:
+                    if token_obs_valid is not None:
+                        final_obs[:, :token_obs_write_cap] = final_obs_t[:, :token_obs_write_cap].detach() * token_obs_valid
+                    if token_reward_rows is not None and token_reward_rows.numel() > 0:
+                        final_obs[token_reward_rows, token_reward_cols[token_reward_rows]] = reward_t[token_reward_rows].detach()
+                    if token_mask_rows is not None and token_mask_rows.numel() > 0:
+                        final_obs[token_mask_rows, token_mask_cols[token_mask_rows]] = reward_mask_t[token_mask_rows].detach()
+                    if token_phase_rows is not None and token_phase_rows.numel() > 0:
+                        final_obs[token_phase_rows, token_phase_cols[token_phase_rows]] = phase_eval_t.reshape(-1)[token_phase_rows]
+                    if token_terminal_rows is not None and token_terminal_rows.numel() > 0:
+                        final_obs[token_terminal_rows, token_terminal_cols[token_terminal_rows]] = terminal_t[token_terminal_rows].detach()
+                    if token_action_dst_rows is not None:
+                        final_action_src = action_t[:, :token_action_write_cap].detach()
+                        final_obs[token_action_dst_rows, token_action_dst_cols] = final_action_src[
+                            token_action_dst_rows,
+                            token_action_src_cols,
+                        ]
+                else:
+                    obs_cap = torch.minimum(obs_dims, obs_slot_dims)
+                    obs_write_cap = min(max_obs_dim, num_features)
+                    if obs_write_cap > 0:
+                        obs_cols = torch.arange(obs_write_cap, device=device).unsqueeze(0)
+                        obs_valid = (obs_cols < obs_cap.unsqueeze(1)).to(dtype=final_obs_t.dtype)
+                        final_obs[:, :obs_write_cap] = final_obs_t[:, :obs_write_cap].detach() * obs_valid
+                    reward_cols = obs_slot_dims
+                    reward_rows = torch.nonzero(reward_cols < num_features, as_tuple=False).squeeze(1)
+                    if reward_rows.numel() > 0:
+                        final_obs[reward_rows, reward_cols[reward_rows]] = reward_t[reward_rows].detach()
+                    mask_cols = obs_slot_dims + 1
+                    mask_rows = torch.nonzero(mask_cols < num_features, as_tuple=False).squeeze(1)
+                    if mask_rows.numel() > 0:
+                        final_obs[mask_rows, mask_cols[mask_rows]] = reward_mask_t[mask_rows].detach()
+                    phase_cols = obs_slot_dims + 2
+                    phase_rows = torch.nonzero(phase_cols < num_features, as_tuple=False).squeeze(1)
+                    if phase_rows.numel() > 0:
+                        final_obs[phase_rows, phase_cols[phase_rows]] = phase_eval_t.reshape(-1)[phase_rows]
+                    terminal_cols = obs_slot_dims + 3
+                    terminal_rows = torch.nonzero(
+                        terminal_reset_enabled & (terminal_cols < num_features),
+                        as_tuple=False,
+                    ).squeeze(1)
+                    if terminal_rows.numel() > 0:
+                        final_obs[terminal_rows, terminal_cols[terminal_rows]] = terminal_t[terminal_rows].detach()
+                    action_write_cap = min(max_action_dim, num_features)
+                    if action_write_cap > 0:
+                        action_positions = torch.arange(action_write_cap, device=device).unsqueeze(0)
+                        action_start = (obs_slot_dims + 3 + terminal_token_offset).unsqueeze(1)
+                        action_cap = torch.minimum(action_dims, action_slot_dims).unsqueeze(1)
+                        action_cols = action_start + action_positions
+                        action_valid = (action_positions < action_cap) & (action_cols < num_features)
+                        if torch.any(action_valid):
+                            action_rows = torch.arange(batch_size, device=device).unsqueeze(1).expand(-1, action_write_cap)
+                            final_action_src = action_t[:, :action_write_cap].detach()
+                            final_obs[action_rows[action_valid], action_cols[action_valid]] = final_action_src[action_valid]
+            self.last_rollout_ppo_trace = {
+                "obs": None if stream_ppo_steps else ppo_obs_steps,
+                "values": None if stream_ppo_steps else ppo_value_steps,
+                "actions": None if stream_ppo_steps else ppo_sampled_action_steps,
+                "action_mask": action_mask.detach().to(device=torch.device("cpu"), dtype=torch.bool),
+                "terminal": None if stream_ppo_steps else ppo_terminal_steps,
+                "next_state": None if stream_ppo_steps else ppo_next_state_steps,
+                "state_mask": (
+                    state_mask.detach().to(device=torch.device("cpu"), dtype=torch.bool)
+                    if stream_ppo_steps
+                    else ppo_state_mask
+                ),
+                "final_obs": final_obs.detach().to(device=torch.device("cpu")),
+                "final_terminal": terminal_t.detach().to(device=torch.device("cpu"), dtype=torch.bool),
+                "single_eval_pos": int(single_eval_pos),
+                "streamed_to_sink": bool(stream_ppo_steps),
+            }
         self.last_rollout_reinforce = (
             {
                 "log_probs": log_prob_steps,
@@ -17136,10 +17398,23 @@ class EnvironmentPrior:
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
 
+            if ppo_terminal_steps is not None:
+                ppo_terminal_steps[t].copy_(terminal_next.detach().to(dtype=torch.bool), non_blocking=False)
+
             y_steps[t] = reward_next
             reward_values[t] = reward_next.detach()
             state_abs_max[t] = state_next.detach().abs().amax(dim=1)
             terminal_count_realized = terminal_count_realized + terminal_next.to(dtype=torch.float32)
+
+            if ppo_next_state_steps is not None:
+                ppo_next_state_steps[t].zero_()
+                state_copy = int(min(max_state_dim, int(state_next.shape[-1])))
+                if state_copy > 0:
+                    ppo_next_state_steps[t, :, :state_copy].copy_(
+                        state_next[:, :state_copy].detach()
+                        * state_mask[:, :state_copy].to(dtype=state_next.dtype),
+                        non_blocking=False,
+                    )
 
             state_t = state_next
             action_t = action_next
@@ -18042,20 +18317,47 @@ class EnvironmentPrior:
 
     @staticmethod
     def _call_with_optional_keyword(fn, *args, keyword_name: str, keyword_value, **kwargs):
+        return EnvironmentPrior._call_with_optional_keywords(
+            fn,
+            *args,
+            optional_kwargs={keyword_name: keyword_value},
+            **kwargs,
+        )
+
+    @staticmethod
+    def _call_with_optional_keywords(fn, *args, optional_kwargs=None, **kwargs):
         if not callable(fn):
             raise TypeError("fn must be callable")
         try:
             sig = inspect.signature(fn)
         except (TypeError, ValueError):
             sig = None
+        optional_kwargs = {} if optional_kwargs is None else dict(optional_kwargs)
         if sig is not None:
             params = sig.parameters
-            if (
-                keyword_name in params
-                or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
-            ):
-                kwargs[keyword_name] = keyword_value
+            accepts_var_kwargs = any(
+                p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values()
+            )
+            for keyword_name, keyword_value in optional_kwargs.items():
+                if keyword_name in params or accepts_var_kwargs:
+                    kwargs[keyword_name] = keyword_value
+        else:
+            kwargs.update(optional_kwargs)
         return fn(*args, **kwargs)
+
+    @staticmethod
+    def _callable_accepts_keyword(fn, keyword_name: str):
+        if not callable(fn):
+            return False
+        try:
+            sig = inspect.signature(fn)
+        except (TypeError, ValueError):
+            return False
+        params = sig.parameters
+        return (
+            keyword_name in params
+            or any(p.kind == inspect.Parameter.VAR_KEYWORD for p in params.values())
+        )
 
     @staticmethod
     def _concat_output_chunks(output_chunks: dict[str, list[torch.Tensor]]):
@@ -18896,6 +19198,7 @@ class EnvironmentPrior:
                 target_dim=replay_flow_target_dim,
                 name="replay flow-state",
             )
+        flow_steps = int(max(0, flow_query_stop - flow_query_start))
         stream_policy_and_aux_outputs_with_kv_fn = (
             self._resolve_stream_replay_policy_and_aux_outputs_with_kv_fn(policy_step_fn)
         )
@@ -18906,8 +19209,48 @@ class EnvironmentPrior:
         replay_policy_and_aux_sequence_outputs_fn = (
             self._resolve_replay_policy_and_aux_sequence_outputs_fn(policy_step_fn)
         )
+        conditioned_policy_replay_outputs_from_train_tokens_fn = getattr(
+            model_ref,
+            "replay_policy_sequence_outputs_from_train_tokens",
+            None,
+        ) if model_ref is not None else None
+        conditioned_policy_replay_outputs_fn = getattr(
+            model_ref,
+            "replay_policy_sequence_outputs",
+            None,
+        ) if model_ref is not None else None
+        conditioned_policy_aux_from_train_tokens_supported = bool(
+            callable(conditioned_policy_replay_outputs_from_train_tokens_fn)
+            and ((not q_aux_enabled) or self._callable_accepts_keyword(
+                conditioned_policy_replay_outputs_from_train_tokens_fn,
+                "q_action_query",
+            ))
+            and ((not (flow_aux_enabled and flow_steps > 0)) or self._callable_accepts_keyword(
+                conditioned_policy_replay_outputs_from_train_tokens_fn,
+                "flow_action_query",
+            ))
+        )
+        conditioned_policy_aux_supported = bool(
+            conditioned_policy_aux_from_train_tokens_supported
+            or (
+                callable(conditioned_policy_replay_outputs_fn)
+                and ((not q_aux_enabled) or self._callable_accepts_keyword(
+                    conditioned_policy_replay_outputs_fn,
+                    "q_action_query",
+                ))
+                and ((not (flow_aux_enabled and flow_steps > 0)) or self._callable_accepts_keyword(
+                    conditioned_policy_replay_outputs_fn,
+                    "flow_action_query",
+                ))
+            )
+        )
+        aux_backbone_query_pass_requested = bool(
+            use_aux_outputs
+            and self._resolve_reinforce_aux_backbone_query_pass_enabled(self.config)
+        )
         policy_aux_shared_context_forward = bool(
             use_aux_outputs
+            and aux_backbone_query_pass_requested
             and self._resolve_reinforce_sequence_replay_share_context_forward(self.config)
             and (
                 callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn)
@@ -18923,9 +19266,21 @@ class EnvironmentPrior:
         replay_aux_sequence_outputs_from_train_tokens_fn = (
             self._resolve_replay_aux_sequence_outputs_from_train_tokens_fn(policy_step_fn)
         )
+        conditioned_aux_from_policy_pass = bool(
+            use_aux_outputs
+            and (not policy_aux_shared_context_forward)
+            and (not aux_backbone_query_pass_requested)
+            and conditioned_policy_aux_supported
+        )
+        conditioned_policy_aux_prefers_train_tokens = bool(
+            conditioned_aux_from_policy_pass
+            and callable(encode_train_tokens_fn)
+            and conditioned_policy_aux_from_train_tokens_supported
+        )
         share_train_token_encoding = bool(
             (not policy_aux_shared_context_forward)
             and use_aux_outputs
+            and (not conditioned_aux_from_policy_pass)
             and callable(replay_outputs_fn)
             and self._resolve_reinforce_sequence_replay_share_train_token_encoding(self.config)
             and callable(encode_train_tokens_fn)
@@ -18945,7 +19300,7 @@ class EnvironmentPrior:
             # determined by each loss path independently.
             policy_aux_shared_context_forward = False
             share_train_token_encoding = False
-        if use_aux_outputs and (not policy_aux_shared_context_forward):
+        if use_aux_outputs and (not policy_aux_shared_context_forward) and (not conditioned_aux_from_policy_pass):
             (
                 _init_kv_cache_fn,
                 append_train_token_to_kv_fn,
@@ -18979,7 +19334,6 @@ class EnvironmentPrior:
                     "normalized_q_value_weight requires model_ref.get_normalized_q_value_bardist()"
                 )
             normalized_q_bardist = model_ref.get_normalized_q_value_bardist()
-        flow_steps = int(max(0, flow_query_stop - flow_query_start))
         if next_state_flow_matching_weight > 0.0:
             if not all(torch.is_tensor(t) for t in (flow_action, flow_next_state, flow_state_mask)):
                 raise RuntimeError(
@@ -19003,8 +19357,21 @@ class EnvironmentPrior:
                 )
         else:
             flow_total_elements = 1.0
-        aux_query_pass_enabled = bool(q_aux_enabled or (flow_aux_enabled and flow_steps > 0))
-        q_flow_shared_aux_query_pass = bool(q_aux_enabled and flow_aux_enabled and flow_steps > 0)
+        aux_query_pass_enabled = bool(
+            use_aux_outputs
+            and (not conditioned_aux_from_policy_pass)
+            and (
+                policy_aux_shared_context_forward
+                or q_aux_enabled
+                or (flow_aux_enabled and flow_steps > 0)
+            )
+        )
+        q_flow_shared_aux_query_pass = bool(
+            aux_query_pass_enabled
+            and q_aux_enabled
+            and flow_aux_enabled
+            and flow_steps > 0
+        )
         batch_size = int(x_tokens.shape[1])
         if model_ref is not None and hasattr(model_ref, "resolve_replay_batch_chunk_size"):
             replay_batch_chunk = int(
@@ -19015,7 +19382,6 @@ class EnvironmentPrior:
             )
         else:
             replay_batch_chunk = int(batch_size)
-        replay_batch_chunk = int(max(1, replay_batch_chunk // 4))
         replay_batch_chunk = int(max(1, min(batch_size, replay_batch_chunk)))
         replay_chunk_count = int((batch_size + replay_batch_chunk - 1) // replay_batch_chunk)
         total_elements = float(max(1, rewards_eval.numel()))
@@ -19066,6 +19432,42 @@ class EnvironmentPrior:
                 flow_action_chunk = flow_action[:, start:end]
             else:
                 flow_action_chunk = None
+            policy_replay_eval_start = int(eval_start)
+            q_action_query_policy_chunk = None
+            flow_action_query_policy_chunk = None
+            flow_matching_xt_policy_chunk = flow_matching_xt_chunk
+            flow_matching_t_policy_chunk = flow_matching_t_chunk
+            if conditioned_aux_from_policy_pass:
+                policy_replay_eval_start = 0
+                if q_aux_enabled:
+                    q_action_query_policy_chunk = sampled_action_chunk.new_zeros(
+                        int(full_length),
+                        int(end - start),
+                        int(sampled_action_chunk.shape[-1]),
+                    )
+                    q_action_query_policy_chunk[eval_start:eval_start + int(sampled_action_chunk.shape[0])] = (
+                        sampled_action_chunk
+                    )
+                if flow_aux_enabled and flow_steps > 0 and torch.is_tensor(flow_action_chunk):
+                    flow_action_query_policy_chunk = flow_action_chunk.new_zeros(
+                        int(full_length),
+                        int(end - start),
+                        int(flow_action_chunk.shape[-1]),
+                    )
+                    flow_action_query_policy_chunk[flow_query_start:flow_query_stop] = flow_action_chunk
+                if next_state_flow_matching_weight > 0.0 and torch.is_tensor(flow_matching_xt_chunk):
+                    flow_matching_xt_policy_chunk = flow_matching_xt_chunk.new_zeros(
+                        int(full_length),
+                        int(end - start),
+                        int(flow_matching_xt_chunk.shape[-1]),
+                    )
+                    flow_matching_xt_policy_chunk[flow_query_start:flow_query_stop] = flow_matching_xt_chunk
+                    flow_matching_t_policy_chunk = flow_matching_t_chunk.new_zeros(
+                        int(full_length),
+                        int(end - start),
+                        int(flow_matching_t_chunk.shape[-1]),
+                    )
+                    flow_matching_t_policy_chunk[flow_query_start:flow_query_stop] = flow_matching_t_chunk
             q_query_tokens_chunk = None
             q_query_start_chunk = int(eval_start)
             q_query_stop_chunk = int(full_length)
@@ -19095,7 +19497,7 @@ class EnvironmentPrior:
                 policy_aux_shared_context_forward
                 and callable(replay_policy_and_aux_sequence_outputs_from_train_tokens_fn)
                 and callable(encode_train_tokens_fn)
-            ):
+            ) or conditioned_policy_aux_prefers_train_tokens:
                 train_tokens_chunk = encode_train_tokens_fn(
                     x_tokens[:, start:end],
                     reward_in[:, start:end],
@@ -19160,6 +19562,69 @@ class EnvironmentPrior:
                 action_log_std_replay = replay_outputs.get("action_log_std", None)
                 normalized_q_logits = shared_replay_outputs.get("q", {}).get("normalized_q_logits", None)
                 next_state_flow_pred = shared_replay_outputs.get("flow", {}).get("next_state_flow", None)
+            elif conditioned_aux_from_policy_pass:
+                replay_outputs = None
+                if (
+                    train_tokens_chunk is not None
+                    and callable(conditioned_policy_replay_outputs_from_train_tokens_fn)
+                ):
+                    replay_outputs = self._call_with_optional_keywords(
+                        conditioned_policy_replay_outputs_from_train_tokens_fn,
+                        train_tokens_chunk,
+                        optional_kwargs={
+                            "q_action_query": q_action_query_policy_chunk,
+                            "flow_action_query": flow_action_query_policy_chunk,
+                        },
+                        eval_start=policy_replay_eval_start,
+                        flow_matching_xt=flow_matching_xt_policy_chunk,
+                        flow_matching_t=flow_matching_t_policy_chunk,
+                    )
+                elif callable(conditioned_policy_replay_outputs_fn):
+                    replay_outputs = self._call_with_optional_keywords(
+                        conditioned_policy_replay_outputs_fn,
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        optional_kwargs={
+                            "q_action_query": q_action_query_policy_chunk,
+                            "flow_action_query": flow_action_query_policy_chunk,
+                        },
+                        eval_start=policy_replay_eval_start,
+                        flow_matching_xt=flow_matching_xt_policy_chunk,
+                        flow_matching_t=flow_matching_t_policy_chunk,
+                    )
+                elif train_tokens_chunk is not None and callable(replay_outputs_from_train_tokens_fn):
+                    replay_outputs = replay_outputs_from_train_tokens_fn(
+                        train_tokens_chunk,
+                        eval_start=eval_start,
+                    )
+                elif callable(replay_outputs_fn):
+                    replay_outputs = replay_outputs_fn(
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        eval_start=eval_start,
+                    )
+                if replay_outputs is not None:
+                    action_mean_replay = replay_outputs["action_mean"]
+                    action_std_replay = replay_outputs.get("action_std", None)
+                    action_log_std_replay = replay_outputs.get("action_log_std", None)
+                    normalized_q_logits = replay_outputs.get("normalized_q_logits", None)
+                    next_state_flow_pred = replay_outputs.get("next_state_flow", None)
+                    if torch.is_tensor(normalized_q_logits):
+                        normalized_q_logits = normalized_q_logits[
+                            eval_start : eval_start + int(sampled_action_chunk.shape[0])
+                        ]
+                    if torch.is_tensor(next_state_flow_pred):
+                        next_state_flow_pred = next_state_flow_pred[flow_query_start:flow_query_stop]
+                else:
+                    action_mean_replay = replay_fn(
+                        x_tokens[:, start:end],
+                        reward_in[:, start:end],
+                        eval_start=eval_start,
+                    )
+                    action_std_replay = None
+                    action_log_std_replay = None
+                    normalized_q_logits = None
+                    next_state_flow_pred = None
             elif callable(replay_outputs_fn):
                 if train_tokens_chunk is not None:
                     replay_outputs = replay_outputs_from_train_tokens_fn(
@@ -19189,6 +19654,10 @@ class EnvironmentPrior:
                 next_state_flow_pred = None
             if int(sampled_action.shape[0]) != int(action_mean_replay.shape[0]):
                 action_mean_replay = action_mean_replay[eval_start : eval_start + int(sampled_action.shape[0])]
+                if torch.is_tensor(action_std_replay):
+                    action_std_replay = action_std_replay[eval_start : eval_start + int(sampled_action.shape[0])]
+                if torch.is_tensor(action_log_std_replay):
+                    action_log_std_replay = action_log_std_replay[eval_start : eval_start + int(sampled_action.shape[0])]
             replay_action_dim = int(sampled_action.shape[-1])
             if callable(fit_action_dim_fn):
                 action_mean_replay = fit_action_dim_fn(
@@ -19270,7 +19739,14 @@ class EnvironmentPrior:
                 advantages[:, start:end] * log_probs_chunk
             ).sum() / total_elements
             chunk_loss = float(policy_gradient_weight) * reinforce_loss_chunk
-            if callable(loss_sink) and not (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload):
+            defer_combined_chunk_sink = bool(
+                callable(loss_sink)
+                and (
+                    conditioned_aux_from_policy_pass
+                    or (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload)
+                )
+            )
+            if callable(loss_sink) and (not defer_combined_chunk_sink):
                 loss_sink(chunk_loss)
                 chunk_loss = None
             aux_chunk_loss = None
@@ -19351,7 +19827,7 @@ class EnvironmentPrior:
                 aux_outputs_streamed = bool(aux_outputs_streamed or aux_replay_outputs.get("_streamed_via_sink", False))
                 normalized_q_logits = aux_replay_outputs.get("q", {}).get("normalized_q_logits", None)
                 next_state_flow_pred = aux_replay_outputs.get("flow", {}).get("next_state_flow", None)
-            elif not policy_aux_shared_context_forward:
+            elif not (policy_aux_shared_context_forward or conditioned_aux_from_policy_pass):
                 normalized_q_logits = None
                 next_state_flow_pred = None
             if (normalized_q_value_weight > 0.0) and (not aux_outputs_streamed):
@@ -19398,7 +19874,14 @@ class EnvironmentPrior:
                     aux_chunk_loss = flow_loss_contrib if aux_chunk_loss is None else (aux_chunk_loss + flow_loss_contrib)
                 else:
                     chunk_loss = chunk_loss + flow_loss_contrib
-            if callable(loss_sink) and (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload):
+            if callable(loss_sink) and conditioned_aux_from_policy_pass:
+                combined_chunk_loss = chunk_loss
+                if aux_chunk_loss is not None:
+                    combined_chunk_loss = combined_chunk_loss + aux_chunk_loss
+                    aux_chunk_loss = None
+                loss_sink(combined_chunk_loss)
+                chunk_loss = None
+            elif callable(loss_sink) and (policy_aux_shared_context_forward and loss_sink_accepts_replay_payload):
                 shared_chunk_loss = chunk_loss
                 if aux_chunk_loss is not None:
                     shared_chunk_loss = shared_chunk_loss + aux_chunk_loss
@@ -19433,6 +19916,9 @@ class EnvironmentPrior:
         stats["reinforce_sequence_replay_flow_steps"] = int(flow_steps)
         stats["reinforce_sequence_replay_policy_aux_shared_context_forward"] = int(
             policy_aux_shared_context_forward
+        )
+        stats["reinforce_sequence_replay_conditioned_aux_from_policy_pass"] = int(
+            conditioned_aux_from_policy_pass
         )
         stats["reinforce_sequence_replay_aux_query_pass_enabled"] = int(aux_query_pass_enabled)
         stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"] = int(
@@ -21806,7 +22292,8 @@ class EnvironmentPrior:
         normalized_q_value_weight = self._resolve_normalized_q_value_weight(self.config)
         next_state_flow_matching_weight = self._resolve_next_state_flow_matching_weight(self.config)
         auxiliary_replay_heads_enabled = bool(
-            (normalized_q_value_weight > 0.0) or (next_state_flow_matching_weight > 0.0)
+            reinforce_enabled
+            and ((normalized_q_value_weight > 0.0) or (next_state_flow_matching_weight > 0.0))
         )
         reinforce_sequence_replay_enabled = bool(
             reinforce_enabled and self._resolve_reinforce_sequence_replay_enabled(self.config)

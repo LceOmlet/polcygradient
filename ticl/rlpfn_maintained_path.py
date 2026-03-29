@@ -27,11 +27,13 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reinforce_advantage_norm_eps": 1e-6,
     "reinforce_advantage_norm_clip": 10.0,
     "policy_gradient_weight": 0.4,
+    "reinforce_aux_enabled": True,
+    "reinforce_aux_backbone_query_pass_enabled": False,
     "normalized_q_value_weight": 1.0,
     "next_state_flow_matching_weight": 1.0,
     "next_state_flow_head_type": "rwkv_two_layer",
     "reinforce_sequence_replay_enabled": True,
-    "reinforce_sequence_replay_share_context_forward": True,
+    "reinforce_sequence_replay_share_context_forward": False,
     "first_policy_gradient_state_grad_clip_norm": 4.0,
     "first_policy_gradient_action_grad_clip_value": 0.0,
     "first_policy_gradient_action_grad_clip_norm": 1.0,
@@ -43,8 +45,8 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "pg_markov_adjacent_replay_enabled": True,
     "pg_markov_adjacent_replay_sample_prob": 0.5,
     "pg_replay_window_depth": 1,
-    "action_noise_train_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.2},
-    "action_noise_eval_std": {"distribution": "log_uniform", "min": 1e-2, "max": 0.1},
+    "action_noise_train_std": 0.0,
+    "action_noise_eval_std": 0.0,
     "reward_dropout_enabled": True,
     "reward_dropout_randomize": True,
     "reward_dropout_ratio_min": 0.1,
@@ -101,7 +103,7 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
     config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = 64
     config["transformer"]["rwkv_sequence_replay_token_budget"] = 262144
-    config["optimizer"]["rl_objective"] = "reinforce"
+    config["optimizer"]["rl_objective"] = "ppo"
     return layout
 
 
@@ -110,8 +112,8 @@ def validate_rlpfn_maintained_path_config(config):
     layout = resolve_rlpfn_token_layout(env_cfg, num_features=config["prior"].get("num_features", None))
     if config["prior"]["prior_type"] != "environment_only":
         raise ValueError("Maintained RLPFN path requires prior_type=environment_only.")
-    if str(config["optimizer"]["rl_objective"]).strip().lower() != "reinforce":
-        raise ValueError("Maintained RLPFN path requires optimizer.rl_objective=reinforce.")
+    if str(config["optimizer"]["rl_objective"]).strip().lower() != "ppo":
+        raise ValueError("Maintained RLPFN path requires optimizer.rl_objective=ppo.")
     if str(config["transformer"].get("backbone", "transformer")).strip().lower() != "rwkv7":
         raise ValueError("Maintained RLPFN path requires transformer.backbone=rwkv7.")
     if str(config["transformer"]["x_encoder_type"]).strip().lower() != "split_obs_action":

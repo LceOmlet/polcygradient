@@ -419,8 +419,11 @@ def main(argv, extra_config=None):
 
     model_state, optimizer_state, scheduler = None, None, None
     if warm_start_weights is not None:
-        model_state, old_optimizer_state, old_scheduler, old_config = torch.load(
-            warm_start_weights, map_location='cpu')
+        loaded_states = torch.load(warm_start_weights, map_location='cpu')
+        if isinstance(loaded_states, (list, tuple)) and len(loaded_states) >= 5:
+            model_state, old_optimizer_state, old_scheduler, old_config = loaded_states[:4]
+        else:
+            model_state, old_optimizer_state, old_scheduler, old_config = loaded_states
         module_prefix = 'module.'
         model_state = {k.replace(module_prefix, ''): v for k, v in model_state.items()}
         if args.orchestration.continue_run:

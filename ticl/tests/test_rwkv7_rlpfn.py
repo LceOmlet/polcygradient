@@ -2,6 +2,7 @@ from copy import deepcopy
 from collections import OrderedDict
 import os
 import random
+import shutil
 import sys
 import types
 
@@ -12,9 +13,10 @@ import torch
 import ticl.train as train_mod
 from ticl.model_builder import get_model
 from ticl.model_configs import get_model_default_config
+from ticl.models.tabpfn import TabPFN
 from ticl.models.tabpfn_bar_distribution import make_standardized_full_support_bar_distribution
 from ticl.priors.maintained_fast_runner import dispatch_policy_rollout
-from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn
+from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn, RWKVTwoLayerFlowMatchingHead
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
 from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
@@ -30,6 +32,11 @@ def _ensure_torch_extensions_dir():
     torch_ext_dir = "/tmp/ticl_torch_extensions"
     os.makedirs(torch_ext_dir, exist_ok=True)
     os.environ.setdefault("TORCH_EXTENSIONS_DIR", torch_ext_dir)
+
+
+def _skip_if_ninja_missing():
+    if shutil.which("ninja") is None:
+        pytest.skip("ninja is required to compile official RWKV CUDA extensions for this test.")
 
 
 def _build_rwkv7_rlpfn_config():
@@ -77,6 +84,55 @@ def _resolve_dim_upper_bound(spec):
         if "value" in spec:
             return int(spec["value"])
     return int(spec)
+
+
+def test_reinforce_aux_disabled_overrides_aux_weights():
+    env_cfg = {
+        "reinforce_aux_enabled": False,
+        "normalized_q_value_weight": 0.25,
+        "next_state_flow_matching_weight": 0.5,
+    }
+
+    assert EnvironmentPrior._resolve_normalized_q_value_weight(env_cfg) == 0.0
+    assert EnvironmentPrior._resolve_next_state_flow_matching_weight(env_cfg) == 0.0
+
+
+def test_rwkv7_aux_heads_condition_on_action_query():
+    model = TabPFN(
+        n_out=1,
+        emsize=16,
+        nhead=1,
+        nhid_factor=2,
+        nlayers=2,
+        n_features=10,
+        y_encoder_layer=torch.nn.Linear(1, 16),
+        classification_task=False,
+        x_encoder_type="split_obs_action",
+        x_obs_dim=7,
+        x_action_dim=3,
+        single_eval_causal=True,
+        normalized_q_value_head_enabled=True,
+        next_state_flow_dim=5,
+        next_state_flow_head_type="mlp",
+    )
+    with torch.no_grad():
+        model.normalized_q_value_action_proj.weight.fill_(0.25)
+        model.normalized_q_value_action_proj.bias.zero_()
+        model.next_state_flow_action_proj.weight.fill_(0.5)
+        model.next_state_flow_action_proj.bias.zero_()
+    hidden = torch.zeros(4, 2, 16, dtype=torch.float32)
+    x_t = torch.randn(4, 2, 5, dtype=torch.float32)
+    t = torch.rand(4, 2, 1, dtype=torch.float32)
+    action_a = torch.zeros(4, 2, 3, dtype=torch.float32)
+    action_b = torch.ones(4, 2, 3, dtype=torch.float32)
+
+    q_logits_a = model._decode_normalized_q_value_logits(hidden, action=action_a)
+    q_logits_b = model._decode_normalized_q_value_logits(hidden, action=action_b)
+    flow_a = model._decode_next_state_flow(hidden, x_t, t, action=action_a)
+    flow_b = model._decode_next_state_flow(hidden, x_t, t, action=action_b)
+
+    assert not torch.allclose(q_logits_a, q_logits_b)
+    assert not torch.allclose(flow_a, flow_b)
 
 
 def _run_rwkv7_exact_scm_chunk(
@@ -582,6 +638,7 @@ def test_rwkv7_block_batch1_fastpath_matches_manual_vmap_semantics():
 
 def test_rwkv7_block_batch_gt1_no_grad_fastpath_matches_manual_vmap_semantics():
     _ensure_torch_extensions_dir()
+    _skip_if_ninja_missing()
     _seed_everything(131)
     cfg = _build_rwkv7_rlpfn_config()
     cfg["transformer"]["emsize"] = 64
@@ -702,8 +759,9 @@ def test_rwkv7_block_batch1_fastpath_skips_vmap(monkeypatch):
     assert tuple(v_first_next.shape) == tuple(v_first.shape)
 
 
-def test_rwkv7_block_batch_gt1_no_grad_fastpath_skips_vmap(monkeypatch):
+def test_rwkv7_block_batch_gt1_no_grad_fastpath_uses_vendor_vmap(monkeypatch):
     _ensure_torch_extensions_dir()
+    _skip_if_ninja_missing()
     _seed_everything(171)
     cfg = _build_rwkv7_rlpfn_config()
     cfg["transformer"]["emsize"] = 64
@@ -728,7 +786,7 @@ def test_rwkv7_block_batch_gt1_no_grad_fastpath_skips_vmap(monkeypatch):
     with torch.no_grad():
         out, state_next, v_first_next = block.forward_step(x, state, v_first)
 
-    assert vmap_calls["count"] == 0
+    assert vmap_calls["count"] >= 1
     assert tuple(out.shape) == tuple(x.shape)
     assert len(state_next) == 3
     assert tuple(v_first_next.shape) == tuple(v_first.shape)
@@ -752,6 +810,7 @@ def test_rwkv7_core_cuda_batch1_official_eval_fastpath_matches_raw_step():
 
     with torch.no_grad():
         out_fast, state_fast = core.forward_step(token.clone(), None)
+        out_fast_2, state_fast_2 = core.forward_step(token.clone(), state_fast)
 
         raw_state = core.init_state(1, device=token.device, dtype=token.dtype)
         x_ref = token.clone()
@@ -763,11 +822,29 @@ def test_rwkv7_core_cuda_batch1_official_eval_fastpath_matches_raw_step():
         x_ref = core.ln_out(x_ref)
         flat_state_ref = core._flatten_official_eval_state(new_state)
 
+        x_ref_2 = token.clone()
+        new_state_2 = []
+        v_first_2 = None
+        for block, block_state in zip(core.blocks, new_state):
+            x_ref_2, block_state_next, v_first_2 = block.forward_step(x_ref_2, block_state, v_first_2)
+            new_state_2.append(block_state_next)
+        x_ref_2 = core.ln_out(x_ref_2)
+        flat_state_ref_2 = core._flatten_official_eval_state(new_state_2)
+
     assert isinstance(state_fast, list)
     assert len(state_fast) == int(cfg["transformer"]["nlayers"]) * 3
     assert torch.allclose(out_fast, x_ref, atol=1e-2, rtol=1e-2)
     for fast_tensor, ref_tensor in zip(state_fast, flat_state_ref):
         assert torch.allclose(fast_tensor.to(dtype=ref_tensor.dtype), ref_tensor, atol=1e-2, rtol=1e-2)
+    for idx, state_tensor in enumerate(state_fast):
+        expected_dtype = torch.float32 if idx % 3 == 1 else torch.bfloat16
+        assert state_tensor.dtype == expected_dtype
+    assert torch.allclose(out_fast_2, x_ref_2, atol=1e-2, rtol=1e-2)
+    for fast_tensor, ref_tensor in zip(state_fast_2, flat_state_ref_2):
+        assert torch.allclose(fast_tensor.to(dtype=ref_tensor.dtype), ref_tensor, atol=1e-2, rtol=1e-2)
+    for idx, state_tensor in enumerate(state_fast_2):
+        expected_dtype = torch.float32 if idx % 3 == 1 else torch.bfloat16
+        assert state_tensor.dtype == expected_dtype
 
 
 def test_rwkv7_rlpfn_exact_scm_reinforce_rollout_backward_is_finite():
@@ -1439,6 +1516,131 @@ def test_reinforce_sequence_replay_q_flow_shared_aux_query_pass_sinks_policy_the
     assert torch.allclose(loss.detach(), stats["policy_total_loss"].detach(), atol=1e-6, rtol=1e-6)
 
 
+def test_reinforce_sequence_replay_defaults_to_conditioned_policy_aux_pass():
+    _seed_everything(9993)
+    _, env_cfg = _build_small_exact_scm_env_cfg()
+    env_cfg["policy_gradient_weight"] = 0.1
+    env_cfg["normalized_q_value_weight"] = 0.25
+    env_cfg["next_state_flow_matching_weight"] = 0.5
+    env_cfg["obs_slot_dim"] = 8
+    env_cfg["action_slot_dim"] = 3
+    prior = EnvironmentPrior(env_cfg)
+    bardist = make_standardized_full_support_bar_distribution()
+    event_log = []
+
+    class _DummyReplayModel:
+        def resolve_replay_batch_chunk_size(self, *, seq_len, total_batch):
+            del seq_len
+            return int(total_batch)
+
+        def get_normalized_q_value_bardist(self):
+            return bardist
+
+        def encode_train_sequence_tokens(self, x_tokens, y_tokens):
+            del y_tokens
+            event_log.append("encode_train")
+            return x_tokens[..., :4].to(dtype=torch.float32)
+
+        def replay_policy_sequence_outputs_from_train_tokens(
+            self,
+            train_tokens,
+            *,
+            eval_start=0,
+            q_action_query=None,
+            flow_action_query=None,
+            flow_matching_xt=None,
+            flow_matching_t=None,
+        ):
+            del flow_matching_t
+            event_log.append("conditioned_policy_forward")
+            assert int(eval_start) == 0
+            assert q_action_query is not None
+            assert flow_action_query is not None
+            assert tuple(q_action_query.shape[:2]) == tuple(train_tokens.shape[:2])
+            assert tuple(flow_action_query.shape[:2]) == tuple(train_tokens.shape[:2])
+            assert tuple(flow_matching_xt.shape[:2]) == tuple(train_tokens.shape[:2])
+            action_mean = torch.zeros(
+                int(train_tokens.shape[0]),
+                int(train_tokens.shape[1]),
+                3,
+                dtype=train_tokens.dtype,
+            )
+            action_std = torch.full_like(action_mean, 0.05)
+            q_logits = q_action_query.mean(dim=-1, keepdim=True).expand(
+                int(train_tokens.shape[0]),
+                int(train_tokens.shape[1]),
+                bardist.num_bars,
+            ).to(dtype=torch.float32)
+            return {
+                "action_mean": action_mean,
+                "action_std": action_std,
+                "normalized_q_logits": q_logits,
+                "normalized_q": bardist.mean(q_logits),
+                "next_state_flow": torch.zeros_like(flow_matching_xt),
+            }
+
+    def _dummy_step_fn(*args, **kwargs):
+        raise AssertionError("conditioned aux replay test should not call live policy_step")
+
+    _dummy_step_fn._reinforce_sequence_replay_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("conditioned aux replay test should not use live replay fallback")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_outputs_fn = lambda *args, **kwargs: (_ for _ in ()).throw(
+        AssertionError("conditioned aux replay test should bypass legacy actor-only replay helper")
+    )
+    _dummy_step_fn._reinforce_sequence_replay_aux_sequence_outputs_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("conditioned aux replay test should bypass aux backbone replay")
+        )
+    )
+    _dummy_step_fn._reinforce_sequence_stream_replay_aux_outputs_with_kv_fn = (
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError("conditioned aux replay test should bypass streaming aux fallback")
+        )
+    )
+    _dummy_step_fn._fit_action_dim_fn = lambda x, action_dim: x[..., :action_dim]
+    _dummy_step_fn._model_ref = _DummyReplayModel()
+
+    seq_len = 5
+    eval_start = 2
+    batch_size = 1
+    state_dim = _resolve_dim_upper_bound(env_cfg["state_dim"])
+    action_dim = int(env_cfg["action_slot_dim"])
+    rewards = torch.randn(seq_len, batch_size, dtype=torch.float32)
+    replay_payload = {
+        "reward_in": torch.randn(seq_len, batch_size, dtype=torch.float32),
+        "sampled_action": torch.randn(seq_len - eval_start, batch_size, action_dim, dtype=torch.float32),
+        "action_std": torch.full((seq_len - eval_start, batch_size), 0.05, dtype=torch.float32),
+        "action_mask": torch.ones(batch_size, action_dim, dtype=torch.bool),
+        "next_state": torch.randn(seq_len - eval_start, batch_size, state_dim, dtype=torch.float32),
+        "state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_action": torch.randn(eval_start, batch_size, action_dim, dtype=torch.float32),
+        "flow_next_state": torch.randn(eval_start, batch_size, state_dim, dtype=torch.float32),
+        "flow_state_mask": torch.ones(batch_size, state_dim, dtype=torch.bool),
+        "flow_query_start": 0,
+        "flow_query_stop": eval_start,
+        "eval_start": eval_start,
+        "full_length": seq_len,
+    }
+
+    loss, stats, replay_log_probs = prior.reinforce_sequence_replay_loss_from_rollout(
+        policy_step_fn=_dummy_step_fn,
+        x_tokens=torch.randn(seq_len, batch_size, 12, dtype=torch.float32),
+        rewards=rewards,
+        replay_payload=replay_payload,
+        single_eval_pos=eval_start,
+        fit_action_dim_fn=_dummy_step_fn._fit_action_dim_fn,
+    )
+
+    assert torch.isfinite(loss).item()
+    assert torch.isfinite(replay_log_probs).all().item()
+    assert event_log == ["encode_train", "conditioned_policy_forward"]
+    assert int(stats["reinforce_sequence_replay_policy_aux_shared_context_forward"]) == 0
+    assert int(stats["reinforce_sequence_replay_conditioned_aux_from_policy_pass"]) == 1
+    assert int(stats["reinforce_sequence_replay_aux_query_pass_enabled"]) == 0
+    assert int(stats["reinforce_sequence_replay_q_flow_shared_aux_query_pass"]) == 0
+
+
 def test_reinforce_sequence_replay_prefers_official_sequence_aux_helper():
     _seed_everything(9994)
     _, env_cfg = _build_small_exact_scm_env_cfg()
@@ -1600,6 +1802,7 @@ def test_reinforce_sequence_replay_prefers_shared_context_forward_helper():
     env_cfg["next_state_flow_matching_weight"] = 0.5
     env_cfg["obs_slot_dim"] = 8
     env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     env_cfg["reinforce_sequence_replay_share_context_forward"] = True
     prior = EnvironmentPrior(env_cfg)
     bardist = make_standardized_full_support_bar_distribution()
@@ -2381,6 +2584,7 @@ def test_reinforce_sequence_replay_loss_sink_disables_shared_context_forward_to_
     env_cfg["next_state_flow_matching_weight"] = 0.5
     env_cfg["obs_slot_dim"] = 8
     env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     env_cfg["reinforce_sequence_replay_share_context_forward"] = True
     prior = EnvironmentPrior(env_cfg)
     bardist = make_standardized_full_support_bar_distribution()
@@ -2674,6 +2878,7 @@ def test_reinforce_sequence_replay_loss_sink_with_payload_keeps_shared_context_f
     env_cfg["next_state_flow_matching_weight"] = 0.5
     env_cfg["obs_slot_dim"] = 8
     env_cfg["action_slot_dim"] = 3
+    env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     env_cfg["reinforce_sequence_replay_share_context_forward"] = True
     prior = EnvironmentPrior(env_cfg)
     bardist = make_standardized_full_support_bar_distribution()
@@ -2845,6 +3050,7 @@ def test_reinforce_sequence_replay_shared_context_forward_pads_narrow_flow_targe
     env_cfg["obs_slot_dim"] = 8
     env_cfg["action_slot_dim"] = 3
     env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 7, "max": 8}
+    env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     env_cfg["reinforce_sequence_replay_share_context_forward"] = True
     prior = EnvironmentPrior(env_cfg)
     bardist = make_standardized_full_support_bar_distribution()
@@ -3005,7 +3211,7 @@ def test_reinforce_sequence_replay_uses_model_resolved_backward_microbatch():
 
     assert torch.isfinite(loss).item()
     assert torch.isfinite(replay_log_probs).all().item()
-    assert int(stats["reinforce_sequence_replay_batch_chunk"]) == 16
+    assert int(stats["reinforce_sequence_replay_batch_chunk"]) == batch_size
     assert int(stats["reinforce_sequence_replay_chunk_count"]) == 1
 
 
@@ -3441,6 +3647,7 @@ def test_rwkv7_replay_policy_and_aux_sequence_outputs_from_train_tokens_uses_sin
     cfg["prior"]["environment"]["normalized_q_value_weight"] = 0.2
     cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
     cfg["prior"]["environment"]["next_state_flow_head_type"] = "mlp"
+    cfg["prior"]["environment"]["reinforce_aux_backbone_query_pass_enabled"] = True
     cfg["prior"]["environment"]["reinforce_sequence_replay_share_context_forward"] = True
     cfg["transformer"]["emsize"] = 64
     cfg["transformer"]["nlayers"] = 2
@@ -3515,10 +3722,12 @@ def test_reinforce_sequence_replay_shared_context_forward_matches_separate_paths
     bardist = make_standardized_full_support_bar_distribution()
 
     shared_env_cfg = deepcopy(base_env_cfg)
+    shared_env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     shared_env_cfg["reinforce_sequence_replay_share_context_forward"] = True
     shared_prior = EnvironmentPrior(shared_env_cfg)
 
     legacy_env_cfg = deepcopy(base_env_cfg)
+    legacy_env_cfg["reinforce_aux_backbone_query_pass_enabled"] = True
     legacy_env_cfg["reinforce_sequence_replay_share_context_forward"] = False
     legacy_env_cfg["reinforce_sequence_replay_share_train_token_encoding"] = False
     legacy_prior = EnvironmentPrior(legacy_env_cfg)
@@ -4875,6 +5084,71 @@ def test_rwkv7_default_replay_chunk_resolver_scales_with_sequence_length():
     _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
     assert int(model.resolve_replay_batch_chunk_size(seq_len=512, total_batch=1024)) == 64
     assert int(model.resolve_replay_batch_chunk_size(seq_len=4096, total_batch=1024)) == 32
+
+
+def test_rwkv7_two_layer_flow_head_scales_inherited_replay_budget_by_layer_ratio():
+    if not torch.cuda.is_available():
+        return
+
+    _ensure_torch_extensions_dir()
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["prior"]["environment"]["reinforce_aux_enabled"] = True
+    cfg["prior"]["environment"]["next_state_flow_matching_weight"] = 0.5
+    cfg["prior"]["environment"]["next_state_flow_head_type"] = "rwkv_two_layer"
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    assert isinstance(model.next_state_flow_head, RWKVTwoLayerFlowMatchingHead)
+    assert int(model.next_state_flow_head.rwkv_sequence_replay_batch_chunk_size) == int(model.rwkv_sequence_replay_batch_chunk_size)
+    assert int(model.next_state_flow_head.rwkv_sequence_replay_token_budget) == int(model.rwkv_sequence_replay_token_budget)
+    assert float(model.next_state_flow_head.rwkv_sequence_replay_token_budget_scale) == pytest.approx(
+        float(cfg["transformer"]["nlayers"]) / 2.0
+    )
+    assert int(model.next_state_flow_head.resolve_replay_batch_chunk_size(seq_len=512, total_batch=1024)) == 64
+    assert int(model.next_state_flow_head.resolve_replay_batch_chunk_size(seq_len=4096, total_batch=1024)) == 64
+
+
+def test_rwkv7_two_layer_flow_head_chunking_matches_full_forward():
+    if not torch.cuda.is_available():
+        return
+
+    _ensure_torch_extensions_dir()
+    _seed_everything(777)
+    hidden_dim = 64
+    target_dim = 11
+    seq_len = 64
+    batch_size = 8
+
+    head_full = RWKVTwoLayerFlowMatchingHead(
+        hidden_dim=hidden_dim,
+        target_dim=target_dim,
+        head_size=64,
+        ffn_mult=4,
+        time_embedding_dim=128,
+        sequence_replay_checkpoint=True,
+        rwkv_sequence_replay_batch_chunk_size=None,
+        rwkv_sequence_replay_token_budget=None,
+    ).cuda().eval()
+    head_chunk = RWKVTwoLayerFlowMatchingHead(
+        hidden_dim=hidden_dim,
+        target_dim=target_dim,
+        head_size=64,
+        ffn_mult=4,
+        time_embedding_dim=128,
+        sequence_replay_checkpoint=True,
+        rwkv_sequence_replay_batch_chunk_size=2,
+        rwkv_sequence_replay_token_budget=1 << 20,
+    ).cuda().eval()
+    head_chunk.load_state_dict(head_full.state_dict())
+
+    hidden = torch.randn(seq_len, batch_size, hidden_dim, device="cuda")
+    x_t = torch.randn(seq_len, batch_size, target_dim, device="cuda")
+    t = torch.rand(seq_len, batch_size, 1, device="cuda")
+
+    with torch.no_grad():
+        out_full = head_full(hidden, x_t, t)
+        out_chunk = head_chunk(hidden, x_t, t)
+
+    assert int(head_chunk.resolve_replay_batch_chunk_size(seq_len=seq_len, total_batch=batch_size)) == 2
+    assert torch.allclose(out_full, out_chunk, atol=1e-5, rtol=1e-4)
 
 
 def test_rwkv7_cuda_stepwise_core_matches_official_sequence_core():

@@ -6801,6 +6801,94 @@ def train_epoch_policy_gradient(
     return mean_loss, 0.0, 0.0
 
 
+def train_epoch_official_recurrent_ppo(
+    *,
+    model,
+    ppo_algo,
+    ppo_callback,
+    ppo_total_timesteps_target: int,
+    epoch_idx=None,
+):
+    rollout_wall_t0 = time.perf_counter()
+    continue_training = ppo_algo.collect_rollouts(
+        ppo_algo.env,
+        ppo_callback,
+        ppo_algo.rollout_buffer,
+        n_rollout_steps=ppo_algo.n_steps,
+    )
+    rollout_wall_s = float(time.perf_counter() - rollout_wall_t0)
+    if not continue_training:
+        raise RuntimeError("Official RecurrentPPO rollout callback requested early stop.")
+    ppo_algo._update_current_progress_remaining(ppo_algo.num_timesteps, ppo_total_timesteps_target)
+    if epoch_idx is not None:
+        ppo_algo.dump_logs(int(epoch_idx))
+    train_wall_t0 = time.perf_counter()
+    ppo_algo.train()
+    train_wall_s = float(time.perf_counter() - train_wall_t0)
+
+    logger_values = dict(getattr(ppo_algo.logger, "name_to_value", {}))
+
+    ep_rew_mean = None
+    ep_len_mean = None
+    ep_infos = list(getattr(ppo_algo, "ep_info_buffer", []) or [])
+    if len(ep_infos) > 0:
+        try:
+            ep_rew_mean = float(np.mean([float(ep["r"]) for ep in ep_infos if "r" in ep]))
+        except Exception:
+            ep_rew_mean = None
+        try:
+            ep_len_mean = float(np.mean([float(ep["l"]) for ep in ep_infos if "l" in ep]))
+        except Exception:
+            ep_len_mean = None
+
+    target_model = model.module if hasattr(model, "module") else model
+    target_model.last_pg_epoch_metrics = None
+    target_model.last_ppo_epoch_metrics = {
+        "policy_total_loss_mean": logger_values.get("train/loss", None),
+        "policy_gradient_loss_mean": logger_values.get("train/policy_gradient_loss", None),
+        "value_loss_mean": logger_values.get("train/value_loss", None),
+        "entropy_loss_mean": logger_values.get("train/entropy_loss", None),
+        "approx_kl_mean": logger_values.get("train/approx_kl", None),
+        "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
+        "explained_variance": logger_values.get("train/explained_variance", None),
+        "clip_range": logger_values.get("train/clip_range", None),
+        "clip_range_vf": logger_values.get("train/clip_range_vf", None),
+        "n_updates": logger_values.get("train/n_updates", None),
+        "episode_reward_mean": ep_rew_mean,
+        "episode_length_mean": ep_len_mean,
+        "num_timesteps": int(getattr(ppo_algo, "num_timesteps", 0)),
+        "rollout_wall_time_sec": rollout_wall_s,
+        "update_wall_time_sec": train_wall_s,
+        "logged_update_wall_time_sec": logger_values.get("train/update_wall_time_sec", None),
+        "outer_batches": logger_values.get("train/outer_batches", None),
+        "subbatches": logger_values.get("train/subbatches", None),
+    }
+    mean_loss = logger_values.get("train/loss", 0.0)
+    return float(mean_loss), 0.0, 0.0
+
+
+def _resolve_official_ppo_rollout_shape(
+    *,
+    batch_size: int,
+    n_samples: int,
+    configured_n_envs=None,
+    configured_n_steps=None,
+):
+    derived_n_envs = int(max(1, int(batch_size)))
+    derived_n_steps = int(max(1, int(n_samples)))
+    if configured_n_envs is not None and int(configured_n_envs) != derived_n_envs:
+        raise ValueError(
+            "Official RecurrentPPO rollout n_envs must match the existing EnvironmentPrior batch_size. "
+            f"Expected {derived_n_envs}, got {int(configured_n_envs)}."
+        )
+    if configured_n_steps is not None and int(configured_n_steps) != derived_n_steps:
+        raise ValueError(
+            "Official RecurrentPPO rollout n_steps must match the existing EnvironmentPrior n_samples. "
+            f"Expected {derived_n_steps}, got {int(configured_n_steps)}."
+        )
+    return derived_n_envs, derived_n_steps
+
+
 def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           epochs=10, stop_after_epochs=None, learning_rate=None, min_lr=None, weight_decay=0.0, warmup_epochs=10,
           device='cuda:0',
@@ -6869,11 +6957,24 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           pg_phase_log_file=None,
           anil_inner_steps=1,
           anil_inner_learning_rate=0.1,
+          ppo_n_envs=None,
+          ppo_n_steps=None,
+          ppo_batch_size=None,
+          ppo_n_epochs=4,
+          ppo_gamma=1.0,
+          ppo_gae_lambda=0.95,
+          ppo_clip_range=0.2,
+          ppo_clip_range_vf=None,
+          ppo_normalize_advantage=True,
+          ppo_ent_coef=0.0,
+          ppo_vf_coef=0.5,
+          ppo_max_grad_norm=0.5,
+          ppo_target_kl=None,
           ):
     del train_host_rss_limit_gib, train_host_rss_limit_poll_interval_sec, train_host_rss_limit_try_rlimit_as
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
-    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
+    if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil', 'ppo'}:
         raise ValueError(f"Unknown rl_objective: {rl_objective}")
     if rank == 0 and verbose:
         print(f'Using {device} device')
@@ -6982,13 +7083,13 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"export_trace={kernel_profiler_cfg.export_trace}, "
                 f"summary_top_k={kernel_profiler_cfg.summary_top_k})"
             )
-    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
+    if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil', 'ppo'}:
         if using_dist:
             raise ValueError(f"{rl_objective} objective does not support distributed training yet.")
         env_prior = _resolve_environment_prior(getattr(dl, "prior", None))
         if env_prior is None:
             raise ValueError(f"{rl_objective} objective requires EnvironmentPrior in dataloader prior chain.")
-        if rank == 0 and verbose:
+        if rank == 0 and verbose and rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
             print(f"Using {rl_objective} objective with differentiable EnvironmentPrior rollout.")
             env_backend = str(getattr(env_prior, "config", {}).get("batch_parallel_backend", "python_thread"))
             env_grouping = str(getattr(env_prior, "config", {}).get("batch_vectorized_grouping", "structure"))
@@ -7472,6 +7573,16 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     f"export_trace={kernel_profiler_export_trace}",
                     f"summary_top_k={kernel_profiler_summary_top_k}",
                 )
+        if rank == 0 and verbose and rl_objective == "ppo":
+            env_backend = str(getattr(env_prior, "config", {}).get("batch_parallel_backend", "python_thread"))
+            reward_transform_mode = str(getattr(env_prior, "config", {}).get("reinforce_reward_transform", "none")).strip().lower()
+            action_transform_mode = str(getattr(env_prior, "config", {}).get("reinforce_action_transform", "none")).strip().lower()
+            print("Using strict official RecurrentPPO path with RWKV official rollout/train plumbing.")
+            print(
+                "PPO environment backend:",
+                env_backend,
+                f"(reward_transform={reward_transform_mode}, action_transform={action_transform_mode})",
+            )
 
     n_out = model.n_out
     if using_dist:
@@ -7496,42 +7607,138 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             epoch_callback(model, None, None, "start")
 
     dl.model = model
-    adamw_kwargs = dict(lr=learning_rate, weight_decay=weight_decay, betas=(adam_beta1, 0.999))
     optimizer = None
-    if bool(adamw_fused) and ("cuda" in str(device)):
-        try:
-            optimizer = torch.optim.AdamW(model.parameters(), fused=True, **adamw_kwargs)
-            if rank == 0 and verbose:
-                print("AdamW fused: enabled")
-        except Exception as e:
-            if rank == 0 and verbose:
-                print(f"[optim-warn] fused AdamW unavailable, fallback to standard AdamW: {e}")
-            optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
-    else:
-        optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
-    if optimizer_state is not None:
-        optimizer.load_state_dict(optimizer_state)
     spike_scheduler = None
-    if scheduler is None:
-        if learning_rate_schedule == 'cosine':
-            base_scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=min_lr)
-        elif learning_rate_schedule == 'exponential':
-            base_scheduler = ExponentialLR(optimizer, gamma=lr_decay, min_lr=min_lr)
-        elif learning_rate_schedule == 'constant':
-            base_scheduler = ExponentialLR(optimizer, gamma=1, min_lr=min_lr)
-        else:
-            raise ValueError(f"Invalid learning rate schedule: {learning_rate_schedule}")
-        # add linear warmup to scheduler
-        scheduler = SequentialLR(optimizer, [LinearLR(optimizer, start_factor=1e-10, end_factor=1, total_iters=warmup_epochs),
-                                             base_scheduler], milestones=[warmup_epochs])
+    ppo_algo = None
+    ppo_callback = None
+    ppo_vec_env = None
+    ppo_callback_started = False
+    ppo_total_timesteps_target = None
+    if rl_objective == "ppo":
+        from ticl.sb3_recurrent_ppo import (
+            build_recurrent_ppo,
+            extract_validation_recurrent_ppo_policy_state,
+            resolve_official_ppo_update_batch_size,
+        )
 
+        if optimizer_state is not None or scheduler is not None:
+            raise ValueError(
+                "rl_objective='ppo' delegates optimization and scheduling to official sb3-contrib RecurrentPPO; "
+                "external optimizer_state/scheduler resume is not supported in this path."
+            )
+        ppo_batch_envs = int(dl.batch_size)
+        ppo_rollout_steps = int(dl.n_samples)
+        ppo_num_features = int(dl.num_features)
+        ppo_n_envs, ppo_n_steps = _resolve_official_ppo_rollout_shape(
+            batch_size=ppo_batch_envs,
+            n_samples=ppo_rollout_steps,
+            configured_n_envs=ppo_n_envs,
+            configured_n_steps=ppo_n_steps,
+        )
+        ppo_batch_size = resolve_official_ppo_update_batch_size(
+            model=model,
+            n_envs=ppo_n_envs,
+            n_steps=ppo_n_steps,
+            configured_batch_size=ppo_batch_size,
+        )
+        if rank == 0 and verbose:
+            print(
+                "Using strict official RecurrentPPO with official RWKV rollout/train paths "
+                f"(n_envs={int(ppo_n_envs)}, n_steps={int(ppo_n_steps)}, "
+                f"batch_size={int(ppo_batch_size)})."
+            )
+            try:
+                ppo_progress_min_interval_print = float(
+                    os.environ.get("TICL_PPO_PHASE_LOG_MIN_INTERVAL_SEC", "10.0")
+                )
+            except Exception:
+                ppo_progress_min_interval_print = 10.0
+            print(
+                "PPO phase progress logging:",
+                f"every_batches={int(max(1, int(pg_phase_log_every_batches)))}",
+                f"min_interval_sec={float(max(0.0, ppo_progress_min_interval_print)):.1f}",
+                f"log_file={pg_phase_log_file if (pg_phase_log_file is not None and str(pg_phase_log_file).strip() != '') else 'disabled'}",
+            )
+        ppo_algo, ppo_callback, ppo_vec_env = build_recurrent_ppo(
+            model=model,
+            env_prior=env_prior,
+            device=device,
+            num_features=ppo_num_features,
+            n_envs=int(ppo_n_envs),
+            n_steps=int(ppo_n_steps),
+            learning_rate=learning_rate,
+            batch_size=int(ppo_batch_size),
+            n_epochs=int(ppo_n_epochs),
+            gamma=float(ppo_gamma),
+            gae_lambda=float(ppo_gae_lambda),
+            clip_range=ppo_clip_range,
+            clip_range_vf=ppo_clip_range_vf,
+            normalize_advantage=bool(ppo_normalize_advantage),
+            ent_coef=float(ppo_ent_coef),
+            vf_coef=float(ppo_vf_coef),
+            max_grad_norm=float(ppo_max_grad_norm),
+            target_kl=ppo_target_kl,
+            verbose=int(verbose),
+        )
+
+        def _attach_validation_ppo_policy_handles(target, *, live_policy, saved_policy_state):
+            if target is None:
+                return
+            target.__dict__["_validation_sb3_policy_live"] = live_policy
+            target.__dict__["_validation_ppo_policy_state"] = saved_policy_state
+
+        validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
+        _attach_validation_ppo_policy_handles(model, live_policy=ppo_algo.policy, saved_policy_state=validation_ppo_policy_state)
+        module_target = getattr(model, "module", None)
+        if module_target is not None:
+            _attach_validation_ppo_policy_handles(
+                module_target,
+                live_policy=ppo_algo.policy,
+                saved_policy_state=validation_ppo_policy_state,
+            )
         start_epoch = 1
     else:
-        start_epoch = scheduler.last_epoch + 1
+        adamw_kwargs = dict(lr=learning_rate, weight_decay=weight_decay, betas=(adam_beta1, 0.999))
+        if bool(adamw_fused) and ("cuda" in str(device)):
+            try:
+                optimizer = torch.optim.AdamW(model.parameters(), fused=True, **adamw_kwargs)
+                if rank == 0 and verbose:
+                    print("AdamW fused: enabled")
+            except Exception as e:
+                if rank == 0 and verbose:
+                    print(f"[optim-warn] fused AdamW unavailable, fallback to standard AdamW: {e}")
+                optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        else:
+            optimizer = torch.optim.AdamW(model.parameters(), **adamw_kwargs)
+        if optimizer_state is not None:
+            optimizer.load_state_dict(optimizer_state)
+        if scheduler is None:
+            if learning_rate_schedule == 'cosine':
+                base_scheduler = CosineAnnealingLR(optimizer, T_max=epochs - warmup_epochs, eta_min=min_lr)
+            elif learning_rate_schedule == 'exponential':
+                base_scheduler = ExponentialLR(optimizer, gamma=lr_decay, min_lr=min_lr)
+            elif learning_rate_schedule == 'constant':
+                base_scheduler = ExponentialLR(optimizer, gamma=1, min_lr=min_lr)
+            else:
+                raise ValueError(f"Invalid learning rate schedule: {learning_rate_schedule}")
+            scheduler = SequentialLR(
+                optimizer,
+                [LinearLR(optimizer, start_factor=1e-10, end_factor=1, total_iters=warmup_epochs), base_scheduler],
+                milestones=[warmup_epochs],
+            )
+            start_epoch = 1
+        else:
+            start_epoch = scheduler.last_epoch + 1
 
-    if reduce_lr_on_spike:
-        # In this case we're not properly restarting the scheduler when we load a checkpoint, sad
-        spike_scheduler = ReduceLROnSpike(optimizer, smoothing=10, factor=0.5, min_lr=min_lr, tolerance=spike_tolerance, verbose=True)
+        if reduce_lr_on_spike:
+            spike_scheduler = ReduceLROnSpike(
+                optimizer,
+                smoothing=10,
+                factor=0.5,
+                min_lr=min_lr,
+                tolerance=spike_tolerance,
+                verbose=True,
+            )
     try:
         scaler_device_type = torch.device(str(device)).type
     except Exception:
@@ -7544,6 +7751,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         if train_mixed_precision and scaler_device_type == "cuda" and scaler_autocast_dtype == torch.float16
         else None
     )
+    if rl_objective == "ppo" and ppo_algo is not None:
+        setattr(ppo_algo, "_rwkv_grad_scaler", scaler)
+        setattr(ppo_algo, "_rwkv_autocast_dtype", scaler_autocast_dtype)
 
     # check that everything uses up-to-date APIs
     utils.check_compatibility(dl)
@@ -7551,8 +7761,30 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     total_loss = float('inf')
     epoch = start_epoch
     pg_phase_log_file_rank0 = pg_phase_log_file if int(rank) == 0 else None
+    if rl_objective == "ppo" and ppo_algo is not None:
+        setattr(ppo_algo, "_rwkv_progress_log_enabled", bool(int(rank) == 0 and verbose))
+        setattr(ppo_algo, "_rwkv_progress_log_every", int(max(1, int(pg_phase_log_every_batches))))
+        try:
+            ppo_progress_min_interval_sec = float(
+                os.environ.get("TICL_PPO_PHASE_LOG_MIN_INTERVAL_SEC", "10.0")
+            )
+        except Exception:
+            ppo_progress_min_interval_sec = 10.0
+        setattr(ppo_algo, "_rwkv_progress_log_min_interval_sec", float(max(0.0, ppo_progress_min_interval_sec)))
+        setattr(ppo_algo, "_rwkv_progress_log_file", pg_phase_log_file_rank0)
     if stop_after_epochs is not None:
         epochs = min(epochs, stop_after_epochs)
+    if rl_objective == "ppo" and ppo_algo is not None:
+        ppo_total_timesteps_target = int(max(1, epochs)) * int(ppo_algo.n_envs) * int(ppo_algo.n_steps)
+        ppo_total_timesteps_target, ppo_callback = ppo_algo._setup_learn(
+            int(ppo_total_timesteps_target),
+            callback=ppo_callback,
+            reset_num_timesteps=True,
+            tb_log_name="ppo",
+            progress_bar=False,
+        )
+        ppo_callback.on_training_start(locals(), globals())
+        ppo_callback_started = True
     if "cuda" in device:
         gpu_start_time = torch.cuda.Event(enable_timing=True)
         gpu_end_time = torch.cuda.Event(enable_timing=True)
@@ -7572,7 +7804,15 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 torch.cuda.reset_peak_memory_stats()
                 gpu_start_time.record()
             
-            if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
+            if rl_objective == 'ppo':
+                new_loss, nan_share, ignore_share = train_epoch_official_recurrent_ppo(
+                    model=model,
+                    ppo_algo=ppo_algo,
+                    ppo_callback=ppo_callback,
+                    ppo_total_timesteps_target=int(ppo_total_timesteps_target),
+                    epoch_idx=epoch,
+                )
+            elif rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
                 new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
                     model=model,
                     aggregate_k_gradients=aggregate_k_gradients,
@@ -7647,7 +7887,21 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 )
 
             total_loss = new_loss
-            if spike_scheduler is not None:
+            if rl_objective == 'ppo':
+                validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
+                model.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
+                model.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
+                module_target = getattr(model, "module", None)
+                if module_target is not None:
+                    module_target.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
+                    module_target.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
+                ppo_policy_optimizer = getattr(getattr(ppo_algo, "policy", None), "optimizer", None)
+                if ppo_policy_optimizer is None:
+                    raise RuntimeError(
+                        "PPO path expected an internal SB3 policy optimizer, but none was available."
+                    )
+                last_lr = float(ppo_policy_optimizer.param_groups[0]["lr"])
+            elif spike_scheduler is not None:
                 last_lr = spike_scheduler.get_last_lr()[0]
             else:
                 last_lr = scheduler.get_last_lr()[0]
@@ -7725,6 +7979,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     )
                 if rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
                     mean_loss_str = f"{float(total_loss):+.6e}"
+                elif rl_objective == 'ppo':
+                    mean_loss_str = f"{float(total_loss):+.6e}"
                 else:
                     mean_loss_str = f"{float(total_loss):5.4f}"
                 print(
@@ -7749,6 +8005,35 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                             f"reinforce { _fmt_pg_loss_value('reinforce_loss_mean') } | "
                             f"qaux { _fmt_pg_loss_value('normalized_q_value_loss_mean') } | "
                             f"fmaux { _fmt_pg_loss_value('next_state_flow_matching_loss_mean') }"
+                        )
+                elif rl_objective == 'ppo':
+                    ppo_diag = getattr(model, "last_ppo_epoch_metrics", None)
+                    if hasattr(model, "module"):
+                        ppo_diag = getattr(model.module, "last_ppo_epoch_metrics", ppo_diag)
+                    if isinstance(ppo_diag, dict):
+                        def _fmt_ppo_value(key):
+                            value = ppo_diag.get(key, None)
+                            if value is None:
+                                return "na"
+                            try:
+                                return f"{float(value):+.3e}"
+                            except Exception:
+                                return "na"
+
+                        print(
+                            " ppo-losses "
+                            f"total { _fmt_ppo_value('policy_total_loss_mean') } | "
+                            f"pg { _fmt_ppo_value('policy_gradient_loss_mean') } | "
+                            f"value { _fmt_ppo_value('value_loss_mean') } | "
+                            f"kl { _fmt_ppo_value('approx_kl_mean') } | "
+                            f"clip_frac { _fmt_ppo_value('clip_fraction_mean') }"
+                        )
+                        print(
+                            " ppo-phases "
+                            f"rollout_s { _fmt_ppo_value('rollout_wall_time_sec') } | "
+                            f"update_s { _fmt_ppo_value('update_wall_time_sec') } | "
+                            f"outer_batches { _fmt_ppo_value('outer_batches') } | "
+                            f"subbatches { _fmt_ppo_value('subbatches') }"
                         )
                 if profile_record is not None:
                     print(
@@ -7781,16 +8066,17 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 print('-' * 89)
                 
             if (
-                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}
+                rl_objective not in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil', 'ppo'}
                 and math.isfinite(prev_total_loss)
                 and new_loss > 1.5 * prev_total_loss
             ):
                 print("LOSS DIVERGED")
                 return total_loss, model.to('cpu'), dl, epoch
             
-            scheduler.step()
-            if spike_scheduler is not None:
-                spike_scheduler.step(metrics=total_loss)
+            if rl_objective != 'ppo':
+                scheduler.step()
+                if spike_scheduler is not None:
+                    spike_scheduler.step(metrics=total_loss)
             # stepping with wallclock time based scheduler
             if epoch_callback is not None and rank == 0:
                 model.learning_rates.append(last_lr)
@@ -7814,6 +8100,16 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         traceback.print_exc()
         raise
     finally:
+        if ppo_callback_started and (ppo_callback is not None):
+            try:
+                ppo_callback.on_training_end()
+            except Exception:
+                pass
+        if ppo_vec_env is not None:
+            try:
+                ppo_vec_env.close()
+            except Exception:
+                pass
         if kernel_profiler is not None:
             kernel_profiler.stop()
         if gpu_observer is not None:

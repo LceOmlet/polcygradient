@@ -8,7 +8,12 @@ import torch
 
 from ticl.models.encoders import Linear
 from ticl.models.tabpfn import TabPFN
-from ticl.rl_validation import _score_candidate_actions, evaluate_rlpfn_on_gym_envs
+from ticl.rl_validation import (
+    _concat_cache_batch_dim,
+    _score_candidate_actions,
+    _slice_cache_batch_dim,
+    evaluate_rlpfn_on_gym_envs,
+)
 
 
 def _build_small_causal_model():
@@ -47,6 +52,39 @@ def _build_small_split_rlpfn_like_model():
     )
     model.eval()
     return model
+
+
+def test_validation_cache_helpers_normalize_official_eval_flat_cache():
+    flat_cache_0 = [
+        torch.randn(32),
+        torch.randn(2, 4, 4),
+        torch.randn(32),
+        torch.randn(32),
+        torch.randn(2, 4, 4),
+        torch.randn(32),
+    ]
+    flat_cache_1 = [
+        torch.randn(32),
+        torch.randn(2, 4, 4),
+        torch.randn(32),
+        torch.randn(32),
+        torch.randn(2, 4, 4),
+        torch.randn(32),
+    ]
+
+    sliced = _slice_cache_batch_dim(flat_cache_0, 0)
+    assert isinstance(sliced, list)
+    assert len(sliced) == 2
+    assert sliced[0][0].shape == (1, 32)
+    assert sliced[0][1].shape == (1, 2, 4, 4)
+    assert sliced[0][2].shape == (1, 32)
+
+    merged = _concat_cache_batch_dim([flat_cache_0, flat_cache_1])
+    assert isinstance(merged, list)
+    assert len(merged) == 2
+    assert merged[0][0].shape == (2, 32)
+    assert merged[0][1].shape == (2, 2, 4, 4)
+    assert merged[0][2].shape == (2, 32)
 
 
 def test_score_candidate_actions_bootstrap_step_no_prefix_no_crash():
@@ -313,12 +351,146 @@ class _FixedActionPolicyModel(torch.nn.Module):
         return out, {"step": 1 if kv_cache is None else int(kv_cache.get("step", 0)) + 1}
 
 
-def _install_fake_gym(monkeypatch, env_factory):
+class _MinimalValidationModel(torch.nn.Module):
+    pass
+
+
+class _FakePPOValidationPolicy:
+    def __init__(self, *, action_dim=1, action_mean=0.5, action_std=0.25):
+        self.action_dim = int(action_dim)
+        self.action_mean = float(action_mean)
+        self.action_std = float(action_std)
+        self.batch_sizes = []
+        self.phase_batches = []
+        self.sample_calls = 0
+
+    def eval(self):
+        return self
+
+    def to(self, device):
+        del device
+        return self
+
+    def make_vectorized_rollout_step_fn(self):
+        policy = self
+
+        def _step_fn(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx, env_info):
+            del obs_t
+            del action_t
+            del reward_t
+            del reward_mask_t
+            del step_idx
+            batch_size = int(env_info["phase_t"].shape[0])
+            policy.batch_sizes.append(batch_size)
+            policy.phase_batches.append(env_info["phase_t"].detach().cpu().reshape(-1).tolist())
+            action_mean = torch.full(
+                (batch_size, policy.action_dim),
+                policy.action_mean,
+                dtype=torch.float32,
+                device=env_info["phase_t"].device,
+            )
+            action_std = torch.full_like(action_mean, policy.action_std)
+            next_cache = {"step": torch.arange(batch_size, device=action_mean.device, dtype=torch.float32).reshape(-1, 1)}
+            if cache is not None and isinstance(cache, dict) and "step" in cache:
+                next_cache["step"] = cache["step"] + 1.0
+            return {
+                "action_mean": action_mean,
+                "action_std": action_std,
+                "values": torch.zeros((batch_size, 1), dtype=action_mean.dtype, device=action_mean.device),
+            }, next_cache
+
+        def _sample_fn(actor_outputs, noise):
+            policy.sample_calls += 1
+            return actor_outputs["action_mean"] + (noise * actor_outputs["action_std"])
+
+        _step_fn._policy_actor_sample_fn = _sample_fn
+        return _step_fn
+
+
+class _FakeSyncVectorEnv:
+    def __init__(self, env_fns, copy=True, observation_mode="same"):
+        del observation_mode
+        self.copy = bool(copy)
+        self.envs = [fn() for fn in env_fns]
+        self.num_envs = int(len(self.envs))
+        self._observations = None
+        self._rewards = np.zeros((self.num_envs,), dtype=np.float32)
+        self._terminations = np.zeros((self.num_envs,), dtype=np.bool_)
+        self._truncations = np.zeros((self.num_envs,), dtype=np.bool_)
+        self._autoreset_envs = np.zeros((self.num_envs,), dtype=np.bool_)
+        self.step_calls = 0
+
+    def reset(self, *, seed=None, options=None):
+        del options
+        if seed is None:
+            seed = [None] * self.num_envs
+        elif isinstance(seed, int):
+            seed = [seed + i for i in range(self.num_envs)]
+        observations = []
+        infos = {}
+        for idx, (env, env_seed) in enumerate(zip(self.envs, seed)):
+            obs, info = env.reset(seed=env_seed)
+            observations.append(np.asarray(obs, dtype=np.float32))
+            for key, value in dict(info).items():
+                infos.setdefault(key, np.empty((self.num_envs,), dtype=object))
+                infos.setdefault(f"_{key}", np.zeros((self.num_envs,), dtype=np.bool_))
+                infos[key][idx] = value
+                infos[f"_{key}"][idx] = True
+        self._observations = np.stack(observations, axis=0)
+        self._rewards.fill(0.0)
+        self._terminations.fill(False)
+        self._truncations.fill(False)
+        self._autoreset_envs.fill(False)
+        return np.copy(self._observations) if self.copy else self._observations, infos
+
+    def step(self, actions):
+        self.step_calls += 1
+        observations = []
+        infos = {}
+        for idx, (env, action) in enumerate(zip(self.envs, np.asarray(actions))):
+            if self._autoreset_envs[idx]:
+                obs, info = env.reset(seed=None)
+                reward = 0.0
+                terminated = False
+                truncated = False
+            else:
+                obs, reward, terminated, truncated, info = env.step(action)
+            observations.append(np.asarray(obs, dtype=np.float32))
+            self._rewards[idx] = float(reward)
+            self._terminations[idx] = bool(terminated)
+            self._truncations[idx] = bool(truncated)
+            for key, value in dict(info).items():
+                infos.setdefault(key, np.empty((self.num_envs,), dtype=object))
+                infos.setdefault(f"_{key}", np.zeros((self.num_envs,), dtype=np.bool_))
+                infos[key][idx] = value
+                infos[f"_{key}"][idx] = True
+        self._observations = np.stack(observations, axis=0)
+        self._autoreset_envs = np.logical_or(self._terminations, self._truncations)
+        return (
+            np.copy(self._observations) if self.copy else self._observations,
+            np.copy(self._rewards),
+            np.copy(self._terminations),
+            np.copy(self._truncations),
+            infos,
+        )
+
+    def close(self):
+        for env in self.envs:
+            env.close()
+
+
+def _install_fake_gym(monkeypatch, env_factory, *, with_vector=False):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
     spaces_mod.Box = _FakeBox
+    gym_mod.Env = object
     gym_mod.spaces = spaces_mod
     gym_mod.make = lambda env_name: env_factory(env_name)
+    if bool(with_vector):
+        vector_mod = types.ModuleType("gymnasium.vector")
+        vector_mod.SyncVectorEnv = _FakeSyncVectorEnv
+        gym_mod.vector = vector_mod
+        monkeypatch.setitem(sys.modules, "gymnasium.vector", vector_mod)
     monkeypatch.setitem(sys.modules, "gymnasium", gym_mod)
     monkeypatch.setitem(sys.modules, "gymnasium.spaces", spaces_mod)
 
@@ -915,3 +1087,210 @@ def test_evaluate_rlpfn_on_gym_envs_respects_parallel_column_cap(monkeypatch):
     assert per_env["DummyEnv-vC"]["return_mean"] == 2.0
     assert per_env["DummyEnv-vD"]["return_mean"] == 2.0
     assert max(model.call_widths) == 1
+
+
+def test_evaluate_rlpfn_on_gym_envs_ppo_validation_uses_sb3_policy_math_and_batches(monkeypatch):
+    action_logs = {"DummyEnv-vPPOA": [], "DummyEnv-vPPOB": []}
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ActionRecordingEnv(
+            [2, 2],
+            [0.0, 0.0],
+            action_logs[env_name],
+            obs_dim=4,
+            action_dim=1,
+        ),
+    )
+    model = _MinimalValidationModel()
+    fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.5, action_std=0.25)
+    model.__dict__["_validation_sb3_policy_live"] = fake_policy
+
+    import ticl.train as train_mod
+    import ticl.rl_validation as rl_validation_mod
+
+    def _forbid_fastpath(*args, **kwargs):
+        raise AssertionError("PPO validation must not build the generic policy_step fastpath")
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("PPO validation must not fall back to candidate-action scoring")
+
+    monkeypatch.setattr(train_mod, "_build_policy_step_fn", _forbid_fastpath)
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "rl_objective": "ppo",
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vPPOA,DummyEnv-vPPOB",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+            "rl_validate_max_parallel_columns": 2,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vPPOA"]["return_mean"] == 0.0
+    assert per_env["DummyEnv-vPPOB"]["return_mean"] == 0.0
+    assert max(fake_policy.batch_sizes) == 2
+    assert any(any(float(phase) < 1.0 for phase in batch) for batch in fake_policy.phase_batches)
+    assert any(any(float(phase) >= 1.0 for phase in batch) for batch in fake_policy.phase_batches)
+    assert fake_policy.sample_calls == 2
+    assert action_logs["DummyEnv-vPPOA"][-2:] == pytest.approx([0.5, 0.5], abs=1e-6)
+    assert action_logs["DummyEnv-vPPOB"][-2:] == pytest.approx([0.5, 0.5], abs=1e-6)
+
+
+def test_evaluate_rlpfn_on_gym_envs_ppo_validation_vectorizes_same_env_episodes(monkeypatch):
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ActionRecordingEnv([2, 2], [0.0, 0.0], [], obs_dim=4, action_dim=1),
+        with_vector=True,
+    )
+    model = _MinimalValidationModel()
+    fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.5, action_std=0.25)
+    model.__dict__["_validation_sb3_policy_live"] = fake_policy
+
+    import ticl.rl_validation as rl_validation_mod
+
+    original_advance_single = rl_validation_mod._advance_validation_policy_state_with_action
+    single_calls = {"count": 0}
+    vector_step_calls = {"count": 0}
+
+    def _spy_single(*args, **kwargs):
+        single_calls["count"] += 1
+        return original_advance_single(*args, **kwargs)
+
+    original_vector = rl_validation_mod._advance_validation_state_actions_vectorized
+
+    def _spy_vector(*args, **kwargs):
+        vector_step_calls["count"] += 1
+        return original_vector(*args, **kwargs)
+
+    monkeypatch.setattr(rl_validation_mod, "_advance_validation_policy_state_with_action", _spy_single)
+    monkeypatch.setattr(rl_validation_mod, "_advance_validation_state_actions_vectorized", _spy_vector)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "rl_objective": "ppo",
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vVectorPPO",
+            "rl_validate_episodes": 2,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+            "rl_validate_max_parallel_columns": 2,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vVectorPPO"]["return_mean"] == 0.0
+    assert vector_step_calls["count"] > 0
+    assert single_calls["count"] == 0
+
+
+def test_evaluate_rlpfn_on_gym_envs_ppo_validation_rebuilds_saved_policy(monkeypatch):
+    action_log = []
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ActionRecordingEnv([2, 2], [0.0, 0.0], action_log, obs_dim=4, action_dim=1),
+    )
+    model = _MinimalValidationModel()
+    model.__dict__["_validation_ppo_policy_state"] = {"dummy_weight": torch.tensor([1.0])}
+
+    import ticl.train as train_mod
+    import ticl.rl_validation as rl_validation_mod
+
+    fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.25, action_std=0.1)
+    builder_calls = {}
+
+    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict):
+        builder_calls["device"] = device
+        builder_calls["num_features"] = int(num_features)
+        builder_calls["policy_state_dict"] = policy_state_dict
+        return fake_policy
+
+    def _forbid_fastpath(*args, **kwargs):
+        raise AssertionError("rebuilt PPO validation policy must bypass generic policy_step validation")
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("rebuilt PPO validation policy must not use candidate-action scoring")
+
+    fake_ppo_mod = types.ModuleType("ticl.sb3_recurrent_ppo")
+    fake_ppo_mod.build_validation_recurrent_ppo_policy = _fake_builder
+    monkeypatch.setitem(sys.modules, "ticl.sb3_recurrent_ppo", fake_ppo_mod)
+    monkeypatch.setattr(train_mod, "_build_policy_step_fn", _forbid_fastpath)
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "rl_objective": "ppo",
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vSavedPPO",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert per_env["DummyEnv-vSavedPPO"]["return_mean"] == 0.0
+    assert builder_calls["device"] == "cpu"
+    assert builder_calls["num_features"] == 9
+    assert "dummy_weight" in builder_calls["policy_state_dict"]
+    assert action_log[-2:] == pytest.approx([0.25, 0.25], abs=1e-6)

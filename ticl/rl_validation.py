@@ -197,6 +197,13 @@ def _sample_action_candidates(rng, action_low, action_high, n_candidates):
     return candidates
 
 
+def _resolve_validation_vector_env_cls(gym):
+    vector_mod = getattr(gym, "vector", None)
+    if vector_mod is None:
+        return None
+    return getattr(vector_mod, "SyncVectorEnv", None)
+
+
 def _resolve_validation_action_bounds(action_space, *, fallback_abs_bound=10.0):
     fallback_abs_bound = float(max(0.1, fallback_abs_bound))
 
@@ -231,6 +238,54 @@ def _resolve_validation_action_bounds(action_space, *, fallback_abs_bound=10.0):
     return low_fallback, high_fallback, True
 
 
+def _extract_vector_info_at(infos, idx):
+    if not isinstance(infos, dict):
+        return {}
+    result = {}
+    for key, value in infos.items():
+        key_str = str(key)
+        if key_str.startswith("_"):
+            continue
+        include = True
+        mask = infos.get(f"_{key_str}", None)
+        if mask is not None:
+            try:
+                include = bool(np.asarray(mask).reshape(-1)[int(idx)])
+            except Exception:
+                include = False
+        if not include:
+            continue
+        try:
+            result[key_str] = value[int(idx)]
+        except Exception:
+            result[key_str] = value
+    return result
+
+
+def _resolve_validation_model_attr(model, attr_name):
+    queue = [model]
+    seen = set()
+    while queue:
+        candidate = queue.pop(0)
+        if candidate is None:
+            continue
+        ident = id(candidate)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        candidate_dict = getattr(candidate, "__dict__", {})
+        if attr_name in candidate_dict and candidate_dict[attr_name] is not None:
+            return candidate_dict[attr_name]
+        value = getattr(candidate, attr_name, None)
+        if value is not None:
+            return value
+        for nested_attr in ("module", "model", "_orig_mod"):
+            nested = getattr(candidate, nested_attr, None)
+            if nested is not None and id(nested) not in seen:
+                queue.append(nested)
+    return None
+
+
 def _resolve_policy_model_ref(model):
     queue = [model]
     seen = set()
@@ -254,6 +309,98 @@ def _resolve_policy_model_ref(model):
 def _model_supports_policy_step(model):
     model_ref = _resolve_policy_model_ref(model)
     return hasattr(model_ref, "forward_policy_step")
+
+
+def _uses_ppo_validation_math(config):
+    optimizer_cfg = config.get("optimizer", {})
+    return str(optimizer_cfg.get("rl_objective", "")).strip().lower() == "ppo"
+
+
+def _looks_like_official_eval_flat_cache(item):
+    return (
+        isinstance(item, list)
+        and len(item) > 0
+        and (len(item) % 3) == 0
+        and all(torch.is_tensor(value) for value in item)
+    )
+
+
+def _normalize_validation_cache_item(item):
+    if item is None:
+        return None
+    if _looks_like_official_eval_flat_cache(item):
+        normalized = []
+        for idx in range(0, len(item), 3):
+            att_x_prev = item[idx]
+            att_kv = item[idx + 1]
+            ffn_x_prev = item[idx + 2]
+            if att_x_prev.ndim == 1:
+                att_x_prev = att_x_prev.unsqueeze(0)
+            if att_kv.ndim == 3:
+                att_kv = att_kv.unsqueeze(0)
+            if ffn_x_prev.ndim == 1:
+                ffn_x_prev = ffn_x_prev.unsqueeze(0)
+            normalized.append((att_x_prev.contiguous(), att_kv.contiguous(), ffn_x_prev.contiguous()))
+        return normalized
+    return item
+
+
+def _concat_cache_batch_dim(items):
+    if not items:
+        return None
+    items = [_normalize_validation_cache_item(item) for item in items]
+    first = items[0]
+    if first is None:
+        return None
+    if torch.is_tensor(first):
+        return torch.cat(items, dim=0)
+    if isinstance(first, list):
+        return [_concat_cache_batch_dim([item[idx] for item in items]) for idx in range(len(first))]
+    if isinstance(first, tuple):
+        return tuple(_concat_cache_batch_dim([item[idx] for item in items]) for idx in range(len(first)))
+    if isinstance(first, dict):
+        return {key: _concat_cache_batch_dim([item[key] for item in items]) for key in first.keys()}
+    raise TypeError(f"Unsupported PPO validation cache type: {type(first)!r}")
+
+
+def _slice_cache_batch_dim(item, idx):
+    item = _normalize_validation_cache_item(item)
+    if item is None:
+        return None
+    if torch.is_tensor(item):
+        return item[idx : idx + 1]
+    if isinstance(item, list):
+        return [_slice_cache_batch_dim(value, idx) for value in item]
+    if isinstance(item, tuple):
+        return tuple(_slice_cache_batch_dim(value, idx) for value in item)
+    if isinstance(item, dict):
+        return {key: _slice_cache_batch_dim(value, idx) for key, value in item.items()}
+    raise TypeError(f"Unsupported PPO validation cache type: {type(item)!r}")
+
+
+def _resolve_validation_recurrent_ppo_policy(*, model, config, env_cfg, device, num_features):
+    live_policy = _resolve_validation_model_attr(model, "_validation_sb3_policy_live")
+    if live_policy is not None:
+        live_policy.to(device)
+        live_policy.eval()
+        return live_policy
+
+    policy_state_dict = _resolve_validation_model_attr(model, "_validation_ppo_policy_state")
+    if not isinstance(policy_state_dict, dict):
+        raise ValueError(
+            "PPO gym validation requires saved SB3 policy-head state. "
+            "Expected model._validation_sb3_policy_live or model._validation_ppo_policy_state."
+        )
+
+    from ticl.sb3_recurrent_ppo import build_validation_recurrent_ppo_policy
+
+    return build_validation_recurrent_ppo_policy(
+        model=model,
+        env_cfg=env_cfg,
+        device=device,
+        num_features=int(num_features),
+        policy_state_dict=policy_state_dict,
+    )
 
 
 def _require_validation_policy_action_head(model):
@@ -357,6 +504,9 @@ def _initialize_validation_policy_state(state, *, env_cfg, orch_cfg, device, act
     state["policy_terminal_t"] = torch.zeros((1, 1), device=device, dtype=torch.float32)
     state["policy_cache"] = None
     state["policy_action_dim"] = int(action_dim)
+    state["policy_device"] = device
+    state["policy_obs_t"] = None
+    state["policy_obs_dim"] = 0
 
 
 def _transform_validation_reward(reward_raw, *, policy_hparams, device):
@@ -496,10 +646,337 @@ def _select_policy_action(
     return action_np
 
 
+def _advance_validation_policy_state_with_action(*, state, action, device, max_steps, context_lower_bound):
+    obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
+    reward_next = float(reward_next)
+    done_flag = bool(terminated or truncated)
+    _accumulate_validation_reward_terms(state, info)
+    reward_input = _transform_validation_reward(
+        reward_next,
+        policy_hparams=state["policy_hparams"],
+        device=device,
+    )
+    state["obs"] = obs_next
+    obs_next_arr = _to_1d_array(obs_next)
+    state["policy_obs_t"] = torch.from_numpy(obs_next_arr).to(device=device, dtype=torch.float32)
+    state["policy_obs_dim"] = int(obs_next_arr.shape[0])
+    state["prev_reward"] = reward_next
+    state["prev_terminal"] = 1.0 if done_flag else 0.0
+    state["policy_action_t"] = torch.from_numpy(action.reshape(1, -1)).to(
+        device=device,
+        dtype=torch.float32,
+    )
+    state["policy_reward_t"] = torch.full(
+        (1, 1),
+        float(reward_input),
+        device=device,
+        dtype=torch.float32,
+    )
+    state["policy_reward_mask_t"] = torch.full(
+        (1, 1),
+        float(state["policy_hparams"]["reward_mask_present_value"]),
+        device=device,
+        dtype=torch.float32,
+    )
+    state["policy_terminal_t"] = torch.full(
+        (1, 1),
+        1.0 if done_flag else 0.0,
+        device=device,
+        dtype=torch.float32,
+    )
+    state["current_rollout_return"] += reward_next
+    state["current_rollout_len"] += 1
+
+    if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+        if int(state["current_rollout_len"]) >= int(max_steps):
+            state["prev_terminal"] = 1.0
+            state["policy_terminal_t"] = torch.ones_like(state["policy_terminal_t"])
+        _finalize_validation_rollout(state, context_lower_bound)
+
+
+def _advance_validation_state_actions_vectorized(*, action_pairs, device, max_steps, context_lower_bound):
+    if not action_pairs:
+        return
+    first_state, _ = action_pairs[0]
+    env_batch = first_state.get("env_batch", None)
+    if env_batch is None:
+        for state, action in action_pairs:
+            if "policy_hparams" in state:
+                _advance_validation_policy_state_with_action(
+                    state=state,
+                    action=action,
+                    device=device,
+                    max_steps=max_steps,
+                    context_lower_bound=context_lower_bound,
+                )
+            else:
+                obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
+                reward_next = float(reward_next)
+                done_flag = bool(terminated or truncated)
+                _accumulate_validation_reward_terms(state, info)
+                state["y_hist"].append(reward_next)
+                state["obs"] = obs_next
+                state["prev_reward"] = reward_next
+                state["prev_terminal"] = 1.0 if done_flag else 0.0
+                state["current_rollout_return"] += reward_next
+                state["current_rollout_len"] += 1
+
+                if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+                    if int(state["current_rollout_len"]) >= int(max_steps):
+                        state["prev_terminal"] = 1.0
+                    _finalize_validation_rollout(state, context_lower_bound)
+        return
+
+    action_dim = int(first_state["action_low"].shape[0])
+    actions_full = np.zeros((int(env_batch.num_envs), action_dim), dtype=np.float32)
+    active_rows = []
+    for state, action in action_pairs:
+        env_idx = int(state["env_idx"])
+        actions_full[env_idx, : int(action.shape[0])] = action.astype(np.float32)
+        active_rows.append(env_idx)
+
+    obs_batch, reward_batch, terminated_batch, truncated_batch, infos = env_batch.step(actions_full)
+    active_set = set(int(idx) for idx in active_rows)
+    for state, action in action_pairs:
+        del action
+        env_idx = int(state["env_idx"])
+        if env_idx not in active_set:
+            continue
+        obs_next = np.asarray(obs_batch[env_idx], dtype=np.float32)
+        reward_next = float(np.asarray(reward_batch).reshape(-1)[env_idx])
+        terminated = bool(np.asarray(terminated_batch).reshape(-1)[env_idx])
+        truncated = bool(np.asarray(truncated_batch).reshape(-1)[env_idx])
+        info = _extract_vector_info_at(infos, env_idx)
+        done_flag = bool(terminated or truncated)
+        _accumulate_validation_reward_terms(state, info)
+        state["obs"] = obs_next
+        state["prev_reward"] = reward_next
+        state["prev_terminal"] = 1.0 if done_flag else 0.0
+        if "policy_hparams" in state:
+            reward_input = _transform_validation_reward(
+                reward_next,
+                policy_hparams=state["policy_hparams"],
+                device=device,
+            )
+            obs_next_arr = _to_1d_array(obs_next)
+            state["policy_obs_t"] = torch.from_numpy(obs_next_arr).to(device=device, dtype=torch.float32)
+            state["policy_obs_dim"] = int(obs_next_arr.shape[0])
+            state["policy_action_t"] = torch.from_numpy(actions_full[env_idx : env_idx + 1]).to(
+                device=device,
+                dtype=torch.float32,
+            )
+            state["policy_reward_t"] = torch.full(
+                (1, 1),
+                float(reward_input),
+                device=device,
+                dtype=torch.float32,
+            )
+            state["policy_reward_mask_t"] = torch.full(
+                (1, 1),
+                float(state["policy_hparams"]["reward_mask_present_value"]),
+                device=device,
+                dtype=torch.float32,
+            )
+            state["policy_terminal_t"] = torch.full(
+                (1, 1),
+                1.0 if done_flag else 0.0,
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            state["y_hist"].append(reward_next)
+        state["current_rollout_return"] += reward_next
+        state["current_rollout_len"] += 1
+
+        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
+            if int(state["current_rollout_len"]) >= int(max_steps):
+                state["prev_terminal"] = 1.0
+                if "policy_terminal_t" in state:
+                    state["policy_terminal_t"] = torch.ones_like(state["policy_terminal_t"])
+            _finalize_validation_rollout(state, context_lower_bound)
+
+
+def _advance_validation_state_action_pairs(*, action_pairs, device, max_steps, context_lower_bound):
+    if not action_pairs:
+        return
+    grouped = {}
+    for state, action in action_pairs:
+        env_batch = state.get("env_batch", None)
+        key = id(env_batch) if env_batch is not None else ("single", id(state))
+        grouped.setdefault(key, []).append((state, action))
+    for pairs in grouped.values():
+        _advance_validation_state_actions_vectorized(
+            action_pairs=pairs,
+            device=device,
+            max_steps=max_steps,
+            context_lower_bound=context_lower_bound,
+        )
+
+
+def _select_ppo_policy_actions_batched(
+    *,
+    states,
+    policy,
+    policy_step_fn,
+    device,
+    obs_slot_dim,
+    action_slot_dim,
+    terminal_token_enabled,
+    max_parallel_columns,
+):
+    if not states:
+        return []
+
+    batch_cap = int(max_parallel_columns) if int(max_parallel_columns) > 0 else int(len(states))
+    batch_cap = max(1, batch_cap)
+    action_list = []
+    sample_fn = getattr(policy_step_fn, "_policy_actor_sample_fn", None)
+    if not callable(sample_fn):
+        raise RuntimeError("PPO validation policy step function must expose _policy_actor_sample_fn.")
+
+    with torch.no_grad():
+        for chunk_start in range(0, len(states), batch_cap):
+            chunk_states = states[chunk_start : chunk_start + batch_cap]
+            obs_dims = [int(state["policy_obs_dim"]) for state in chunk_states]
+            action_dims = [int(state["policy_action_dim"]) for state in chunk_states]
+            max_obs_dim = max(obs_dims)
+            max_action_dim = max(action_dims)
+
+            obs_t = torch.zeros((len(chunk_states), max_obs_dim), device=device, dtype=torch.float32)
+            action_t = torch.zeros((len(chunk_states), max_action_dim), device=device, dtype=torch.float32)
+            reward_t = torch.empty((len(chunk_states), 1), device=device, dtype=torch.float32)
+            reward_mask_t = torch.empty((len(chunk_states), 1), device=device, dtype=torch.float32)
+            phase_t = torch.empty((len(chunk_states), 1), device=device, dtype=torch.float32)
+            terminal_t = (
+                torch.empty((len(chunk_states), 1), device=device, dtype=torch.float32)
+                if bool(terminal_token_enabled)
+                else None
+            )
+            deterministic_mask = torch.empty((len(chunk_states),), device=device, dtype=torch.bool)
+
+            cache_rows = []
+            any_cache = False
+            for row_idx, state in enumerate(chunk_states):
+                obs_row = state["policy_obs_t"]
+                if obs_row is None:
+                    obs_arr = _to_1d_array(state["obs"])
+                    obs_row = torch.from_numpy(obs_arr).to(device=device, dtype=torch.float32)
+                    state["policy_obs_t"] = obs_row
+                    state["policy_obs_dim"] = int(obs_arr.shape[0])
+                obs_t[row_idx, : int(state["policy_obs_dim"])] = obs_row[: int(state["policy_obs_dim"])]
+                prev_action_t = state["policy_action_t"].to(device=device, dtype=torch.float32).reshape(1, -1)
+                action_t[row_idx, : int(prev_action_t.shape[-1])] = prev_action_t[0]
+                reward_t[row_idx] = state["policy_reward_t"].to(device=device, dtype=torch.float32)[0]
+                reward_mask_t[row_idx] = state["policy_reward_mask_t"].to(device=device, dtype=torch.float32)[0]
+                phase_t[row_idx, 0] = float(state["phase_flag"])
+                deterministic_mask[row_idx] = bool(float(state["phase_flag"]) >= 1.0)
+                if terminal_t is not None:
+                    terminal_t[row_idx] = state["policy_terminal_t"].to(device=device, dtype=torch.float32)[0]
+                cache_rows.append(state["policy_cache"])
+                any_cache = any_cache or (state["policy_cache"] is not None)
+
+            env_info = {
+                "obs_slot_dim": torch.full(
+                    (len(chunk_states),),
+                    int(obs_slot_dim),
+                    device=device,
+                    dtype=torch.long,
+                ),
+                "obs_dim": torch.as_tensor(obs_dims, device=device, dtype=torch.long),
+                "action_slot_dim": torch.full(
+                    (len(chunk_states),),
+                    int(action_slot_dim),
+                    device=device,
+                    dtype=torch.long,
+                ),
+                "action_dim_per_sample": torch.as_tensor(action_dims, device=device, dtype=torch.long),
+                "terminal_reset_enabled": torch.full(
+                    (len(chunk_states),),
+                    bool(terminal_token_enabled),
+                    device=device,
+                    dtype=torch.bool,
+                ),
+                "phase_t": phase_t,
+            }
+            if terminal_t is not None:
+                env_info["terminal_t"] = terminal_t
+
+            cache_in = _concat_cache_batch_dim(cache_rows) if any_cache else None
+            actor_outputs, cache_next = policy_step_fn(
+                obs_t,
+                action_t,
+                reward_t,
+                reward_mask_t,
+                cache_in,
+                0,
+                env_info,
+            )
+            action_mean = actor_outputs["action_mean"]
+            if bool(torch.all(deterministic_mask).item()):
+                action_env = action_mean
+            else:
+                action_env = action_mean.clone()
+                explore_rows = (~deterministic_mask).nonzero(as_tuple=False).reshape(-1)
+                if int(explore_rows.numel()) > 0:
+                    noise_t = torch.from_numpy(
+                        np.stack(
+                            [
+                                chunk_states[int(row_idx)]["rng"].normal(size=(int(action_mean.shape[-1]),)).astype(np.float32)
+                                for row_idx in explore_rows.detach().cpu().tolist()
+                            ],
+                            axis=0,
+                        )
+                    ).to(device=device, dtype=action_mean.dtype)
+                    explore_outputs = {
+                        "action_mean": actor_outputs["action_mean"].index_select(0, explore_rows),
+                        "action_std": actor_outputs["action_std"].index_select(0, explore_rows),
+                    }
+                    action_env.index_copy_(
+                        0,
+                        explore_rows,
+                        sample_fn(explore_outputs, noise=noise_t),
+                    )
+
+            for row_idx, state in enumerate(chunk_states):
+                action_dim = int(state["policy_action_dim"])
+                action_np = action_env[row_idx, :action_dim].detach().to(dtype=torch.float32).cpu().numpy()
+                action_np = np.clip(
+                    action_np,
+                    state["action_low"][:action_dim],
+                    state["action_high"][:action_dim],
+                ).astype(np.float32)
+                state["policy_cache"] = _slice_cache_batch_dim(cache_next, row_idx)
+                action_list.append((state, action_np))
+
+    return action_list
+
+
 def _reset_validation_rollout(state, preserve_prev=False):
-    obs, _ = state["env"].reset(seed=int(state["next_reset_seed"]))
+    env_batch = state.get("env_batch", None)
+    if env_batch is not None:
+        env_idx = int(state["env_idx"])
+        obs, _ = env_batch.envs[env_idx].reset(seed=int(state["next_reset_seed"]))
+        if hasattr(env_batch, "_autoreset_envs"):
+            env_batch._autoreset_envs[env_idx] = False
+        if hasattr(env_batch, "_terminations"):
+            env_batch._terminations[env_idx] = False
+        if hasattr(env_batch, "_truncations"):
+            env_batch._truncations[env_idx] = False
+        if hasattr(env_batch, "_rewards"):
+            env_batch._rewards[env_idx] = 0.0
+        if hasattr(env_batch, "_observations") and env_batch._observations is not None:
+            try:
+                env_batch._observations[env_idx] = np.asarray(obs, dtype=np.float32)
+            except Exception:
+                pass
+    else:
+        obs, _ = state["env"].reset(seed=int(state["next_reset_seed"]))
     state["next_reset_seed"] += 1
     state["obs"] = obs
+    if "policy_device" in state:
+        obs_arr = _to_1d_array(obs)
+        state["policy_obs_t"] = torch.from_numpy(obs_arr).to(device=state["policy_device"], dtype=torch.float32)
+        state["policy_obs_dim"] = int(obs_arr.shape[0])
     state["current_rollout_reward_terms"] = {}
     if not bool(preserve_prev):
         state["prev_reward"] = 0.0
@@ -562,13 +1039,23 @@ def _build_validation_episode_states(
     action_high=None,
     policy_step_enabled=False,
 ):
+    vector_env = None
+    sync_vector_env_cls = _resolve_validation_vector_env_cls(gym)
+    if int(episodes) > 1 and sync_vector_env_cls is not None:
+        try:
+            env_fns = [lambda env_name=env_name: gym.make(env_name) for _ in range(int(episodes))]
+            vector_env = sync_vector_env_cls(env_fns)
+        except Exception:
+            vector_env = None
     episode_states = []
     for ep in range(int(episodes)):
-        env = gym.make(env_name)
+        env = vector_env.envs[ep] if vector_env is not None else gym.make(env_name)
         rng_seed = int(base_seed + ep)
         reset_seed = int(base_seed + (ep * 1000))
         state = {
             "env": env,
+            "env_batch": vector_env,
+            "env_idx": int(ep),
             "rng": np.random.default_rng(rng_seed),
             "x_hist": [],
             "y_hist": [],
@@ -597,7 +1084,7 @@ def _build_validation_episode_states(
             )
         _reset_validation_rollout(state)
         episode_states.append(state)
-    return episode_states
+    return episode_states, vector_env
 
 
 def evaluate_rlpfn_on_gym_envs(model, config):
@@ -628,9 +1115,21 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     num_features = int(layout["num_features"])
     device = config.get("device", "cpu")
     optimizer_cfg = config.get("optimizer", {})
+    use_ppo_validation = bool(_uses_ppo_validation_math(config))
+    ppo_validation_policy = None
+    ppo_policy_step_fn = None
     policy_step_fn = None
-    use_policy_step_validation = bool(_model_supports_policy_step(model))
-    if bool(use_policy_step_validation):
+    use_policy_step_validation = bool((not use_ppo_validation) and _model_supports_policy_step(model))
+    if bool(use_ppo_validation):
+        ppo_validation_policy = _resolve_validation_recurrent_ppo_policy(
+            model=model,
+            config=config,
+            env_cfg=env_cfg,
+            device=device,
+            num_features=int(num_features),
+        )
+        ppo_policy_step_fn = ppo_validation_policy.make_vectorized_rollout_step_fn()
+    elif bool(use_policy_step_validation):
         _require_validation_policy_action_head(model)
         from ticl.train import _build_policy_step_fn
         cache_cfg = _resolve_validation_policy_cache_config(
@@ -657,6 +1156,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     all_env_means = []
     env_states = {}
     env_action_bounds = {}
+    env_batches = {}
 
     try:
         for env_name in env_names:
@@ -686,7 +1186,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 probe_env.close()
             except Exception:
                 pass
-            states = _build_validation_episode_states(
+            states, env_batch = _build_validation_episode_states(
                 gym=gym,
                 env_name=env_name,
                 episodes=episodes,
@@ -696,10 +1196,11 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                 device=device,
                 action_low=action_low,
                 action_high=action_high,
-                policy_step_enabled=use_policy_step_validation,
+                policy_step_enabled=(bool(use_policy_step_validation) or bool(use_ppo_validation)),
             )
             env_states[env_name] = states
             env_action_bounds[env_name] = (action_low, action_high)
+            env_batches[env_name] = env_batch
             if bool(used_fallback_bounds):
                 per_env.setdefault(env_name, {})["fallback_action_bounds"] = 1
 
@@ -707,7 +1208,34 @@ def evaluate_rlpfn_on_gym_envs(model, config):
 
         try:
             while any(not state["done"] for state in all_states):
-                if bool(use_policy_step_validation):
+                if bool(use_ppo_validation):
+                    active_states = []
+                    for state in all_states:
+                        if bool(state["done"]):
+                            continue
+                        if int(state["current_rollout_len"]) >= int(max_steps):
+                            _finalize_validation_rollout(state, context_lower_bound)
+                            continue
+                        active_states.append(state)
+
+                    action_pairs = _select_ppo_policy_actions_batched(
+                        states=active_states,
+                        policy=ppo_validation_policy,
+                        policy_step_fn=ppo_policy_step_fn,
+                        device=device,
+                        obs_slot_dim=obs_slot_dim,
+                        action_slot_dim=action_slot_dim,
+                        terminal_token_enabled=terminal_token_enabled,
+                        max_parallel_columns=max_parallel_columns,
+                    )
+                    _advance_validation_state_action_pairs(
+                        action_pairs=action_pairs,
+                        device=device,
+                        max_steps=max_steps,
+                        context_lower_bound=context_lower_bound,
+                    )
+                elif bool(use_policy_step_validation):
+                    action_pairs = []
                     for state in all_states:
                         if bool(state["done"]):
                             continue
@@ -722,48 +1250,13 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                             action_slot_dim=action_slot_dim,
                             terminal_token_enabled=terminal_token_enabled,
                         )
-                        obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
-                        reward_next = float(reward_next)
-                        done_flag = bool(terminated or truncated)
-                        _accumulate_validation_reward_terms(state, info)
-                        reward_input = _transform_validation_reward(
-                            reward_next,
-                            policy_hparams=state["policy_hparams"],
-                            device=device,
-                        )
-                        state["obs"] = obs_next
-                        state["prev_reward"] = reward_next
-                        state["prev_terminal"] = 1.0 if done_flag else 0.0
-                        state["policy_action_t"] = torch.from_numpy(action.reshape(1, -1)).to(
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        state["policy_reward_t"] = torch.full(
-                            (1, 1),
-                            float(reward_input),
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        state["policy_reward_mask_t"] = torch.full(
-                            (1, 1),
-                            float(state["policy_hparams"]["reward_mask_present_value"]),
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        state["policy_terminal_t"] = torch.full(
-                            (1, 1),
-                            1.0 if done_flag else 0.0,
-                            device=device,
-                            dtype=torch.float32,
-                        )
-                        state["current_rollout_return"] += reward_next
-                        state["current_rollout_len"] += 1
-
-                        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
-                            if int(state["current_rollout_len"]) >= int(max_steps):
-                                state["prev_terminal"] = 1.0
-                                state["policy_terminal_t"] = torch.ones_like(state["policy_terminal_t"])
-                            _finalize_validation_rollout(state, context_lower_bound)
+                        action_pairs.append((state, action))
+                    _advance_validation_state_action_pairs(
+                        action_pairs=action_pairs,
+                        device=device,
+                        max_steps=max_steps,
+                        context_lower_bound=context_lower_bound,
+                    )
                 else:
                     jobs = []
                     job_states = []
@@ -814,6 +1307,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     else:
                         score_list = []
 
+                    action_pairs = []
                     for (state, candidates), scores in zip(job_states, score_list):
                         action = candidates[int(np.argmax(scores))]
                         state["x_hist"].append(
@@ -830,21 +1324,13 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                                 terminal_token_enabled=terminal_token_enabled,
                             )
                         )
-                        obs_next, reward_next, terminated, truncated, info = state["env"].step(action.astype(np.float32))
-                        reward_next = float(reward_next)
-                        done_flag = bool(terminated or truncated)
-                        _accumulate_validation_reward_terms(state, info)
-                        state["y_hist"].append(reward_next)
-                        state["obs"] = obs_next
-                        state["prev_reward"] = reward_next
-                        state["prev_terminal"] = 1.0 if done_flag else 0.0
-                        state["current_rollout_return"] += reward_next
-                        state["current_rollout_len"] += 1
-
-                        if done_flag or int(state["current_rollout_len"]) >= int(max_steps):
-                            if int(state["current_rollout_len"]) >= int(max_steps):
-                                state["prev_terminal"] = 1.0
-                            _finalize_validation_rollout(state, context_lower_bound)
+                        action_pairs.append((state, action.astype(np.float32)))
+                    _advance_validation_state_action_pairs(
+                        action_pairs=action_pairs,
+                        device=device,
+                        max_steps=max_steps,
+                        context_lower_bound=context_lower_bound,
+                    )
 
             for env_name in env_names:
                 states = env_states.get(env_name, None)
@@ -903,7 +1389,18 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                     per_env[env_name] = existing_summary
                     all_env_means.append(mean_ret)
         finally:
+            closed_batches = set()
+            for env_name in env_names:
+                env_batch = env_batches.get(env_name, None)
+                if env_batch is not None and id(env_batch) not in closed_batches:
+                    try:
+                        env_batch.close()
+                    except Exception:
+                        pass
+                    closed_batches.add(id(env_batch))
             for state in all_states:
+                if state.get("env_batch", None) is not None:
+                    continue
                 try:
                     state["env"].close()
                 except Exception:
