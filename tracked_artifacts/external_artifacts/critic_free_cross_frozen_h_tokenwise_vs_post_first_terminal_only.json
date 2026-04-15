@@ -1,0 +1,86 @@
+{
+  "audit_entry": "critic_free_cross_frozen_h_tokenwise_vs_post_first_terminal_only",
+  "baseline_tokenwise_delta_smp_gap": {
+    "12345": 4.787384033203125,
+    "23456": -1.6493287086486816,
+    "34567": -1.2400238513946533,
+    "45678": 0.4813547134399414
+  },
+  "by_frozen_h_seed": {
+    "12345": {
+      "delta_det_gap": 0.2821248769760132,
+      "delta_smp_gap": 0.28212714195251465,
+      "frozen_h_seed": 12345,
+      "post_det_gap": 0.5083745718002319,
+      "post_smp_gap": 0.5083745718002319,
+      "pre_det_gap": 0.22624969482421875,
+      "pre_smp_gap": 0.22624742984771729
+    },
+    "23456": {
+      "delta_det_gap": -1.5379691123962402,
+      "delta_smp_gap": -1.5379691123962402,
+      "frozen_h_seed": 23456,
+      "post_det_gap": -1.5050625801086426,
+      "post_smp_gap": -1.5050625801086426,
+      "pre_det_gap": 0.032906532287597656,
+      "pre_smp_gap": 0.032906532287597656
+    },
+    "34567": {
+      "delta_det_gap": -0.0009897947311401367,
+      "delta_smp_gap": -0.0009897947311401367,
+      "frozen_h_seed": 34567,
+      "post_det_gap": -0.06868863105773926,
+      "post_smp_gap": -0.06868863105773926,
+      "pre_det_gap": -0.06769883632659912,
+      "pre_smp_gap": -0.06769883632659912
+    },
+    "45678": {
+      "delta_det_gap": -0.006687641143798828,
+      "delta_smp_gap": -0.006687641143798828,
+      "frozen_h_seed": 45678,
+      "post_det_gap": -0.06689596176147461,
+      "post_smp_gap": -0.06689596176147461,
+      "pre_det_gap": -0.06020832061767578,
+      "pre_smp_gap": -0.06020832061767578
+    }
+  },
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "setup": {
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise_post_first_terminal_only",
+    "batch_size": 256,
+    "boundary_contract_mode": "normal",
+    "device": "cuda:0",
+    "learning_rate": 0.0002,
+    "modes": [
+      "learned"
+    ],
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "single_eval_pos": 64,
+    "target_kl": 0.03
+  },
+  "summary": {
+    "baseline_tokenwise": {
+      "delta_smp_gap_mean": 0.5948465466499329,
+      "positive_count": 2,
+      "values": [
+        4.787384033203125,
+        -1.6493287086486816,
+        -1.2400238513946533,
+        0.4813547134399414
+      ]
+    },
+    "tokenwise_post_first_terminal_only": {
+      "delta_smp_gap_mean": -0.31587985157966614,
+      "positive_count": 1,
+      "values": [
+        0.28212714195251465,
+        -1.5379691123962402,
+        -0.0009897947311401367,
+        -0.006687641143798828
+      ]
+    }
+  }
+}

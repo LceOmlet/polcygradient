@@ -1,0 +1,51 @@
+{
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "frozen_h_seed": 12345,
+  "train_env_seed": 2020,
+  "single_eval_pos": 64,
+  "n_steps": 256,
+  "outer_epochs": 4,
+  "learning_rate": 0.0002,
+  "batch_size": 256,
+  "n_epochs": 1,
+  "target_kl": 0.03,
+  "ppo_reset_env_state_at_sep": true,
+  "actor_gae_space": "normalized",
+  "actor_objective_mode": "tokenwise",
+  "critic_warmup_min_outer_epochs": 2,
+  "critic_warmup_raw_corr_threshold": 0.2,
+  "history": [
+    {
+      "outer_epoch": 1,
+      "actor_baseline_mode": "zero",
+      "critic_objective_total": 192,
+      "critic_raw_corr": 0.004438004922121763,
+      "critic_explained_variance_raw": -0.4174271821975708,
+      "switches_to_learned_next": false
+    },
+    {
+      "outer_epoch": 2,
+      "actor_baseline_mode": "zero",
+      "critic_objective_total": 192,
+      "critic_raw_corr": 0.0360851064324379,
+      "critic_explained_variance_raw": -0.43959105014801025,
+      "switches_to_learned_next": false
+    },
+    {
+      "outer_epoch": 3,
+      "actor_baseline_mode": "zero",
+      "critic_objective_total": 192,
+      "critic_raw_corr": -0.043086789548397064,
+      "critic_explained_variance_raw": -0.5023890733718872,
+      "switches_to_learned_next": false
+    },
+    {
+      "outer_epoch": 4,
+      "actor_baseline_mode": "zero",
+      "critic_objective_total": 192,
+      "critic_raw_corr": -0.2502281963825226,
+      "critic_explained_variance_raw": -0.9920196533203125,
+      "switches_to_learned_next": false
+    }
+  ]
+}

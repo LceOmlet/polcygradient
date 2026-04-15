@@ -1,0 +1,45 @@
+{
+  "audit_entry": "sep_state_reset_gradient_compare",
+  "batch_size": 256,
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "device": "cuda:0",
+  "frozen_h_seed": 12345,
+  "grad_compare": {
+    "cosine_similarity": 0.065281443297863,
+    "l2_delta_norm": 5.522181510925293,
+    "normal_grad_norm": 3.745711088180542,
+    "state_reset_grad_norm": 4.309488296508789
+  },
+  "learning_rate": 0.0002,
+  "modes": {
+    "normal": {
+      "advantages_std": 0.40139153599739075,
+      "approx_kl": 0.0013424823991954327,
+      "clip_fraction": 0.0,
+      "grad_norm": 3.7457163333892822,
+      "num_features": 434,
+      "objective_total": 192,
+      "policy_loss": -0.26173797249794006,
+      "ppo_reset_env_state_at_sep": false,
+      "returns_std": 0.36769428849220276,
+      "sep_state_reset_count": 0
+    },
+    "state_reset_at_sep": {
+      "advantages_std": 0.5078206658363342,
+      "approx_kl": 0.0008279818575829268,
+      "clip_fraction": 0.0,
+      "grad_norm": 4.309494972229004,
+      "num_features": 434,
+      "objective_total": 192,
+      "policy_loss": -0.027393745258450508,
+      "ppo_reset_env_state_at_sep": true,
+      "returns_std": 0.3913595676422119,
+      "sep_state_reset_count": 1
+    }
+  },
+  "n_epochs": 1,
+  "n_steps": 256,
+  "single_eval_pos": 64,
+  "target_kl": 0.03,
+  "train_env_seed": 2020
+}

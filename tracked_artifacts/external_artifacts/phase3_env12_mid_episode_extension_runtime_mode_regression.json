@@ -1,0 +1,112 @@
+{
+  "audit_entry": "phase3_env12_mid_episode_extension_runtime_mode_regression",
+  "conclusions": {
+    "branch_specific_gate_supported_in_runtime": true,
+    "env12_mid_episode_extension_block_reproduces_counterfactual_carry_shrink": true,
+    "shared_core_unchanged": true
+  },
+  "control_block": {
+    "branch_specific": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "dominant_source": "baseline_bootstrap_semantic_mismatch",
+    "future_chain_step_count": [
+      38,
+      37,
+      36,
+      35
+    ],
+    "local_indices": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "negative_source_shares_reference": {
+      "baseline_bootstrap_semantic_mismatch": 0.5491065753155423,
+      "terminal_reset_tail_semantic_mismatch": 0.45089342468445764
+    },
+    "row_count": 4,
+    "runtime_control_granularity": "contiguous_four_token_block",
+    "tokens_to_objective_episode_end": [
+      38,
+      37,
+      36,
+      35
+    ]
+  },
+  "counterfactual_reference": {
+    "mean_start_gae_future_carry_norm": {
+      "abs_shrink": 0.02045608926564456,
+      "counterfactual_abs": 0.06972909942269324,
+      "counterfactual_over_observed_ratio": 0.7731768424154796,
+      "observed_abs": 0.0901851886883378,
+      "observed_over_counterfactual_ratio": 1.2933651722882735
+    },
+    "mean_start_raw_rollout_residual_norm": {
+      "abs_shrink": 0.7392120670826595,
+      "counterfactual_abs": 0.0648687719972905,
+      "counterfactual_over_observed_ratio": 0.08067444073349021,
+      "observed_abs": 0.80408083907995,
+      "observed_over_counterfactual_ratio": 12.39549962674699
+    },
+    "mean_weighted_delta_sum": {
+      "abs_shrink": 0.020455745239239626,
+      "counterfactual_abs": 0.06972909895965959,
+      "counterfactual_over_observed_ratio": 0.7731797906738602,
+      "observed_abs": 0.09018484419889922,
+      "observed_over_counterfactual_ratio": 1.2933602404797155
+    }
+  },
+  "material_counterfactual": {
+    "mean_start_gae_future_carry_norm": {
+      "abs_shrink": 0.02045608926564456,
+      "counterfactual_abs": 0.06972909942269324,
+      "counterfactual_over_observed_ratio": 0.7731768424154796,
+      "observed_abs": 0.0901851886883378,
+      "observed_over_counterfactual_ratio": 1.2933651722882735
+    },
+    "mean_start_raw_rollout_residual_norm": {
+      "abs_shrink": 0.7392120670826595,
+      "counterfactual_abs": 0.0648687719972905,
+      "counterfactual_over_observed_ratio": 0.08067444073349021,
+      "observed_abs": 0.80408083907995,
+      "observed_over_counterfactual_ratio": 12.39549962674699
+    },
+    "mean_weighted_delta_sum": {
+      "abs_shrink": 0.020455745239239626,
+      "counterfactual_abs": 0.06972909895965959,
+      "counterfactual_over_observed_ratio": 0.7731797906738602,
+      "observed_abs": 0.09018484419889922,
+      "observed_over_counterfactual_ratio": 1.2933602404797155
+    }
+  },
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "reason": "The branch-specific env12 mid-episode extension block can be expressed by a minimal runtime actor-objective gate that scales only objective positions 18..21 in objective episode 0. It reproduces the same negative-carry shrink without touching the shared core.",
+    "runtime_gate_kind": "branch_specific_actor_objective_mode",
+    "runtime_mode_name": "tokenwise_scale_env12_mid_episode_extension_block",
+    "shared_guardrail_unchanged": true
+  },
+  "regression": {
+    "abs_shrink": 0.020456090569496155,
+    "block_after_abs": 0.06972909718751907,
+    "block_before_abs": 0.09018518775701523,
+    "block_local_indices": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "core_after": -0.06972909718751907,
+    "core_before": -0.06972909718751907,
+    "core_local_index": 100,
+    "counterfactual_block_abs": 0.06972909942269324,
+    "counterfactual_matches_scaled_block": true,
+    "shared_core_unchanged": true
+  },
+  "runtime_mode_name": "tokenwise_scale_env12_mid_episode_extension_block",
+  "runtime_mode_scale_factor": 0.7731768424154796,
+  "source_env12_counterfactual_pack_json": "/home/chen/RLPFN/artifacts/phase3_env12_mid_episode_extension_counterfactual_pack.json",
+  "source_env12_runtime_control_json": "/home/chen/RLPFN/artifacts/phase3_env12_mid_episode_extension_runtime_control_probe.json"
+}

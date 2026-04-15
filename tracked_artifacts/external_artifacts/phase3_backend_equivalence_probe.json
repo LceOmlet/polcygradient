@@ -1,0 +1,36 @@
+{
+  "batch_size": 2,
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "diff": {
+    "full_return_mean_abs_diff": 0.08179330825805664,
+    "full_return_per_env_max_abs_diff": 0.16503214836120605,
+    "suffix_return_mean_abs_diff": 0.006688060238957405,
+    "suffix_return_per_env_max_abs_diff": 0.05222103372216225
+  },
+  "family_vectorized": {
+    "full_return_mean": -2.850238800048828,
+    "full_return_per_env": [
+      -3.90213680267334,
+      -1.7983410358428955
+    ],
+    "suffix_return_mean": -0.006688060238957405,
+    "suffix_return_per_env": [
+      0.038844913244247437,
+      -0.05222103372216225
+    ]
+  },
+  "n_samples": 256,
+  "serial": {
+    "full_return_mean": -2.7684454917907715,
+    "full_return_per_env": [
+      -3.737104654312134,
+      -1.79978609085083
+    ],
+    "suffix_return_mean": 0.0,
+    "suffix_return_per_env": [
+      0.0,
+      0.0
+    ]
+  },
+  "single_eval_pos": 1946
+}

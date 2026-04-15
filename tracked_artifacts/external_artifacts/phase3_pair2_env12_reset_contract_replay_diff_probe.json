@@ -1,0 +1,486 @@
+{
+  "audit_entry": "phase3_reset_contract_replay_diff_probe",
+  "conclusions": {
+    "legacy_mode_matches_stored_reset_count_any_run": true,
+    "legacy_mode_omits_explicit_collect_seed_wiring": true,
+    "legacy_mode_repeats_disagree": true,
+    "likely_single_source": "stored distance row is tied to the legacy unseeded collect contract; current official collect explicitly wires suite env/rollout seeds and therefore resolves a different reset layout",
+    "official_mode_wires_suite_env_and_rollout_seeds": true,
+    "official_strict_matches_stored_reset_count": false
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "distance_probe_json": "/home/chen/RLPFN/artifacts/phase3_post_reset_tail_distance_probe_pair2.json",
+    "env_index": 12,
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+    "n_samples": 2048,
+    "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+    "single_eval_pos": 1946,
+    "suite_name": "pair2",
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "modes": {
+    "legacy_distance_probe_runA": {
+      "collect_contract_debug": {
+        "algo_runtime_flags": {
+          "deterministic_actor_sampling": false,
+          "deterministic_batch_plan": false,
+          "env_rng_seed_spec": null,
+          "last_collect_rollout_env_rng_seeds": null,
+          "last_collect_rollout_rollout_rng_seeds": null,
+          "rollout_rng_seed_spec": null,
+          "strict_fixed_env_mode": false
+        },
+        "description": "legacy distance-probe collect contract without explicit strict suite seed wiring",
+        "mode": "legacy_distance_probe",
+        "requested_build_kwargs": {},
+        "suite_env_seeds": [
+          1442941694,
+          984791062,
+          206635565,
+          493201022,
+          2107061342,
+          1584089744,
+          1491086902,
+          743607623,
+          224090232,
+          1080379705,
+          1398242522,
+          1016760292,
+          379681280,
+          182943133,
+          1909806910,
+          1325777525
+        ],
+        "suite_rollout_seeds": [
+          810497065,
+          1115901460,
+          561726351,
+          598223505,
+          625604307,
+          1652755600,
+          2047862393,
+          1305697605,
+          807143084,
+          2014241443,
+          1341751404,
+          1467266567,
+          2114629823,
+          1506271267,
+          620380557,
+          155881736
+        ]
+      },
+      "contains_terminal_row_within_objective": true,
+      "fresh_rollout_summary": {
+        "compressed_segment_starts": [
+          0,
+          54
+        ],
+        "compressed_segments": [
+          [
+            0,
+            54
+          ],
+          [
+            54,
+            102
+          ]
+        ],
+        "episode_starts_on_objective_positions": [
+          54
+        ],
+        "objective_steps_head": [
+          1946,
+          1947,
+          1948,
+          1949,
+          1950,
+          1951,
+          1952,
+          1953,
+          1954,
+          1955
+        ],
+        "objective_steps_tail": [
+          2038,
+          2039,
+          2040,
+          2041,
+          2042,
+          2043,
+          2044,
+          2045,
+          2046,
+          2047
+        ],
+        "objective_terminal_reset_count_from_segments": 1,
+        "objective_token_count": 102,
+        "terminal_row_count_within_objective": 1,
+        "terminal_rows_within_objective_global_steps": [
+          1999
+        ]
+      },
+      "matches_stored_reset_count": true,
+      "mode_name": "legacy_distance_probe_runA",
+      "stored_probe_claims_reset_but_mode_has_no_terminal_row": false,
+      "stored_probe_claims_reset_but_mode_has_none": false,
+      "suite_summary": {
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+        "objective_token_total": 1632,
+        "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json",
+        "suite_name": "pair2",
+        "suite_pre_minus_zero_suffix": 1.5457842350006104,
+        "suite_runtime_wall_s": 101.94436933309771,
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt",
+        "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json"
+      }
+    },
+    "legacy_distance_probe_runB": {
+      "collect_contract_debug": {
+        "algo_runtime_flags": {
+          "deterministic_actor_sampling": false,
+          "deterministic_batch_plan": false,
+          "env_rng_seed_spec": null,
+          "last_collect_rollout_env_rng_seeds": null,
+          "last_collect_rollout_rollout_rng_seeds": null,
+          "rollout_rng_seed_spec": null,
+          "strict_fixed_env_mode": false
+        },
+        "description": "legacy distance-probe collect contract without explicit strict suite seed wiring",
+        "mode": "legacy_distance_probe",
+        "requested_build_kwargs": {},
+        "suite_env_seeds": [
+          1442941694,
+          984791062,
+          206635565,
+          493201022,
+          2107061342,
+          1584089744,
+          1491086902,
+          743607623,
+          224090232,
+          1080379705,
+          1398242522,
+          1016760292,
+          379681280,
+          182943133,
+          1909806910,
+          1325777525
+        ],
+        "suite_rollout_seeds": [
+          810497065,
+          1115901460,
+          561726351,
+          598223505,
+          625604307,
+          1652755600,
+          2047862393,
+          1305697605,
+          807143084,
+          2014241443,
+          1341751404,
+          1467266567,
+          2114629823,
+          1506271267,
+          620380557,
+          155881736
+        ]
+      },
+      "contains_terminal_row_within_objective": true,
+      "fresh_rollout_summary": {
+        "compressed_segment_starts": [
+          0,
+          69,
+          101
+        ],
+        "compressed_segments": [
+          [
+            0,
+            69
+          ],
+          [
+            69,
+            101
+          ],
+          [
+            101,
+            102
+          ]
+        ],
+        "episode_starts_on_objective_positions": [
+          69,
+          101
+        ],
+        "objective_steps_head": [
+          1946,
+          1947,
+          1948,
+          1949,
+          1950,
+          1951,
+          1952,
+          1953,
+          1954,
+          1955
+        ],
+        "objective_steps_tail": [
+          2038,
+          2039,
+          2040,
+          2041,
+          2042,
+          2043,
+          2044,
+          2045,
+          2046,
+          2047
+        ],
+        "objective_terminal_reset_count_from_segments": 2,
+        "objective_token_count": 102,
+        "terminal_row_count_within_objective": 2,
+        "terminal_rows_within_objective_global_steps": [
+          2014,
+          2046
+        ]
+      },
+      "matches_stored_reset_count": false,
+      "mode_name": "legacy_distance_probe_runB",
+      "stored_probe_claims_reset_but_mode_has_no_terminal_row": false,
+      "stored_probe_claims_reset_but_mode_has_none": false,
+      "suite_summary": {
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+        "objective_token_total": 1632,
+        "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json",
+        "suite_name": "pair2",
+        "suite_pre_minus_zero_suffix": 1.5457842350006104,
+        "suite_runtime_wall_s": 100.35823428886943,
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt",
+        "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json"
+      }
+    },
+    "official_strict": {
+      "collect_contract_debug": {
+        "algo_runtime_flags": {
+          "deterministic_actor_sampling": false,
+          "deterministic_batch_plan": true,
+          "env_rng_seed_spec": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "last_collect_rollout_env_rng_seeds": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "last_collect_rollout_rollout_rng_seeds": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "rollout_rng_seed_spec": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "description": "current official strict fixed-suite collect contract",
+        "mode": "official_strict",
+        "requested_build_kwargs": {
+          "deterministic_batch_plan": true,
+          "env_rng_seeds": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "rollout_rng_seeds": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "suite_env_seeds": [
+          1442941694,
+          984791062,
+          206635565,
+          493201022,
+          2107061342,
+          1584089744,
+          1491086902,
+          743607623,
+          224090232,
+          1080379705,
+          1398242522,
+          1016760292,
+          379681280,
+          182943133,
+          1909806910,
+          1325777525
+        ],
+        "suite_rollout_seeds": [
+          810497065,
+          1115901460,
+          561726351,
+          598223505,
+          625604307,
+          1652755600,
+          2047862393,
+          1305697605,
+          807143084,
+          2014241443,
+          1341751404,
+          1467266567,
+          2114629823,
+          1506271267,
+          620380557,
+          155881736
+        ]
+      },
+      "contains_terminal_row_within_objective": false,
+      "fresh_rollout_summary": {
+        "compressed_segment_starts": [
+          0
+        ],
+        "compressed_segments": [
+          [
+            0,
+            102
+          ]
+        ],
+        "episode_starts_on_objective_positions": [],
+        "objective_steps_head": [
+          1946,
+          1947,
+          1948,
+          1949,
+          1950,
+          1951,
+          1952,
+          1953,
+          1954,
+          1955
+        ],
+        "objective_steps_tail": [
+          2038,
+          2039,
+          2040,
+          2041,
+          2042,
+          2043,
+          2044,
+          2045,
+          2046,
+          2047
+        ],
+        "objective_terminal_reset_count_from_segments": 0,
+        "objective_token_count": 102,
+        "terminal_row_count_within_objective": 0,
+        "terminal_rows_within_objective_global_steps": []
+      },
+      "matches_stored_reset_count": false,
+      "mode_name": "official_strict",
+      "stored_probe_claims_reset_but_mode_has_no_terminal_row": true,
+      "stored_probe_claims_reset_but_mode_has_none": true,
+      "suite_summary": {
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+        "objective_token_total": 1632,
+        "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json",
+        "suite_name": "pair2",
+        "suite_pre_minus_zero_suffix": 1.5457842350006104,
+        "suite_runtime_wall_s": 108.26302161999047,
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt",
+        "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json"
+      }
+    }
+  },
+  "runtime_wall_s_total": 314.26777550391853,
+  "stored_distance_row": {
+    "env_index": 12,
+    "env_seed": 379681280,
+    "objective_terminal_reset_count": 1,
+    "pre_vs_zero_suffix_gap": 21.452394485473633,
+    "rollout_seed": 2114629823
+  }
+}

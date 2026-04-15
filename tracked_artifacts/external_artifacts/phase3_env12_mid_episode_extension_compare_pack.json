@@ -1,0 +1,102 @@
+{
+  "audit_entry": "phase3_env12_mid_episode_extension_compare_pack",
+  "comparison": {
+    "extension_block": {
+      "dominant_source": "baseline_bootstrap_semantic_mismatch",
+      "dominant_source_counts": {
+        "baseline_bootstrap_semantic_mismatch": 4
+      },
+      "future_chain_step_count": [
+        38,
+        37,
+        36,
+        35
+      ],
+      "global_steps": [
+        1964,
+        1965,
+        1966,
+        1967
+      ],
+      "is_contiguous": true,
+      "local_indices": [
+        18,
+        19,
+        20,
+        21
+      ],
+      "mean_start_gae_future_carry_norm": -0.0901851886883378,
+      "mean_start_raw_rollout_residual_norm": 0.80408083907995,
+      "mean_tokens_to_objective_episode_end": 36.5,
+      "mean_weighted_delta_sum": -0.09018484419889922,
+      "monotone_tte_decreasing": true,
+      "monotone_weighted_delta_more_negative": true,
+      "negative_source_shares_is_uniform": true,
+      "negative_source_shares_max_abs_deviation": 1.1102230246251565e-16,
+      "negative_source_shares_reference": {
+        "baseline_bootstrap_semantic_mismatch": 0.5491065753155423,
+        "terminal_reset_tail_semantic_mismatch": 0.45089342468445764
+      },
+      "row_count": 4,
+      "tokens_to_objective_episode_end": [
+        38,
+        37,
+        36,
+        35
+      ]
+    },
+    "terminal_adjacent_core": {
+      "dominant_source": "baseline_bootstrap_semantic_mismatch",
+      "dominant_source_counts": {
+        "baseline_bootstrap_semantic_mismatch": 1
+      },
+      "future_chain_step_count": [
+        1
+      ],
+      "global_steps": [
+        2046
+      ],
+      "is_contiguous": true,
+      "local_indices": [
+        100
+      ],
+      "mean_start_gae_future_carry_norm": -0.06972909942269324,
+      "mean_start_raw_rollout_residual_norm": 0.0648687719972905,
+      "mean_tokens_to_objective_episode_end": 1.0,
+      "mean_weighted_delta_sum": -0.06972909895965959,
+      "monotone_tte_decreasing": true,
+      "monotone_weighted_delta_more_negative": true,
+      "negative_source_shares_is_uniform": true,
+      "negative_source_shares_max_abs_deviation": 0.0,
+      "negative_source_shares_reference": {
+        "baseline_bootstrap_semantic_mismatch": 1.0
+      },
+      "row_count": 1,
+      "tokens_to_objective_episode_end": [
+        1
+      ]
+    }
+  },
+  "conclusions": {
+    "env12_mid_episode_extension_has_no_internal_split_supported": true,
+    "env12_mid_episode_extension_has_uniform_source_shares": true,
+    "env12_mid_episode_extension_is_branch_specific": true,
+    "env12_mid_episode_extension_is_contiguous": true,
+    "env12_mid_episode_extension_root_source_is_baseline_bootstrap_semantic_mismatch": true,
+    "env12_terminal_adjacent_core_remains_shared_guardrail_anchor": true
+  },
+  "core_local_index": 100,
+  "extension_local_indices": [
+    18,
+    19,
+    20,
+    21
+  ],
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "reason": "The env12 mid-episode extension is a contiguous four-token block with uniform negative-source shares and a single dominant source, so it can be treated as one branch-specific control block. No finer split is supported by the current evidence.",
+    "shared_guardrail_unchanged": true
+  },
+  "source_env12_json": "/home/chen/RLPFN/artifacts/phase3_future_carry_source_chain_probe_pair2_env12.json"
+}

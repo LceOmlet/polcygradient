@@ -1,0 +1,25 @@
+{
+  "comparison": {
+    "tokenwise_actor_signal": {
+      "corr_vs_delta_suffix_return": 0.020809794315539597,
+      "corr_vs_post_suffix_return": 0.057977053838355656,
+      "high_count": 8,
+      "high_nonpositive_delta_count": 5,
+      "low_positive_delta_count": 5,
+      "score": "trajectory mean of token-wise actor_advantages over objective suffix",
+      "spearman_vs_delta_suffix_return": -0.05205278592375366,
+      "spearman_vs_post_suffix_return": 0.08760997067448678
+    },
+    "trajectory_level_raw_suffix_signal": {
+      "corr_vs_delta_suffix_return": 0.1221577432646471,
+      "corr_vs_post_suffix_return": 0.9853888800443794,
+      "high_count": 8,
+      "high_nonpositive_delta_count": 3,
+      "low_positive_delta_count": 5,
+      "score": "pre-update raw suffix return per trajectory",
+      "spearman_vs_delta_suffix_return": 0.07001466275659823,
+      "spearman_vs_post_suffix_return": 0.9769061583577712
+    }
+  },
+  "source_probe": "/home/chen/RLPFN/artifacts/mainline_like_actor_objective_alignment_probe.json"
+}

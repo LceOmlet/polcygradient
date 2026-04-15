@@ -1,0 +1,1271 @@
+{
+  "audit_entry": "phase3_official_strict_reset_census",
+  "conclusions": {
+    "all_pair1_pair2_envs_fail_official_strict_scale_chain_entry": false,
+    "any_official_strict_scale_chain_entry": true,
+    "official_strict_scale_chain_entry_points": [
+      {
+        "distance_probe_objective_terminal_reset_count": 2,
+        "env_index": 10,
+        "official_strict_objective_terminal_reset_count": 1,
+        "suite_name": "pair1",
+        "terminal_row_count_within_objective": 1
+      },
+      {
+        "distance_probe_objective_terminal_reset_count": 1,
+        "env_index": 13,
+        "official_strict_objective_terminal_reset_count": 1,
+        "suite_name": "pair1",
+        "terminal_row_count_within_objective": 1
+      },
+      {
+        "distance_probe_objective_terminal_reset_count": 2,
+        "env_index": 2,
+        "official_strict_objective_terminal_reset_count": 1,
+        "suite_name": "pair2",
+        "terminal_row_count_within_objective": 1
+      },
+      {
+        "distance_probe_objective_terminal_reset_count": 1,
+        "env_index": 9,
+        "official_strict_objective_terminal_reset_count": 1,
+        "suite_name": "pair2",
+        "terminal_row_count_within_objective": 1
+      },
+      {
+        "distance_probe_objective_terminal_reset_count": 1,
+        "env_index": 13,
+        "official_strict_objective_terminal_reset_count": 1,
+        "suite_name": "pair2",
+        "terminal_row_count_within_objective": 1
+      }
+    ]
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "n_samples": 2048,
+    "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+    "single_eval_pos": 1946,
+    "suite_names": [
+      "pair1",
+      "pair2"
+    ],
+    "train_profile": "trusted_sep_reset_mainline"
+  },
+  "runtime_wall_s_total": 226.21490847691894,
+  "suite_results": [
+    {
+      "collect_contract_debug": {
+        "algo_runtime_flags": {
+          "deterministic_actor_sampling": false,
+          "deterministic_batch_plan": true,
+          "env_rng_seed_spec": [
+            2108174692,
+            1690508958,
+            1891078594,
+            1422116608,
+            671209925,
+            224896980,
+            1845844219,
+            1426050690,
+            1098736063,
+            993119803,
+            497748661,
+            150327249,
+            787425143,
+            858469659,
+            282252270,
+            405619005
+          ],
+          "last_collect_rollout_env_rng_seeds": [
+            2108174692,
+            1690508958,
+            1891078594,
+            1422116608,
+            671209925,
+            224896980,
+            1845844219,
+            1426050690,
+            1098736063,
+            993119803,
+            497748661,
+            150327249,
+            787425143,
+            858469659,
+            282252270,
+            405619005
+          ],
+          "last_collect_rollout_rollout_rng_seeds": [
+            1026265284,
+            2053028349,
+            712607618,
+            405073145,
+            175250828,
+            122603029,
+            376698782,
+            1379243106,
+            1034704523,
+            86747796,
+            292475123,
+            1106573764,
+            1419953343,
+            966801183,
+            1265126920,
+            317615330
+          ],
+          "rollout_rng_seed_spec": [
+            1026265284,
+            2053028349,
+            712607618,
+            405073145,
+            175250828,
+            122603029,
+            376698782,
+            1379243106,
+            1034704523,
+            86747796,
+            292475123,
+            1106573764,
+            1419953343,
+            966801183,
+            1265126920,
+            317615330
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "description": "current official strict fixed-suite collect contract",
+        "mode": "official_strict",
+        "requested_build_kwargs": {
+          "deterministic_batch_plan": true,
+          "env_rng_seeds": [
+            2108174692,
+            1690508958,
+            1891078594,
+            1422116608,
+            671209925,
+            224896980,
+            1845844219,
+            1426050690,
+            1098736063,
+            993119803,
+            497748661,
+            150327249,
+            787425143,
+            858469659,
+            282252270,
+            405619005
+          ],
+          "rollout_rng_seeds": [
+            1026265284,
+            2053028349,
+            712607618,
+            405073145,
+            175250828,
+            122603029,
+            376698782,
+            1379243106,
+            1034704523,
+            86747796,
+            292475123,
+            1106573764,
+            1419953343,
+            966801183,
+            1265126920,
+            317615330
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "suite_env_seeds": [
+          2108174692,
+          1690508958,
+          1891078594,
+          1422116608,
+          671209925,
+          224896980,
+          1845844219,
+          1426050690,
+          1098736063,
+          993119803,
+          497748661,
+          150327249,
+          787425143,
+          858469659,
+          282252270,
+          405619005
+        ],
+        "suite_rollout_seeds": [
+          1026265284,
+          2053028349,
+          712607618,
+          405073145,
+          175250828,
+          122603029,
+          376698782,
+          1379243106,
+          1034704523,
+          86747796,
+          292475123,
+          1106573764,
+          1419953343,
+          966801183,
+          1265126920,
+          317615330
+        ]
+      },
+      "env_rows": [
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              63
+            ],
+            [
+              63,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 0,
+          "env_seed": 2108174692,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 1026265284,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            62
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2008
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              64
+            ],
+            [
+              64,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 1,
+          "env_seed": 1690508958,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 2053028349,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            63
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2009
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              80
+            ],
+            [
+              80,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 2,
+          "env_seed": 1891078594,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 712607618,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            79
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2025
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              52
+            ],
+            [
+              52,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 3,
+          "env_seed": 1422116608,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 405073145,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            51
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1997
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              16
+            ],
+            [
+              16,
+              63
+            ],
+            [
+              63,
+              69
+            ],
+            [
+              69,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 4,
+          "env_seed": 671209925,
+          "official_strict_objective_terminal_reset_count": 3,
+          "rollout_seed": 175250828,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [
+            15,
+            62,
+            68
+          ],
+          "terminal_row_count_within_objective": 3,
+          "terminal_rows_within_objective_global_steps": [
+            1961,
+            2008,
+            2014
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 5,
+          "env_seed": 224896980,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 122603029,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 6,
+          "env_seed": 1845844219,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 376698782,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              1
+            ],
+            [
+              1,
+              96
+            ],
+            [
+              96,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 7,
+          "env_seed": 1426050690,
+          "official_strict_objective_terminal_reset_count": 2,
+          "rollout_seed": 1379243106,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [
+            0,
+            95
+          ],
+          "terminal_row_count_within_objective": 2,
+          "terminal_rows_within_objective_global_steps": [
+            1946,
+            2041
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 8,
+          "env_seed": 1098736063,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1034704523,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 9,
+          "env_seed": 993119803,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 86747796,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": true,
+          "compressed_segments": [
+            [
+              0,
+              81
+            ],
+            [
+              81,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 2,
+          "entry_failure_reason": null,
+          "env_index": 10,
+          "env_seed": 497748661,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 292475123,
+          "selected_target_local_available": true,
+          "selected_target_local_index": 80,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            80
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2026
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 11,
+          "env_seed": 150327249,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1106573764,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 12,
+          "env_seed": 787425143,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1419953343,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": true,
+          "compressed_segments": [
+            [
+              0,
+              23
+            ],
+            [
+              23,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": null,
+          "env_index": 13,
+          "env_seed": 858469659,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 966801183,
+          "selected_target_local_available": true,
+          "selected_target_local_index": 22,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            22
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1968
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              72
+            ],
+            [
+              72,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 14,
+          "env_seed": 282252270,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 1265126920,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            71
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2017
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              46
+            ],
+            [
+              46,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 15,
+          "env_seed": 405619005,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 317615330,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            45
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1991
+          ]
+        }
+      ],
+      "suite_name": "pair1",
+      "suite_spec": {
+        "distance_probe_json": "/home/chen/RLPFN/artifacts/phase3_post_reset_tail_distance_probe_pair1_suite_matched.json",
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+      },
+      "suite_summary": {
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+        "objective_token_total": 1632,
+        "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/ppo_cross_env_baseline.json",
+        "suite_name": "pair1",
+        "suite_pre_minus_zero_suffix": 2.8122913241386414,
+        "suite_runtime_wall_s": 112.7935293680057,
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt",
+        "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/zero_cross_env_control.json"
+      },
+      "summary": {
+        "env_count": 16,
+        "official_reset_positive_env_count": 10,
+        "official_reset_positive_env_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          7,
+          10,
+          13,
+          14,
+          15
+        ],
+        "official_scale_chain_entry_env_count": 2,
+        "official_scale_chain_entry_env_indices": [
+          10,
+          13
+        ],
+        "official_terminal_row_positive_env_count": 10,
+        "official_terminal_row_positive_env_indices": [
+          0,
+          1,
+          2,
+          3,
+          4,
+          7,
+          10,
+          13,
+          14,
+          15
+        ]
+      }
+    },
+    {
+      "collect_contract_debug": {
+        "algo_runtime_flags": {
+          "deterministic_actor_sampling": false,
+          "deterministic_batch_plan": true,
+          "env_rng_seed_spec": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "last_collect_rollout_env_rng_seeds": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "last_collect_rollout_rollout_rng_seeds": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "rollout_rng_seed_spec": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "description": "current official strict fixed-suite collect contract",
+        "mode": "official_strict",
+        "requested_build_kwargs": {
+          "deterministic_batch_plan": true,
+          "env_rng_seeds": [
+            1442941694,
+            984791062,
+            206635565,
+            493201022,
+            2107061342,
+            1584089744,
+            1491086902,
+            743607623,
+            224090232,
+            1080379705,
+            1398242522,
+            1016760292,
+            379681280,
+            182943133,
+            1909806910,
+            1325777525
+          ],
+          "rollout_rng_seeds": [
+            810497065,
+            1115901460,
+            561726351,
+            598223505,
+            625604307,
+            1652755600,
+            2047862393,
+            1305697605,
+            807143084,
+            2014241443,
+            1341751404,
+            1467266567,
+            2114629823,
+            1506271267,
+            620380557,
+            155881736
+          ],
+          "strict_fixed_env_mode": true
+        },
+        "suite_env_seeds": [
+          1442941694,
+          984791062,
+          206635565,
+          493201022,
+          2107061342,
+          1584089744,
+          1491086902,
+          743607623,
+          224090232,
+          1080379705,
+          1398242522,
+          1016760292,
+          379681280,
+          182943133,
+          1909806910,
+          1325777525
+        ],
+        "suite_rollout_seeds": [
+          810497065,
+          1115901460,
+          561726351,
+          598223505,
+          625604307,
+          1652755600,
+          2047862393,
+          1305697605,
+          807143084,
+          2014241443,
+          1341751404,
+          1467266567,
+          2114629823,
+          1506271267,
+          620380557,
+          155881736
+        ]
+      },
+      "env_rows": [
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 0,
+          "env_seed": 1442941694,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 810497065,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 1,
+          "env_seed": 984791062,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1115901460,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": true,
+          "compressed_segments": [
+            [
+              0,
+              83
+            ],
+            [
+              83,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 2,
+          "entry_failure_reason": null,
+          "env_index": 2,
+          "env_seed": 206635565,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 561726351,
+          "selected_target_local_available": true,
+          "selected_target_local_index": 82,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            82
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            2028
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 3,
+          "env_seed": 493201022,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 598223505,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 4,
+          "env_seed": 2107061342,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 625604307,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 2,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 5,
+          "env_seed": 1584089744,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1652755600,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 6,
+          "env_seed": 1491086902,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 2047862393,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 7,
+          "env_seed": 743607623,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1305697605,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 8,
+          "env_seed": 224090232,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 807143084,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": true,
+          "compressed_segments": [
+            [
+              0,
+              26
+            ],
+            [
+              26,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": null,
+          "env_index": 9,
+          "env_seed": 1080379705,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 2014241443,
+          "selected_target_local_available": true,
+          "selected_target_local_index": 25,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            25
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1971
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 10,
+          "env_seed": 1398242522,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 1341751404,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              18
+            ],
+            [
+              18,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 11,
+          "env_seed": 1016760292,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 1467266567,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            17
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1963
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": "Could not infer full-rollout mean/std from terminal token rows.",
+          "env_index": 12,
+          "env_seed": 379681280,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 2114629823,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": true,
+          "compressed_segments": [
+            [
+              0,
+              38
+            ],
+            [
+              38,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 1,
+          "entry_failure_reason": null,
+          "env_index": 13,
+          "env_seed": 182943133,
+          "official_strict_objective_terminal_reset_count": 1,
+          "rollout_seed": 1506271267,
+          "selected_target_local_available": true,
+          "selected_target_local_index": 37,
+          "single_terminal_local": true,
+          "terminal_local_indices": [
+            37
+          ],
+          "terminal_row_count_within_objective": 1,
+          "terminal_rows_within_objective_global_steps": [
+            1983
+          ]
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 14,
+          "env_seed": 1909806910,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 620380557,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        },
+        {
+          "can_enter_terminal_local_scale_chain": false,
+          "compressed_segments": [
+            [
+              0,
+              102
+            ]
+          ],
+          "distance_probe_objective_terminal_reset_count": 0,
+          "entry_failure_reason": "distance_probe_has_no_objective_terminal_reset",
+          "env_index": 15,
+          "env_seed": 1325777525,
+          "official_strict_objective_terminal_reset_count": 0,
+          "rollout_seed": 155881736,
+          "selected_target_local_available": false,
+          "selected_target_local_index": null,
+          "single_terminal_local": false,
+          "terminal_local_indices": [],
+          "terminal_row_count_within_objective": 0,
+          "terminal_rows_within_objective_global_steps": []
+        }
+      ],
+      "suite_name": "pair2",
+      "suite_spec": {
+        "distance_probe_json": "/home/chen/RLPFN/artifacts/phase3_post_reset_tail_distance_probe_pair2.json",
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+      },
+      "suite_summary": {
+        "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+        "objective_token_total": 1632,
+        "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json",
+        "suite_name": "pair2",
+        "suite_pre_minus_zero_suffix": 1.5457842350006104,
+        "suite_runtime_wall_s": 110.53972658887506,
+        "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt",
+        "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json"
+      },
+      "summary": {
+        "env_count": 16,
+        "official_reset_positive_env_count": 4,
+        "official_reset_positive_env_indices": [
+          2,
+          9,
+          11,
+          13
+        ],
+        "official_scale_chain_entry_env_count": 3,
+        "official_scale_chain_entry_env_indices": [
+          2,
+          9,
+          13
+        ],
+        "official_terminal_row_positive_env_count": 4,
+        "official_terminal_row_positive_env_indices": [
+          2,
+          9,
+          11,
+          13
+        ]
+      }
+    }
+  ]
+}

@@ -1,0 +1,133 @@
+{
+  "audit_entry": "critic_free_boundary_credit_refinement_spotcheck",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "config": {
+    "device": "cuda:0",
+    "train_env_seed": 2020,
+    "eval_env_seed_start": 3000,
+    "eval_rollout_seed_start": 4000,
+    "eval_env_count": 8,
+    "single_eval_pos": 64,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "learning_rate": 0.0002,
+    "batch_size": 256,
+    "n_epochs": 1,
+    "target_kl": 0.03,
+    "baseline_mode": "learned",
+    "frozen_h_seeds": [
+      12345,
+      45678
+    ]
+  },
+  "results": {
+    "tokenwise": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": 0.06505680084228516,
+          "post_smp_gap": -4.187469959259033,
+          "delta_smp_gap": -4.252526760101318,
+          "pre_det_gap": 0.06506109237670898,
+          "post_det_gap": -4.187469959259033,
+          "delta_det_gap": -4.252531051635742
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": -0.01461935043334961,
+          "post_smp_gap": 3.5252184867858887,
+          "delta_smp_gap": 3.5398378372192383,
+          "pre_det_gap": -0.01461935043334961,
+          "post_det_gap": 3.5252184867858887,
+          "delta_det_gap": 3.5398378372192383
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": -0.35634446144104004,
+        "positive_count": 1,
+        "nonpositive_count": 1
+      }
+    },
+    "tokenwise_drop_first_8_suffix_steps": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": 0.27138078212738037,
+          "post_smp_gap": 2.669992983341217,
+          "delta_smp_gap": 2.3986122012138367,
+          "pre_det_gap": 0.27138078212738037,
+          "post_det_gap": 2.669992983341217,
+          "delta_det_gap": 2.3986122012138367
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": 0.1336967945098877,
+          "post_smp_gap": -1.6043107509613037,
+          "delta_smp_gap": -1.7380075454711914,
+          "pre_det_gap": 0.1336967945098877,
+          "post_det_gap": -1.6043107509613037,
+          "delta_det_gap": -1.7380075454711914
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": 0.33030232787132263,
+        "positive_count": 1,
+        "nonpositive_count": 1
+      }
+    },
+    "tokenwise_linear_ramp_first_8_suffix_steps": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": -0.05836069583892822,
+          "post_smp_gap": -1.7482491731643677,
+          "delta_smp_gap": -1.6898884773254395,
+          "pre_det_gap": -0.05836069583892822,
+          "post_det_gap": -1.7482491731643677,
+          "delta_det_gap": -1.6898884773254395
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": 0.05777692794799805,
+          "post_smp_gap": 1.524907112121582,
+          "delta_smp_gap": 1.467130184173584,
+          "pre_det_gap": 0.05777692794799805,
+          "post_det_gap": 1.524907112121582,
+          "delta_det_gap": 1.467130184173584
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": -0.11137914657592773,
+        "positive_count": 1,
+        "nonpositive_count": 1
+      }
+    },
+    "tokenwise_drop_q1_early": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": 0.37541961669921875,
+          "post_smp_gap": -2.592254638671875,
+          "delta_smp_gap": -2.9676742553710938,
+          "pre_det_gap": 0.37541961669921875,
+          "post_det_gap": -2.592254638671875,
+          "delta_det_gap": -2.9676742553710938
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": -0.007890701293945312,
+          "post_smp_gap": 1.7970120906829834,
+          "delta_smp_gap": 1.8049027919769287,
+          "pre_det_gap": -0.007890701293945312,
+          "post_det_gap": 1.7970120906829834,
+          "delta_det_gap": 1.8049027919769287
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": -0.5813857316970825,
+        "positive_count": 1,
+        "nonpositive_count": 1
+      }
+    }
+  }
+}

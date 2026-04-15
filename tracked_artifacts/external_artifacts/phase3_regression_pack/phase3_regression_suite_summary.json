@@ -1,0 +1,144 @@
+{
+  "checkpoint_generalization": {
+    "pair1": {
+      "heldout_suite": {
+        "full_gap": 59.01048278808594,
+        "suffix_gap": 2.8122913241386414
+      },
+      "train_suite": {
+        "full_gap": -12.389642596244812,
+        "suffix_gap": -0.5169562138617039
+      }
+    },
+    "pair2": {
+      "heldout_suite": {
+        "full_gap": 26.168006896972656,
+        "suffix_gap": 1.5457842350006104
+      },
+      "train_suite": {
+        "full_gap": 66.80872344970703,
+        "suffix_gap": 3.2046568989753723
+      }
+    }
+  },
+  "generated_artifacts": {
+    "phase3_cross_env_baseline_pair1_ppo": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair1_ppo.json",
+    "phase3_cross_env_baseline_pair1_zero": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair1_zero.json",
+    "phase3_cross_env_baseline_pair2_ppo": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair2_ppo.json",
+    "phase3_cross_env_baseline_pair2_zero": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair2_zero.json",
+    "phase3_longrun_gradient_compare": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_longrun_gradient_compare.json",
+    "phase3_multi_env_trusted_pair1": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_multi_env_trusted_pair1.json",
+    "phase3_shortrun_profile_gradient_regression_v2": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_shortrun_profile_gradient_regression_v2.json"
+  },
+  "legacy_pair1_optimization": {
+    "heldout_full_return_delta": -0.2744731903076172,
+    "heldout_suffix_return_delta": 0.019055277109146118,
+    "post_heldout_vs_zero": {
+      "full_return_gap": -0.1986064910888672,
+      "suffix_return_gap": 0.019331395626068115
+    },
+    "post_train_vs_zero": {
+      "full_return_gap": -0.9628076553344727,
+      "suffix_return_gap": -0.07402229309082031
+    },
+    "pre_heldout_vs_zero": {
+      "full_return_gap": 0.07586669921875,
+      "suffix_return_gap": 0.00027611851692199707
+    },
+    "pre_train_vs_zero": {
+      "full_return_gap": 0.07730293273925781,
+      "suffix_return_gap": 0.005422830581665039
+    },
+    "train_full_return_delta": -1.0401105880737305,
+    "train_suffix_return_delta": -0.07944512367248535
+  },
+  "legacy_pair1_optimization_trusted": false,
+  "legacy_shortrun_profile_gradient_compare": {
+    "cosine_similarity": 1.000003457069397,
+    "driver_grad_norm": 17.220685958862305,
+    "l2_delta_norm": 0.0005920693511143327,
+    "reference_grad_norm": 17.220726013183594
+  },
+  "legacy_shortrun_profile_gradient_compare_trusted": false,
+  "manifest_path": "/home/chen/RLPFN/reinforce-terminal-explore/ticl/analysis/phase3_regression_manifest.json",
+  "pack_role": "diagnostic_only",
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  },
+  "phase3_claims_trusted": false,
+  "phase3_correct_contract": {
+    "batch_many_env": true,
+    "checkpoint_generalization_source": "fixed cross-env suites",
+    "internal_multi_episode_rollouts": true,
+    "one_fixed_n_samples_rollout_per_env": true,
+    "trusted_training_profile": "trusted_sep_reset_mainline"
+  },
+  "phase3_trust_reason": "Phase 3 longrun and optimization artifacts are currently quarantined. The only trusted branch is the maintained Phase 2 shared actor-critic backbone contract.",
+  "source_artifact_fingerprints": {
+    "phase3_cross_env_baseline_pair1_ppo": {
+      "mtime_ns": 1775529804841988787,
+      "path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/ppo_cross_env_baseline.json",
+      "sha256": "8b3881aec5cf25b5d1807d3087963b4422b4a09309be799bfce882c04a5bbe33",
+      "size": 11994
+    },
+    "phase3_cross_env_baseline_pair1_zero": {
+      "mtime_ns": 1775529137878952191,
+      "path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/zero_cross_env_control.json",
+      "sha256": "7925da4a4a56579a4d96a35e2fc987cc7e9b37c71dfd9d4189b6e65737eb0659",
+      "size": 11741
+    },
+    "phase3_cross_env_baseline_pair2_ppo": {
+      "mtime_ns": 1775548396429603659,
+      "path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json",
+      "sha256": "63c190f99b197bf7988af9319aa72ea991bbf026b35f13b57e92bcc927d8a59a",
+      "size": 12103
+    },
+    "phase3_cross_env_baseline_pair2_zero": {
+      "mtime_ns": 1775547217820499379,
+      "path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json",
+      "sha256": "75c256507419bd482859d4a54cbb7709939dfe8a5fda45118f147141ca284925",
+      "size": 11822
+    },
+    "phase3_longrun_gradient_compare": {
+      "mtime_ns": 1775780270603064526,
+      "path": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare.json",
+      "sha256": "130fcd74ed6d11c8b0b13f5bfe58c6891c895d3e2b6e23bef6aba5db2ff37838",
+      "size": 3927
+    },
+    "phase3_multi_env_trusted_pair1": {
+      "mtime_ns": 1775740993051752900,
+      "path": "/home/chen/RLPFN/artifacts/phase3_multi_env_trusted_pair1.json",
+      "sha256": "fe6e945db5306e838cd0e64f228c229f035af0c785de5d36103e4b76121a66b2",
+      "size": 15576
+    },
+    "phase3_shortrun_profile_gradient_regression_v2": {
+      "mtime_ns": 1775780270611426229,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2.json",
+      "sha256": "8c4649dbdc883b10eb5301bc332f48b878ec0e420abede899ec23e512a292f3b",
+      "size": 3555
+    }
+  },
+  "suite_name": "phase3_regression_pack",
+  "summary_reused": false,
+  "trusted_longrun_gradient_compare": {
+    "cosine_similarity": 1.000220775604248,
+    "l2_delta_norm": 3.819410994765349e-05,
+    "phase3_isolated_grad_norm": 8.315511703491211,
+    "resume_grad_norm": 8.315512657165527
+  },
+  "validation": {
+    "all_checks_pass": true,
+    "diagnostic_only": true,
+    "failures": [],
+    "manifest_path": "/home/chen/RLPFN/reinforce-terminal-explore/ticl/analysis/phase3_regression_manifest.json",
+    "phase3_claims_trusted": false,
+    "phase3_trust_reason": "Phase 3 longrun and optimization artifacts are currently quarantined. The only trusted branch is the maintained Phase 2 shared actor-critic backbone contract."
+  }
+}

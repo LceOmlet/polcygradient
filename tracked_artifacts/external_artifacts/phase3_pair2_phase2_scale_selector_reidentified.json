@@ -1,0 +1,74 @@
+{
+  "candidate_rows": [
+    {
+      "candidate_position_end": 7,
+      "candidate_position_start": 0,
+      "candidate_token_count": 8,
+      "epoch_idx": 1,
+      "outer_batch_idx": 13,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18
+      ],
+      "target_env_objective_token_count": 192,
+      "target_episode_positions_present": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "target_episode_token_count": 8,
+      "target_objective_episode_index": 10,
+      "target_status": "target_position_range_absent"
+    }
+  ],
+  "canonical_selector": {
+    "epoch_idx": 1,
+    "outer_batch_idx": 13,
+    "selection_reason": "Phase-2-scale trace contains no exact hit for the stale requested range. Pick the same env/episode on the earliest outer batch where that episode is present, and shrink the selector to the actual contiguous position span present there.",
+    "target_env_index": 12,
+    "target_objective_episode_index": 10,
+    "target_objective_position_end": 7,
+    "target_objective_position_start": 0,
+    "token_count": 8
+  },
+  "conclusions": {
+    "candidate_preserves_env_and_episode_identity": true,
+    "candidate_requires_position_shrink": true,
+    "phase2_scale_candidate_selector_found": true,
+    "phase2_scale_requested_selector_is_absent": true
+  },
+  "inputs": {
+    "selector_trace_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_selector_trace.json"
+  },
+  "phase2_scale_trace_summary": {
+    "first_match": null,
+    "requested_selector": {
+      "target_env_index": 12,
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 13,
+      "target_objective_position_start": 10
+    },
+    "row_count": 16,
+    "target_appeared": false
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_selector_reidentified",
+  "recommendation": {
+    "next_focus": "phase2_scale_target_present_recapture",
+    "reason": "The trusted Phase-2-scale selector should be re-captured using the reidentified present span, not the stale larger-scale range."
+  }
+}

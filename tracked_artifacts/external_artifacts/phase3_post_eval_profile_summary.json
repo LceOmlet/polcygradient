@@ -1,0 +1,45 @@
+{
+  "bundle_path": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/phase3_pair1_post_policy_bundle.pt",
+  "conclusion": {
+    "new_trusted_phase3_baseline_established": false,
+    "no_evidence_of_single_env_runtime_concentration_in_first4": true,
+    "profile_tool_no_grad_bug_fixed": true,
+    "profile_tool_parallel_gpu_oom_observed": true,
+    "runtime_is_uniform_serial_rollout_cost": true,
+    "train_and_heldout_post_eval_both_slow": true
+  },
+  "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+  "profiles": {
+    "heldout": {
+      "path": "/home/chen/RLPFN/artifacts/phase3_post_heldout_profile_max4.json",
+      "profiled_env_count": 4,
+      "rollout_s_max": 38.29958159988746,
+      "rollout_s_mean": 36.64169899671106,
+      "rollout_s_min": 35.77861754898913,
+      "rollout_s_per_env": [
+        38.29958159988746,
+        36.45585691789165,
+        35.77861754898913,
+        36.03273992007598
+      ],
+      "suffix_return_mean": -2.164815902709961,
+      "wall_s": 146.59172149887308
+    },
+    "train": {
+      "path": "/home/chen/RLPFN/artifacts/phase3_post_train_profile_max4.json",
+      "profiled_env_count": 4,
+      "rollout_s_max": 36.942661557812244,
+      "rollout_s_mean": 36.03896406892454,
+      "rollout_s_min": 34.83946519205347,
+      "rollout_s_per_env": [
+        36.942661557812244,
+        35.86916852998547,
+        36.50456099584699,
+        34.83946519205347
+      ],
+      "suffix_return_mean": -1.9739540815353394,
+      "wall_s": 144.18292630487122
+    }
+  },
+  "status": "completed"
+}

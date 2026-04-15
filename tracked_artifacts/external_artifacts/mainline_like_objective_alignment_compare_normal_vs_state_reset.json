@@ -1,0 +1,19 @@
+{
+  "audit_entry": "mainline_like_objective_alignment_compare_normal_vs_state_reset",
+  "modes": {
+    "normal": {
+      "corr_mean_vs_delta": -0.12027354924790831,
+      "corr_pos_mass_vs_delta": -0.170642659987972,
+      "high_count": 8,
+      "high_nonpositive_delta_count": 5,
+      "trajectory_corr_raw_suffix_vs_delta": -0.07662002099431528
+    },
+    "reset_env_state_at_sep_keep_actor_history": {
+      "corr_mean_vs_delta": -0.008269690389413043,
+      "corr_pos_mass_vs_delta": -0.021699430514553558,
+      "high_count": 8,
+      "high_nonpositive_delta_count": 3,
+      "trajectory_corr_raw_suffix_vs_delta": 0.25227553723976
+    }
+  }
+}

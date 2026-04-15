@@ -1,0 +1,173 @@
+{
+  "conclusions": {
+    "build_obs_dominated_by_scalar_and_action_writes": true,
+    "build_obs_reward_mask_phase_terminal_is_largest_subpath_heldout": true,
+    "build_obs_reward_mask_phase_terminal_is_largest_subpath_train": true,
+    "heldout_terminal_tail_heavier_than_train": true,
+    "new_phase3_trusted_baseline_established": false,
+    "state_full_rms_not_in_subpath_topline": true,
+    "terminal_reset_dominated_by_terminal_event_call": true,
+    "terminal_tail_boundary_math_material": true
+  },
+  "heldout_path": "/home/chen/RLPFN/artifacts/phase3_post_heldout_subpath_env0.json",
+  "subpaths": {
+    "build_obs.action_tail_write": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.025762106291599564,
+      "heldout_total_s": 0.9399681091308594,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.025971982089046563,
+      "train_total_s": 0.9276791571173817
+    },
+    "build_obs.env_info_and_index_setup": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.012979294404897005,
+      "heldout_total_s": 0.47356853052042425,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.01384827419336444,
+      "train_total_s": 0.4946390031836927
+    },
+    "build_obs.obs_prefix_copy": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.0074818712256711625,
+      "heldout_total_s": 0.2729870092589408,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.007797435399664871,
+      "train_total_s": 0.27851237053982913
+    },
+    "build_obs.reward_mask_phase_terminal_write": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.07103957201892065,
+      "heldout_total_s": 2.591982636367902,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.07026340150380664,
+      "train_total_s": 2.509700370952487
+    },
+    "build_obs.total": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.11794315830792339,
+      "heldout_total_s": 4.303328549489379,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.11859784132871999,
+      "train_total_s": 4.2361320403870195
+    },
+    "terminal_reset.bonus_compute": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.007898138628624459,
+      "heldout_total_s": 0.2881751339882612,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.008406508084562324,
+      "train_total_s": 0.3002675077877939
+    },
+    "terminal_reset.history_store": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.0023806988019588688,
+      "heldout_total_s": 0.08686327608302236,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.00235981012011297,
+      "train_total_s": 0.08428877918049693
+    },
+    "terminal_reset.reward_bonus_apply": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.0032914206337330203,
+      "heldout_total_s": 0.12009229348041117,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.003350051977087709,
+      "train_total_s": 0.11965869157575071
+    },
+    "terminal_reset.setup_enabled_prob": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.006762300734715349,
+      "heldout_total_s": 0.24673242797143757,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.00715897552707756,
+      "train_total_s": 0.25570756825618446
+    },
+    "terminal_reset.state_reset_where": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.0033101116833269707,
+      "heldout_total_s": 0.1207742637488991,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.0034061751169925073,
+      "train_total_s": 0.12166332360357046
+    },
+    "terminal_reset.terminal_event_call": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.11134589487512439,
+      "heldout_total_s": 4.062617748742923,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.0844230737903314,
+      "train_total_s": 3.0154620339162648
+    },
+    "terminal_reset.total": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.13560550190170031,
+      "heldout_total_s": 4.947764975717291,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.10973884649943248,
+      "train_total_s": 3.9197024037130177
+    },
+    "terminal_tail.finalize_mask": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.004381291534115851,
+      "heldout_total_s": 0.1598578265402466,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.004728792957637709,
+      "train_total_s": 0.16890519368462265
+    },
+    "terminal_tail.history_prepare_and_sort": {
+      "heldout_calls": 2047,
+      "heldout_share_of_wall": 0.015935158001737264,
+      "heldout_total_s": 0.5814175349660218,
+      "train_calls": 2047,
+      "train_share_of_wall": 0.01653805621698494,
+      "train_total_s": 0.5907138700131327
+    },
+    "terminal_tail.lower_tail_boundary": {
+      "heldout_calls": 1790,
+      "heldout_share_of_wall": 0.03155197426022761,
+      "heldout_total_s": 1.1512199060525745,
+      "train_calls": 850,
+      "train_share_of_wall": 0.015354012700410953,
+      "train_total_s": 0.5484216611366719
+    },
+    "terminal_tail.scatter_history_result": {
+      "heldout_calls": 1790,
+      "heldout_share_of_wall": 0.0026651570194054595,
+      "heldout_total_s": 0.09724214999005198,
+      "train_calls": 850,
+      "train_share_of_wall": 0.0013306746696840396,
+      "train_total_s": 0.04752964759245515
+    },
+    "terminal_tail.setup": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.03014103305416314,
+      "heldout_total_s": 1.0997396535240114,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.030982955159285987,
+      "train_total_s": 1.1066633893642575
+    },
+    "terminal_tail.total": {
+      "heldout_calls": 2048,
+      "heldout_share_of_wall": 0.10969491584412534,
+      "heldout_total_s": 4.002379365265369,
+      "train_calls": 2048,
+      "train_share_of_wall": 0.08309406326020251,
+      "train_total_s": 2.9679918268229812
+    },
+    "terminal_tail.upper_tail_boundary": {
+      "heldout_calls": 1790,
+      "heldout_share_of_wall": 0.02379562404215366,
+      "heldout_total_s": 0.8682181295007467,
+      "train_calls": 850,
+      "train_share_of_wall": 0.011478011429503217,
+      "train_total_s": 0.4099768716841936
+    }
+  },
+  "train_path": "/home/chen/RLPFN/artifacts/phase3_post_train_subpath_env0.json",
+  "wall_s": {
+    "heldout_env0": 36.48646187898703,
+    "heldout_over_train_ratio": 1.0215015904403097,
+    "train_env0": 35.71845821919851
+  }
+}

@@ -1,0 +1,101 @@
+{
+  "audit_entry": "phase3_env12_mid_episode_extension_counterfactual_pack",
+  "comparison": {
+    "counterfactual": {
+      "mean_start_gae_future_carry_norm": {
+        "abs_shrink": 0.02045608926564456,
+        "counterfactual_abs": 0.06972909942269324,
+        "counterfactual_over_observed_ratio": 0.7731768424154796,
+        "observed_abs": 0.0901851886883378,
+        "observed_over_counterfactual_ratio": 1.2933651722882735
+      },
+      "mean_start_raw_rollout_residual_norm": {
+        "abs_shrink": 0.7392120670826595,
+        "counterfactual_abs": 0.0648687719972905,
+        "counterfactual_over_observed_ratio": 0.08067444073349021,
+        "observed_abs": 0.80408083907995,
+        "observed_over_counterfactual_ratio": 12.39549962674699
+      },
+      "mean_weighted_delta_sum": {
+        "abs_shrink": 0.020455745239239626,
+        "counterfactual_abs": 0.06972909895965959,
+        "counterfactual_over_observed_ratio": 0.7731797906738602,
+        "observed_abs": 0.09018484419889922,
+        "observed_over_counterfactual_ratio": 1.2933602404797155
+      }
+    },
+    "counterfactual_anchor_terminal_adjacent_core": {
+      "dominant_source": "baseline_bootstrap_semantic_mismatch",
+      "future_chain_step_count": [
+        1
+      ],
+      "is_contiguous": true,
+      "local_indices": [
+        100
+      ],
+      "mean_start_gae_future_carry_norm": -0.06972909942269324,
+      "mean_start_raw_rollout_residual_norm": 0.0648687719972905,
+      "mean_weighted_delta_sum": -0.06972909895965959,
+      "monotone_tte_decreasing": true,
+      "monotone_weighted_delta_more_negative": true,
+      "negative_source_shares_is_uniform": true,
+      "negative_source_shares_max_abs_deviation": 0.0,
+      "negative_source_shares_reference": {
+        "baseline_bootstrap_semantic_mismatch": 1.0
+      },
+      "row_count": 1,
+      "tokens_to_objective_episode_end": [
+        1
+      ]
+    },
+    "observed_extension_block": {
+      "dominant_source": "baseline_bootstrap_semantic_mismatch",
+      "future_chain_step_count": [
+        38,
+        37,
+        36,
+        35
+      ],
+      "is_contiguous": true,
+      "local_indices": [
+        18,
+        19,
+        20,
+        21
+      ],
+      "mean_start_gae_future_carry_norm": -0.0901851886883378,
+      "mean_start_raw_rollout_residual_norm": 0.80408083907995,
+      "mean_weighted_delta_sum": -0.09018484419889922,
+      "monotone_tte_decreasing": true,
+      "monotone_weighted_delta_more_negative": true,
+      "negative_source_shares_is_uniform": true,
+      "negative_source_shares_max_abs_deviation": 1.1102230246251565e-16,
+      "negative_source_shares_reference": {
+        "baseline_bootstrap_semantic_mismatch": 0.5491065753155423,
+        "terminal_reset_tail_semantic_mismatch": 0.45089342468445764
+      },
+      "row_count": 4,
+      "tokens_to_objective_episode_end": [
+        38,
+        37,
+        36,
+        35
+      ]
+    }
+  },
+  "conclusions": {
+    "env12_mid_episode_extension_counterfactual_does_not_change_shared_guardrail_anchor": true,
+    "env12_mid_episode_extension_counterfactual_shrinks_negative_carry": true,
+    "env12_mid_episode_extension_counterfactual_shrinks_negative_carry_materially": true,
+    "env12_mid_episode_extension_counterfactual_shrinks_raw_residual_materially": true,
+    "env12_mid_episode_extension_counterfactual_supports_branch_specific_small_control": true
+  },
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "counterfactual_anchor": "terminal_adjacent_core",
+    "reason": "Replacing the env12 mid-episode extension block with the terminal-adjacent core reduces the absolute GAE future-carry magnitude by 0.020456 (22.68%) and the raw residual magnitude by 0.739212 (91.93%). This is material enough to keep as a narrow branch-specific control candidate, not a pooled fix.",
+    "shared_guardrail_unchanged": true
+  },
+  "source_env12_compare_pack_json": "/home/chen/RLPFN/artifacts/phase3_env12_mid_episode_extension_compare_pack.json"
+}

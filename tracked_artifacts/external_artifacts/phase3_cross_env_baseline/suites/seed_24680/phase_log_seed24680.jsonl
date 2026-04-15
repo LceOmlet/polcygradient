@@ -1,0 +1,3 @@
+{"event": "phase_start", "phase": "train_loop", "t": 1900860.96179789}
+{"event": "phase_end", "phase": "train_loop", "t": 1900964.152115664, "wall_s": 103.19031777395867}
+{"event": "phase_start", "phase": "post_train", "t": 1900964.402723667}

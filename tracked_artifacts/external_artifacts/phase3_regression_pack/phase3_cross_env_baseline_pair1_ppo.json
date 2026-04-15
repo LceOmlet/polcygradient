@@ -1,0 +1,375 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "policy": {
+    "requested_mode": "ppo",
+    "resolved_mode": "ppo",
+    "device": "cuda:0"
+  },
+  "config": {
+    "n_samples": 2048,
+    "num_features": 434,
+    "single_eval_pos": 1946,
+    "suite_regime": "cross_env",
+    "core_a": false,
+    "reference_semantics_enabled": false,
+    "rollout_backend": "serial",
+    "include_action_reachability_probe": true
+  },
+  "suite_paths": {
+    "train": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt",
+    "heldout": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt"
+  },
+  "base_suite": null,
+  "train_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 12345,
+      "fingerprint": "04f3f0c11c71cff0",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 1, 1, 27, 104, 295, 400, 30, 2, 200, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 120, 117, 5, 264, 16, 400, 30, 8, 26, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 126, 83, 17, 200, 74, 400, 30, 3, 33, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 162, 9, 11, 12, 226, 400, 30, 2, 44, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 165, 62, 9, 180, 55, 400, 30, 7, 45, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 219.125,
+      "obs_dim_mean": 106.875,
+      "action_dim_mean": 16.625
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        -22.512033462524414,
+        -7.541322708129883,
+        -10.767602920532227,
+        -137.0947723388672,
+        6.5853071212768555,
+        -1.479828953742981,
+        8.661453247070312,
+        -5.985490798950195,
+        2.6094582080841064,
+        -10.730926513671875,
+        6.6154680252075195,
+        21.019561767578125,
+        9.078991889953613,
+        -97.05180358886719,
+        50.90591812133789,
+        -28.403690338134766
+      ],
+      "suffix_return_per_env": [
+        -0.5081824660301208,
+        -0.8891627788543701,
+        -0.5948618650436401,
+        -6.071261405944824,
+        0.1817316859960556,
+        -0.07638705521821976,
+        0.7348312735557556,
+        -0.026846647262573242,
+        -0.1130216047167778,
+        -0.580554723739624,
+        0.06926162540912628,
+        1.7456951141357422,
+        0.4800081253051758,
+        -4.438807487487793,
+        2.339052200317383,
+        -1.3901350498199463
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -13.505706787109375,
+      "full_return_std": 43.459556579589844,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -0.5711650848388672,
+      "suffix_return_std": 2.0056474208831787,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.006594584323465824,
+      "reward_step_std": 0.05336792767047882,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -0.005599657539278269,
+      "suffix_reward_step_std": 0.05074620246887207
+    },
+    "action_reachability": {
+      "probe_backend": "serial",
+      "action_low": 0.0,
+      "action_high": 100.0,
+      "single_eval_pos": 1946,
+      "reward_step0_delta_abs_per_env": [
+        1.3596556186676025,
+        11.531095504760742,
+        20.59627342224121,
+        0.4916630685329437,
+        106.89385223388672,
+        2317.360107421875,
+        144.43569946289062,
+        30.46434783935547,
+        18.034509658813477,
+        489.3451232910156,
+        1917.884521484375,
+        0.5830850005149841,
+        583.3231811523438,
+        0.2910456359386444,
+        24.422677993774414,
+        0.047805123031139374
+      ],
+      "suffix_return_delta_abs_per_env": [
+        136.51113891601562,
+        1176.35888671875,
+        2091.807861328125,
+        70.08370208740234,
+        10904.876953125,
+        236370.796875,
+        14732.6787109375,
+        3109.57568359375,
+        1843.873046875,
+        49912.76953125,
+        195623.328125,
+        84.79457092285156,
+        59498.52734375,
+        25.642822265625,
+        2493.5771484375,
+        4.320253372192383
+      ],
+      "obs_max_abs_delta_per_env": [
+        4.013219833374023,
+        3.663228988647461,
+        4.124026298522949,
+        4.215163230895996,
+        3.6773343086242676,
+        2.3742332458496094,
+        3.8624801635742188,
+        3.8875222206115723,
+        2.9353649616241455,
+        3.9910991191864014,
+        3.0045323371887207,
+        4.456063747406006,
+        4.54891300201416,
+        3.69441294670105,
+        1.9999998807907104,
+        2.2441399097442627
+      ],
+      "suffix_return_delta_abs_mean": 36129.96875,
+      "suffix_return_delta_abs_std": 70554.078125,
+      "obs_max_abs_delta_mean": 3.5432333946228027,
+      "obs_max_abs_delta_std": 0.7675488591194153,
+      "suffix_return_delta_abs_lt_1e_3_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_2_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_1_share": 0.0,
+      "suffix_return_delta_abs_lt_1e0_share": 0.0,
+      "obs_max_abs_delta_gt_1e_2_share": 1.0,
+      "state_only_sensitive_share_obs_gt_1e_2_reward_lt_1e_3": 0.0,
+      "reward_step0_delta_abs_nonfinite_count": 0,
+      "reward_step0_delta_abs_nonfinite_share": 0.0,
+      "reward_step0_delta_abs_mean": 354.1915588378906,
+      "reward_step0_delta_abs_std": 691.720458984375,
+      "suffix_return_delta_abs_nonfinite_count": 0,
+      "suffix_return_delta_abs_nonfinite_share": 0.0,
+      "obs_max_abs_delta_nonfinite_count": 0,
+      "obs_max_abs_delta_nonfinite_share": 0.0
+    }
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 67890,
+      "fingerprint": "41ede11a0fafcda9",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 104, 15, 12, 43, 253, 400, 30, 2, 136, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 116, 105, 7, 72, 212, 400, 30, 2, 270, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 136, 46, 2, 227, 37, 400, 30, 8, 40, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 181, 155, 21, 177, 42, 400, 30, 3, 65, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 220, 210, 11, 48, 132, 400, 30, 2, 184, 'sin')",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 218.0625,
+      "obs_dim_mean": 117.3125,
+      "action_dim_mean": 13.8125
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        21.78350257873535,
+        -23.325458526611328,
+        -184.7547607421875,
+        3.550320625305176,
+        0.932259202003479,
+        -24.337644577026367,
+        -10.212872505187988,
+        -13.260993957519531,
+        -5.254443168640137,
+        -4.97214412689209,
+        100.75524139404297,
+        143.38475036621094,
+        124.97057342529297,
+        12.950347900390625,
+        4.957000732421875,
+        1.7073101997375488
+      ],
+      "suffix_return_per_env": [
+        1.109145998954773,
+        -0.6114140748977661,
+        -9.58687973022461,
+        0.9053424000740051,
+        0.0603247731924057,
+        -1.573051929473877,
+        -1.5577611923217773,
+        -3.739954948425293,
+        -0.29563117027282715,
+        -0.053376734256744385,
+        4.985030174255371,
+        6.802548885345459,
+        5.067523956298828,
+        0.39159634709358215,
+        1.7086491584777832,
+        0.12924063205718994
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": 9.304561614990234,
+      "full_return_std": 71.25203704833984,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": 0.23383325338363647,
+      "suffix_return_std": 3.6429202556610107,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": 0.004543243907392025,
+      "reward_step_std": 0.0776561051607132,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": 0.002292483113706112,
+      "suffix_reward_step_std": 0.07400673627853394
+    },
+    "action_reachability": {
+      "probe_backend": "serial",
+      "action_low": 0.0,
+      "action_high": 100.0,
+      "single_eval_pos": 1946,
+      "reward_step0_delta_abs_per_env": [
+        0.24574308097362518,
+        99.4306411743164,
+        1275.55517578125,
+        30.99312400817871,
+        278.8753662109375,
+        39.5319709777832,
+        94.68653869628906,
+        105.66114044189453,
+        509.73394775390625,
+        0.41225382685661316,
+        943.783203125,
+        2244.42431640625,
+        0.16274288296699524,
+        15.44815444946289,
+        610.6458129882812,
+        0.013051042333245277
+      ],
+      "suffix_return_delta_abs_per_env": [
+        25.236705780029297,
+        10134.5283203125,
+        130093.046875,
+        3160.329345703125,
+        28440.48046875,
+        4030.929443359375,
+        9655.66015625,
+        10788.7412109375,
+        51992.90625,
+        38.56547164916992,
+        96275.2890625,
+        228934.96875,
+        46.83323287963867,
+        1571.41845703125,
+        62294.58203125,
+        2.472330331802368
+      ],
+      "obs_max_abs_delta_per_env": [
+        2.866384506225586,
+        3.1936943531036377,
+        3.181201696395874,
+        3.6382718086242676,
+        4.095513820648193,
+        2.634777784347534,
+        5.978920936584473,
+        6.231123924255371,
+        3.540158748626709,
+        4.747267723083496,
+        4.557829856872559,
+        4.285229682922363,
+        5.202054023742676,
+        2.9349400997161865,
+        5.1684722900390625,
+        2.769441843032837
+      ],
+      "suffix_return_delta_abs_mean": 39842.875,
+      "suffix_return_delta_abs_std": 61714.49609375,
+      "obs_max_abs_delta_mean": 4.064080238342285,
+      "obs_max_abs_delta_std": 1.1196837425231934,
+      "suffix_return_delta_abs_lt_1e_3_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_2_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_1_share": 0.0,
+      "suffix_return_delta_abs_lt_1e0_share": 0.0,
+      "obs_max_abs_delta_gt_1e_2_share": 1.0,
+      "state_only_sensitive_share_obs_gt_1e_2_reward_lt_1e_3": 0.0,
+      "reward_step0_delta_abs_nonfinite_count": 0,
+      "reward_step0_delta_abs_nonfinite_share": 0.0,
+      "reward_step0_delta_abs_mean": 390.6002197265625,
+      "reward_step0_delta_abs_std": 605.050537109375,
+      "suffix_return_delta_abs_nonfinite_count": 0,
+      "suffix_return_delta_abs_nonfinite_share": 0.0,
+      "obs_max_abs_delta_nonfinite_count": 0,
+      "obs_max_abs_delta_nonfinite_share": 0.0
+    }
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": 22.81026840209961,
+    "heldout_minus_train_suffix_return_mean": 0.8049983382225037
+  },
+  "paired_metrics": null
+}

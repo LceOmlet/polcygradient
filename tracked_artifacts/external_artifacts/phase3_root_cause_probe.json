@@ -1,0 +1,114 @@
+{
+  "audit_entry": "phase3_root_cause_probe",
+  "comparisons": {
+    "high_pre_gap_env_capture": {
+      "heldout_top2": {
+        "env_indices": [
+          12,
+          11
+        ],
+        "k": 2,
+        "mean_pre_gap": 19.35310935974121,
+        "positive_mass_share": 0.000625611271196134
+      },
+      "heldout_top4": {
+        "env_indices": [
+          12,
+          11,
+          10,
+          14
+        ],
+        "k": 4,
+        "mean_pre_gap": 11.487610328942537,
+        "positive_mass_share": 0.4069862473567402
+      },
+      "train_top2": {
+        "env_indices": [
+          3,
+          14
+        ],
+        "k": 2,
+        "mean_pre_gap": 6.013847082853317,
+        "positive_mass_share": 0.027044156315304445
+      },
+      "train_top4": {
+        "env_indices": [
+          3,
+          14,
+          10,
+          0
+        ],
+        "k": 4,
+        "mean_pre_gap": 3.751857180148363,
+        "positive_mass_share": 0.2786425357827183
+      }
+    },
+    "sequence_layout_probe": {
+      "collect_path_stable": true,
+      "conclusion": "{'masked_action_tail_is_cosmetic_only': False, 'return_path_driver': 'stable', 'seq_packing_or_flatten_order_instability': False, 'terminal_reset_or_episode_starts_instability': False}"
+    },
+    "train_vs_heldout_positive_mass_coupling": {
+      "corr_last16_positive_share_vs_positive_norm_mass": {
+        "heldout": -0.12841151654720306,
+        "train": -0.4613945782184601
+      },
+      "corr_pre_suffix_gap_vs_positive_norm_mass": {
+        "heldout": -0.12057212740182877,
+        "train": -0.2884853780269623
+      },
+      "corr_terminal_resets_vs_positive_norm_mass": {
+        "heldout": 0.9236622452735901,
+        "train": 0.5391517877578735
+      },
+      "corr_value_corr_vs_positive_norm_mass": {
+        "heldout": 0.27778440713882446,
+        "train": 0.3590961992740631
+      },
+      "raw_positive_mass": {
+        "heldout": {
+          "corr_raw_positive_mass_vs_pre_suffix_gap": -0.1273721857948932,
+          "corr_raw_positive_mass_vs_terminal_resets": 0.9202737453563774,
+          "corr_raw_positive_mass_vs_value_corr": 0.2759784311768421
+        },
+        "train": {
+          "corr_raw_positive_mass_vs_pre_suffix_gap": -0.2816091241537814,
+          "corr_raw_positive_mass_vs_terminal_resets": 0.5491291857854549,
+          "corr_raw_positive_mass_vs_value_corr": 0.34370651098253513
+        }
+      }
+    },
+    "transfer_pattern": {
+      "all_bucket_alignment_signs_flip_between_train_and_heldout": true,
+      "phase3_transfer_pattern_is_mode_inversion_not_simple_weakening": true
+    }
+  },
+  "conclusions": {
+    "active_collect_layout_bug_supported": false,
+    "diagnostic_only": true,
+    "heldout_clean_high_pre_gap_envs_are_starved": true,
+    "heldout_positive_mass_is_reset_heavy": true,
+    "new_phase3_trusted_baseline_established": false,
+    "normalization_is_not_primary_driver": true,
+    "optimization_selection_bias_supported": true,
+    "sequence_layout_removed_as_current_root_cause": true,
+    "task_unlearnable_supported": false,
+    "train_to_heldout_transfer_is_mode_inversion": true
+  },
+  "config": {
+    "heldout_rollout_quality_json": "/home/chen/RLPFN/artifacts/phase3_heldout_rollout_quality_probe.json",
+    "runtime_wall_s": 0.0026886570267379284,
+    "sequence_layout_json": "/home/chen/RLPFN/artifacts/phase3_shortrun_sequence_layout_source_probe.json",
+    "train_rollout_quality_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe.json",
+    "transfer_bottleneck_json": "/home/chen/RLPFN/artifacts/phase3_transfer_bottleneck_probe.json"
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  }
+}

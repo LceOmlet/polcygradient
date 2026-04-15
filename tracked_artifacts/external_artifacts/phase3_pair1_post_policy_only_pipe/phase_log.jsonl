@@ -1,0 +1,2 @@
+{"event": "phase_start", "phase": "post_train", "t": 1695105.966388865}
+{"error": "", "error_type": "KeyboardInterrupt", "event": "phase_error", "phase": "post_train", "t": 1695341.631604165, "wall_s": 235.66521530016325}

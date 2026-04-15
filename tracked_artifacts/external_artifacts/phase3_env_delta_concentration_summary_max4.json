@@ -1,0 +1,45 @@
+{
+  "conclusions": {
+    "heldout_majority_nonpositive": true,
+    "heldout_suffix_gap_delta_mean_negative": true,
+    "heldout_update_is_more_concentrated": true,
+    "new_phase3_trusted_baseline_established": false,
+    "subset_only_diagnostic": true,
+    "train_suffix_gap_delta_mean_positive": true,
+    "train_update_is_concentrated": true
+  },
+  "heldout_subset": {
+    "env_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "full_gap_delta_mean": -4.104875564575195,
+    "suffix_delta_top1_abs_mass_share": 0.6979920268058777,
+    "suffix_delta_top2_abs_mass_share": 0.8590435981750488,
+    "suffix_gap_delta_mean": -0.11886574327945709,
+    "suffix_gap_delta_nonpositive_count": 3,
+    "suffix_gap_delta_positive_count": 1
+  },
+  "runtime": {
+    "combined_rollout_s": 284.1171367946081,
+    "heldout_subset_rollout_s": 141.71398786455393,
+    "train_subset_rollout_s": 142.40314893005416
+  },
+  "source_artifact": "/home/chen/RLPFN/artifacts/phase3_env_delta_concentration_probe_max4.json",
+  "train_subset": {
+    "env_indices": [
+      0,
+      1,
+      2,
+      3
+    ],
+    "full_gap_delta_mean": 0.6605565547943115,
+    "suffix_delta_top1_abs_mass_share": 0.5382760763168335,
+    "suffix_delta_top2_abs_mass_share": 0.9302064180374146,
+    "suffix_gap_delta_mean": 0.04191288352012634,
+    "suffix_gap_delta_nonpositive_count": 1,
+    "suffix_gap_delta_positive_count": 3
+  }
+}

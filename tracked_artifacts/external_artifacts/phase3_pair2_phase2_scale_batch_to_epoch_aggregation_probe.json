@@ -1,0 +1,173 @@
+{
+  "conclusions": {
+    "cross_batch_overwrite_is_a_more_plausible_bottleneck_than_intra_batch_mixing": true,
+    "no_intra_batch_cross_env_mixing_in_trusted_epoch": true,
+    "target_scope_hits_exactly_one_outer_batch_per_epoch": true,
+    "target_scope_is_a_sequential_single_step_effect_within_epoch": true
+  },
+  "epoch_layout": {
+    "constant_objective_total": true,
+    "objective_total_per_outer_batch": 192,
+    "outer_batch_env_order": [
+      {
+        "env_index": 0,
+        "outer_batch_idx": 1
+      },
+      {
+        "env_index": 1,
+        "outer_batch_idx": 2
+      },
+      {
+        "env_index": 2,
+        "outer_batch_idx": 3
+      },
+      {
+        "env_index": 3,
+        "outer_batch_idx": 4
+      },
+      {
+        "env_index": 4,
+        "outer_batch_idx": 5
+      },
+      {
+        "env_index": 5,
+        "outer_batch_idx": 6
+      },
+      {
+        "env_index": 6,
+        "outer_batch_idx": 7
+      },
+      {
+        "env_index": 7,
+        "outer_batch_idx": 8
+      },
+      {
+        "env_index": 8,
+        "outer_batch_idx": 9
+      },
+      {
+        "env_index": 9,
+        "outer_batch_idx": 10
+      },
+      {
+        "env_index": 10,
+        "outer_batch_idx": 11
+      },
+      {
+        "env_index": 11,
+        "outer_batch_idx": 12
+      },
+      {
+        "env_index": 12,
+        "outer_batch_idx": 13
+      },
+      {
+        "env_index": 13,
+        "outer_batch_idx": 14
+      },
+      {
+        "env_index": 14,
+        "outer_batch_idx": 15
+      },
+      {
+        "env_index": 15,
+        "outer_batch_idx": 16
+      }
+    ],
+    "singleton_env_outer_batches": true,
+    "total_outer_batches": 16
+  },
+  "inputs": {
+    "exact_audit_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_exact_update_aggregation_audit.json",
+    "selector_trace_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_selector_trace.json"
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_batch_to_epoch_aggregation_probe",
+  "recommendation": {
+    "next_focus": "cross_batch_overwrite_read_only_probe",
+    "reason": "The trusted target scope occupies one single-env outer batch and is applied in one optimizer step. The next narrow question is whether later outer-batch steps counteract or overwrite that local step."
+  },
+  "target_scope_epoch_context": {
+    "target_batch_objective_episode_spans": [
+      {
+        "objective_episode_index": 8,
+        "objective_position_max": 9,
+        "objective_position_min": 0,
+        "token_count": 10
+      },
+      {
+        "objective_episode_index": 9,
+        "objective_position_max": 11,
+        "objective_position_min": 0,
+        "token_count": 12
+      },
+      {
+        "objective_episode_index": 10,
+        "objective_position_max": 7,
+        "objective_position_min": 0,
+        "token_count": 8
+      },
+      {
+        "objective_episode_index": 11,
+        "objective_position_max": 0,
+        "objective_position_min": 0,
+        "token_count": 1
+      },
+      {
+        "objective_episode_index": 12,
+        "objective_position_max": 0,
+        "objective_position_min": 0,
+        "token_count": 1
+      },
+      {
+        "objective_episode_index": 13,
+        "objective_position_max": 1,
+        "objective_position_min": 0,
+        "token_count": 2
+      },
+      {
+        "objective_episode_index": 14,
+        "objective_position_max": 2,
+        "objective_position_min": 0,
+        "token_count": 3
+      },
+      {
+        "objective_episode_index": 15,
+        "objective_position_max": 0,
+        "objective_position_min": 0,
+        "token_count": 1
+      },
+      {
+        "objective_episode_index": 16,
+        "objective_position_max": 5,
+        "objective_position_min": 0,
+        "token_count": 6
+      },
+      {
+        "objective_episode_index": 17,
+        "objective_position_max": 0,
+        "objective_position_min": 0,
+        "token_count": 1
+      },
+      {
+        "objective_episode_index": 18,
+        "objective_position_max": 146,
+        "objective_position_min": 0,
+        "token_count": 147
+      }
+    ],
+    "target_batches_after_in_epoch": 3,
+    "target_batches_before_in_epoch": 12,
+    "target_env_batches_per_epoch": 1,
+    "target_env_index": 12,
+    "target_outer_batch_idx": 13,
+    "target_present_batches_per_epoch": 1,
+    "target_share_of_batch_negative_mass_after_clipping": 0.17802543705133486,
+    "target_step_fraction_of_epoch": 0.0625,
+    "uniform_step_weight_epoch_share_heuristic": 0.011126589815708429
+  },
+  "train_loop_contract": {
+    "optimizer_step_per_outer_batch": true,
+    "outer_batch_loss_normalized_by_that_batch_objective_total": true,
+    "sequential_outer_batch_updates_within_epoch": true
+  }
+}

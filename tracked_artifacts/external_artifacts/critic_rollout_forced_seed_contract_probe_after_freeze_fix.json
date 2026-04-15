@@ -1,0 +1,203 @@
+{
+  "audit_entry": "critic_rollout_forced_seed_contract_probe",
+  "frozen_h_seed": 12345,
+  "train_env_seed": 2020,
+  "rollout_seed": 4040,
+  "ppo_reset_env_state_at_sep": true,
+  "ppo_separate_value_backbone": true,
+  "run1": {
+    "obs_t_shape": [
+      1,
+      217
+    ],
+    "env_info_preview": {
+      "family": [
+        "scm"
+      ],
+      "state_dim": [
+        271
+      ],
+      "obs_dim": [
+        217
+      ],
+      "action_dim": 28,
+      "action_dim_per_sample": [
+        28
+      ],
+      "noise_dim": [
+        117
+      ],
+      "zero_pad_dim": [
+        12
+      ],
+      "obs_slot_dim": 400,
+      "action_slot_dim": 30,
+      "reward_dropout_ratio": [
+        0.0
+      ],
+      "reward_dropout_enabled": [
+        false
+      ],
+      "reward_dropout_impute_zero": [
+        true
+      ],
+      "state_input_scale_enabled": [
+        false
+      ],
+      "state_input_scale": [
+        1.0
+      ],
+      "state_full_rms_enabled": [
+        true
+      ],
+      "state_full_rms_target": [
+        1.0
+      ],
+      "reinforce_reward_transform": "none",
+      "reinforce_reward_rms_eps": [
+        9.999999974752427e-07
+      ],
+      "reinforce_reward_tanh_c": [
+        10.0
+      ],
+      "reinforce_reward_tanh_bound": [
+        1.4593781232833862
+      ],
+      "reinforce_action_transform": "none",
+      "reinforce_action_rms_eps": [
+        9.999999974752427e-07
+      ],
+      "reinforce_action_clip_bound": [
+        5.0
+      ],
+      "terminal_reset_enabled": [
+        true
+      ],
+      "terminal_reset_count_target": [
+        3.4182851314544678
+      ],
+      "terminal_bonus_tanh_c": [
+        10.0
+      ],
+      "terminal_bonus_scale_min": [
+        1.0
+      ],
+      "terminal_bonus_scale_max": [
+        2.0
+      ],
+      "state_highway_enabled": [
+        false
+      ],
+      "state_highway_lambda": [
+        0.0
+      ],
+      "terminal_t": [
+        0.0
+      ],
+      "phase_t": [
+        0.0
+      ]
+    }
+  },
+  "run2": {
+    "obs_t_shape": [
+      1,
+      217
+    ],
+    "env_info_preview": {
+      "family": [
+        "scm"
+      ],
+      "state_dim": [
+        271
+      ],
+      "obs_dim": [
+        217
+      ],
+      "action_dim": 28,
+      "action_dim_per_sample": [
+        28
+      ],
+      "noise_dim": [
+        117
+      ],
+      "zero_pad_dim": [
+        12
+      ],
+      "obs_slot_dim": 400,
+      "action_slot_dim": 30,
+      "reward_dropout_ratio": [
+        0.0
+      ],
+      "reward_dropout_enabled": [
+        false
+      ],
+      "reward_dropout_impute_zero": [
+        true
+      ],
+      "state_input_scale_enabled": [
+        false
+      ],
+      "state_input_scale": [
+        1.0
+      ],
+      "state_full_rms_enabled": [
+        true
+      ],
+      "state_full_rms_target": [
+        1.0
+      ],
+      "reinforce_reward_transform": "none",
+      "reinforce_reward_rms_eps": [
+        9.999999974752427e-07
+      ],
+      "reinforce_reward_tanh_c": [
+        10.0
+      ],
+      "reinforce_reward_tanh_bound": [
+        1.4593781232833862
+      ],
+      "reinforce_action_transform": "none",
+      "reinforce_action_rms_eps": [
+        9.999999974752427e-07
+      ],
+      "reinforce_action_clip_bound": [
+        5.0
+      ],
+      "terminal_reset_enabled": [
+        true
+      ],
+      "terminal_reset_count_target": [
+        3.4182851314544678
+      ],
+      "terminal_bonus_tanh_c": [
+        10.0
+      ],
+      "terminal_bonus_scale_min": [
+        1.0
+      ],
+      "terminal_bonus_scale_max": [
+        2.0
+      ],
+      "state_highway_enabled": [
+        false
+      ],
+      "state_highway_lambda": [
+        0.0
+      ],
+      "terminal_t": [
+        0.0
+      ],
+      "phase_t": [
+        0.0
+      ]
+    }
+  },
+  "obs_shape_equal": true,
+  "obs_dim_run1": 217,
+  "obs_dim_run2": 217,
+  "noise_dim_run1": 117,
+  "noise_dim_run2": 117,
+  "zero_pad_dim_run1": 12,
+  "zero_pad_dim_run2": 12
+}

@@ -1,0 +1,86 @@
+{
+  "audit_entry": "phase3_env12_local56_scale_collapse_probe",
+  "conclusions": {
+    "episode0_and_episode1_are_each_more_scale_collapsed_than_objective_all": true,
+    "episode1_only_is_most_scale_collapsed_objective_subscope": true,
+    "objective_scope_std_collapse_is_explained_by_truncating_away_high_variance_prefix": true,
+    "objective_window_is_low_variance_slice_not_high_variance_source": true,
+    "remaining_objective_variance_is_mostly_between_episode_means": true
+  },
+  "config": {
+    "env_index": 12,
+    "objective_local_focus": 56,
+    "source_boundary_scope_counterfactual_json": "/home/chen/RLPFN/artifacts/phase3_env12_local56_boundary_scope_counterfactual_probe.json",
+    "source_mean_source_json": "/home/chen/RLPFN/artifacts/phase3_env12_local56_mean_source_probe.json",
+    "suite_name": "pair2"
+  },
+  "full_variance_decomposition": {
+    "between_prefix_objective_contribution": 4.904851372911643,
+    "between_prefix_objective_share": 0.024719969342931716,
+    "dominant_full_variance_source": "within_prefix",
+    "reconstruction_error": 0.0,
+    "total_variance_raw": 198.4165637452179,
+    "within_objective_contribution": 0.7754294224371933,
+    "within_objective_share": 0.0039080881545398806,
+    "within_prefix_contribution": 192.73628294986906,
+    "within_prefix_share": 0.9713719425025285
+  },
+  "objective_variance_decomposition": {
+    "between_episode_means_contribution": 11.690085528134428,
+    "between_episode_means_share": 0.7508369423835801,
+    "dominant_objective_variance_source": "between_episode_means",
+    "reconstruction_error": 5.329070518200751e-15,
+    "total_variance_raw": 15.569406442660508,
+    "within_episode0_contribution": 2.539006443526627,
+    "within_episode0_share": 0.16307663704954706,
+    "within_episode1_contribution": 1.3403144709994574,
+    "within_episode1_share": 0.08608642056687318
+  },
+  "scale_collapse_readout": {
+    "episode0_std_ratio_vs_full": 0.1513232281772316,
+    "episode0_std_ratio_vs_objective": 0.5402049152957753,
+    "episode1_std_ratio_vs_full": 0.12373946108672668,
+    "episode1_std_ratio_vs_objective": 0.4417343318688046,
+    "full_to_objective_variance_multiple": 12.74400308553525,
+    "objective_std_ratio_vs_full": 0.2801219016942459,
+    "objective_variance_ratio_vs_full": 0.07846827980880075,
+    "prefix_std_ratio_vs_full": 1.0110818995144684
+  },
+  "scope_stats": [
+    {
+      "mean_raw": 16.339805603027344,
+      "scope_name": "full_rollout",
+      "std_raw": 14.086041450500488,
+      "token_count": 2048,
+      "variance_raw": 198.4165637452179
+    },
+    {
+      "mean_raw": 16.846844869857236,
+      "scope_name": "omitted_prefix_before_objective",
+      "std_raw": 14.24214154641157,
+      "token_count": 1946,
+      "variance_raw": 202.83859582802256
+    },
+    {
+      "mean_raw": 6.666291747625698,
+      "scope_name": "objective_all_tokens",
+      "std_raw": 3.9458087184581703,
+      "token_count": 102,
+      "variance_raw": 15.569406442660508
+    },
+    {
+      "mean_raw": 9.704221123143247,
+      "scope_name": "objective_episode0_only",
+      "std_raw": 2.1315452645280275,
+      "token_count": 57,
+      "variance_raw": 4.5434852147318585
+    },
+    {
+      "mean_raw": 2.818247871970137,
+      "scope_name": "objective_episode1_only",
+      "std_raw": 1.742999177930224,
+      "token_count": 45,
+      "variance_raw": 3.038046134265437
+    }
+  ]
+}

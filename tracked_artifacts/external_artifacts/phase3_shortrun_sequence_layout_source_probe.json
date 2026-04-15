@@ -1,0 +1,138 @@
+{
+  "audit_entry": "phase3_shortrun_sequence_layout_source_probe",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "comparisons": {
+    "batch_plan_hashes.batch_inds": true,
+    "batch_plan_hashes.env_change": true,
+    "buffer_hashes.actions_full": true,
+    "buffer_hashes.actions_tail": true,
+    "buffer_hashes.actions_valid": true,
+    "buffer_hashes.actor_advantages": true,
+    "buffer_hashes.advantages": true,
+    "buffer_hashes.episode_starts": true,
+    "buffer_hashes.objective_masks": true,
+    "buffer_hashes.returns": true,
+    "flat_batch_hashes.actions_full": true,
+    "flat_batch_hashes.actor_advantages": true,
+    "flat_batch_hashes.advantages": true,
+    "flat_batch_hashes.episode_starts": true,
+    "flat_batch_hashes.returns": true,
+    "flat_batch_hashes.seq_lengths": true,
+    "flat_batch_hashes.seq_start_indices": true,
+    "step_hashes.action_masks": true,
+    "step_hashes.actions_full": true,
+    "step_hashes.actions_tail": true,
+    "step_hashes.actions_valid": true,
+    "step_hashes.dones": true,
+    "step_hashes.episode_starts": true,
+    "step_hashes.rewards": true
+  },
+  "conclusion": {
+    "masked_action_tail_is_cosmetic_only": false,
+    "return_path_driver": "stable",
+    "seq_packing_or_flatten_order_instability": false,
+    "terminal_reset_or_episode_starts_instability": false
+  },
+  "contract": {
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "n_samples": 2048,
+    "phase2_all_checks_pass": true,
+    "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+    "restore_validation_policy_state": true,
+    "single_eval_pos": 1946,
+    "strict_fixed_env_mode": true,
+    "train_profile": "legacy_actor_only_probe",
+    "train_suite_batch_size": 16,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+  },
+  "runs": [
+    {
+      "batch_plan_hashes": {
+        "batch_inds": "5ccf19f4f2c0424bb9636387a42e899d136172cb5e410c08d271cedf5925f25d",
+        "env_change": "0b60b3e1f85ab31b79b26ce492bcc8966404c4701af8525bf91c6e20e34b6167"
+      },
+      "buffer_hashes": {
+        "actions_full": "686f76cd976376862414aefd00d720c3bd54b54a54b735d4c62f90d84d0643cd",
+        "actions_tail": "2dac9e13ff33116b8553620bf139e5cb483bddd3e88e7bb8fbac321fd71d7db0",
+        "actions_valid": "686f76cd976376862414aefd00d720c3bd54b54a54b735d4c62f90d84d0643cd",
+        "actor_advantages": "820cad95414f2d2c92dfd4b2110cf6832aff72c1a68f0095275483ad9a07adfa",
+        "advantages": "d472ab64f0c52bd20b2e3cbb7124adc94db3294781b3213be71fab07f2bfdbb2",
+        "episode_starts": "ab2d541aa264fc9f38d41fa536088d39c2351217e51f488241b922805328e7c6",
+        "objective_masks": "99e4a6b3574c1b36c21f47a997328dfa96e58389e70b40d338b89466358ae427",
+        "returns": "30c3e84a3306e94b7df6747359e67c3296dd59f66f1d896cb2ba91fb396fec66"
+      },
+      "collect_wall_s": 114.82458767597564,
+      "flat_batch_diagnostics": {
+        "seq_layout_matches_buffer_batch": true
+      },
+      "flat_batch_hashes": {
+        "actions_full": "7501b910e183f238b05bf59d32e4060a4739b1bfbadd1614e3c2f736c85d1974",
+        "actor_advantages": "db60854d39e43f17a7d983a2eb6ba75499deddf40d94ee23d353d70df034529b",
+        "advantages": "d8aeab093411986047afecac8ff3b306daceca65d14151cb3e62056fcc9f9484",
+        "episode_starts": "e8d2116003586428de37d469f3b98892ee8e823566b05fb510f749b8ba68f8a7",
+        "returns": "21762719e00508f0825b4d205b71dc83e8d35c9a89a9e44eb014be9d227d4631",
+        "seq_lengths": "adc95d2fdc5ecd0c74e52e46734a7e0c21acf7c4e317b5dade2f393f59f20e59",
+        "seq_start_indices": "16b35cca5610645967e7297698f939a2a65be6071ccae0abf66bc8860811a219"
+      },
+      "step_diagnostics": {
+        "action_tail_abs_max": 0.0,
+        "action_tail_nonzero_count": 0,
+        "episode_starts_follow_previous_dones": true
+      },
+      "step_hashes": {
+        "action_masks": "21066a71510d96e4ad8d2140dd32b4a0122f04f4ae80b2e5d6408ffa725b6ef4",
+        "actions_full": "8b65e8bca4841d2a9d6b23508b5e6e8b1c266cd3010dfe3e7fad4645dee950f3",
+        "actions_tail": "9bf4fe7893e54ad5a33bb8d4cddf26b68693eb3df4b29668181eeba7c5bd5300",
+        "actions_valid": "8b65e8bca4841d2a9d6b23508b5e6e8b1c266cd3010dfe3e7fad4645dee950f3",
+        "dones": "fdae08d67087682bf1707f14acb79ed0249a06e6b2a7284388245cef18dbc86d",
+        "episode_starts": "bfd0886a0d682acd4d653af9d10be85208c94dfa11326c8f1aa9c5545a06d53a",
+        "rewards": "518387d8860cdd7e0ae59a6f8621c55eee11d84bbf361935700738555d10fbd2"
+      }
+    },
+    {
+      "batch_plan_hashes": {
+        "batch_inds": "5ccf19f4f2c0424bb9636387a42e899d136172cb5e410c08d271cedf5925f25d",
+        "env_change": "0b60b3e1f85ab31b79b26ce492bcc8966404c4701af8525bf91c6e20e34b6167"
+      },
+      "buffer_hashes": {
+        "actions_full": "686f76cd976376862414aefd00d720c3bd54b54a54b735d4c62f90d84d0643cd",
+        "actions_tail": "2dac9e13ff33116b8553620bf139e5cb483bddd3e88e7bb8fbac321fd71d7db0",
+        "actions_valid": "686f76cd976376862414aefd00d720c3bd54b54a54b735d4c62f90d84d0643cd",
+        "actor_advantages": "820cad95414f2d2c92dfd4b2110cf6832aff72c1a68f0095275483ad9a07adfa",
+        "advantages": "d472ab64f0c52bd20b2e3cbb7124adc94db3294781b3213be71fab07f2bfdbb2",
+        "episode_starts": "ab2d541aa264fc9f38d41fa536088d39c2351217e51f488241b922805328e7c6",
+        "objective_masks": "99e4a6b3574c1b36c21f47a997328dfa96e58389e70b40d338b89466358ae427",
+        "returns": "30c3e84a3306e94b7df6747359e67c3296dd59f66f1d896cb2ba91fb396fec66"
+      },
+      "collect_wall_s": 114.15812335303053,
+      "flat_batch_diagnostics": {
+        "seq_layout_matches_buffer_batch": true
+      },
+      "flat_batch_hashes": {
+        "actions_full": "7501b910e183f238b05bf59d32e4060a4739b1bfbadd1614e3c2f736c85d1974",
+        "actor_advantages": "db60854d39e43f17a7d983a2eb6ba75499deddf40d94ee23d353d70df034529b",
+        "advantages": "d8aeab093411986047afecac8ff3b306daceca65d14151cb3e62056fcc9f9484",
+        "episode_starts": "e8d2116003586428de37d469f3b98892ee8e823566b05fb510f749b8ba68f8a7",
+        "returns": "21762719e00508f0825b4d205b71dc83e8d35c9a89a9e44eb014be9d227d4631",
+        "seq_lengths": "adc95d2fdc5ecd0c74e52e46734a7e0c21acf7c4e317b5dade2f393f59f20e59",
+        "seq_start_indices": "16b35cca5610645967e7297698f939a2a65be6071ccae0abf66bc8860811a219"
+      },
+      "step_diagnostics": {
+        "action_tail_abs_max": 0.0,
+        "action_tail_nonzero_count": 0,
+        "episode_starts_follow_previous_dones": true
+      },
+      "step_hashes": {
+        "action_masks": "21066a71510d96e4ad8d2140dd32b4a0122f04f4ae80b2e5d6408ffa725b6ef4",
+        "actions_full": "8b65e8bca4841d2a9d6b23508b5e6e8b1c266cd3010dfe3e7fad4645dee950f3",
+        "actions_tail": "9bf4fe7893e54ad5a33bb8d4cddf26b68693eb3df4b29668181eeba7c5bd5300",
+        "actions_valid": "8b65e8bca4841d2a9d6b23508b5e6e8b1c266cd3010dfe3e7fad4645dee950f3",
+        "dones": "fdae08d67087682bf1707f14acb79ed0249a06e6b2a7284388245cef18dbc86d",
+        "episode_starts": "bfd0886a0d682acd4d653af9d10be85208c94dfa11326c8f1aa9c5545a06d53a",
+        "rewards": "518387d8860cdd7e0ae59a6f8621c55eee11d84bbf361935700738555d10fbd2"
+      }
+    }
+  ]
+}

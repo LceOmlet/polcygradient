@@ -1,0 +1,58 @@
+{
+  "capture": {
+    "first_match": null,
+    "same_hit_relationship_preserved": false,
+    "selector_trace_written": true,
+    "snapshot_objective_total": null,
+    "snapshot_outer_batch_idx": null,
+    "snapshot_target_match_count": null,
+    "snapshot_target_selector": null,
+    "snapshot_written": false,
+    "target_appeared": false
+  },
+  "config": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "output_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_capture.json",
+    "selector_trace_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_selector_trace.json",
+    "single_eval_pos": 64,
+    "snapshot_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_snapshot.json",
+    "strict_fixed_env_mode": true,
+    "target_env_index": 12,
+    "target_objective_episode_index": 10,
+    "target_objective_position_end": 13,
+    "target_objective_position_start": 10,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "phase2_reference_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "ppo_reset_env_state_at_sep": true,
+    "shared_actor_critic_backbone": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_target_present_capture",
+  "runtime": {
+    "elapsed_wall_time_sec": 24.0238984990865,
+    "last_update_wall_time_sec": 5.627691549947485
+  },
+  "selector_trace_path": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_selector_trace.json",
+  "snapshot_path": null
+}

@@ -1,0 +1,158 @@
+{
+  "assembly_mode": {
+    "reuse_canonical_official_monkey": true,
+    "reuse_canonical_shared_milestone": true
+  },
+  "generated_artifacts": {
+    "official_vs_monkey_regression": "/home/chen/RLPFN/artifacts/phase2_regression_pack/critic_official_vs_monkey_regression.json",
+    "shared_backbone_milestone_quick": "/home/chen/RLPFN/artifacts/phase2_regression_pack/shared_backbone_milestone_quick.json"
+  },
+  "legacy_artifacts": {
+    "canonical_official_vs_monkey": "/home/chen/RLPFN/artifacts/critic_official_vs_monkey_regression_seed12345.json",
+    "canonical_shared_milestone": "/home/chen/RLPFN/artifacts/critic_help_vs_zero_state_reset_shared_seed12345_strict_fixed_env_deterministic_quick.json",
+    "sep_state_reset_gradient_snapshot": "/home/chen/RLPFN/artifacts/legacy_frozen_h_seed12345_sep_state_reset_gradient_snapshot.json"
+  },
+  "manifest_path": "/home/chen/RLPFN/reinforce-terminal-explore/ticl/analysis/phase2_regression_manifest.json",
+  "official_vs_monkey_regression": {
+    "audit_entry": "critic_official_vs_monkey_regression",
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "first_step_compare_after_sync": {
+      "action_mean_max_abs_diff": 2.6341789634898305e-05,
+      "action_t_equal": true,
+      "obs_t_equal": true,
+      "reward_mask_t_equal": true,
+      "reward_t_equal": true,
+      "values_max_abs_diff": 0.0003270059823989868
+    },
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "ppo_separate_value_backbone": false,
+    "regression_compare_after_sync": {
+      "actions_max_abs_diff": 0.0,
+      "advantages_max_abs_diff": 0.0,
+      "grad_cosine": 1.000003695487976,
+      "grad_l2_delta": 0.0,
+      "log_probs_max_abs_diff": 0.0,
+      "monkey_collect_s_single": 5.396847997093573,
+      "official_collect_s_single": 5.38852726505138,
+      "policy_loss_abs_diff": 0.0,
+      "returns_max_abs_diff": 0.0,
+      "values_max_abs_diff": 0.0
+    },
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "synced_param_diff": {
+      "differing_tensors": [],
+      "num_param_tensors_with_diff": 0,
+      "policy_param_max_abs_diff": 0.0
+    },
+    "target_kl": 0.03,
+    "timing_compare_after_sync": {
+      "monkey_mean_s": 5.352937340348338,
+      "monkey_times_s": [
+        5.4387945958878845,
+        5.3419959200546145,
+        5.278021505102515
+      ],
+      "official_mean_s": 5.438624874688685,
+      "official_over_monkey_ratio": 1.0160075728319231,
+      "official_times_s": [
+        5.395683027105406,
+        5.602614145027474,
+        5.317577451933175
+      ]
+    },
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040,
+    "unsynced_param_diff": {
+      "differing_tensors": [
+        {
+          "max_abs_diff": 0.002700251992791891,
+          "name": "action_net.weight"
+        },
+        {
+          "max_abs_diff": 0.2921191453933716,
+          "name": "value_net.weight"
+        }
+      ],
+      "num_param_tensors_with_diff": 2,
+      "policy_param_max_abs_diff": 0.2921191453933716
+    }
+  },
+  "pass_flags": {
+    "official_vs_monkey_numeric_match": true,
+    "shared_learned_beats_zero": true,
+    "shared_learned_post_return_positive": true
+  },
+  "phase2_frozen": true,
+  "shared_backbone_milestone": {
+    "learned": {
+      "delta_det_gap": 0.7247717380523682,
+      "delta_smp_gap": 0.7247717380523682,
+      "post_det_gap": 0.6964260339736938,
+      "post_return": 0.13302600383758545,
+      "post_smp_gap": 0.6964260339736938,
+      "pre_det_gap": -0.028345704078674316,
+      "pre_return": -0.5917457342147827,
+      "pre_smp_gap": -0.028345704078674316
+    },
+    "zero": {
+      "delta_det_gap": 0.15179061889648438,
+      "delta_smp_gap": 0.15179061889648438,
+      "post_det_gap": 0.18433082103729248,
+      "post_return": -0.3790692090988159,
+      "post_smp_gap": 0.18433082103729248,
+      "pre_det_gap": 0.032540202140808105,
+      "pre_return": -0.5308598279953003,
+      "pre_smp_gap": 0.032540202140808105
+    },
+    "zero_suffix_return_mean": -0.5634000301361084
+  },
+  "suite_name": "phase2_regression_pack",
+  "trusted_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "ppo_reset_env_state_at_sep": true,
+    "shared_actor_critic_backbone": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "validation": {
+    "all_checks_pass": true,
+    "checked_items": {
+      "official_vs_monkey_exact_zero_keys": [
+        "policy_loss_abs_diff",
+        "grad_l2_delta",
+        "actions_max_abs_diff",
+        "returns_max_abs_diff",
+        "values_max_abs_diff",
+        "advantages_max_abs_diff",
+        "log_probs_max_abs_diff"
+      ],
+      "official_vs_monkey_timing_ratio_range": [
+        0.9,
+        1.1
+      ],
+      "shared_milestone_abs_tol": 1e-06
+    },
+    "failures": [],
+    "manifest_path": "/home/chen/RLPFN/reinforce-terminal-explore/ticl/analysis/phase2_regression_manifest.json"
+  }
+}

@@ -1,0 +1,44 @@
+{
+  "conclusions": {
+    "new_phase3_trusted_baseline_established": false,
+    "phase3_collect_path_slowdown_vs_phase2_is_moderate": true,
+    "phase3_full_pair1_rebuild_runtime_not_yet_tolerable_for_inner_loop": true,
+    "phase3_post_eval_single_env_per_step_not_slower_than_phase2": true,
+    "therefore_only_lightweight_reuse_based_phase3_diagnostics_should_continue": true
+  },
+  "phase2_reference": {
+    "artifact": "/home/chen/RLPFN/artifacts/critic_official_vs_monkey_regression_seed12345.json",
+    "collect_s_per_step": 0.021048934629106952,
+    "collect_s_single": 5.38852726505138,
+    "n_steps": 256
+  },
+  "phase3_full_rebuild_runtime": {
+    "artifact": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/monitor_summary.json",
+    "bundle_run_total_wall_s": 136.89600004605018,
+    "interrupted_post_train_wall_s_before_stop": 29.73866279888898,
+    "projected_single_post_suite_wall_s_from_env0_heldout": 583.4690971709788,
+    "projected_single_post_suite_wall_s_from_env0_train": 571.1352061592042,
+    "projected_train_plus_heldout_post_eval_wall_s": 1154.604303330183,
+    "train_loop_wall_s": 105.20873046899214
+  },
+  "phase3_many_env_collect": {
+    "artifact": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare.json",
+    "isolated_over_phase2_per_step_ratio": 1.1159106482582828,
+    "n_steps": 2048,
+    "phase3_isolated_collect_s": 48.10491962800734,
+    "phase3_isolated_collect_s_per_step": 0.023488730287112958,
+    "resume_collect_s": 51.071697749895975,
+    "resume_collect_s_per_step": 0.024937352416941394,
+    "resume_over_phase2_per_step_ratio": 1.1847322848567094
+  },
+  "phase3_post_eval_single_env": {
+    "heldout_env0_artifact": "/home/chen/RLPFN/artifacts/phase3_post_heldout_subpath_env0.json",
+    "heldout_env0_rollout_s": 36.466818573186174,
+    "heldout_env0_s_per_step": 0.01780606375643856,
+    "heldout_eval_over_phase2_per_step_ratio": 0.8459365792231558,
+    "train_env0_artifact": "/home/chen/RLPFN/artifacts/phase3_post_train_subpath_env0.json",
+    "train_env0_rollout_s": 35.695950384950265,
+    "train_env0_s_per_step": 0.017429663273901497,
+    "train_eval_over_phase2_per_step_ratio": 0.8280544161032909
+  }
+}

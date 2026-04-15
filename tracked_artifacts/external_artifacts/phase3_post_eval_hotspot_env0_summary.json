@@ -1,0 +1,52 @@
+{
+  "conclusions": {
+    "build_obs_and_terminal_path_dominate_named_hotspots": true,
+    "largest_named_hotspot_heldout_env0": "_apply_terminal_reset_step",
+    "largest_named_hotspot_train_env0": "_build_obs_from_rollout_step_inputs",
+    "new_phase3_trusted_baseline_established": false,
+    "single_env_train_vs_heldout_runtime_same_order": true,
+    "state_full_rms_not_primary_hotspot": true,
+    "terminal_reset_path_material": true
+  },
+  "heldout_path": "/home/chen/RLPFN/artifacts/phase3_post_heldout_hotspot_env0.json",
+  "hotspots": {
+    "_apply_state_full_rms": {
+      "heldout_minus_train_total_s": 0.038781030336394906,
+      "heldout_over_train_total_ratio": 1.0610123949018495,
+      "heldout_share_of_wall": 0.01715265081815813,
+      "heldout_total_s": 0.6744064700324088,
+      "train_share_of_wall": 0.017122857961887155,
+      "train_total_s": 0.6356254396960139
+    },
+    "_apply_terminal_reset_step": {
+      "heldout_minus_train_total_s": 1.2980707925744355,
+      "heldout_over_train_total_ratio": 1.3167590623275156,
+      "heldout_share_of_wall": 0.13724140767614573,
+      "heldout_total_s": 5.396046026609838,
+      "train_share_of_wall": 0.11039370591787141,
+      "train_total_s": 4.0979752340354025
+    },
+    "_build_obs_from_rollout_step_inputs": {
+      "heldout_minus_train_total_s": 0.01965735526755452,
+      "heldout_over_train_total_ratio": 1.0041695183001067,
+      "heldout_share_of_wall": 0.12040811433596255,
+      "heldout_total_s": 4.734196026809514,
+      "train_share_of_wall": 0.12700306027279884,
+      "train_total_s": 4.714538671541959
+    },
+    "_terminal_tail_event_from_signal": {
+      "heldout_minus_train_total_s": 1.3156645700801164,
+      "heldout_over_train_total_ratio": 1.4219979060632324,
+      "heldout_share_of_wall": 0.11275696012825248,
+      "heldout_total_s": 4.433368594618514,
+      "train_share_of_wall": 0.08398657423923385,
+      "train_total_s": 3.117704024538398
+    }
+  },
+  "train_path": "/home/chen/RLPFN/artifacts/phase3_post_train_hotspot_env0.json",
+  "wall_s": {
+    "heldout_env0": 39.317915183026344,
+    "heldout_over_train_ratio": 1.0591694966747387,
+    "train_env0": 37.121457242174074
+  }
+}

@@ -1,0 +1,230 @@
+{
+  "audit_entry": "phase3_train_env_quality_contrast_probe",
+  "conclusions": {
+    "early_mass_distinguishes_better_than_tail_mass": true,
+    "episode_segmentation_not_primary_separator": true,
+    "high_positive_mass_alone_is_not_sufficient_for_positive_delta": true,
+    "low_mass_positive_envs_have_higher_pre_suffix_gap_than_high_mass_nonpositive": true,
+    "low_mass_positive_envs_have_higher_value_corr_than_high_mass_nonpositive": true,
+    "new_phase3_trusted_baseline_established": false,
+    "subset_only_diagnostic": true
+  },
+  "contrasts": {
+    "low_mass_positive_minus_high_mass_nonpositive": {
+      "episode_count": 0.0,
+      "first16_positive_share": 0.17816548235714436,
+      "last16_positive_share": -0.1410301139112562,
+      "pre_suffix_gap": 5.8693541288375854,
+      "raw_value_return_corr": 0.05886543565429747,
+      "terminal_reset_count": 0.0
+    }
+  },
+  "groups": {
+    "high_mass_nonpositive": {
+      "rows": [
+        {
+          "env_index": 1,
+          "env_seed": 404077994,
+          "normalized_actor_adv_abs_mass": 128.08058166503906,
+          "normalized_actor_adv_first16_positive_share": 0.0,
+          "normalized_actor_adv_last16_positive_share": 0.2437666803598404,
+          "normalized_actor_adv_negative_count": 40,
+          "normalized_actor_adv_negative_mass": 68.85211181640625,
+          "normalized_actor_adv_positive_count": 62,
+          "normalized_actor_adv_positive_mass": 59.228492736816406,
+          "normalized_actor_adv_top16_abs_share": 0.32909008860588074,
+          "normalized_actor_adv_top1_abs_share": 0.028115369379520416,
+          "normalized_actor_adv_top4_abs_share": 0.10575329512357712,
+          "objective_episode_count": 1,
+          "objective_terminal_reset_count": 0,
+          "objective_token_count": 102,
+          "objective_token_fraction": 0.0498046875,
+          "post_vs_zero_suffix_gap": -0.9839644134044647,
+          "pre_full_return": -7.541322708129883,
+          "pre_suffix_return": -0.8891627788543701,
+          "pre_vs_zero_full_gap": -8.37460196018219,
+          "pre_vs_zero_suffix_gap": -0.6799580752849579,
+          "raw_actor_adv_abs_mass": 32.47006607055664,
+          "raw_actor_adv_negative_mass": 18.038776397705078,
+          "raw_actor_adv_positive_mass": 14.431291580200195,
+          "raw_objective_return_mean": 0.47083747386932373,
+          "raw_objective_return_std": 0.16435682773590088,
+          "raw_value_explained_variance": -0.001415848731994629,
+          "raw_value_return_corr": 0.0023302591871470213,
+          "rollout_seed": 164846267,
+          "suffix_gap_delta": -0.30400633811950684,
+          "suffix_return_delta": -0.30400633811950684,
+          "zero_full_return": 0.8332792520523071,
+          "zero_suffix_return": -0.20920470356941223
+        }
+      ],
+      "summary": {
+        "count": 1,
+        "env_indices": [
+          1
+        ],
+        "mean_episode_count": 1.0,
+        "mean_first16_positive_share": 0.0,
+        "mean_last16_positive_share": 0.2437666803598404,
+        "mean_positive_mass": 59.228492736816406,
+        "mean_pre_suffix_gap": -0.6799580752849579,
+        "mean_suffix_gap_delta": -0.30400633811950684,
+        "mean_terminal_reset_count": 0.0,
+        "mean_value_corr": 0.0023302591871470213
+      }
+    },
+    "high_mass_positive": {
+      "rows": [
+        {
+          "env_index": 2,
+          "env_seed": 723695242,
+          "normalized_actor_adv_abs_mass": 124.76847076416016,
+          "normalized_actor_adv_first16_positive_share": 0.6084023714065552,
+          "normalized_actor_adv_last16_positive_share": 0.007673404645174742,
+          "normalized_actor_adv_negative_count": 61,
+          "normalized_actor_adv_negative_mass": 94.38397216796875,
+          "normalized_actor_adv_positive_count": 41,
+          "normalized_actor_adv_positive_mass": 30.38450050354004,
+          "normalized_actor_adv_top16_abs_share": 0.46674996614456177,
+          "normalized_actor_adv_top1_abs_share": 0.041793521493673325,
+          "normalized_actor_adv_top4_abs_share": 0.16005763411521912,
+          "objective_episode_count": 2,
+          "objective_terminal_reset_count": 1,
+          "objective_token_count": 102,
+          "objective_token_fraction": 0.0498046875,
+          "post_vs_zero_suffix_gap": -0.5079448968172073,
+          "pre_full_return": -10.767602920532227,
+          "pre_suffix_return": -0.5948618650436401,
+          "pre_vs_zero_full_gap": -9.68894910812378,
+          "pre_vs_zero_suffix_gap": -0.5461155325174332,
+          "raw_actor_adv_abs_mass": 32.10003662109375,
+          "raw_actor_adv_negative_mass": 24.79672622680664,
+          "raw_actor_adv_positive_mass": 7.303312301635742,
+          "raw_objective_return_mean": 0.4676860272884369,
+          "raw_objective_return_std": 0.16597804427146912,
+          "raw_value_explained_variance": -0.0014541149139404297,
+          "raw_value_return_corr": 0.004249839577823877,
+          "rollout_seed": 1648075888,
+          "suffix_gap_delta": 0.03817063570022583,
+          "suffix_return_delta": 0.03817063570022583,
+          "zero_full_return": -1.0786538124084473,
+          "zero_suffix_return": -0.04874633252620697
+        }
+      ],
+      "summary": {
+        "count": 1,
+        "env_indices": [
+          2
+        ],
+        "mean_episode_count": 2.0,
+        "mean_first16_positive_share": 0.6084023714065552,
+        "mean_last16_positive_share": 0.007673404645174742,
+        "mean_positive_mass": 30.38450050354004,
+        "mean_pre_suffix_gap": -0.5461155325174332,
+        "mean_suffix_gap_delta": 0.03817063570022583,
+        "mean_terminal_reset_count": 1.0,
+        "mean_value_corr": 0.004249839577823877
+      }
+    },
+    "low_mass_positive": {
+      "rows": [
+        {
+          "env_index": 0,
+          "env_seed": 313143644,
+          "normalized_actor_adv_abs_mass": 30.89015007019043,
+          "normalized_actor_adv_first16_positive_share": 0.036492083221673965,
+          "normalized_actor_adv_last16_positive_share": 0.004718609619885683,
+          "normalized_actor_adv_negative_count": 42,
+          "normalized_actor_adv_negative_mass": 10.750997543334961,
+          "normalized_actor_adv_positive_count": 60,
+          "normalized_actor_adv_positive_mass": 20.13915252685547,
+          "normalized_actor_adv_top16_abs_share": 0.3561692535877228,
+          "normalized_actor_adv_top1_abs_share": 0.029824145138263702,
+          "normalized_actor_adv_top4_abs_share": 0.11522209644317627,
+          "objective_episode_count": 1,
+          "objective_terminal_reset_count": 0,
+          "objective_token_count": 102,
+          "objective_token_fraction": 0.0498046875,
+          "post_vs_zero_suffix_gap": 0.7438417673110962,
+          "pre_full_return": -22.512033462524414,
+          "pre_suffix_return": -0.5081824660301208,
+          "pre_vs_zero_full_gap": -10.455822944641113,
+          "pre_vs_zero_suffix_gap": 0.7278760075569153,
+          "raw_actor_adv_abs_mass": 7.734598159790039,
+          "raw_actor_adv_negative_mass": 3.2435293197631836,
+          "raw_actor_adv_positive_mass": 4.4910688400268555,
+          "raw_objective_return_mean": 0.47062715888023376,
+          "raw_objective_return_std": 0.16573964059352875,
+          "raw_value_explained_variance": -0.0010775327682495117,
+          "raw_value_return_corr": 0.002572702243924141,
+          "rollout_seed": 1538400912,
+          "suffix_gap_delta": 0.015965759754180908,
+          "suffix_return_delta": 0.015965759754180908,
+          "zero_full_return": -12.0562105178833,
+          "zero_suffix_return": -1.2360584735870361
+        },
+        {
+          "env_index": 3,
+          "env_seed": 2031096653,
+          "normalized_actor_adv_abs_mass": 14.478031158447266,
+          "normalized_actor_adv_first16_positive_share": 0.31983888149261475,
+          "normalized_actor_adv_last16_positive_share": 0.20075452327728271,
+          "normalized_actor_adv_negative_count": 38,
+          "normalized_actor_adv_negative_mass": 4.859023571014404,
+          "normalized_actor_adv_positive_count": 64,
+          "normalized_actor_adv_positive_mass": 9.61900806427002,
+          "normalized_actor_adv_top16_abs_share": 0.3494132161140442,
+          "normalized_actor_adv_top1_abs_share": 0.03176724910736084,
+          "normalized_actor_adv_top4_abs_share": 0.11217918246984482,
+          "objective_episode_count": 1,
+          "objective_terminal_reset_count": 0,
+          "objective_token_count": 102,
+          "objective_token_fraction": 0.0498046875,
+          "post_vs_zero_suffix_gap": 10.068437576293945,
+          "pre_full_return": -137.0947723388672,
+          "pre_suffix_return": -6.071261405944824,
+          "pre_vs_zero_full_gap": 174.34764099121094,
+          "pre_vs_zero_suffix_gap": 9.65091609954834,
+          "raw_actor_adv_abs_mass": 3.5140573978424072,
+          "raw_actor_adv_negative_mass": 1.724205493927002,
+          "raw_actor_adv_positive_mass": 1.7898517847061157,
+          "raw_objective_return_mean": 0.46940961480140686,
+          "raw_objective_return_std": 0.16435903310775757,
+          "raw_value_explained_variance": 0.008205294609069824,
+          "raw_value_return_corr": 0.11981868743896484,
+          "rollout_seed": 1782898837,
+          "suffix_gap_delta": 0.41752147674560547,
+          "suffix_return_delta": 0.41752147674560547,
+          "zero_full_return": -311.4424133300781,
+          "zero_suffix_return": -15.722177505493164
+        }
+      ],
+      "summary": {
+        "count": 2,
+        "env_indices": [
+          0,
+          3
+        ],
+        "mean_episode_count": 1.0,
+        "mean_first16_positive_share": 0.17816548235714436,
+        "mean_last16_positive_share": 0.1027365664485842,
+        "mean_positive_mass": 14.879080295562744,
+        "mean_pre_suffix_gap": 5.189396053552628,
+        "mean_suffix_gap_delta": 0.2167436182498932,
+        "mean_terminal_reset_count": 0.0,
+        "mean_value_corr": 0.06119569484144449
+      }
+    }
+  },
+  "source_rollout_quality_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe.json",
+  "subset_mass_median": 25.261826515197754,
+  "suite_context": {
+    "expected_train_suite_summary_json": "/home/chen/RLPFN/artifacts/phase3_multi_env_trusted_pair1.json",
+    "suite_name": "pair1",
+    "suite_regime": "positive",
+    "suite_regime_summary_json": "/home/chen/RLPFN/artifacts/phase3_cross_suite_regime_summary.json",
+    "suite_regime_summary_membership_verified": true,
+    "train_suite_fingerprint": "04f3f0c11c71cff0",
+    "train_suite_summary_fingerprint_match": true
+  }
+}

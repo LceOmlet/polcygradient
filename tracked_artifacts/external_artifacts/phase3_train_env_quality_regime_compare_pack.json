@@ -1,0 +1,80 @@
+{
+  "audit_entry": "phase3_train_env_quality_regime_compare_pack",
+  "comparison": {
+    "nonpositive": {
+      "contrast": {
+        "episode_count": 0.0,
+        "first16_positive_share": 0.005454041762277484,
+        "last16_positive_share": 0.028802640736103058,
+        "pre_suffix_gap": 0.1285586655139923,
+        "raw_value_return_corr": 0.006977026292588562,
+        "terminal_reset_count": 0.0
+      },
+      "shared_true_count": 4,
+      "suite_name": "seed24680",
+      "suite_regime": "nonpositive"
+    },
+    "positive": {
+      "contrast": {
+        "episode_count": 0.0,
+        "first16_positive_share": 0.17816548235714436,
+        "last16_positive_share": -0.1410301139112562,
+        "pre_suffix_gap": 5.8693541288375854,
+        "raw_value_return_corr": 0.05886543565429747,
+        "terminal_reset_count": 0.0
+      },
+      "shared_true_count": 4,
+      "suite_name": "pair1",
+      "suite_regime": "positive"
+    }
+  },
+  "conclusions": {
+    "regime_specific_early_mass_separator_is_positive_only": true,
+    "regime_split_guardrail_preferred": true,
+    "shared_signals_consistent_across_regimes": true,
+    "weighting_repair_not_yet_supported": true
+  },
+  "nonpositive_suite_context": {
+    "expected_train_suite_summary_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe_seed24680.json",
+    "suite_name": "seed24680",
+    "suite_regime": "nonpositive",
+    "suite_regime_summary_json": "/home/chen/RLPFN/artifacts/phase3_cross_suite_regime_summary.json",
+    "suite_regime_summary_membership_verified": true,
+    "train_suite_fingerprint": "d7c6a96c0f77cd30",
+    "train_suite_summary_fingerprint_match": true
+  },
+  "positive_suite_context": {
+    "expected_train_suite_summary_json": "/home/chen/RLPFN/artifacts/phase3_multi_env_trusted_pair1.json",
+    "suite_name": "pair1",
+    "suite_regime": "positive",
+    "suite_regime_summary_json": "/home/chen/RLPFN/artifacts/phase3_cross_suite_regime_summary.json",
+    "suite_regime_summary_membership_verified": true,
+    "train_suite_fingerprint": "04f3f0c11c71cff0",
+    "train_suite_summary_fingerprint_match": true
+  },
+  "recommendation": {
+    "reason": "Shared signals survive both regimes, but the only strong discriminator that differs across regimes is early_mass_distinguishes_better_than_tail_mass, which is positive-only. A pooled weighting tweak is therefore not yet justified.",
+    "recommended_next_step": "guardrail_only",
+    "regime_split_guardrail_required": true,
+    "weighting_repair_candidate_supported": false
+  },
+  "regime_specific_signals": {
+    "contrast_amplification": {
+      "first16_positive_share_ratio": 32.6666883245035,
+      "last16_positive_share_delta": -0.16983275464735925,
+      "last16_positive_share_sign_flip": true,
+      "pre_suffix_gap_ratio": 45.65506421034501,
+      "raw_value_return_corr_ratio": 8.437037956532865
+    },
+    "nonpositive_early_mass_distinguishes_better_than_tail_mass": false,
+    "positive_only_early_mass_distinguishes_better_than_tail_mass": true
+  },
+  "shared_signals": {
+    "episode_segmentation_not_primary_separator": true,
+    "high_positive_mass_alone_is_not_sufficient_for_positive_delta": true,
+    "low_mass_positive_envs_have_higher_pre_suffix_gap_than_high_mass_nonpositive": true,
+    "low_mass_positive_envs_have_higher_value_corr_than_high_mass_nonpositive": true
+  },
+  "source_nonpositive_contrast_json": "/home/chen/RLPFN/artifacts/phase3_train_env_quality_contrast_regime_seed24680_nonpositive.json",
+  "source_positive_contrast_json": "/home/chen/RLPFN/artifacts/phase3_train_env_quality_contrast_regime_pair1_positive.json"
+}

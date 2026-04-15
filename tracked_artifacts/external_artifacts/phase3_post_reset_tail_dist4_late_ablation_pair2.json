@@ -1,0 +1,292 @@
+{
+  "audit_entry": "phase3_post_reset_tail_dist4_late_ablation_verify",
+  "base_summary": {
+    "corr_vs_pre_suffix_gap": 0.21842823922634125,
+    "corr_vs_terminal_resets": 0.8627931475639343,
+    "mass_total": 168.73503589257598
+  },
+  "conclusions": {
+    "ablation_improves_pre_gap_alignment": true,
+    "ablation_reduces_reset_bias": true,
+    "new_phase3_trusted_baseline_established": false
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "dist_limit": 4,
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+    "late_k": 4,
+    "n_samples": 2048,
+    "reuse_heldout_subset_delta_json": null,
+    "reuse_pre_policy_json": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair2_ppo.json",
+    "reuse_zero_control_json": "/home/chen/RLPFN/artifacts/phase3_regression_pack/phase3_cross_env_baseline_pair2_zero.json",
+    "runtime_wall_s": 105.06157572311349,
+    "single_eval_pos": 1946,
+    "tail_len": 8,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "deltas": {
+    "corr_pre_delta": 0.02889956533908844,
+    "corr_reset_delta": -0.060752034187316895
+  },
+  "env_rows": [
+    {
+      "base_positive_mass": 15.812002182006836,
+      "env_index": 0,
+      "env_seed": 1442941694,
+      "objective_terminal_reset_count": 1,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 3.2047375440597534,
+      "remaining_mass": 15.812002182006836,
+      "removed_mass": 0.0,
+      "rollout_seed": 810497065
+    },
+    {
+      "base_positive_mass": 2.9278318881988525,
+      "env_index": 1,
+      "env_seed": 984791062,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 3.211248070001602,
+      "remaining_mass": 2.9278318881988525,
+      "removed_mass": 0.0,
+      "rollout_seed": 1115901460
+    },
+    {
+      "base_positive_mass": 24.18212127685547,
+      "env_index": 2,
+      "env_seed": 206635565,
+      "objective_terminal_reset_count": 2,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -0.18388396501541138,
+      "remaining_mass": 21.48512275516987,
+      "removed_mass": 2.6969985216856003,
+      "rollout_seed": 561726351
+    },
+    {
+      "base_positive_mass": 4.224902153015137,
+      "env_index": 3,
+      "env_seed": 493201022,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -1.060459464788437,
+      "remaining_mass": 4.224902153015137,
+      "removed_mass": 0.0,
+      "rollout_seed": 598223505
+    },
+    {
+      "base_positive_mass": 0.03280032053589821,
+      "env_index": 4,
+      "env_seed": 2107061342,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 1.7305832505226135,
+      "remaining_mass": 0.03280032053589821,
+      "removed_mass": 0.0,
+      "rollout_seed": 625604307
+    },
+    {
+      "base_positive_mass": 0.032089680433273315,
+      "env_index": 5,
+      "env_seed": 1584089744,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.5842159353196621,
+      "remaining_mass": 0.032089680433273315,
+      "removed_mass": 0.0,
+      "rollout_seed": 1652755600
+    },
+    {
+      "base_positive_mass": 2.461778163909912,
+      "env_index": 6,
+      "env_seed": 1491086902,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -0.6206572651863098,
+      "remaining_mass": 2.461778163909912,
+      "removed_mass": 0.0,
+      "rollout_seed": 2047862393
+    },
+    {
+      "base_positive_mass": 12.78274154663086,
+      "env_index": 7,
+      "env_seed": 743607623,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 1.9466119706630707,
+      "remaining_mass": 12.78274154663086,
+      "removed_mass": 0.0,
+      "rollout_seed": 1305697605
+    },
+    {
+      "base_positive_mass": 17.393407821655273,
+      "env_index": 8,
+      "env_seed": 224090232,
+      "objective_terminal_reset_count": 1,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -3.451277256011963,
+      "remaining_mass": 17.36293913796544,
+      "removed_mass": 0.030468683689832687,
+      "rollout_seed": 807143084
+    },
+    {
+      "base_positive_mass": 18.513442993164062,
+      "env_index": 9,
+      "env_seed": 1080379705,
+      "objective_terminal_reset_count": 1,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.027603209018707275,
+      "remaining_mass": 18.504660308361053,
+      "removed_mass": 0.008782684803009033,
+      "rollout_seed": 2014241443
+    },
+    {
+      "base_positive_mass": 20.623943328857422,
+      "env_index": 10,
+      "env_seed": 1398242522,
+      "objective_terminal_reset_count": 1,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.4627540409564972,
+      "remaining_mass": 20.57413113117218,
+      "removed_mass": 0.0498121976852417,
+      "rollout_seed": 1341751404
+    },
+    {
+      "base_positive_mass": 0.03758874535560608,
+      "env_index": 11,
+      "env_seed": 1016760292,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -0.42487525939941406,
+      "remaining_mass": 0.03758874535560608,
+      "removed_mass": 0.0,
+      "rollout_seed": 1467266567
+    },
+    {
+      "base_positive_mass": 17.866397857666016,
+      "env_index": 12,
+      "env_seed": 379681280,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 21.452394485473633,
+      "remaining_mass": 17.866397857666016,
+      "removed_mass": 0.0,
+      "rollout_seed": 2114629823
+    },
+    {
+      "base_positive_mass": 0.07460355013608932,
+      "env_index": 13,
+      "env_seed": 182943133,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 1.40617735683918,
+      "remaining_mass": 0.07460355013608932,
+      "removed_mass": 0.0,
+      "rollout_seed": 1506271267
+    },
+    {
+      "base_positive_mass": 0.0,
+      "env_index": 14,
+      "env_seed": 1909806910,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": -5.131105720996857,
+      "remaining_mass": 0.0,
+      "removed_mass": 0.0,
+      "rollout_seed": 620380557
+    },
+    {
+      "base_positive_mass": 31.769384384155273,
+      "env_index": 15,
+      "env_seed": 1325777525,
+      "objective_terminal_reset_count": 3,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 1.5784763097763062,
+      "remaining_mass": 25.448157709091902,
+      "removed_mass": 6.321226675063372,
+      "rollout_seed": 155881736
+    }
+  ],
+  "heldout_suite_summary": {
+    "action_dim_mean": 16.625,
+    "batch_size": 16,
+    "family_counts": {
+      "scm": 16
+    },
+    "fingerprint": "ec11e526e4f6f68d",
+    "obs_dim_mean": 114.25,
+    "state_dim_mean": 214.875,
+    "suite_seed": 13579,
+    "top_structures": [
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 142, 69, 22, 57, 201, 400, 30, 4, 15, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 20, 10, 5, 200, 180, 400, 30, 2, 8, 'sin')"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 247, 32, 6, 75, 78, 400, 30, 2, 29, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 260, 236, 30, 41, 99, 400, 30, 3, 58, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 268, 243, 8, 109, 23, 400, 30, 2, 190, 'sin')"
+      }
+    ],
+    "unique_structures": 16
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  },
+  "post_reset_tail_dist4_late_ablation_summary": {
+    "corr_vs_pre_suffix_gap": 0.2473278045654297,
+    "corr_vs_terminal_resets": 0.8020411133766174,
+    "mass_total": 159.62774712964892
+  },
+  "train_suite_summary": {
+    "action_dim_mean": 15.6875,
+    "batch_size": 16,
+    "family_counts": {
+      "scm": 16
+    },
+    "fingerprint": "207a0b2867895288",
+    "obs_dim_mean": 103.9375,
+    "state_dim_mean": 241.5625,
+    "suite_seed": 24680,
+    "top_structures": [
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 105, 19, 20, 223, 72, 400, 30, 9, 53, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 11, 8, 27, 240, 149, 400, 30, 2, 36, <class 'torch.nn.modules.activation.Tanh'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 170, 39, 24, 199, 31, 400, 30, 3, 58, <class 'torch.nn.modules.activation.ReLU'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 181, 97, 5, 111, 108, 400, 30, 3, 80, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 208, 18, 3, 166, 26, 400, 30, 5, 112, <class 'torch.nn.modules.activation.ReLU'>)"
+      }
+    ],
+    "unique_structures": 16
+  }
+}

@@ -1,0 +1,33 @@
+{
+  "output_json": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/phase3_multi_env_trusted_pair1_restored_policy.json",
+  "phase_events": [
+    {
+      "event": "phase_start",
+      "phase": "train_loop",
+      "t": 1693849.397823226
+    },
+    {
+      "event": "phase_end",
+      "phase": "train_loop",
+      "t": 1693952.484610318,
+      "wall_s": 103.08678709203377
+    },
+    {
+      "event": "phase_start",
+      "phase": "pre_train",
+      "t": 1693952.484696598
+    },
+    {
+      "error": "",
+      "error_type": "KeyboardInterrupt",
+      "event": "phase_error",
+      "phase": "pre_train",
+      "t": 1694024.607034129,
+      "wall_s": 72.12233753106557
+    }
+  ],
+  "phase_log_jsonl": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/phase_log.jsonl",
+  "stack_dump_log": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/stack_dump.log",
+  "status": "interrupted",
+  "wall_s": 176.88005570089445
+}

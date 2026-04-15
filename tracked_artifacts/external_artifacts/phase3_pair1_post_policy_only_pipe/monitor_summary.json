@@ -1,0 +1,22 @@
+{
+  "output_json": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/phase3_multi_env_trusted_pair1_restored_policy.json",
+  "phase_events": [
+    {
+      "event": "phase_start",
+      "phase": "post_train",
+      "t": 1695105.966388865
+    },
+    {
+      "error": "",
+      "error_type": "KeyboardInterrupt",
+      "event": "phase_error",
+      "phase": "post_train",
+      "t": 1695341.631604165,
+      "wall_s": 235.66521530016325
+    }
+  ],
+  "phase_log_jsonl": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/phase_log.jsonl",
+  "stack_dump_log": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/stack_dump.log",
+  "status": "interrupted",
+  "wall_s": 237.58327143709175
+}

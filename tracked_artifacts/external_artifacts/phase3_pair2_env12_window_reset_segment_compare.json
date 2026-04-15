@@ -1,0 +1,419 @@
+{
+  "audit_entry": "phase3_pair2_env12_window_reset_segment_compare",
+  "conclusions": {
+    "current_strict_split_starts_inside_window": [],
+    "current_strict_window_is_split_into_multiple_segments": false,
+    "source_defers_first_boundary_until_after_window": true,
+    "source_local_indices_align_with_current_raw_global_positions": true,
+    "source_local_indices_do_not_align_with_current_episode_local_positions": false,
+    "source_window_is_one_long_episode0_segment": true,
+    "window_mismatch_is_reset_segment_contract_mismatch": false
+  },
+  "config": {
+    "allow_source_suite_mismatch": false,
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "compare_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+    "compare_suite_role": "heldout",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "env_index": 12,
+    "global_step_end": 2002,
+    "global_step_start": 1946,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_samples": 2048,
+    "single_eval_pos": 1946,
+    "source_expected_compare_suite_role": "heldout",
+    "source_json": "/home/chen/RLPFN/artifacts/phase3_residual_anchor_gae_path_probe.json",
+    "source_suite_name": "pair2",
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_profile": "trusted_sep_reset_mainline"
+  },
+  "current_strict_window": {
+    "compressed_segment_boundary_steps_inside_window": [],
+    "compressed_segments": [
+      {
+        "episode_index": 0,
+        "global_step_end": 2002,
+        "global_step_start": 1946,
+        "local_index_end": 56,
+        "local_index_start": 0,
+        "token_count": 57
+      }
+    ],
+    "raw_segment_boundary_steps_inside_window": [],
+    "raw_segments": [
+      {
+        "episode_index": 16,
+        "global_step_end": 2002,
+        "global_step_start": 1946,
+        "local_index_end": 56,
+        "local_index_start": 0,
+        "token_count": 57
+      }
+    ],
+    "row_count": 57,
+    "rows_excerpt_head": [
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 0,
+        "episode_start": 0,
+        "global_step": 1946,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 0,
+        "raw_objective_global_position": 0
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 1,
+        "episode_start": 0,
+        "global_step": 1947,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 1,
+        "raw_objective_global_position": 1
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 2,
+        "episode_start": 0,
+        "global_step": 1948,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 2,
+        "raw_objective_global_position": 2
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 3,
+        "episode_start": 0,
+        "global_step": 1949,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 3,
+        "raw_objective_global_position": 3
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 4,
+        "episode_start": 0,
+        "global_step": 1950,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 4,
+        "raw_objective_global_position": 4
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 5,
+        "episode_start": 0,
+        "global_step": 1951,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 5,
+        "raw_objective_global_position": 5
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 6,
+        "episode_start": 0,
+        "global_step": 1952,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 6,
+        "raw_objective_global_position": 6
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 7,
+        "episode_start": 0,
+        "global_step": 1953,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 7,
+        "raw_objective_global_position": 7
+      }
+    ],
+    "rows_excerpt_tail": [
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 49,
+        "episode_start": 0,
+        "global_step": 1995,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 49,
+        "raw_objective_global_position": 49
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 50,
+        "episode_start": 0,
+        "global_step": 1996,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 50,
+        "raw_objective_global_position": 50
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 51,
+        "episode_start": 0,
+        "global_step": 1997,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 51,
+        "raw_objective_global_position": 51
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 52,
+        "episode_start": 0,
+        "global_step": 1998,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 52,
+        "raw_objective_global_position": 52
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 53,
+        "episode_start": 0,
+        "global_step": 1999,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 53,
+        "raw_objective_global_position": 53
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 54,
+        "episode_start": 0,
+        "global_step": 2000,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 54,
+        "raw_objective_global_position": 54
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 55,
+        "episode_start": 0,
+        "global_step": 2001,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 55,
+        "raw_objective_global_position": 55
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 56,
+        "episode_start": 0,
+        "global_step": 2002,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 56,
+        "raw_objective_global_position": 56
+      }
+    ]
+  },
+  "source_window": {
+    "row_count": 57,
+    "rows_excerpt_head": [
+      {
+        "global_step": 1946,
+        "objective_episode_index": 0,
+        "objective_local_index": 0,
+        "tokens_to_objective_episode_end": 56
+      },
+      {
+        "global_step": 1947,
+        "objective_episode_index": 0,
+        "objective_local_index": 1,
+        "tokens_to_objective_episode_end": 55
+      },
+      {
+        "global_step": 1948,
+        "objective_episode_index": 0,
+        "objective_local_index": 2,
+        "tokens_to_objective_episode_end": 54
+      },
+      {
+        "global_step": 1949,
+        "objective_episode_index": 0,
+        "objective_local_index": 3,
+        "tokens_to_objective_episode_end": 53
+      },
+      {
+        "global_step": 1950,
+        "objective_episode_index": 0,
+        "objective_local_index": 4,
+        "tokens_to_objective_episode_end": 52
+      },
+      {
+        "global_step": 1951,
+        "objective_episode_index": 0,
+        "objective_local_index": 5,
+        "tokens_to_objective_episode_end": 51
+      },
+      {
+        "global_step": 1952,
+        "objective_episode_index": 0,
+        "objective_local_index": 6,
+        "tokens_to_objective_episode_end": 50
+      },
+      {
+        "global_step": 1953,
+        "objective_episode_index": 0,
+        "objective_local_index": 7,
+        "tokens_to_objective_episode_end": 49
+      }
+    ],
+    "rows_excerpt_tail": [
+      {
+        "global_step": 1995,
+        "objective_episode_index": 0,
+        "objective_local_index": 49,
+        "tokens_to_objective_episode_end": 7
+      },
+      {
+        "global_step": 1996,
+        "objective_episode_index": 0,
+        "objective_local_index": 50,
+        "tokens_to_objective_episode_end": 6
+      },
+      {
+        "global_step": 1997,
+        "objective_episode_index": 0,
+        "objective_local_index": 51,
+        "tokens_to_objective_episode_end": 5
+      },
+      {
+        "global_step": 1998,
+        "objective_episode_index": 0,
+        "objective_local_index": 52,
+        "tokens_to_objective_episode_end": 4
+      },
+      {
+        "global_step": 1999,
+        "objective_episode_index": 0,
+        "objective_local_index": 53,
+        "tokens_to_objective_episode_end": 3
+      },
+      {
+        "global_step": 2000,
+        "objective_episode_index": 0,
+        "objective_local_index": 54,
+        "tokens_to_objective_episode_end": 2
+      },
+      {
+        "global_step": 2001,
+        "objective_episode_index": 0,
+        "objective_local_index": 55,
+        "tokens_to_objective_episode_end": 1
+      },
+      {
+        "global_step": 2002,
+        "objective_episode_index": 0,
+        "objective_local_index": 56,
+        "tokens_to_objective_episode_end": 0
+      }
+    ],
+    "segment_boundary_steps_inside_window": [],
+    "segments": [
+      {
+        "episode_index": 0,
+        "global_step_end": 2002,
+        "global_step_start": 1946,
+        "local_index_end": 56,
+        "local_index_start": 0,
+        "token_count": 57
+      }
+    ]
+  },
+  "target_block_alignment": {
+    "current_raw_episode_positions": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "current_raw_global_positions": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "current_rows": [
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 18,
+        "episode_start": 0,
+        "global_step": 1964,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 18,
+        "raw_objective_global_position": 18
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 19,
+        "episode_start": 0,
+        "global_step": 1965,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 19,
+        "raw_objective_global_position": 19
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 20,
+        "episode_start": 0,
+        "global_step": 1966,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 20,
+        "raw_objective_global_position": 20
+      },
+      {
+        "compressed_objective_episode_index": 0,
+        "compressed_objective_episode_position": 21,
+        "episode_start": 0,
+        "global_step": 1967,
+        "raw_objective_episode_index": 16,
+        "raw_objective_episode_position": 21,
+        "raw_objective_global_position": 21
+      }
+    ],
+    "global_steps": [
+      1964,
+      1965,
+      1966,
+      1967
+    ],
+    "local_index_shift_vs_current_raw_episode_positions": [
+      0,
+      0,
+      0,
+      0
+    ],
+    "pre_split_token_count": 57,
+    "source_local_indices": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "source_rows": [
+      {
+        "global_step": 1964,
+        "objective_episode_index": 0,
+        "objective_local_index": 18,
+        "tokens_to_objective_episode_end": 38
+      },
+      {
+        "global_step": 1965,
+        "objective_episode_index": 0,
+        "objective_local_index": 19,
+        "tokens_to_objective_episode_end": 37
+      },
+      {
+        "global_step": 1966,
+        "objective_episode_index": 0,
+        "objective_local_index": 20,
+        "tokens_to_objective_episode_end": 36
+      },
+      {
+        "global_step": 1967,
+        "objective_episode_index": 0,
+        "objective_local_index": 21,
+        "tokens_to_objective_episode_end": 35
+      }
+    ]
+  }
+}

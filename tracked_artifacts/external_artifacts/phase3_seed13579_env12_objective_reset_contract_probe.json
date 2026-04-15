@@ -1,0 +1,88 @@
+{
+  "audit_entry": "phase3_objective_reset_contract_probe",
+  "conclusions": {
+    "fresh_reset_count_matches_stored_distance_probe": true,
+    "fresh_rollout_contains_in_objective_terminal_row": true,
+    "stored_distance_probe_claims_reset_but_fresh_rollout_has_no_terminal_row": false,
+    "stored_distance_probe_claims_reset_but_fresh_rollout_has_none": false
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "distance_probe_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/phase3_post_reset_tail_distance_probe.json",
+    "env_index": 12,
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/heldout_suite.pt",
+    "n_samples": 2048,
+    "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+    "single_eval_pos": 1946,
+    "suite_name": "seed13579",
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/train_suite.pt"
+  },
+  "fresh_rollout_summary": {
+    "compressed_segment_starts": [
+      0,
+      91
+    ],
+    "compressed_segments": [
+      [
+        0,
+        91
+      ],
+      [
+        91,
+        102
+      ]
+    ],
+    "episode_starts_on_objective_positions": [
+      91
+    ],
+    "objective_steps_head": [
+      1946,
+      1947,
+      1948,
+      1949,
+      1950,
+      1951,
+      1952,
+      1953,
+      1954,
+      1955
+    ],
+    "objective_steps_tail": [
+      2038,
+      2039,
+      2040,
+      2041,
+      2042,
+      2043,
+      2044,
+      2045,
+      2046,
+      2047
+    ],
+    "objective_terminal_reset_count_from_segments": 1,
+    "objective_token_count": 102,
+    "terminal_row_count_within_objective": 1,
+    "terminal_rows_within_objective_global_steps": [
+      2036
+    ]
+  },
+  "runtime_wall_s_total": 114.21666427911259,
+  "stored_distance_row": {
+    "env_index": 12,
+    "env_seed": 379681280,
+    "objective_terminal_reset_count": 1,
+    "pre_vs_zero_suffix_gap": 0.012968063354492188,
+    "rollout_seed": 2114629823
+  },
+  "suite_summary": {
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/heldout_suite.pt",
+    "objective_token_total": 1632,
+    "ppo_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/ppo_cross_env_baseline.json",
+    "suite_name": "seed13579",
+    "suite_pre_minus_zero_suffix": 0.014652371406555176,
+    "suite_runtime_wall_s": 112.43635356379673,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/train_suite.pt",
+    "zero_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/zero_cross_env_control.json"
+  }
+}

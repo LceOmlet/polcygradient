@@ -1,0 +1,288 @@
+{
+  "audit_entry": "phase3_pair2_exact_update_aggregation_audit",
+  "available_snapshot_scope": {
+    "objective_segments": [
+      {
+        "env_index": 0,
+        "objective_episode_index": 2,
+        "objective_position_max": 101,
+        "objective_position_min": 0,
+        "token_count": 102
+      }
+    ]
+  },
+  "baseline": {
+    "policy_num_from_clipped_objective": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 77.33426445908844,
+        "mean": 1.9042898772978315e-05,
+        "negative_mass": 38.6661610417068,
+        "positive_mass": 38.668103417381644,
+        "signed_sum": 0.0019423756748437881,
+        "token_count": 102
+      }
+    },
+    "post_normalization_advantages": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 77.3797246045433,
+        "mean": -6.706435598579108e-09,
+        "negative_mass": 38.689862644299865,
+        "positive_mass": 38.689861960243434,
+        "signed_sum": -6.84056431055069e-07,
+        "token_count": 102
+      }
+    },
+    "pre_normalization_actor_advantages": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 7.23355102352798,
+        "mean": -0.07091716689733314,
+        "negative_mass": 7.23355102352798,
+        "positive_mass": 0.0,
+        "signed_sum": -7.23355102352798,
+        "token_count": 102
+      }
+    },
+    "ratio_and_clipping": {
+      "block_clip_active_fraction": 0.0,
+      "block_ratio_mean": 0.0,
+      "env12_clip_active_fraction": 0.0,
+      "env12_ratio_mean": 0.0,
+      "whole_batch_clip_active_fraction": 0.5784313725490197,
+      "whole_batch_ratio_mean": 0.9993933608718947
+    }
+  },
+  "conclusions": {
+    "block_exact_policy_num_negative_mass_shrink_retained": false,
+    "block_exact_post_norm_negative_mass_shrink_retained": false,
+    "block_exact_pre_norm_negative_mass_shrinks": false,
+    "current_single_snapshot_is_insufficient_for_env12_block_audit": true,
+    "normalization_is_a_major_dilution_stage": true,
+    "ratio_and_clipping_further_reduce_transfer": true,
+    "requested_target_block_present_in_captured_outer_batch": false
+  },
+  "delta": {
+    "policy_num_from_clipped_objective": {
+      "block_abs_mass_delta": 0.0,
+      "block_negative_mass_shrink": 0.0,
+      "block_share_of_batch_abs_mass_delta": 0.0,
+      "block_share_of_batch_negative_mass_delta": 0.0,
+      "block_share_of_env12_negative_mass_delta": 0.0,
+      "block_signed_sum_delta": 0.0
+    },
+    "post_normalization_advantages": {
+      "block_abs_mass_delta": 0.0,
+      "block_negative_mass_shrink": 0.0,
+      "block_share_of_batch_abs_mass_delta": 0.0,
+      "block_share_of_batch_negative_mass_delta": 0.0,
+      "block_share_of_env12_negative_mass_delta": 0.0,
+      "block_signed_sum_delta": 0.0
+    },
+    "pre_normalization_actor_advantages": {
+      "block_abs_mass_delta": 0.0,
+      "block_negative_mass_shrink": 0.0,
+      "block_share_of_batch_abs_mass_delta": 0.0,
+      "block_share_of_batch_negative_mass_delta": 0.0,
+      "block_share_of_env12_negative_mass_delta": 0.0,
+      "block_signed_sum_delta": 0.0
+    },
+    "ratio_and_clipping": {
+      "block_clip_active_fraction_delta": 0.0,
+      "block_ratio_mean_delta": 0.0,
+      "env12_clip_active_fraction_delta": 0.0,
+      "whole_batch_clip_active_fraction_delta": 0.0
+    },
+    "shrink_retention": {
+      "policy_over_post_negative_mass_shrink_retention": 0.0,
+      "policy_over_pre_negative_mass_shrink_retention": 0.0,
+      "post_over_pre_negative_mass_shrink_retention": 0.0
+    }
+  },
+  "inputs": {
+    "baseline_snapshot_json": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_outer_batch_snapshot.json",
+    "override_snapshot_json": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_outer_batch_snapshot.json"
+  },
+  "override": {
+    "policy_num_from_clipped_objective": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 77.33426445908844,
+        "mean": 1.9042898772978315e-05,
+        "negative_mass": 38.6661610417068,
+        "positive_mass": 38.668103417381644,
+        "signed_sum": 0.0019423756748437881,
+        "token_count": 102
+      }
+    },
+    "post_normalization_advantages": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 77.3797246045433,
+        "mean": -6.706435598579108e-09,
+        "negative_mass": 38.689862644299865,
+        "positive_mass": 38.689861960243434,
+        "signed_sum": -6.84056431055069e-07,
+        "token_count": 102
+      }
+    },
+    "pre_normalization_actor_advantages": {
+      "block": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "block_share_of_batch_abs_mass": 0.0,
+      "block_share_of_batch_negative_mass": 0.0,
+      "block_share_of_env12_abs_mass": 0.0,
+      "block_share_of_env12_negative_mass": 0.0,
+      "env12": {
+        "abs_mass": 0.0,
+        "mean": 0.0,
+        "negative_mass": 0.0,
+        "positive_mass": 0.0,
+        "signed_sum": 0.0,
+        "token_count": 0
+      },
+      "whole_batch": {
+        "abs_mass": 7.23355102352798,
+        "mean": -0.07091716689733314,
+        "negative_mass": 7.23355102352798,
+        "positive_mass": 0.0,
+        "signed_sum": -7.23355102352798,
+        "token_count": 102
+      }
+    },
+    "ratio_and_clipping": {
+      "block_clip_active_fraction": 0.0,
+      "block_ratio_mean": 0.0,
+      "env12_clip_active_fraction": 0.0,
+      "env12_ratio_mean": 0.0,
+      "whole_batch_clip_active_fraction": 0.5784313725490197,
+      "whole_batch_ratio_mean": 0.9993933608718947
+    }
+  },
+  "recommendation": {
+    "next_focus": "exact_update_aggregation_audit",
+    "reason": "If the captured strict outer batch contains the env12 block, the exact stage-wise contribution can be measured directly from the snapshot. If the target block is absent, the hook must be refined to capture a selected outer batch instead of the first one that reaches train()."
+  },
+  "strict_contract": {
+    "baseline_actor_objective_mode": "tokenwise",
+    "batch_size_flat": 256,
+    "epoch_idx": 1,
+    "normalize_advantage": true,
+    "objective_total": 102,
+    "outer_batch_idx": 8,
+    "override_actor_objective_mode": "tokenwise_scale_env12_mid_episode_extension_block",
+    "runtime_suite_name": "pair2"
+  },
+  "target_block": {
+    "batch_objective_token_count": 102,
+    "block_token_count": 0,
+    "env12_objective_token_count": 0,
+    "env_index": 12,
+    "objective_episode_index": 0,
+    "objective_position_end": 21,
+    "objective_position_start": 18,
+    "target_block_present_in_snapshot": false
+  }
+}

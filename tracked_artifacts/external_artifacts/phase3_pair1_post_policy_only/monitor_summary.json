@@ -1,0 +1,23 @@
+{
+  "config": {
+    "batch_size": null,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "device": "cuda:0",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+    "learning_rate": null,
+    "n_epochs": null,
+    "n_samples": 2048,
+    "outer_epochs": 1,
+    "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+    "resume_post_policy_bundle_path": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/phase3_pair1_post_policy_bundle.pt",
+    "reuse_pre_policy_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/ppo_cross_env_baseline.json",
+    "reuse_zero_control_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/zero_cross_env_control.json",
+    "rollout_backend": "serial",
+    "save_post_policy_bundle_path": null,
+    "single_eval_pos": 1946,
+    "target_kl": null,
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+  },
+  "status": "started"
+}

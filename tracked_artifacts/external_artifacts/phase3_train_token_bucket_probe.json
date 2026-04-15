@@ -1,0 +1,258 @@
+{
+  "audit_entry": "phase3_train_token_bucket_probe",
+  "bucket_alignment": {
+    "q1": {
+      "corr_delta_vs_negative_mass_share": 0.3917294144630432,
+      "corr_delta_vs_positive_mass_share": -0.6809900403022766,
+      "corr_delta_vs_value_corr": 0.46305814385414124
+    },
+    "q2": {
+      "corr_delta_vs_negative_mass_share": 0.8873786926269531,
+      "corr_delta_vs_positive_mass_share": -0.6538011431694031,
+      "corr_delta_vs_value_corr": 0.16129061579704285
+    },
+    "q3": {
+      "corr_delta_vs_negative_mass_share": -0.5239306092262268,
+      "corr_delta_vs_positive_mass_share": 0.8468202948570251,
+      "corr_delta_vs_value_corr": -0.5050829648971558
+    },
+    "q4": {
+      "corr_delta_vs_negative_mass_share": -0.5218150615692139,
+      "corr_delta_vs_positive_mass_share": 0.6420256495475769,
+      "corr_delta_vs_value_corr": -0.6666391491889954
+    }
+  },
+  "bucket_contrast_low_mass_positive_minus_high_mass_nonpositive": {
+    "q1": {
+      "negative_mass_share": 0.19752096782281567,
+      "positive_mass_share": -0.2989689020741497,
+      "value_corr": 0.5607968838885427
+    },
+    "q2": {
+      "negative_mass_share": 0.14813342449438946,
+      "positive_mass_share": -0.15732050441370413,
+      "value_corr": 0.07388697564601898
+    },
+    "q3": {
+      "negative_mass_share": -0.16298777125906616,
+      "positive_mass_share": 0.06147356666483098,
+      "value_corr": -0.16024000197649002
+    },
+    "q4": {
+      "negative_mass_share": -0.18266656508816778,
+      "positive_mass_share": 0.39481579632930863,
+      "value_corr": -0.29788473062217236
+    }
+  },
+  "conclusions": {
+    "bucketed_value_corr_supports_early_buckets_more_than_tail": true,
+    "new_phase3_trusted_baseline_established": false,
+    "q1_positive_mass_share_tracks_delta_best": false,
+    "q4_tail_positive_mass_share_not_primary_driver": false,
+    "subset_only_diagnostic": true
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+    "n_samples": 2048,
+    "reuse_pre_policy_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/ppo_cross_env_baseline.json",
+    "reuse_train_subset_delta_json": "/home/chen/RLPFN/artifacts/phase3_env_delta_concentration_probe_max4.json",
+    "reuse_zero_control_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/zero_cross_env_control.json",
+    "runtime_wall_s": 101.0446338520851,
+    "single_eval_pos": 1946,
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  },
+  "subset_rows": [
+    {
+      "bucket_metrics": {
+        "q1": {
+          "negative_mass": 0.13978895545005798,
+          "negative_mass_share": 0.12520472223281046,
+          "positive_mass": 1.3166779279708862,
+          "positive_mass_share": 0.4516581867157286,
+          "raw_value_return_corr": 0.33899784088134766,
+          "signed_mean": 0.04526496306061745,
+          "token_count": 26.0
+        },
+        "q2": {
+          "negative_mass": 0.2802436053752899,
+          "negative_mass_share": 0.2510056867909729,
+          "positive_mass": 0.8324438333511353,
+          "positive_mass_share": 0.285552043006813,
+          "raw_value_return_corr": -0.13907331228256226,
+          "signed_mean": 0.022088009864091873,
+          "token_count": 25.0
+        },
+        "q3": {
+          "negative_mass": 0.5028205513954163,
+          "negative_mass_share": 0.45036109804042157,
+          "positive_mass": 0.16191671788692474,
+          "positive_mass_share": 0.05554206510659123,
+          "raw_value_return_corr": -0.1027955636382103,
+          "signed_mean": -0.013636154122650623,
+          "token_count": 25.0
+        },
+        "q4": {
+          "negative_mass": 0.19363003969192505,
+          "negative_mass_share": 0.17342854632186525,
+          "positive_mass": 0.604170024394989,
+          "positive_mass_share": 0.2072475978288534,
+          "raw_value_return_corr": 0.14090308547019958,
+          "signed_mean": 0.015789998695254326,
+          "token_count": 26.0
+        }
+      },
+      "env_index": 0,
+      "post_vs_zero_suffix_gap": 0.7438417673110962,
+      "pre_vs_zero_suffix_gap": 0.7278760075569153,
+      "suffix_gap_delta": 0.015965759754180908,
+      "suffix_return_delta": 0.015965759754180908
+    },
+    {
+      "bucket_metrics": {
+        "q1": {
+          "negative_mass": 0.005008816719055176,
+          "negative_mass_share": 0.0013195785865782932,
+          "positive_mass": 4.052889823913574,
+          "positive_mass_share": 0.5936677680632793,
+          "raw_value_return_corr": -0.3977031111717224,
+          "signed_mean": 0.15568773448467255,
+          "token_count": 26.0
+        },
+        "q2": {
+          "negative_mass": 0.44662147760391235,
+          "negative_mass_share": 0.11766294740032937,
+          "positive_mass": 2.343615770339966,
+          "positive_mass_share": 0.3432931078871834,
+          "raw_value_return_corr": -0.22108416259288788,
+          "signed_mean": 0.0758797824382782,
+          "token_count": 25.0
+        },
+        "q3": {
+          "negative_mass": 2.005615234375,
+          "negative_mass_share": 0.528381664700976,
+          "positive_mass": 0.25475645065307617,
+          "positive_mass_share": 0.037316754224740505,
+          "raw_value_return_corr": 0.07638142257928848,
+          "signed_mean": -0.07003435492515564,
+          "token_count": 25.0
+        },
+        "q4": {
+          "negative_mass": 1.3385244607925415,
+          "negative_mass_share": 0.35263582501502927,
+          "positive_mass": 0.17560313642024994,
+          "positive_mass_share": 0.025722367642072967,
+          "raw_value_return_corr": 0.3430536091327667,
+          "signed_mean": -0.04472774267196655,
+          "token_count": 26.0
+        }
+      },
+      "env_index": 1,
+      "post_vs_zero_suffix_gap": -0.9839644134044647,
+      "pre_vs_zero_suffix_gap": -0.6799580752849579,
+      "suffix_gap_delta": -0.30400633811950684,
+      "suffix_return_delta": -0.30400633811950684
+    },
+    {
+      "bucket_metrics": {
+        "q1": {
+          "negative_mass": 6.017200469970703,
+          "negative_mass_share": 0.6416146969458614,
+          "positive_mass": 0.0,
+          "positive_mass_share": 0.0,
+          "raw_value_return_corr": 0.029231563210487366,
+          "signed_mean": -0.231430783867836,
+          "token_count": 26.0
+        },
+        "q2": {
+          "negative_mass": 2.3452260494232178,
+          "negative_mass_share": 0.25007169172436494,
+          "positive_mass": 0.01692361943423748,
+          "positive_mass_share": 0.001041801150584131,
+          "raw_value_return_corr": 0.11792449653148651,
+          "signed_mean": -0.09313209354877472,
+          "token_count": 25.0
+        },
+        "q3": {
+          "negative_mass": 0.8841845989227295,
+          "negative_mass_share": 0.09428069354065699,
+          "positive_mass": 2.0360774993896484,
+          "positive_mass_share": 0.12533890222391247,
+          "raw_value_return_corr": -0.17635126411914825,
+          "signed_mean": 0.046075716614723206,
+          "token_count": 25.0
+        },
+        "q4": {
+          "negative_mass": 0.13160303235054016,
+          "negative_mass_share": 0.014032844699149493,
+          "positive_mass": 14.191575050354004,
+          "positive_mass_share": 0.873619220374888,
+          "raw_value_return_corr": -0.2067783623933792,
+          "signed_mean": 0.5407681465148926,
+          "token_count": 26.0
+        }
+      },
+      "env_index": 2,
+      "post_vs_zero_suffix_gap": -0.5079448968172073,
+      "pre_vs_zero_suffix_gap": -0.5461155325174332,
+      "suffix_gap_delta": 0.03817063570022583,
+      "suffix_return_delta": 0.03817063570022583
+    },
+    {
+      "bucket_metrics": {
+        "q1": {
+          "negative_mass": 0.8124066591262817,
+          "negative_mass_share": 0.27247637058597746,
+          "positive_mass": 0.03209177404642105,
+          "positive_mass_share": 0.13773954526253046,
+          "raw_value_return_corr": -0.012810295447707176,
+          "signed_mean": -0.030012112110853195,
+          "token_count": 26.0
+        },
+        "q2": {
+          "negative_mass": 0.8365892171859741,
+          "negative_mass_share": 0.2805870569984647,
+          "positive_mass": 0.02012864127755165,
+          "positive_mass_share": 0.08639316394014562,
+          "raw_value_return_corr": -0.15532106161117554,
+          "signed_mean": -0.032658420503139496,
+          "token_count": 25.0
+        },
+        "q3": {
+          "negative_mass": 0.8361110687255859,
+          "negative_mass_share": 0.28042668884339816,
+          "positive_mass": 0.0330934002995491,
+          "positive_mass_share": 0.14203857667255174,
+          "raw_value_return_corr": -0.06492159515619278,
+          "signed_mean": -0.032120708376169205,
+          "token_count": 25.0
+        },
+        "q4": {
+          "negative_mass": 0.4964607059955597,
+          "negative_mass_share": 0.16650997353185773,
+          "positive_mass": 0.14767500758171082,
+          "positive_mass_share": 0.6338287301139098,
+          "raw_value_return_corr": -0.05056532844901085,
+          "signed_mean": -0.013414831832051277,
+          "token_count": 26.0
+        }
+      },
+      "env_index": 3,
+      "post_vs_zero_suffix_gap": 10.068437576293945,
+      "pre_vs_zero_suffix_gap": 9.65091609954834,
+      "suffix_gap_delta": 0.41752147674560547,
+      "suffix_return_delta": 0.41752147674560547
+    }
+  ]
+}

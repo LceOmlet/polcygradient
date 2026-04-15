@@ -1,0 +1,184 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": null,
+  "policy": {
+    "requested_mode": "zero",
+    "resolved_mode": "zero",
+    "device": "cpu"
+  },
+  "config": {
+    "n_samples": 16,
+    "num_features": 434,
+    "single_eval_pos": 8,
+    "core_a": true,
+    "reference_semantics_enabled": false
+  },
+  "suite_paths": {},
+  "train_suite": {
+    "summary": {
+      "batch_size": 2,
+      "suite_seed": 11,
+      "fingerprint": "3425e1188da1fd2c",
+      "family_counts": {
+        "scm": 2
+      },
+      "unique_structures": 2,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 26, 20, 15, 349, 25, 400, 30, 3, 34, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 285, 86, 6, 81, 34, 400, 30, 3, 52, 'sin')",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 155.5,
+      "obs_dim_mean": 53.0,
+      "action_dim_mean": 10.5
+    },
+    "metrics": {
+      "batch_size": 2,
+      "n_samples": 16,
+      "single_eval_pos": 8,
+      "suffix_horizon": 8,
+      "full_return_per_env": [
+        0.6444001793861389,
+        -0.7179920673370361
+      ],
+      "suffix_return_per_env": [
+        0.4799090623855591,
+        -0.1137264221906662
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -0.03679594397544861,
+      "full_return_std": 0.6811960935592651,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": 0.18309131264686584,
+      "suffix_return_std": 0.29681774973869324,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.002299747196957469,
+      "reward_step_std": 0.09020634740591049,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": 0.02288641408085823,
+      "suffix_reward_step_std": 0.08975478261709213,
+      "env_return_nonfinite_count": 0,
+      "env_return_nonfinite_share": 0.0,
+      "env_return_mean": 0.18309131264686584,
+      "env_return_std": 0.29681774973869324,
+      "env_nonfinite_count": 0,
+      "env_nonfinite_share": 0.0,
+      "env_mean": 0.02288641408085823,
+      "env_std": 0.08975478261709213,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 2,
+      "suite_seed": 22,
+      "fingerprint": "bcb4513fbe0f8989",
+      "family_counts": {
+        "scm": 2
+      },
+      "unique_structures": 2,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 281, 152, 7, 38, 81, 400, 30, 3, 71, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 284, 259, 30, 11, 105, 400, 30, 2, 71, <class 'torch.nn.modules.activation.Tanh'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 282.5,
+      "obs_dim_mean": 205.5,
+      "action_dim_mean": 18.5
+    },
+    "metrics": {
+      "batch_size": 2,
+      "n_samples": 16,
+      "single_eval_pos": 8,
+      "suffix_horizon": 8,
+      "full_return_per_env": [
+        -0.5439162254333496,
+        -20.264944076538086
+      ],
+      "suffix_return_per_env": [
+        -0.28181836009025574,
+        -25.577428817749023
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -10.404430389404297,
+      "full_return_std": 9.860513687133789,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -12.9296236038208,
+      "suffix_return_std": 12.647805213928223,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.6502768993377686,
+      "reward_step_std": 3.9276881217956543,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -1.6162029504776,
+      "suffix_reward_step_std": 4.7213335037231445,
+      "env_return_nonfinite_count": 0,
+      "env_return_nonfinite_share": 0.0,
+      "env_return_mean": -12.9296236038208,
+      "env_return_std": 12.647805213928223,
+      "env_nonfinite_count": 0,
+      "env_nonfinite_share": 0.0,
+      "env_mean": -1.6162029504776,
+      "env_std": 4.7213335037231445,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": -10.367634445428848,
+    "heldout_minus_train_suffix_return_mean": -13.112714916467667,
+    "heldout_minus_train_ctrl_return_mean": 0.0,
+    "heldout_minus_train_env_return_mean": -13.112714916467667,
+    "heldout_minus_train_survival_return_mean": 0.0
+  }
+}

@@ -1,0 +1,74 @@
+{
+  "audit_entry": "critic_free_cross_frozen_h_hidden_reset_probe_quick_partial",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "config": {
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "baseline_mode": "learned",
+    "batch_size": 128,
+    "eval_env_count": 4,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 128,
+    "outer_epochs": 1,
+    "single_eval_pos": 64,
+    "target_kl": 0.03
+  },
+  "device": "cuda:1",
+  "modes": {
+    "normal": [
+      {
+        "delta_smp_gap": -0.2905299663543701,
+        "frozen_h_seed": 12345,
+        "post_smp_gap": -0.2604246139526367,
+        "pre_smp_gap": 0.0301053524017334
+      },
+      {
+        "delta_smp_gap": -0.49048495292663574,
+        "frozen_h_seed": 23456,
+        "post_smp_gap": -0.4789872169494629,
+        "pre_smp_gap": 0.011497735977172852
+      }
+    ],
+    "normal_summary": {
+      "delta_smp_gap_mean": -0.39050745964050293,
+      "positive_count": 0
+    },
+    "reset_hidden_and_clear_first_eval_history": [
+      {
+        "delta_smp_gap": 1.629974365234375,
+        "frozen_h_seed": 12345,
+        "post_smp_gap": 1.4689788818359375,
+        "pre_smp_gap": -0.1609954833984375
+      },
+      {
+        "delta_smp_gap": 0.4253692626953125,
+        "frozen_h_seed": 23456,
+        "post_smp_gap": 0.2801961898803711,
+        "pre_smp_gap": -0.1451730728149414
+      }
+    ],
+    "reset_hidden_and_clear_first_eval_history_summary": {
+      "delta_smp_gap_mean": 1.0276718139648438,
+      "positive_count": 2
+    },
+    "reset_hidden_at_sep": [
+      {
+        "delta_smp_gap": -0.38706040382385254,
+        "frozen_h_seed": 12345,
+        "post_smp_gap": -0.4127326011657715,
+        "pre_smp_gap": -0.025672197341918945
+      },
+      {
+        "delta_smp_gap": 0.01892995834350586,
+        "frozen_h_seed": 23456,
+        "post_smp_gap": -0.00740814208984375,
+        "pre_smp_gap": -0.02633810043334961
+      }
+    ],
+    "reset_hidden_at_sep_summary": {
+      "delta_smp_gap_mean": -0.18406522274017334,
+      "positive_count": 1
+    }
+  }
+}

@@ -1,0 +1,77 @@
+{
+  "canonical_pair1_heldout_vs_zero": {
+    "full_return_gap": 59.01048278808594,
+    "suffix_return_gap": 2.8122913241386414
+  },
+  "canonical_pair1_train_vs_zero": {
+    "full_return_gap": -12.389642596244812,
+    "suffix_return_gap": -0.5169562138617039
+  },
+  "old_phase3_trusted_pair1_pre_heldout_vs_zero": {
+    "full_return_gap": 0.07586669921875,
+    "suffix_return_gap": 0.00027611851692199707
+  },
+  "old_phase3_trusted_pair1_pre_train_vs_zero": {
+    "full_return_gap": 0.07730293273925781,
+    "suffix_return_gap": 0.005422830581665039
+  },
+  "restore_probe": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "probe": [
+      {
+        "max_abs_diff_vs_saved_validation_state": 13.594415664672852,
+        "restore_validation_policy_state": false,
+        "top5": [
+          [
+            13.594415664672852,
+            "value_bardist.losses_per_bucket"
+          ],
+          [
+            0.29334160685539246,
+            "value_net.weight"
+          ],
+          [
+            0.06894871592521667,
+            "log_std"
+          ],
+          [
+            0.02465171553194523,
+            "value_net.bias"
+          ],
+          [
+            0.017288684844970703,
+            "action_net.weight"
+          ]
+        ],
+        "worst_key": "value_bardist.losses_per_bucket"
+      },
+      {
+        "max_abs_diff_vs_saved_validation_state": 0.0,
+        "restore_validation_policy_state": true,
+        "top5": [
+          [
+            0.0,
+            "value_net.weight"
+          ],
+          [
+            0.0,
+            "value_net.bias"
+          ],
+          [
+            0.0,
+            "value_bardist.losses_per_bucket"
+          ],
+          [
+            0.0,
+            "value_bardist.borders"
+          ],
+          [
+            0.0,
+            "log_std"
+          ]
+        ],
+        "worst_key": null
+      }
+    ]
+  }
+}

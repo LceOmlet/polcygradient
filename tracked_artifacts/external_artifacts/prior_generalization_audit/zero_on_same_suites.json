@@ -1,0 +1,208 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": null,
+  "policy": {
+    "requested_mode": "zero",
+    "resolved_mode": "zero",
+    "device": "cuda:0"
+  },
+  "config": {
+    "n_samples": 64,
+    "num_features": 434,
+    "single_eval_pos": 32,
+    "core_a": false,
+    "reference_semantics_enabled": false
+  },
+  "suite_paths": {},
+  "train_suite": {
+    "summary": {
+      "batch_size": 4,
+      "suite_seed": 101,
+      "fingerprint": "10d30a6c56639252",
+      "family_counts": {
+        "scm": 4
+      },
+      "unique_structures": 4,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 120, 43, 14, 68, 212, 400, 30, 8, 43, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 294, 210, 16, 90, 16, 400, 30, 2, 23, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 304, 199, 27, 38, 58, 400, 30, 3, 121, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 56, 21, 24, 151, 193, 400, 30, 3, 15, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 193.5,
+      "obs_dim_mean": 118.25,
+      "action_dim_mean": 20.25
+    },
+    "metrics": {
+      "batch_size": 4,
+      "n_samples": 64,
+      "single_eval_pos": 32,
+      "suffix_horizon": 32,
+      "full_return_per_env": [
+        27.91689109802246,
+        NaN,
+        -0.6158307790756226,
+        0.05106130242347717
+      ],
+      "suffix_return_per_env": [
+        0.026153499260544777,
+        NaN,
+        -0.43327388167381287,
+        0.02315298095345497
+      ],
+      "full_return_nonfinite_count": 1,
+      "full_return_nonfinite_share": 0.25,
+      "full_return_mean": 9.1173734664917,
+      "full_return_std": 13.296053886413574,
+      "suffix_return_nonfinite_count": 1,
+      "suffix_return_nonfinite_share": 0.25,
+      "suffix_return_mean": -0.12798912823200226,
+      "suffix_return_std": 0.2158723920583725,
+      "reward_step_nonfinite_count": 39,
+      "reward_step_nonfinite_share": 0.15234375,
+      "reward_step_mean": 0.129376620054245,
+      "reward_step_std": 0.36075472831726074,
+      "suffix_reward_step_nonfinite_count": 32,
+      "suffix_reward_step_nonfinite_share": 0.25,
+      "suffix_reward_step_mean": -0.003999660722911358,
+      "suffix_reward_step_std": 0.09583523124456406,
+      "env_return_nonfinite_count": 1,
+      "env_return_nonfinite_share": 0.25,
+      "env_return_mean": -0.12798912823200226,
+      "env_return_std": 0.2158723920583725,
+      "env_nonfinite_count": 32,
+      "env_nonfinite_share": 0.25,
+      "env_mean": -0.003999660722911358,
+      "env_std": 0.09583523124456406,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 4,
+      "suite_seed": 202,
+      "fingerprint": "1952c47e8ac1f2f4",
+      "family_counts": {
+        "scm": 4
+      },
+      "unique_structures": 4,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 317, 178, 30, 16, 67, 400, 30, 3, 29, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 350, 166, 24, 18, 32, 400, 30, 2, 56, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 353, 59, 8, 38, 9, 400, 30, 3, 22, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 99, 96, 6, 261, 40, 400, 30, 2, 72, 'sin')",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 279.75,
+      "obs_dim_mean": 124.75,
+      "action_dim_mean": 17.0
+    },
+    "metrics": {
+      "batch_size": 4,
+      "n_samples": 64,
+      "single_eval_pos": 32,
+      "suffix_horizon": 32,
+      "full_return_per_env": [
+        0.07807792723178864,
+        -0.031188972294330597,
+        -0.05664283037185669,
+        -0.9829162955284119
+      ],
+      "suffix_return_per_env": [
+        -0.06557654589414597,
+        -0.015577256679534912,
+        -0.15144886076450348,
+        -0.5624138712882996
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -0.24816754460334778,
+      "full_return_std": 0.4272157549858093,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -0.19875413179397583,
+      "suffix_return_std": 0.215508833527565,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.003877617884427309,
+      "reward_step_std": 0.042874883860349655,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -0.006211066618561745,
+      "suffix_reward_step_std": 0.041665464639663696,
+      "env_return_nonfinite_count": 0,
+      "env_return_nonfinite_share": 0.0,
+      "env_return_mean": -0.19875413179397583,
+      "env_return_std": 0.215508833527565,
+      "env_nonfinite_count": 0,
+      "env_nonfinite_share": 0.0,
+      "env_mean": -0.006211066618561745,
+      "env_std": 0.041665464639663696,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": -9.365541011095047,
+    "heldout_minus_train_suffix_return_mean": -0.07076500356197357,
+    "heldout_minus_train_ctrl_return_mean": 0.0,
+    "heldout_minus_train_env_return_mean": -0.07076500356197357,
+    "heldout_minus_train_survival_return_mean": 0.0
+  }
+}

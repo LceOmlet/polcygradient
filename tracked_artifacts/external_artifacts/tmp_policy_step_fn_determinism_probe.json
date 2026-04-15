@@ -1,0 +1,6 @@
+{
+  "direct_policy_step_action_max_abs_diff": 0.0,
+  "direct_policy_step_value_max_abs_diff": 0.0,
+  "direct_policy_step_value_logits_max_abs_diff": 0.0,
+  "step_idx": 0
+}

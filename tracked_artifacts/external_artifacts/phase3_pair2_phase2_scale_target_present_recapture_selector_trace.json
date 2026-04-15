@@ -1,0 +1,462 @@
+{
+  "completed": true,
+  "rows": [
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        0
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 1,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        1
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 2,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        2
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 3,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        3
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 4,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        4
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 5,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        5
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 6,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        6
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 7,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        7
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 8,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        8
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 9,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        9
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 10,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        10
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 11,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        11
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 12,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        12
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 13,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [
+        8,
+        9,
+        10,
+        11,
+        12,
+        13,
+        14,
+        15,
+        16,
+        17,
+        18
+      ],
+      "target_env_objective_episode_spans": [
+        {
+          "objective_episode_index": 8,
+          "objective_position_max": 9,
+          "objective_position_min": 0,
+          "token_count": 10
+        },
+        {
+          "objective_episode_index": 9,
+          "objective_position_max": 11,
+          "objective_position_min": 0,
+          "token_count": 12
+        },
+        {
+          "objective_episode_index": 10,
+          "objective_position_max": 7,
+          "objective_position_min": 0,
+          "token_count": 8
+        },
+        {
+          "objective_episode_index": 11,
+          "objective_position_max": 0,
+          "objective_position_min": 0,
+          "token_count": 1
+        },
+        {
+          "objective_episode_index": 12,
+          "objective_position_max": 0,
+          "objective_position_min": 0,
+          "token_count": 1
+        },
+        {
+          "objective_episode_index": 13,
+          "objective_position_max": 1,
+          "objective_position_min": 0,
+          "token_count": 2
+        },
+        {
+          "objective_episode_index": 14,
+          "objective_position_max": 2,
+          "objective_position_min": 0,
+          "token_count": 3
+        },
+        {
+          "objective_episode_index": 15,
+          "objective_position_max": 0,
+          "objective_position_min": 0,
+          "token_count": 1
+        },
+        {
+          "objective_episode_index": 16,
+          "objective_position_max": 5,
+          "objective_position_min": 0,
+          "token_count": 6
+        },
+        {
+          "objective_episode_index": 17,
+          "objective_position_max": 0,
+          "objective_position_min": 0,
+          "token_count": 1
+        },
+        {
+          "objective_episode_index": 18,
+          "objective_position_max": 146,
+          "objective_position_min": 0,
+          "token_count": 147
+        }
+      ],
+      "target_env_objective_token_count": 192,
+      "target_episode_positions_present": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "target_episode_token_count": 8,
+      "target_match_count": 8,
+      "target_match_positions": [
+        0,
+        1,
+        2,
+        3,
+        4,
+        5,
+        6,
+        7
+      ],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_present",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        13
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 14,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        14
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 15,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    },
+    {
+      "epoch_idx": 1,
+      "objective_env_indices_present": [
+        15
+      ],
+      "objective_total": 192,
+      "outer_batch_idx": 16,
+      "target_env_index": 12,
+      "target_env_objective_episode_indices_present": [],
+      "target_env_objective_episode_spans": [],
+      "target_env_objective_token_count": 0,
+      "target_episode_positions_present": [],
+      "target_episode_token_count": 0,
+      "target_match_count": 0,
+      "target_match_positions": [],
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_status": "target_env_absent",
+      "total_outer_batches": 16
+    }
+  ],
+  "selector": {
+    "target_env_index": 12,
+    "target_objective_episode_index": 10,
+    "target_objective_position_end": 7,
+    "target_objective_position_start": 0,
+    "target_outer_batch_idx": 13
+  },
+  "summary": {
+    "first_match": {
+      "epoch_idx": 1,
+      "outer_batch_idx": 13,
+      "target_match_count": 8
+    },
+    "matched_outer_batches": [
+      {
+        "epoch_idx": 1,
+        "outer_batch_idx": 13,
+        "target_match_count": 8
+      }
+    ],
+    "row_count": 16,
+    "target_appeared": true
+  },
+  "trace_entry": "phase3_train_outer_batch_selector_trace"
+}

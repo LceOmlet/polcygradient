@@ -1,0 +1,90 @@
+{
+  "audit_entry": "phase3_shortrun_profile_gradient_regression",
+  "batch_size": 2048,
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "device": "cuda:0",
+  "frozen_h_seed": 12345,
+  "grad_compare": {
+    "cosine_similarity": 1.0000022649765015,
+    "driver_grad_norm": 677.810302734375,
+    "l2_delta_norm": 0.022177403792738914,
+    "reference_grad_norm": 677.8110961914062
+  },
+  "learning_rate": 0.0002,
+  "modes": {
+    "driver_profile_shortrun_aligned": {
+      "advantages_std": 1042.4935302734375,
+      "approx_kl": 1.0451767593622208e-06,
+      "backward_wall_s": 0.15207747090607882,
+      "clip_fraction": 0.0,
+      "collect_wall_s": 51.641078198794276,
+      "grad_norm": 677.8110961914062,
+      "objective_total": 102,
+      "policy_loss": -125.3319320678711,
+      "returns_std": 0.11341869086027145,
+      "sep_state_reset_count": 0
+    },
+    "manual_reference_shortrun_aligned": {
+      "advantages_std": 1042.4935302734375,
+      "approx_kl": 1.044943928718567e-06,
+      "backward_wall_s": 0.11596956895664334,
+      "clip_fraction": 0.0,
+      "collect_wall_s": 48.407700966112316,
+      "grad_norm": 677.8118896484375,
+      "objective_total": 102,
+      "policy_loss": -125.33195495605469,
+      "returns_std": 0.11341476440429688,
+      "sep_state_reset_count": 0
+    }
+  },
+  "n_steps": 2048,
+  "rollout_seed": 2020,
+  "single_eval_pos": 1946,
+  "train_env_seed": 2020,
+  "training_signature": {
+    "diff": {},
+    "driver_profile_shortrun_aligned": {
+      "effective.next_state_flow_matching_weight": 0.0,
+      "effective.normalized_q_value_weight": 0.0,
+      "optimizer.ppo_actor_baseline_mode": "zero",
+      "optimizer.ppo_actor_gae_space": "normalized",
+      "optimizer.ppo_clip_range": 0.2,
+      "optimizer.ppo_gae_lambda": 0.95,
+      "optimizer.ppo_gamma": 1.0,
+      "optimizer.ppo_n_epochs": 4,
+      "optimizer.ppo_normalize_advantage": false,
+      "optimizer.ppo_reset_env_state_at_sep": false,
+      "optimizer.ppo_runtime_next_state_flow_matching_weight_override": 0.0,
+      "optimizer.ppo_runtime_normalized_q_value_weight_override": 0.0,
+      "optimizer.ppo_separate_value_backbone": false,
+      "optimizer.ppo_target_kl": null,
+      "optimizer.ppo_vf_coef": 0.0,
+      "optimizer.rl_objective": "ppo",
+      "prior.environment.next_state_flow_head_type": "rwkv_two_layer",
+      "prior.environment.next_state_flow_matching_weight": 0.2,
+      "prior.environment.normalized_q_value_weight": 0.0
+    },
+    "exact_match": true,
+    "manual_reference_shortrun_aligned": {
+      "effective.next_state_flow_matching_weight": 0.0,
+      "effective.normalized_q_value_weight": 0.0,
+      "optimizer.ppo_actor_baseline_mode": "zero",
+      "optimizer.ppo_actor_gae_space": "normalized",
+      "optimizer.ppo_clip_range": 0.2,
+      "optimizer.ppo_gae_lambda": 0.95,
+      "optimizer.ppo_gamma": 1.0,
+      "optimizer.ppo_n_epochs": 4,
+      "optimizer.ppo_normalize_advantage": false,
+      "optimizer.ppo_reset_env_state_at_sep": false,
+      "optimizer.ppo_runtime_next_state_flow_matching_weight_override": 0.0,
+      "optimizer.ppo_runtime_normalized_q_value_weight_override": 0.0,
+      "optimizer.ppo_separate_value_backbone": false,
+      "optimizer.ppo_target_kl": null,
+      "optimizer.ppo_vf_coef": 0.0,
+      "optimizer.rl_objective": "ppo",
+      "prior.environment.next_state_flow_head_type": "rwkv_two_layer",
+      "prior.environment.next_state_flow_matching_weight": 0.2,
+      "prior.environment.normalized_q_value_weight": 0.0
+    }
+  }
+}

@@ -1,0 +1,169 @@
+{
+  "audit_entry": "phase3_terminal_tail_interaction_probe",
+  "bucket_share_of_base": {
+    "first_episode_non_tail_mass": 0.4495743026417869,
+    "first_episode_tail_mass": 0.1939235528732063,
+    "post_reset_non_tail_mass": 0.18000136748024714,
+    "post_reset_tail_mass": 0.176500790089343,
+    "terminal_tail_mass": 0.3704243393542787
+  },
+  "bucket_summaries": {
+    "first_episode_non_tail_mass": {
+      "corr_vs_pre_suffix_gap": 0.2218463271856308,
+      "corr_vs_terminal_resets": -0.07888811081647873,
+      "mass_total": 90.97426866088063,
+      "top2_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3
+        ],
+        "k": 2,
+        "mass_key": "first_episode_non_tail_mass",
+        "mass_share": 0.16400781910101478,
+        "mean_rank_value": 1.0273348949849606,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      },
+      "top4_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "k": 4,
+        "mass_key": "first_episode_non_tail_mass",
+        "mass_share": 0.38549701945051235,
+        "mean_rank_value": 0.6205695401877165,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      }
+    },
+    "first_episode_tail_mass": {
+      "corr_vs_pre_suffix_gap": 0.12984301149845123,
+      "corr_vs_terminal_resets": 0.6145674586296082,
+      "mass_total": 39.24168551247567,
+      "top2_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3
+        ],
+        "k": 2,
+        "mass_key": "first_episode_tail_mass",
+        "mass_share": 0.20062733805178046,
+        "mean_rank_value": 1.0273348949849606,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      },
+      "top4_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "k": 4,
+        "mass_key": "first_episode_tail_mass",
+        "mass_share": 0.20305788607694858,
+        "mean_rank_value": 0.6205695401877165,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      }
+    },
+    "post_reset_non_tail_mass": {
+      "corr_vs_pre_suffix_gap": -0.2565840184688568,
+      "corr_vs_terminal_resets": 0.41548800468444824,
+      "mass_total": 36.42444122862071,
+      "top2_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3
+        ],
+        "k": 2,
+        "mass_key": "post_reset_non_tail_mass",
+        "mass_share": 0.00016641720235451767,
+        "mean_rank_value": 1.0273348949849606,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      },
+      "top4_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "k": 4,
+        "mass_key": "post_reset_non_tail_mass",
+        "mass_share": 0.00016641720235451767,
+        "mean_rank_value": 0.6205695401877165,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      }
+    },
+    "post_reset_tail_mass": {
+      "corr_vs_pre_suffix_gap": -0.2228962928056717,
+      "corr_vs_terminal_resets": 0.9951661229133606,
+      "mass_total": 35.716076746582985,
+      "top2_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3
+        ],
+        "k": 2,
+        "mass_key": "post_reset_tail_mass",
+        "mass_share": 0.0,
+        "mean_rank_value": 1.0273348949849606,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      },
+      "top4_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "k": 4,
+        "mass_key": "post_reset_tail_mass",
+        "mass_share": 0.0,
+        "mean_rank_value": 0.6205695401877165,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      }
+    },
+    "terminal_tail_mass": {
+      "corr_vs_pre_suffix_gap": -0.08704740554094315,
+      "corr_vs_terminal_resets": 0.9316558241844177,
+      "mass_total": 74.95776152890176,
+      "top2_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3
+        ],
+        "k": 2,
+        "mass_key": "terminal_tail_mass",
+        "mass_share": 0.10503188388299864,
+        "mean_rank_value": 1.0273348949849606,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      },
+      "top4_pre_gap_capture": {
+        "env_indices": [
+          2,
+          3,
+          1,
+          0
+        ],
+        "k": 4,
+        "mass_key": "terminal_tail_mass",
+        "mass_share": 0.10630431784155328,
+        "mean_rank_value": 0.6205695401877165,
+        "rank_key": "pre_vs_zero_suffix_gap"
+      }
+    }
+  },
+  "conclusions": {
+    "dominant_bucket": "post_reset_tail_mass"
+  },
+  "config": {
+    "tail_len": 8,
+    "tail_mask_probe_json": "/home/chen/RLPFN/artifacts/phase3_terminal_tail_mask_probe.json"
+  },
+  "dominant_bias_bucket": {
+    "bucket": "post_reset_tail_mass",
+    "corr_vs_pre_suffix_gap": -0.2228962928056717,
+    "corr_vs_terminal_resets": 0.9951661229133606
+  }
+}

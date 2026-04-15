@@ -1,0 +1,29 @@
+{
+  "corr_pre_suffix_gap_vs_positive_norm_mass": -0.2884853780269623,
+  "corr_terminal_resets_vs_positive_norm_mass": 0.5391517877578735,
+  "corr_value_corr_vs_positive_norm_mass": 0.3590961992740631,
+  "dominant_positive_mass_env_index": 10,
+  "locked_interpretation": {
+    "full_train_rollout_positive_mass_is_not_simply_tracking_preexisting_train_gap": true,
+    "full_train_rollout_update_mass_is_not_explained_by_objective_token_count": true,
+    "last16_tail_share_is_not_the_main_driver_in_subset": true,
+    "subset_positive_delta_tracks_preexisting_gap_more_than_positive_mass": true,
+    "subset_positive_delta_tracks_value_quality_more_than_terminal_resets": true
+  },
+  "objective_token_count_uniform": true,
+  "positive_mass_top1_env_share": 0.21015501954951737,
+  "positive_mass_top2_env_share": 0.342869203715209,
+  "runtime_note": "first run used pre-runtime-instrumentation artifact; exact wall time not locked in this summary",
+  "source_artifact": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe.json",
+  "subset_corr_suffix_gap_delta_vs_last16_positive_share": -0.08129190653562546,
+  "subset_corr_suffix_gap_delta_vs_positive_norm_mass": -0.9263334274291992,
+  "subset_corr_suffix_gap_delta_vs_pre_suffix_gap": 0.8768482804298401,
+  "subset_corr_suffix_gap_delta_vs_terminal_resets": -0.008451326750218868,
+  "subset_corr_suffix_gap_delta_vs_value_corr": 0.8531413674354553,
+  "subset_env_indices": [
+    0,
+    1,
+    2,
+    3
+  ]
+}

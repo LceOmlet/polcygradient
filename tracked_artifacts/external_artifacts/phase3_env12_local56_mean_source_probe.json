@@ -1,0 +1,77 @@
+{
+  "audit_entry": "phase3_env12_local56_mean_source_probe",
+  "conclusions": {
+    "full_mean_is_prefix_dominated_not_objective_dominated": true,
+    "large_terminal_boundary_constant_is_explained_by_full_rollout_centering_scope": true,
+    "local56_terminal_row_is_not_a_positive_mean_source": true,
+    "objective_tail_tokens_are_too_late_to_set_full_mean_constant": true,
+    "post_reset_episode_lowers_objective_mean_instead_of_raising_it": true
+  },
+  "config": {
+    "env_index": 12,
+    "source_boundary_contract_json": "/home/chen/RLPFN/artifacts/phase3_env12_local56_boundary_contract_probe.json",
+    "source_gae_path_json": "/home/chen/RLPFN/artifacts/phase3_residual_anchor_gae_path_probe.json",
+    "suite_name": "pair2"
+  },
+  "evidence_limits": {
+    "direct_terminal_bonus_trace_present_in_input_artifacts": false,
+    "excluded_artifact_reason": "pair2 env12 objective_terminal_reset_count disagrees with current trusted local56 terminal evidence, so it is not used in the main source chain.",
+    "excluded_artifacts_due_to_contract_mismatch": [
+      "/home/chen/RLPFN/artifacts/phase3_terminal_tail_mask_probe_pair2.json"
+    ],
+    "mean_source_result_is_weighted_average_inference_not_replay": true,
+    "used_artifacts_only": true
+  },
+  "full_mean_decomposition": {
+    "full_minus_objective_mean_gap_raw": 9.673513855401644,
+    "full_rollout_mean_over_std": 1.1599998239708984,
+    "full_rollout_mean_raw": 16.339805603027344,
+    "full_rollout_std_raw": 14.086041450500488,
+    "implied_prefix_mean_rollout_return_raw": 16.846844869857236,
+    "n_samples": 2048,
+    "objective_mean_rollout_return_raw": 6.666291747625698,
+    "objective_token_count": 102,
+    "objective_token_share": 0.0498046875,
+    "prefix_minus_objective_mean_gap_raw": 10.180553122231537,
+    "prefix_token_count_before_objective": 1946,
+    "prefix_token_share": 0.9501953125
+  },
+  "local56_position_readout": {
+    "global_step": 2002,
+    "next_non_terminal": 0.0,
+    "objective_episode_index": 0,
+    "objective_local_index": 56,
+    "return_minus_full_mean_raw": -10.651060104370117,
+    "return_minus_objective_mean_raw": -0.9775462489684719,
+    "reward_norm": -1.1878736386941755,
+    "reward_raw": -0.3926317095756531,
+    "rollout_return_raw": 5.688745498657227
+  },
+  "objective_episode_summaries": [
+    {
+      "first_local_index": 0,
+      "last_local_index": 56,
+      "mean_reward_raw": 0.12745611808311783,
+      "mean_rollout_return_raw": 9.704221123143247,
+      "objective_episode_index": 0,
+      "terminal_row_count": 1,
+      "token_count": 57
+    },
+    {
+      "first_local_index": 57,
+      "last_local_index": 101,
+      "mean_reward_raw": 0.13514171863595645,
+      "mean_rollout_return_raw": 2.818247871970137,
+      "objective_episode_index": 1,
+      "terminal_row_count": 0,
+      "token_count": 45
+    }
+  ],
+  "timing_contract": {
+    "objective_global_step_end": 2047,
+    "objective_global_step_start": 1946,
+    "objective_is_tail_of_full_rollout": true,
+    "objective_starts_at_single_eval_pos": true,
+    "single_eval_pos": 1946
+  }
+}

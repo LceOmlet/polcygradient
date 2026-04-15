@@ -1,0 +1,51 @@
+{
+  "audit_entry": "critic_value_fit_probe",
+  "batch_size": 256,
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "device": "cuda:0",
+  "fit_steps": [
+    0,
+    10,
+    50,
+    200
+  ],
+  "frozen_h_seed": 12345,
+  "learning_rate": 0.0002,
+  "measurements": {
+    "0": {
+      "explained_variance_raw": -0.0009506940841674805,
+      "objective_total": 192,
+      "raw_corr": -0.05832847207784653,
+      "raw_return_std": 1.7396700382232666,
+      "raw_value_std": 0.013304994441568851
+    },
+    "10": {
+      "explained_variance_raw": -0.0005202293395996094,
+      "objective_total": 192,
+      "raw_corr": -0.14507149159908295,
+      "raw_return_std": 1.7396700382232666,
+      "raw_value_std": 0.0030997060239315033
+    },
+    "200": {
+      "explained_variance_raw": 0.5545291304588318,
+      "objective_total": 192,
+      "raw_corr": 0.7450330853462219,
+      "raw_return_std": 1.7396700382232666,
+      "raw_value_std": 1.255486011505127
+    },
+    "50": {
+      "explained_variance_raw": 0.0036626458168029785,
+      "objective_total": 192,
+      "raw_corr": 0.06053226441144943,
+      "raw_return_std": 1.7396700382232666,
+      "raw_value_std": 0.10743308067321777
+    }
+  },
+  "n_epochs": 1,
+  "n_steps": 256,
+  "ppo_reset_env_state_at_sep": true,
+  "ppo_separate_value_backbone": true,
+  "single_eval_pos": 64,
+  "target_kl": 0.03,
+  "train_env_seed": 2020
+}

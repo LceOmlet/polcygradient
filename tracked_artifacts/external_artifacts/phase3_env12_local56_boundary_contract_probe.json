@@ -1,0 +1,75 @@
+{
+  "audit_entry": "phase3_env12_local56_boundary_contract_probe",
+  "conclusions": {
+    "local56_boundary_shift_matches_full_rollout_centering_contract": true,
+    "local56_boundary_shift_recovers_most_of_negative_delta_if_removed": true,
+    "nonterminal_boundary_rows_imply_gamma_one_contract": true,
+    "objective_subset_stats_do_not_explain_terminal_boundary_constant": true
+  },
+  "config": {
+    "env_index": 12,
+    "source_gae_path_json": "/home/chen/RLPFN/artifacts/phase3_residual_anchor_gae_path_probe.json",
+    "source_negative_delta_json": "/home/chen/RLPFN/artifacts/phase3_env12_negative_delta_probe.json",
+    "suite_name": "pair2"
+  },
+  "full_rollout_contract": {
+    "full_rollout_mean_over_std": 1.1599998239708984,
+    "full_rollout_mean_raw": 16.339805603027344,
+    "full_rollout_std_raw": 14.086041450500488,
+    "gamma_inferred_from_nonterminal_boundary_max_abs_error": 0.0,
+    "gamma_inferred_from_nonterminal_boundary_mean": 1.0
+  },
+  "local56_boundary": {
+    "actual_boundary_shift_norm": -1.1599998239708984,
+    "boundary_shift_contract_error": 0.0,
+    "boundary_shift_share_of_delta_magnitude": 0.8609402796854854,
+    "delta_norm": -1.3473638663934553,
+    "delta_recovery_from_removing_boundary_shift": 1.1599998239708984,
+    "delta_without_boundary_shift": -0.1873640424225569,
+    "expected_boundary_shift_norm_from_full_contract": -1.1599998239708984,
+    "full_mean_raw_to_immediate_reward_abs_ratio": 41.61611302532598,
+    "global_step": 2002,
+    "next_non_terminal": 0.0,
+    "objective_local_index": 56,
+    "reward_norm": -1.1878736386941755,
+    "reward_over_std": -0.027873814723277174,
+    "reward_raw": -0.3926317095756531,
+    "value_norm": 0.15949022769927979
+  },
+  "nonterminal_contrast_rows": [
+    {
+      "boundary_shift_norm": 0.0,
+      "gamma_inferred_from_boundary": 1.0,
+      "next_non_terminal": 1.0,
+      "objective_local_index": 55,
+      "reward_norm": 0.0077616234639345145,
+      "reward_over_std": 0.0077616234639345145,
+      "reward_raw": 0.10933054983615875
+    },
+    {
+      "boundary_shift_norm": 0.0,
+      "gamma_inferred_from_boundary": 1.0,
+      "next_non_terminal": 1.0,
+      "objective_local_index": 57,
+      "reward_norm": -0.005053128523755635,
+      "reward_over_std": -0.005053128523755635,
+      "reward_raw": -0.07117857784032822
+    },
+    {
+      "boundary_shift_norm": 0.0,
+      "gamma_inferred_from_boundary": 1.0,
+      "next_non_terminal": 1.0,
+      "objective_local_index": 101,
+      "reward_norm": 0.0006501928163962306,
+      "reward_over_std": 0.0006501928163962306,
+      "reward_raw": 0.009158642962574959
+    }
+  ],
+  "objective_subset_contrast": {
+    "mean_over_std_gap_vs_full_contract": 0.5294616333068787,
+    "objective_subset_mean_over_std": 1.689461457277777,
+    "objective_subset_mean_raw": 6.666291747625698,
+    "objective_subset_std_raw": 3.9458087184581703,
+    "objective_subset_token_count": 102
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "artifacts": {
+    "restore_probe": "/home/chen/RLPFN/artifacts/phase3_restore_validation_policy_state_probe.json",
+    "root_cause_summary": "/home/chen/RLPFN/artifacts/phase3_policy_restore_root_cause_summary.json"
+  },
+  "attempt": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+    "n_samples": 2048,
+    "outer_epochs": 1,
+    "restore_validation_policy_state": true,
+    "rollout_backend": "serial",
+    "single_eval_pos": 1946,
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+  },
+  "observed_blocker": {
+    "note": "Full pair1 restored-policy rerun did not emit an output artifact within the interactive budget and was interrupted during pre-train serial suite evaluation.",
+    "path": [
+      "phase3_multi_env_optimization_audit._run_policy_eval",
+      "prior_generalization_audit.evaluate_prior_suite",
+      "prior_generalization_audit._collect_suite_rewards_serial",
+      "environment_prior._rollout_single",
+      "OfficialRWKVRecurrentPPOPolicy._build_obs_from_rollout_step_inputs"
+    ],
+    "stage": "pre_train_evaluation"
+  },
+  "status": "interrupted_due_to_runtime_blocker"
+}

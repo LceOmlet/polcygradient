@@ -1,0 +1,211 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_18_20_50_epoch_2.cpkt",
+  "policy": {
+    "requested_mode": "auto",
+    "resolved_mode": "ppo",
+    "device": "cuda:0"
+  },
+  "config": {
+    "n_samples": 64,
+    "num_features": 434,
+    "single_eval_pos": 32,
+    "core_a": true,
+    "reference_semantics_enabled": false
+  },
+  "suite_paths": {
+    "train": "/home/chen/RLPFN/artifacts/prior_generalization_audit/suites/train_suite.pt",
+    "heldout": "/home/chen/RLPFN/artifacts/prior_generalization_audit/suites/heldout_suite.pt"
+  },
+  "train_suite": {
+    "summary": {
+      "batch_size": 4,
+      "suite_seed": 101,
+      "fingerprint": "10d30a6c56639252",
+      "family_counts": {
+        "scm": 4
+      },
+      "unique_structures": 4,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 120, 43, 14, 68, 212, 400, 30, 8, 43, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 294, 210, 16, 90, 16, 400, 30, 2, 23, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 304, 199, 27, 38, 58, 400, 30, 3, 121, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 56, 21, 24, 151, 193, 400, 30, 3, 15, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 193.5,
+      "obs_dim_mean": 118.25,
+      "action_dim_mean": 20.25
+    },
+    "metrics": {
+      "batch_size": 4,
+      "n_samples": 64,
+      "single_eval_pos": 32,
+      "suffix_horizon": 32,
+      "full_return_per_env": [
+        Infinity,
+        NaN,
+        -3.349015712738037,
+        1.0706291198730469
+      ],
+      "suffix_return_per_env": [
+        0.2511547803878784,
+        NaN,
+        -2.278263807296753,
+        0.4854610562324524
+      ],
+      "full_return_nonfinite_count": 2,
+      "full_return_nonfinite_share": 0.5,
+      "full_return_mean": -1.1391932964324951,
+      "full_return_std": 2.209822416305542,
+      "suffix_return_nonfinite_count": 1,
+      "suffix_return_nonfinite_share": 0.25,
+      "suffix_return_mean": -0.5138826966285706,
+      "suffix_return_std": 1.251267433166504,
+      "reward_step_nonfinite_count": 40,
+      "reward_step_nonfinite_share": 0.15625,
+      "reward_step_mean": -4.0788512001346115e+35,
+      "reward_step_std": 1.0576780956919657e+37,
+      "suffix_reward_step_nonfinite_count": 32,
+      "suffix_reward_step_nonfinite_share": 0.25,
+      "suffix_reward_step_mean": -0.01605883054435253,
+      "suffix_reward_step_std": 0.4917210042476654,
+      "env_return_nonfinite_count": 1,
+      "env_return_nonfinite_share": 0.25,
+      "env_return_mean": -0.5138826966285706,
+      "env_return_std": 1.251267433166504,
+      "env_nonfinite_count": 32,
+      "env_nonfinite_share": 0.25,
+      "env_mean": -0.01605883054435253,
+      "env_std": 0.4917210042476654,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 4,
+      "suite_seed": 202,
+      "fingerprint": "1952c47e8ac1f2f4",
+      "family_counts": {
+        "scm": 4
+      },
+      "unique_structures": 4,
+      "top_structures": [
+        {
+          "signature": "('scm', True, False, 317, 178, 30, 16, 67, 400, 30, 3, 29, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 350, 166, 24, 18, 32, 400, 30, 2, 56, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 353, 59, 8, 38, 9, 400, 30, 3, 22, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, False, 99, 96, 6, 261, 40, 400, 30, 2, 72, 'sin')",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 279.75,
+      "obs_dim_mean": 124.75,
+      "action_dim_mean": 17.0
+    },
+    "metrics": {
+      "batch_size": 4,
+      "n_samples": 64,
+      "single_eval_pos": 32,
+      "suffix_horizon": 32,
+      "full_return_per_env": [
+        0.7788574695587158,
+        -0.4564186930656433,
+        -0.380005419254303,
+        -6.555159091949463
+      ],
+      "suffix_return_per_env": [
+        -0.8410170674324036,
+        -0.2279393970966339,
+        -0.9153795838356018,
+        -3.7574944496154785
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -1.6531814336776733,
+      "full_return_std": 2.872168779373169,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -1.435457706451416,
+      "suffix_return_std": 1.3669122457504272,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.025830954313278198,
+      "reward_step_std": 0.43695268034935,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -0.044858045876026154,
+      "suffix_reward_step_std": 0.41292890906333923,
+      "env_return_nonfinite_count": 0,
+      "env_return_nonfinite_share": 0.0,
+      "env_return_mean": -1.435457706451416,
+      "env_return_std": 1.3669122457504272,
+      "env_nonfinite_count": 0,
+      "env_nonfinite_share": 0.0,
+      "env_mean": -0.044858045876026154,
+      "env_std": 0.41292890906333923,
+      "ctrl_return_nonfinite_count": 0,
+      "ctrl_return_nonfinite_share": 0.0,
+      "ctrl_return_mean": 0.0,
+      "ctrl_return_std": 0.0,
+      "ctrl_nonfinite_count": 0,
+      "ctrl_nonfinite_share": 0.0,
+      "ctrl_mean": 0.0,
+      "ctrl_std": 0.0,
+      "survival_return_nonfinite_count": 0,
+      "survival_return_nonfinite_share": 0.0,
+      "survival_return_mean": 0.0,
+      "survival_return_std": 0.0,
+      "survival_nonfinite_count": 0,
+      "survival_nonfinite_share": 0.0,
+      "survival_mean": 0.0,
+      "survival_std": 0.0,
+      "suffix_terminal_count_mean": 0.0,
+      "suffix_terminal_count_std": 0.0
+    }
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": -0.5139881372451782,
+    "heldout_minus_train_suffix_return_mean": -0.9215750098228455,
+    "heldout_minus_train_ctrl_return_mean": 0.0,
+    "heldout_minus_train_env_return_mean": -0.9215750098228455,
+    "heldout_minus_train_survival_return_mean": 0.0
+  }
+}

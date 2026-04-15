@@ -1,0 +1,37 @@
+{
+  "completed_phases": [
+    "zero_train"
+  ],
+  "current_or_last_phase": "zero_heldout",
+  "events": [
+    {
+      "event": "phase_start",
+      "phase": "zero_train",
+      "t": 1692851.667711687
+    },
+    {
+      "event": "phase_end",
+      "phase": "zero_train",
+      "t": 1692985.95604722,
+      "wall_s": 134.28833553288132
+    },
+    {
+      "event": "phase_start",
+      "phase": "zero_heldout",
+      "t": 1692985.956132276
+    },
+    {
+      "error": "",
+      "error_type": "KeyboardInterrupt",
+      "event": "phase_error",
+      "phase": "zero_heldout",
+      "t": 1693031.761885207,
+      "wall_s": 45.805752930929884
+    }
+  ],
+  "monitor_summary_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_monitored/monitor_summary.json",
+  "phase_log_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_monitored/phase_log.jsonl",
+  "runtime_json_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_monitored/runtime.json",
+  "stack_dump_log_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_monitored/stack_dump.log",
+  "status": "phase3_serial_monitored_runtime_blocker"
+}

@@ -1,0 +1,56 @@
+{
+  "artifacts": {
+    "bundle_monitor_summary": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/monitor_summary.json",
+    "bundle_phase_log": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/phase_log.jsonl",
+    "post_only_monitor_summary": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/monitor_summary.json",
+    "post_only_phase_log": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/phase_log.jsonl",
+    "post_only_stack_dump": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_only_pipe/stack_dump.log"
+  },
+  "bundle_contract": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "n_samples": 2048,
+    "rollout_backend": "serial",
+    "single_eval_pos": 1946,
+    "train_profile": "trusted_sep_reset_mainline"
+  },
+  "conclusion": {
+    "current_blocker_phase": "post_train",
+    "new_trusted_phase3_baseline_established": false,
+    "post_train_serial_eval_still_runtime_dominant": true,
+    "pre_policy_recompute_removed": true,
+    "train_loop_is_checkpointable": true,
+    "zero_control_recompute_removed": true
+  },
+  "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+  "post_only_phase": [
+    {
+      "event": "phase_start",
+      "phase": "post_train",
+      "t": 1695105.966388865
+    },
+    {
+      "error": "",
+      "error_type": "KeyboardInterrupt",
+      "event": "phase_error",
+      "phase": "post_train",
+      "t": 1695341.631604165,
+      "wall_s": 235.66521530016325
+    }
+  ],
+  "post_policy_bundle_path": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/phase3_pair1_post_policy_bundle.pt",
+  "post_policy_bundle_saved": true,
+  "status": "diagnostic_progress",
+  "train_loop_phase": [
+    {
+      "event": "phase_start",
+      "phase": "train_loop",
+      "t": 1694876.563815217
+    },
+    {
+      "event": "phase_end",
+      "phase": "train_loop",
+      "t": 1694981.772545686,
+      "wall_s": 105.20873046899214
+    }
+  ]
+}

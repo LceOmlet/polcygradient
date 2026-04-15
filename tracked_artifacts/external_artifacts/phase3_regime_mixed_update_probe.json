@@ -1,0 +1,113 @@
+{
+  "all_envs_summary": {
+    "corr_dist1_to_4_mass_vs_pre_gap": -0.044519539922475815,
+    "corr_dist1_to_4_mass_vs_reset_count": 0.5230288505554199,
+    "dist1_to_4_mass_weighted_pre_gap": -0.0018018004474783201,
+    "env_count": 64,
+    "mean_pre_vs_zero_suffix_gap": 0.4111925305915065,
+    "nonzero_mass_env_count": 19,
+    "nonzero_mass_env_share": 0.296875,
+    "total_dist1_to_4_mass": 27.03144869627431
+  },
+  "audit_entry": "phase3_regime_mixed_update_probe",
+  "conclusions": {
+    "mixed_update_conflict_present": true,
+    "pooled_sign_hides_regime_split": true,
+    "positive_regime_dominates_pooled_update": true,
+    "pre_gap_alignment_flips_by_regime": false,
+    "regime_split_visible_in_raw_correlation": true,
+    "reset_tracking_stable_across_regimes": true
+  },
+  "regime_groups": {
+    "nonpositive": {
+      "corr_dist1_to_4_mass_vs_pre_gap": 0.049452751874923706,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.58200603723526,
+      "dist1_to_4_mass_weighted_pre_gap": -0.05334419264940201,
+      "env_count": 16,
+      "mass_share": 0.32009452158708657,
+      "mean_pre_vs_zero_suffix_gap": -0.07080858759582043,
+      "nonzero_mass_env_count": 5,
+      "nonzero_mass_env_share": 0.3125,
+      "pooled_covariance_contribution_share": 0.0682706334990793,
+      "pooled_covariance_numerator_contribution": -0.7621620925991063,
+      "suite_names": [
+        "seed24680"
+      ],
+      "total_dist1_to_4_mass": 8.652618638239801
+    },
+    "positive": {
+      "corr_dist1_to_4_mass_vs_pre_gap": -0.047901760786771774,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.5211668014526367,
+      "dist1_to_4_mass_weighted_pre_gap": 0.02246398045465626,
+      "env_count": 48,
+      "mass_share": 0.6799054784129134,
+      "mean_pre_vs_zero_suffix_gap": 0.5718595699872822,
+      "nonzero_mass_env_count": 14,
+      "nonzero_mass_env_share": 0.2916666666666667,
+      "pooled_covariance_contribution_share": 0.9317293665009208,
+      "pooled_covariance_numerator_contribution": -10.401672978733355,
+      "suite_names": [
+        "pair1",
+        "pair2",
+        "seed13579"
+      ],
+      "total_dist1_to_4_mass": 18.37883005803451
+    }
+  },
+  "skipped_suites": [],
+  "suite_count": 4,
+  "suite_summaries": [
+    {
+      "corr_dist1_to_4_mass_vs_pre_gap": -0.21220579743385315,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.9114203453063965,
+      "dist1_to_4_mass_weighted_pre_gap": 0.003706812652586693,
+      "env_count": 16,
+      "mean_pre_vs_zero_suffix_gap": 0.15514238504692912,
+      "nonzero_mass_env_count": 6,
+      "nonzero_mass_env_share": 0.375,
+      "ppo_minus_zero_suffix": 2.8122913241386414,
+      "suite_name": "pair1",
+      "suite_regime": "positive",
+      "total_dist1_to_4_mass": 16.198739986866713
+    },
+    {
+      "corr_dist1_to_4_mass_vs_pre_gap": -0.07383062690496445,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.6041295528411865,
+      "dist1_to_4_mass_weighted_pre_gap": 0.17410933719698427,
+      "env_count": 16,
+      "mean_pre_vs_zero_suffix_gap": 1.5457839525770396,
+      "nonzero_mass_env_count": 4,
+      "nonzero_mass_env_share": 0.25,
+      "ppo_minus_zero_suffix": 1.5457842350006104,
+      "suite_name": "pair2",
+      "suite_regime": "positive",
+      "total_dist1_to_4_mass": 2.06782305566594
+    },
+    {
+      "corr_dist1_to_4_mass_vs_pre_gap": 0.049452751874923706,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.58200603723526,
+      "dist1_to_4_mass_weighted_pre_gap": -0.05334419264940201,
+      "env_count": 16,
+      "mean_pre_vs_zero_suffix_gap": -0.07080858759582043,
+      "nonzero_mass_env_count": 5,
+      "nonzero_mass_env_share": 0.3125,
+      "ppo_minus_zero_suffix": -0.07080888748168945,
+      "suite_name": "seed24680",
+      "suite_regime": "nonpositive",
+      "total_dist1_to_4_mass": 8.652618638239801
+    },
+    {
+      "corr_dist1_to_4_mass_vs_pre_gap": -0.2791765332221985,
+      "corr_dist1_to_4_mass_vs_reset_count": 0.8076223134994507,
+      "dist1_to_4_mass_weighted_pre_gap": -0.06423361987977338,
+      "env_count": 16,
+      "mean_pre_vs_zero_suffix_gap": 0.01465237233787775,
+      "nonzero_mass_env_count": 4,
+      "nonzero_mass_env_share": 0.25,
+      "ppo_minus_zero_suffix": 0.014652371406555176,
+      "suite_name": "seed13579",
+      "suite_regime": "positive",
+      "total_dist1_to_4_mass": 0.1122670155018568
+    }
+  ]
+}

@@ -1,0 +1,372 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_15.cpkt",
+  "policy": {
+    "requested_mode": "ppo",
+    "resolved_mode": "ppo",
+    "device": "cuda:0"
+  },
+  "config": {
+    "n_samples": 2048,
+    "num_features": 434,
+    "single_eval_pos": 1946,
+    "suite_regime": "cross_env",
+    "core_a": false,
+    "reference_semantics_enabled": false,
+    "rollout_backend": "serial",
+    "include_action_reachability_probe": true
+  },
+  "suite_paths": {},
+  "base_suite": null,
+  "train_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 24680,
+      "fingerprint": "207a0b2867895288",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 105, 19, 20, 223, 72, 400, 30, 9, 53, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 11, 8, 27, 240, 149, 400, 30, 2, 36, <class 'torch.nn.modules.activation.Tanh'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 170, 39, 24, 199, 31, 400, 30, 3, 58, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 181, 97, 5, 111, 108, 400, 30, 3, 80, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 208, 18, 3, 166, 26, 400, 30, 5, 112, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 241.5625,
+      "obs_dim_mean": 103.9375,
+      "action_dim_mean": 15.6875
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        -62.37127685546875,
+        3.923494815826416,
+        -3.138540744781494,
+        79.67533874511719,
+        -21.905439376831055,
+        465.67755126953125,
+        -13.293119430541992,
+        -4.792665958404541,
+        -171.44444274902344,
+        -39.30619812011719,
+        14.47162914276123,
+        -2.930008888244629,
+        388.69610595703125,
+        26.137313842773438,
+        -1.5809216499328613,
+        -0.778837263584137
+      ],
+      "suffix_return_per_env": [
+        -3.3980205059051514,
+        0.34650248289108276,
+        0.09525089710950851,
+        4.167319297790527,
+        -0.14304077625274658,
+        22.794574737548828,
+        3.85841703414917,
+        -0.31535661220550537,
+        -9.410926818847656,
+        -1.4920592308044434,
+        0.6025614142417908,
+        -0.13055014610290527,
+        19.21859359741211,
+        -0.45688313245773315,
+        -0.18471120297908783,
+        0.19430597126483917
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": 41.06500244140625,
+      "full_return_std": 154.86778259277344,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": 2.234123468399048,
+      "suffix_return_std": 7.68353796005249,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": 0.020051270723342896,
+      "reward_step_std": 0.10386374592781067,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": 0.02190317213535309,
+      "suffix_reward_step_std": 0.10856693238019943
+    },
+    "action_reachability": {
+      "probe_backend": "serial",
+      "action_low": 0.0,
+      "action_high": 100.0,
+      "single_eval_pos": 1946,
+      "reward_step0_delta_abs_per_env": [
+        0.5526337623596191,
+        12.939170837402344,
+        0.5861805081367493,
+        1359.9737548828125,
+        174.3977813720703,
+        37.213253021240234,
+        1043.248046875,
+        152.23040771484375,
+        148.18035888671875,
+        39.84756088256836,
+        128.553955078125,
+        576.7182006835938,
+        240.3125457763672,
+        87.19026184082031,
+        1295.9559326171875,
+        0.015531782992184162
+      ],
+      "suffix_return_delta_abs_per_env": [
+        60.65594482421875,
+        1320.6275634765625,
+        60.10588836669922,
+        138716.578125,
+        17792.583984375,
+        3812.177001953125,
+        106394.6484375,
+        15518.314453125,
+        15120.7880859375,
+        4072.192626953125,
+        13110.8681640625,
+        58827.86328125,
+        24517.60546875,
+        8885.6064453125,
+        132187.609375,
+        1.3395588397979736
+      ],
+      "obs_max_abs_delta_per_env": [
+        3.9509694576263428,
+        3.250338554382324,
+        4.923933029174805,
+        5.122374057769775,
+        4.9577317237854,
+        4.2530317306518555,
+        6.186136245727539,
+        5.771985054016113,
+        3.761733055114746,
+        3.8620831966400146,
+        4.066597938537598,
+        5.459927558898926,
+        4.188594341278076,
+        3.0722861289978027,
+        3.0975759029388428,
+        3.735741376876831
+      ],
+      "suffix_return_delta_abs_mean": 33774.96875,
+      "suffix_return_delta_abs_std": 46714.0703125,
+      "obs_max_abs_delta_mean": 4.353815078735352,
+      "obs_max_abs_delta_std": 0.9208436608314514,
+      "suffix_return_delta_abs_lt_1e_3_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_2_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_1_share": 0.0,
+      "suffix_return_delta_abs_lt_1e0_share": 0.0,
+      "obs_max_abs_delta_gt_1e_2_share": 1.0,
+      "state_only_sensitive_share_obs_gt_1e_2_reward_lt_1e_3": 0.0,
+      "reward_step0_delta_abs_nonfinite_count": 0,
+      "reward_step0_delta_abs_nonfinite_share": 0.0,
+      "reward_step0_delta_abs_mean": 331.1197509765625,
+      "reward_step0_delta_abs_std": 458.00665283203125,
+      "suffix_return_delta_abs_nonfinite_count": 0,
+      "suffix_return_delta_abs_nonfinite_share": 0.0,
+      "obs_max_abs_delta_nonfinite_count": 0,
+      "obs_max_abs_delta_nonfinite_share": 0.0
+    }
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 13579,
+      "fingerprint": "ec11e526e4f6f68d",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 142, 69, 22, 57, 201, 400, 30, 4, 15, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 20, 10, 5, 200, 180, 400, 30, 2, 8, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 247, 32, 6, 75, 78, 400, 30, 2, 29, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 260, 236, 30, 41, 99, 400, 30, 3, 58, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 268, 243, 8, 109, 23, 400, 30, 2, 190, 'sin')",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 214.875,
+      "obs_dim_mean": 114.25,
+      "action_dim_mean": 16.625
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        41.70003890991211,
+        45.23579406738281,
+        7.816647052764893,
+        -4.395968914031982,
+        19.963008880615234,
+        1.4068315029144287,
+        -11.127201080322266,
+        13.092599868774414,
+        -121.97402954101562,
+        1.2364598512649536,
+        -1.787748098373413,
+        -39.380699157714844,
+        -386.970947265625,
+        -3.1926605701446533,
+        -92.48704528808594,
+        -0.9197649955749512
+      ],
+      "suffix_return_per_env": [
+        1.3657374382019043,
+        3.067734956741333,
+        -0.04288291931152344,
+        -0.18896713852882385,
+        0.9762756824493408,
+        0.06774915754795074,
+        -0.19761338829994202,
+        -0.23388178646564484,
+        -6.461244583129883,
+        -0.0404617115855217,
+        -0.28864073753356934,
+        -2.5510306358337402,
+        -19.85069465637207,
+        -0.040807709097862244,
+        -5.615218162536621,
+        0.822856605052948
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -33.236541748046875,
+      "full_return_std": 100.50848388671875,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -1.825693130493164,
+      "suffix_return_std": 5.205974102020264,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.016228780150413513,
+      "reward_step_std": 0.08168239146471024,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -0.017898952588438988,
+      "suffix_reward_step_std": 0.08151119202375412
+    },
+    "action_reachability": {
+      "probe_backend": "serial",
+      "action_low": 0.0,
+      "action_high": 100.0,
+      "single_eval_pos": 1946,
+      "reward_step0_delta_abs_per_env": [
+        17.827674865722656,
+        398.7768859863281,
+        29.7398738861084,
+        0.019420379772782326,
+        438.8352966308594,
+        0.059028998017311096,
+        18.450237274169922,
+        0.020353756844997406,
+        0.37377625703811646,
+        0.31216496229171753,
+        60.261871337890625,
+        1243.413818359375,
+        56.00223159790039,
+        174.84405517578125,
+        249.63632202148438,
+        67.53142547607422
+      ],
+      "suffix_return_delta_abs_per_env": [
+        1803.79248046875,
+        40671.8828125,
+        3034.639892578125,
+        2.520246982574463,
+        44760.78125,
+        6.333649158477783,
+        1893.5096435546875,
+        8.061530113220215,
+        25.35478401184082,
+        34.730735778808594,
+        6145.62646484375,
+        126826.296875,
+        5675.37939453125,
+        17836.98046875,
+        25460.140625,
+        6885.5439453125
+      ],
+      "obs_max_abs_delta_per_env": [
+        4.439603328704834,
+        3.7829859256744385,
+        4.265528678894043,
+        3.230048656463623,
+        2.5187342166900635,
+        7.497861385345459,
+        3.544950008392334,
+        4.342934608459473,
+        6.197959899902344,
+        3.9229984283447266,
+        3.9878695011138916,
+        3.2259562015533447,
+        4.442375183105469,
+        4.05635929107666,
+        4.433040618896484,
+        4.182466506958008
+      ],
+      "suffix_return_delta_abs_mean": 17566.97265625,
+      "suffix_return_delta_abs_std": 31528.63671875,
+      "obs_max_abs_delta_mean": 4.25447940826416,
+      "obs_max_abs_delta_std": 1.1312966346740723,
+      "suffix_return_delta_abs_lt_1e_3_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_2_share": 0.0,
+      "suffix_return_delta_abs_lt_1e_1_share": 0.0,
+      "suffix_return_delta_abs_lt_1e0_share": 0.0,
+      "obs_max_abs_delta_gt_1e_2_share": 1.0,
+      "state_only_sensitive_share_obs_gt_1e_2_reward_lt_1e_3": 0.0,
+      "reward_step0_delta_abs_nonfinite_count": 0,
+      "reward_step0_delta_abs_nonfinite_share": 0.0,
+      "reward_step0_delta_abs_mean": 172.25653076171875,
+      "reward_step0_delta_abs_std": 309.0995178222656,
+      "suffix_return_delta_abs_nonfinite_count": 0,
+      "suffix_return_delta_abs_nonfinite_share": 0.0,
+      "obs_max_abs_delta_nonfinite_count": 0,
+      "obs_max_abs_delta_nonfinite_share": 0.0
+    }
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": -74.30154418945312,
+    "heldout_minus_train_suffix_return_mean": -4.059816598892212
+  },
+  "paired_metrics": null
+}

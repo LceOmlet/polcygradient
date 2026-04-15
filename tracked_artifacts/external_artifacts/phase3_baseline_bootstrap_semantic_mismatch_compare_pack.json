@@ -1,0 +1,143 @@
+{
+  "audit_entry": "phase3_baseline_bootstrap_semantic_mismatch_compare_pack",
+  "comparison": {
+    "dominant_source_difference": true,
+    "env1": {
+      "baseline_bootstrap_rows": {
+        "mid_episode_extension": {
+          "fraction_within_baseline_bootstrap_rows": 0.0,
+          "mean_negative_share": 0.0,
+          "mean_start_gae_future_carry_norm": 0.0,
+          "mean_start_raw_rollout_residual_norm": 0.0,
+          "mean_tokens_to_objective_episode_end": 0.0,
+          "objective_local_indices": [],
+          "row_count": 0,
+          "tokens_to_objective_episode_end": []
+        },
+        "mid_episode_extension_supported": false,
+        "overall": {
+          "mean_negative_share": 1.0,
+          "mean_start_gae_future_carry_norm": -0.025066775114585955,
+          "mean_start_raw_rollout_residual_norm": 0.014422017798337225,
+          "mean_tokens_to_objective_episode_end": 2.3333333333333335,
+          "objective_local_indices": [
+            97,
+            99,
+            100
+          ],
+          "tokens_to_objective_episode_end": [
+            4,
+            2,
+            1
+          ]
+        },
+        "row_count": 3,
+        "tail_core": {
+          "fraction_within_baseline_bootstrap_rows": 1.0,
+          "mean_negative_share": 1.0,
+          "mean_start_gae_future_carry_norm": -0.025066775114585955,
+          "mean_start_raw_rollout_residual_norm": 0.014422017798337225,
+          "mean_tokens_to_objective_episode_end": 2.3333333333333335,
+          "objective_local_indices": [
+            97,
+            99,
+            100
+          ],
+          "row_count": 3,
+          "tokens_to_objective_episode_end": [
+            4,
+            2,
+            1
+          ],
+          "window_tokens_to_objective_episode_end": 4
+        },
+        "tail_core_is_pure_tail": true,
+        "tail_core_supported": true
+      },
+      "dominant_negative_source": "baseline_bootstrap_semantic_mismatch",
+      "env_index": 1
+    },
+    "env12": {
+      "baseline_bootstrap_rows": {
+        "mid_episode_extension": {
+          "fraction_within_baseline_bootstrap_rows": 0.8,
+          "mean_negative_share": 0.5491065753155424,
+          "mean_start_gae_future_carry_norm": -0.0901851886883378,
+          "mean_start_raw_rollout_residual_norm": 0.80408083907995,
+          "mean_tokens_to_objective_episode_end": 36.5,
+          "objective_local_indices": [
+            18,
+            19,
+            20,
+            21
+          ],
+          "row_count": 4,
+          "tokens_to_objective_episode_end": [
+            38,
+            37,
+            36,
+            35
+          ]
+        },
+        "mid_episode_extension_supported": true,
+        "overall": {
+          "mean_negative_share": 0.6392852602524339,
+          "mean_start_gae_future_carry_norm": -0.0860939708352089,
+          "mean_start_raw_rollout_residual_norm": 0.6562384256634182,
+          "mean_tokens_to_objective_episode_end": 29.4,
+          "objective_local_indices": [
+            18,
+            19,
+            20,
+            21,
+            100
+          ],
+          "tokens_to_objective_episode_end": [
+            38,
+            37,
+            36,
+            35,
+            1
+          ]
+        },
+        "row_count": 5,
+        "tail_core": {
+          "fraction_within_baseline_bootstrap_rows": 0.2,
+          "mean_negative_share": 1.0,
+          "mean_start_gae_future_carry_norm": -0.06972909942269324,
+          "mean_start_raw_rollout_residual_norm": 0.0648687719972905,
+          "mean_tokens_to_objective_episode_end": 1.0,
+          "objective_local_indices": [
+            100
+          ],
+          "row_count": 1,
+          "tokens_to_objective_episode_end": [
+            1
+          ],
+          "window_tokens_to_objective_episode_end": 4
+        },
+        "tail_core_is_pure_tail": false,
+        "tail_core_supported": true
+      },
+      "dominant_negative_source": "baseline_bootstrap_semantic_mismatch",
+      "env_index": 12
+    },
+    "near_terminal_window": 4,
+    "shared_tail_core_supported": true
+  },
+  "conclusions": {
+    "baseline_bootstrap_semantic_mismatch_is_shared_candidate": true,
+    "branch_specific_followup_needed": true,
+    "env12_has_mid_episode_extension": true,
+    "env1_is_tail_only_for_baseline_bootstrap": true,
+    "tail_core_shared_across_env12_and_env1": true
+  },
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_fix_target": "baseline_bootstrap_semantic_mismatch",
+    "narrow_fix_scope": "near_terminal_tail_core",
+    "reason": "Both env12 and env1 share a near-terminal baseline-bootstrap core, but env12 also carries a mid-episode extension that env1 does not. The smallest shared repair axis is therefore the baseline-bootstrap tail core, not the full pooled bootstrap bucket."
+  },
+  "source_env12_json": "/home/chen/RLPFN/artifacts/phase3_future_carry_source_chain_probe_pair2_env12.json",
+  "source_env1_json": "/home/chen/RLPFN/artifacts/phase3_future_carry_source_chain_probe_pair2_env1.json"
+}

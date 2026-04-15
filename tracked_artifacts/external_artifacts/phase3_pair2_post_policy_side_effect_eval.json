@@ -1,0 +1,434 @@
+{
+  "audit_entry": "phase3_pair2_post_policy_side_effect_eval",
+  "baseline": {
+    "bundle": {
+      "contract": {
+        "actor_objective_mode": "tokenwise",
+        "batch_size": 256,
+        "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+        "heldout_suite_fingerprint": "ec11e526e4f6f68d",
+        "learning_rate": 0.0002,
+        "n_epochs": 1,
+        "n_samples": 256,
+        "ppo_actor_baseline_mode": "learned",
+        "ppo_actor_gae_space": "normalized",
+        "ppo_normalize_advantage": false,
+        "ppo_reset_env_state_at_sep": true,
+        "ppo_restore_validation_policy_state": false,
+        "ppo_separate_value_backbone": false,
+        "ppo_vf_coef": 0.5,
+        "rollout_backend": "serial",
+        "single_eval_pos": 64,
+        "strict_native_rollout": true,
+        "target_kl": 0.03,
+        "train_profile": "phase2_shared_backbone_contract",
+        "train_suite_fingerprint": "207a0b2867895288"
+      },
+      "source_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_post_policy_bundle.pt"
+    },
+    "metrics": {
+      "batch_size": 16,
+      "full_return_mean": -3.829878330230713,
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_per_env": [
+        5.322046756744385,
+        4.69388484954834,
+        3.3482275009155273,
+        -0.11864465475082397,
+        2.176382541656494,
+        0.4742848575115204,
+        -2.0840580463409424,
+        2.2522215843200684,
+        -14.615315437316895,
+        -0.10160651803016663,
+        0.0964638739824295,
+        -6.294578552246094,
+        -46.609004974365234,
+        -1.0104974508285522,
+        -9.414213180541992,
+        0.6063534021377563
+      ],
+      "full_return_std": 12.137070655822754,
+      "n_samples": 256,
+      "reward_step_mean": -0.014960464090108871,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_std": 0.08796656876802444,
+      "rollout_backend": "serial",
+      "single_eval_pos": 64,
+      "suffix_horizon": 192,
+      "suffix_return_mean": -3.011280059814453,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_per_env": [
+        4.452308177947998,
+        3.599301338195801,
+        2.1974971294403076,
+        -0.0007093697786331177,
+        1.6954083442687988,
+        0.4886627793312073,
+        -1.8983228206634521,
+        1.6240208148956299,
+        -11.777618408203125,
+        -0.45353397727012634,
+        0.029000313952565193,
+        -4.776723861694336,
+        -34.70313262939453,
+        -0.9854066371917725,
+        -7.809861183166504,
+        0.13862979412078857
+      ],
+      "suffix_return_std": 9.116961479187012,
+      "suffix_reward_step_mean": -0.015683749690651894,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_std": 0.08901690691709518
+    },
+    "suite_summary": {
+      "action_dim_mean": 16.625,
+      "batch_size": 16,
+      "family_counts": {
+        "scm": 16
+      },
+      "fingerprint": "ec11e526e4f6f68d",
+      "obs_dim_mean": 114.25,
+      "state_dim_mean": 214.875,
+      "suite_seed": 13579,
+      "top_structures": [
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 142, 69, 22, 57, 201, 400, 30, 4, 15, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 20, 10, 5, 200, 180, 400, 30, 2, 8, 'sin')"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 247, 32, 6, 75, 78, 400, 30, 2, 29, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 260, 236, 30, 41, 99, 400, 30, 3, 58, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 268, 243, 8, 109, 23, 400, 30, 2, 190, 'sin')"
+        }
+      ],
+      "unique_structures": 16
+    },
+    "wall_s": 120.53717309376225
+  },
+  "comparison": {
+    "full_return_delta_stats": {
+      "count": 16,
+      "max": 0.7089591026306152,
+      "mean": 0.0055379848927259445,
+      "min": -0.9088619947433472,
+      "negative_count": 7,
+      "positive_count": 9,
+      "zero_count": 0
+    },
+    "override_minus_baseline_full_return_mean": 0.005537986755371094,
+    "override_minus_baseline_suffix_return_mean": 0.010786294937133789,
+    "per_env": [
+      {
+        "baseline_full_return": 5.322046756744385,
+        "baseline_suffix_return": 4.452308177947998,
+        "env_index": 0,
+        "full_return_delta": 0.5345520973205566,
+        "override_full_return": 5.856598854064941,
+        "override_suffix_return": 4.864874839782715,
+        "suffix_return_delta": 0.4125666618347168
+      },
+      {
+        "baseline_full_return": 4.69388484954834,
+        "baseline_suffix_return": 3.599301338195801,
+        "env_index": 1,
+        "full_return_delta": -0.47951745986938477,
+        "override_full_return": 4.214367389678955,
+        "override_suffix_return": 3.234898328781128,
+        "suffix_return_delta": -0.36440300941467285
+      },
+      {
+        "baseline_full_return": 3.3482275009155273,
+        "baseline_suffix_return": 2.1974971294403076,
+        "env_index": 2,
+        "full_return_delta": -0.09611248970031738,
+        "override_full_return": 3.25211501121521,
+        "override_suffix_return": 2.129038095474243,
+        "suffix_return_delta": -0.06845903396606445
+      },
+      {
+        "baseline_full_return": -0.11864465475082397,
+        "baseline_suffix_return": -0.0007093697786331177,
+        "env_index": 3,
+        "full_return_delta": 0.08766581118106842,
+        "override_full_return": -0.030978843569755554,
+        "override_suffix_return": 0.061122313141822815,
+        "suffix_return_delta": 0.06183168292045593
+      },
+      {
+        "baseline_full_return": 2.176382541656494,
+        "baseline_suffix_return": 1.6954083442687988,
+        "env_index": 4,
+        "full_return_delta": 0.40169239044189453,
+        "override_full_return": 2.5780749320983887,
+        "override_suffix_return": 1.9972970485687256,
+        "suffix_return_delta": 0.30188870429992676
+      },
+      {
+        "baseline_full_return": 0.4742848575115204,
+        "baseline_suffix_return": 0.4886627793312073,
+        "env_index": 5,
+        "full_return_delta": 0.02759280800819397,
+        "override_full_return": 0.5018776655197144,
+        "override_suffix_return": 0.5174000859260559,
+        "suffix_return_delta": 0.028737306594848633
+      },
+      {
+        "baseline_full_return": -2.0840580463409424,
+        "baseline_suffix_return": -1.8983228206634521,
+        "env_index": 6,
+        "full_return_delta": -0.26946115493774414,
+        "override_full_return": -2.3535192012786865,
+        "override_suffix_return": -2.101989984512329,
+        "suffix_return_delta": -0.20366716384887695
+      },
+      {
+        "baseline_full_return": 2.2522215843200684,
+        "baseline_suffix_return": 1.6240208148956299,
+        "env_index": 7,
+        "full_return_delta": -0.4271104335784912,
+        "override_full_return": 1.8251111507415771,
+        "override_suffix_return": 1.319181203842163,
+        "suffix_return_delta": -0.3048396110534668
+      },
+      {
+        "baseline_full_return": -14.615315437316895,
+        "baseline_suffix_return": -11.777618408203125,
+        "env_index": 8,
+        "full_return_delta": 0.1083230972290039,
+        "override_full_return": -14.50699234008789,
+        "override_suffix_return": -11.650921821594238,
+        "suffix_return_delta": 0.12669658660888672
+      },
+      {
+        "baseline_full_return": -0.10160651803016663,
+        "baseline_suffix_return": -0.45353397727012634,
+        "env_index": 9,
+        "full_return_delta": -0.062372878193855286,
+        "override_full_return": -0.1639793962240219,
+        "override_suffix_return": -0.5038490295410156,
+        "suffix_return_delta": -0.05031505227088928
+      },
+      {
+        "baseline_full_return": 0.0964638739824295,
+        "baseline_suffix_return": 0.029000313952565193,
+        "env_index": 10,
+        "full_return_delta": -0.9088620096445084,
+        "override_full_return": -0.8123981356620789,
+        "override_suffix_return": -0.6571136713027954,
+        "suffix_return_delta": -0.6861139852553606
+      },
+      {
+        "baseline_full_return": -6.294578552246094,
+        "baseline_suffix_return": -4.776723861694336,
+        "env_index": 11,
+        "full_return_delta": 0.7089591026306152,
+        "override_full_return": -5.5856194496154785,
+        "override_suffix_return": -4.267520904541016,
+        "suffix_return_delta": 0.5092029571533203
+      },
+      {
+        "baseline_full_return": -46.609004974365234,
+        "baseline_suffix_return": -34.70313262939453,
+        "env_index": 12,
+        "full_return_delta": 0.06536483764648438,
+        "override_full_return": -46.54364013671875,
+        "override_suffix_return": -34.64198303222656,
+        "suffix_return_delta": 0.06114959716796875
+      },
+      {
+        "baseline_full_return": -1.0104974508285522,
+        "baseline_suffix_return": -0.9854066371917725,
+        "env_index": 13,
+        "full_return_delta": -0.1809520721435547,
+        "override_full_return": -1.191449522972107,
+        "override_suffix_return": -1.12657630443573,
+        "suffix_return_delta": -0.14116966724395752
+      },
+      {
+        "baseline_full_return": -9.414213180541992,
+        "baseline_suffix_return": -7.809861183166504,
+        "env_index": 14,
+        "full_return_delta": 0.4801044464111328,
+        "override_full_return": -8.93410873413086,
+        "override_suffix_return": -7.39532995223999,
+        "suffix_return_delta": 0.41453123092651367
+      },
+      {
+        "baseline_full_return": 0.6063534021377563,
+        "baseline_suffix_return": 0.13862979412078857,
+        "env_index": 15,
+        "full_return_delta": 0.09874165058135986,
+        "override_full_return": 0.7050950527191162,
+        "override_suffix_return": 0.2135770320892334,
+        "suffix_return_delta": 0.07494723796844482
+      }
+    ],
+    "suffix_return_delta_stats": {
+      "count": 16,
+      "max": 0.5092029571533203,
+      "mean": 0.010786525905132294,
+      "min": -0.6861140131950378,
+      "negative_count": 7,
+      "positive_count": 9,
+      "zero_count": 0
+    }
+  },
+  "conclusions": {
+    "eval_only": true,
+    "no_train_loop": true,
+    "override_has_non_target_side_effect": true
+  },
+  "contract": {
+    "baseline_actor_objective_mode": "tokenwise",
+    "eval_n_samples": 256,
+    "n_samples": 256,
+    "override_actor_objective_mode": "tokenwise_scale_env12_mid_episode_extension_block",
+    "single_eval_pos": 64,
+    "strict_native_rollout": true,
+    "train_profile": "phase2_shared_backbone_contract"
+  },
+  "override": {
+    "bundle": {
+      "contract": {
+        "actor_objective_mode": "tokenwise_scale_env12_mid_episode_extension_block",
+        "batch_size": 256,
+        "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+        "heldout_suite_fingerprint": "ec11e526e4f6f68d",
+        "learning_rate": 0.0002,
+        "n_epochs": 1,
+        "n_samples": 256,
+        "ppo_actor_baseline_mode": "learned",
+        "ppo_actor_gae_space": "normalized",
+        "ppo_normalize_advantage": false,
+        "ppo_reset_env_state_at_sep": true,
+        "ppo_restore_validation_policy_state": false,
+        "ppo_separate_value_backbone": false,
+        "ppo_vf_coef": 0.5,
+        "rollout_backend": "serial",
+        "single_eval_pos": 64,
+        "strict_native_rollout": true,
+        "target_kl": 0.03,
+        "train_profile": "phase2_shared_backbone_contract",
+        "train_suite_fingerprint": "207a0b2867895288"
+      },
+      "source_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_post_policy_bundle.pt"
+    },
+    "metrics": {
+      "batch_size": 16,
+      "full_return_mean": -3.824340343475342,
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_per_env": [
+        5.856598854064941,
+        4.214367389678955,
+        3.25211501121521,
+        -0.030978843569755554,
+        2.5780749320983887,
+        0.5018776655197144,
+        -2.3535192012786865,
+        1.8251111507415771,
+        -14.50699234008789,
+        -0.1639793962240219,
+        -0.8123981356620789,
+        -5.5856194496154785,
+        -46.54364013671875,
+        -1.191449522972107,
+        -8.93410873413086,
+        0.7050950527191162
+      ],
+      "full_return_std": 12.079894065856934,
+      "n_samples": 256,
+      "reward_step_mean": -0.014938831329345703,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_std": 0.08785288035869598,
+      "rollout_backend": "serial",
+      "single_eval_pos": 64,
+      "suffix_horizon": 192,
+      "suffix_return_mean": -3.0004937648773193,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_per_env": [
+        4.864874839782715,
+        3.234898328781128,
+        2.129038095474243,
+        0.061122313141822815,
+        1.9972970485687256,
+        0.5174000859260559,
+        -2.101989984512329,
+        1.319181203842163,
+        -11.650921821594238,
+        -0.5038490295410156,
+        -0.6571136713027954,
+        -4.267520904541016,
+        -34.64198303222656,
+        -1.12657630443573,
+        -7.39532995223999,
+        0.2135770320892334
+      ],
+      "suffix_return_std": 9.068318367004395,
+      "suffix_reward_step_mean": -0.01562757045030594,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_std": 0.08890008181333542
+    },
+    "suite_summary": {
+      "action_dim_mean": 16.625,
+      "batch_size": 16,
+      "family_counts": {
+        "scm": 16
+      },
+      "fingerprint": "ec11e526e4f6f68d",
+      "obs_dim_mean": 114.25,
+      "state_dim_mean": 214.875,
+      "suite_seed": 13579,
+      "top_structures": [
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 142, 69, 22, 57, 201, 400, 30, 4, 15, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 20, 10, 5, 200, 180, 400, 30, 2, 8, 'sin')"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 247, 32, 6, 75, 78, 400, 30, 2, 29, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 260, 236, 30, 41, 99, 400, 30, 3, 58, <class 'torch.nn.modules.linear.Identity'>)"
+        },
+        {
+          "count": 1,
+          "signature": "('scm', True, True, 268, 243, 8, 109, 23, 400, 30, 2, 190, 'sin')"
+        }
+      ],
+      "unique_structures": 16
+    },
+    "wall_s": 122.0575940022245
+  },
+  "preflight": {
+    "pair2_preflight_passed": true,
+    "pair2_unexpected_diff": {},
+    "phase2_all_checks_pass": true,
+    "source_path": "/home/chen/RLPFN/artifacts/phase3_preflight_contract_check_pair2.json"
+  },
+  "suite_target": "heldout"
+}

@@ -1,0 +1,72 @@
+{
+  "audit_entry": "critic_official_vs_monkey_regression",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "device": "cuda:0",
+  "frozen_h_seed": 12345,
+  "train_env_seed": 2020,
+  "train_rollout_seed": 4040,
+  "single_eval_pos": 64,
+  "n_steps": 256,
+  "batch_size": 256,
+  "n_epochs": 1,
+  "learning_rate": 0.0002,
+  "target_kl": 0.03,
+  "strict_fixed_env_mode": true,
+  "deterministic_actor_sampling": true,
+  "deterministic_batch_plan": true,
+  "ppo_separate_value_backbone": false,
+  "unsynced_param_diff": {
+    "policy_param_max_abs_diff": 0.2921191453933716,
+    "num_param_tensors_with_diff": 2,
+    "differing_tensors": [
+      {
+        "name": "action_net.weight",
+        "max_abs_diff": 0.002700251992791891
+      },
+      {
+        "name": "value_net.weight",
+        "max_abs_diff": 0.2921191453933716
+      }
+    ]
+  },
+  "synced_param_diff": {
+    "policy_param_max_abs_diff": 0.0,
+    "num_param_tensors_with_diff": 0,
+    "differing_tensors": []
+  },
+  "first_step_compare_after_sync": {
+    "obs_t_equal": true,
+    "action_t_equal": true,
+    "reward_t_equal": true,
+    "reward_mask_t_equal": true,
+    "action_mean_max_abs_diff": 2.6341789634898305e-05,
+    "values_max_abs_diff": 0.0003270059823989868
+  },
+  "regression_compare_after_sync": {
+    "policy_loss_abs_diff": 0.0,
+    "grad_cosine": 1.000003695487976,
+    "grad_l2_delta": 0.0,
+    "actions_max_abs_diff": 0.0,
+    "returns_max_abs_diff": 0.0,
+    "values_max_abs_diff": 0.0,
+    "advantages_max_abs_diff": 0.0,
+    "log_probs_max_abs_diff": 0.0,
+    "official_collect_s_single": 5.38852726505138,
+    "monkey_collect_s_single": 5.396847997093573
+  },
+  "timing_compare_after_sync": {
+    "official_times_s": [
+      5.395683027105406,
+      5.602614145027474,
+      5.317577451933175
+    ],
+    "monkey_times_s": [
+      5.4387945958878845,
+      5.3419959200546145,
+      5.278021505102515
+    ],
+    "official_mean_s": 5.438624874688685,
+    "monkey_mean_s": 5.352937340348338,
+    "official_over_monkey_ratio": 1.0160075728319231
+  }
+}

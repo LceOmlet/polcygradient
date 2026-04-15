@@ -1,0 +1,218 @@
+{
+  "audit_entry": "prior_generalization_audit",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "policy": {
+    "requested_mode": "ppo",
+    "resolved_mode": "ppo",
+    "device": "cuda:0"
+  },
+  "config": {
+    "n_samples": 2048,
+    "num_features": 434,
+    "single_eval_pos": 1946,
+    "suite_regime": "cross_env",
+    "core_a": false,
+    "reference_semantics_enabled": false,
+    "rollout_backend": "serial",
+    "include_action_reachability_probe": false
+  },
+  "suite_paths": {},
+  "base_suite": null,
+  "train_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 12345,
+      "fingerprint": "d7c6a96c0f77cd30",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 1, 1, 27, 350, 49, 400, 30, 2, 200, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 120, 66, 5, 254, 26, 400, 30, 8, 26, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 126, 40, 17, 85, 189, 400, 30, 3, 33, 'sin')",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 162, 23, 11, 24, 214, 400, 30, 2, 44, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 165, 98, 9, 13, 222, 400, 30, 7, 45, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 219.125,
+      "obs_dim_mean": 88.625,
+      "action_dim_mean": 16.625
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        -23.598596572875977,
+        -3.3527727127075195,
+        -13.141311645507812,
+        -176.01914978027344,
+        4.118720531463623,
+        0.33595454692840576,
+        8.134660720825195,
+        -6.228401184082031,
+        -8.134217262268066,
+        -11.231152534484863,
+        8.382936477661133,
+        7.376976013183594,
+        9.577140808105469,
+        -107.57008361816406,
+        86.23292541503906,
+        -28.403690338134766
+      ],
+      "suffix_return_per_env": [
+        -1.1039516925811768,
+        -0.46209409832954407,
+        -0.4116574227809906,
+        -7.904657363891602,
+        -0.5154616832733154,
+        0.012959683313965797,
+        0.6381796598434448,
+        0.06456002593040466,
+        0.843005895614624,
+        -0.6168034672737122,
+        0.3805759847164154,
+        0.42090415954589844,
+        0.3697625994682312,
+        -5.237797737121582,
+        4.4360198974609375,
+        -1.3901350498199463
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": -15.845004081726074,
+      "full_return_std": 54.801639556884766,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": -0.6547869443893433,
+      "suffix_return_std": 2.6040568351745605,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": -0.00773681839928031,
+      "reward_step_std": 0.0639532133936882,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": -0.006419479846954346,
+      "suffix_reward_step_std": 0.06607910245656967
+    },
+    "action_reachability": null
+  },
+  "heldout_suite": {
+    "summary": {
+      "batch_size": 16,
+      "suite_seed": 24680,
+      "fingerprint": "8b23958aa23c1d07",
+      "family_counts": {
+        "scm": 16
+      },
+      "unique_structures": 16,
+      "top_structures": [
+        {
+          "signature": "('scm', True, True, 105, 53, 20, 13, 282, 400, 30, 9, 53, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 11, 10, 27, 157, 232, 400, 30, 2, 36, <class 'torch.nn.modules.activation.Tanh'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 170, 147, 24, 20, 210, 400, 30, 3, 58, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 181, 25, 5, 171, 48, 400, 30, 3, 80, <class 'torch.nn.modules.linear.Identity'>)",
+          "count": 1
+        },
+        {
+          "signature": "('scm', True, True, 208, 21, 3, 64, 128, 400, 30, 5, 112, <class 'torch.nn.modules.activation.ReLU'>)",
+          "count": 1
+        }
+      ],
+      "state_dim_mean": 241.5625,
+      "obs_dim_mean": 102.625,
+      "action_dim_mean": 15.6875
+    },
+    "metrics": {
+      "rollout_backend": "serial",
+      "batch_size": 16,
+      "n_samples": 2048,
+      "single_eval_pos": 1946,
+      "suffix_horizon": 102,
+      "full_return_per_env": [
+        -52.127479553222656,
+        3.9437785148620605,
+        -2.610501766204834,
+        73.98365783691406,
+        -31.980960845947266,
+        432.87652587890625,
+        -15.258291244506836,
+        -8.564595222473145,
+        -148.19189453125,
+        -39.0301513671875,
+        10.589571952819824,
+        -2.32293701171875,
+        394.3988037109375,
+        26.824337005615234,
+        -2.1281332969665527,
+        -0.8378621935844421
+      ],
+      "suffix_return_per_env": [
+        -3.2299792766571045,
+        0.2429039478302002,
+        -0.01564384438097477,
+        4.2747416496276855,
+        -0.7755110263824463,
+        20.98621940612793,
+        3.655453681945801,
+        -0.3350178003311157,
+        -6.896818161010742,
+        -1.5705232620239258,
+        0.4672299921512604,
+        -0.14690077304840088,
+        19.109113693237305,
+        -0.03705361485481262,
+        -0.45599082112312317,
+        0.19152957201004028
+      ],
+      "full_return_nonfinite_count": 0,
+      "full_return_nonfinite_share": 0.0,
+      "full_return_mean": 39.97274398803711,
+      "full_return_std": 148.16293334960938,
+      "suffix_return_nonfinite_count": 0,
+      "suffix_return_nonfinite_share": 0.0,
+      "suffix_return_mean": 2.216484308242798,
+      "suffix_return_std": 7.16037130355835,
+      "reward_step_nonfinite_count": 0,
+      "reward_step_nonfinite_share": 0.0,
+      "reward_step_mean": 0.019517939537763596,
+      "reward_step_std": 0.09615122526884079,
+      "suffix_reward_step_nonfinite_count": 0,
+      "suffix_reward_step_nonfinite_share": 0.0,
+      "suffix_reward_step_mean": 0.02173023857176304,
+      "suffix_reward_step_std": 0.09935691952705383
+    },
+    "action_reachability": null
+  },
+  "comparison": {
+    "heldout_minus_train_full_return_mean": 55.817748069763184,
+    "heldout_minus_train_suffix_return_mean": 2.871271252632141
+  },
+  "paired_metrics": null
+}

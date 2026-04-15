@@ -1,0 +1,7 @@
+{
+  "metric": "loss",
+  "mode": "min",
+  "scores": {
+    "/home/chen/RLPFN/artifacts/phase3_longrun_epoch13_continue/models_diff/rlpfn_reinforce_action_transformnone_continue_04_08_2026_00_06_40_epoch_9.cpkt": 0.03680393844842911
+  }
+}

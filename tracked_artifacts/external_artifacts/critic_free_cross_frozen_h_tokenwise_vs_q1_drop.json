@@ -1,0 +1,117 @@
+{
+  "audit_entry": "critic_free_cross_frozen_h_tokenwise_vs_q1_drop",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "config": {
+    "device": "cuda:0",
+    "train_env_seed": 2020,
+    "eval_env_seed_start": 3000,
+    "eval_rollout_seed_start": 4000,
+    "eval_env_count": 8,
+    "single_eval_pos": 64,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "learning_rate": 0.0002,
+    "batch_size": 256,
+    "n_epochs": 1,
+    "target_kl": 0.03,
+    "baseline_mode": "learned",
+    "frozen_h_seeds": [
+      12345,
+      23456,
+      34567,
+      45678
+    ]
+  },
+  "results": {
+    "tokenwise": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": -0.266204833984375,
+          "post_smp_gap": -3.3739395141601562,
+          "delta_smp_gap": -3.1077346801757812,
+          "pre_det_gap": -0.2662353515625,
+          "post_det_gap": -3.3739395141601562,
+          "delta_det_gap": -3.1077041625976562
+        },
+        {
+          "frozen_h_seed": 23456,
+          "pre_smp_gap": 0.005530834197998047,
+          "post_smp_gap": -0.8347125053405762,
+          "delta_smp_gap": -0.8402433395385742,
+          "pre_det_gap": 0.005530834197998047,
+          "post_det_gap": -0.8347125053405762,
+          "delta_det_gap": -0.8402433395385742
+        },
+        {
+          "frozen_h_seed": 34567,
+          "pre_smp_gap": -0.05116748809814453,
+          "post_smp_gap": -0.8402729034423828,
+          "delta_smp_gap": -0.7891054153442383,
+          "pre_det_gap": -0.05116748809814453,
+          "post_det_gap": -0.8402729034423828,
+          "delta_det_gap": -0.7891054153442383
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": -0.06263566017150879,
+          "post_smp_gap": 0.3517965078353882,
+          "delta_smp_gap": 0.414432168006897,
+          "pre_det_gap": -0.06263566017150879,
+          "post_det_gap": 0.3517965078353882,
+          "delta_det_gap": 0.414432168006897
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": -1.0806628167629242,
+        "positive_count": 1,
+        "nonpositive_count": 3
+      }
+    },
+    "tokenwise_drop_q1_early": {
+      "rows": [
+        {
+          "frozen_h_seed": 12345,
+          "pre_smp_gap": -0.1472536325454712,
+          "post_smp_gap": 2.3734570741653442,
+          "delta_smp_gap": 2.5207107067108154,
+          "pre_det_gap": -0.1472536325454712,
+          "post_det_gap": 2.3734570741653442,
+          "delta_det_gap": 2.5207107067108154
+        },
+        {
+          "frozen_h_seed": 23456,
+          "pre_smp_gap": 0.034893035888671875,
+          "post_smp_gap": -1.7679710388183594,
+          "delta_smp_gap": -1.8028640747070312,
+          "pre_det_gap": 0.034893035888671875,
+          "post_det_gap": -1.7679710388183594,
+          "delta_det_gap": -1.8028640747070312
+        },
+        {
+          "frozen_h_seed": 34567,
+          "pre_smp_gap": 0.011869192123413086,
+          "post_smp_gap": 0.8721456527709961,
+          "delta_smp_gap": 0.860276460647583,
+          "pre_det_gap": 0.011869192123413086,
+          "post_det_gap": 0.8721456527709961,
+          "delta_det_gap": 0.860276460647583
+        },
+        {
+          "frozen_h_seed": 45678,
+          "pre_smp_gap": -0.18693995475769043,
+          "post_smp_gap": 3.460168242454529,
+          "delta_smp_gap": 3.6471081972122192,
+          "pre_det_gap": -0.18693995475769043,
+          "post_det_gap": 3.460168242454529,
+          "delta_det_gap": 3.6471081972122192
+        }
+      ],
+      "summary": {
+        "delta_smp_gap_mean": 1.3063078224658966,
+        "positive_count": 3,
+        "nonpositive_count": 1
+      }
+    }
+  }
+}

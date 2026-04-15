@@ -1,0 +1,292 @@
+{
+  "audit_entry": "phase3_post_reset_tail_dist2_late_ablation_verify",
+  "base_summary": {
+    "corr_vs_pre_suffix_gap": 0.27756547927856445,
+    "corr_vs_terminal_resets": -0.13439017534255981,
+    "mass_total": 120.14215759560466
+  },
+  "conclusions": {
+    "ablation_improves_pre_gap_alignment": true,
+    "ablation_reduces_reset_bias": true,
+    "new_phase3_trusted_baseline_established": false
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "dist_limit": 2,
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/heldout_suite.pt",
+    "late_k": 4,
+    "n_samples": 2048,
+    "reuse_heldout_subset_delta_json": "/home/chen/RLPFN/artifacts/phase3_env_delta_concentration_probe_max4.json",
+    "reuse_pre_policy_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/ppo_cross_env_baseline.json",
+    "reuse_zero_control_json": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/zero_cross_env_control.json",
+    "runtime_wall_s": 103.69798271497712,
+    "single_eval_pos": 1946,
+    "tail_len": 8,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/train_suite.pt"
+  },
+  "deltas": {
+    "corr_pre_delta": 0.0011874139308929443,
+    "corr_reset_delta": -3.325939178466797e-05
+  },
+  "env_rows": [
+    {
+      "base_positive_mass": 11.336536407470703,
+      "env_index": 0,
+      "env_seed": 2108174692,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.13175880908966064,
+      "remaining_mass": 11.336536407470703,
+      "removed_mass": 0.0,
+      "rollout_seed": 1026265284
+    },
+    {
+      "base_positive_mass": 10.053516387939453,
+      "env_index": 1,
+      "env_seed": 1690508958,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.2958495616912842,
+      "remaining_mass": 9.903009943664074,
+      "removed_mass": 0.15050644427537918,
+      "rollout_seed": 2053028349
+    },
+    {
+      "base_positive_mass": 0.39689889550209045,
+      "env_index": 2,
+      "env_seed": 1891078594,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 1.0591468811035156,
+      "remaining_mass": 0.39689889550209045,
+      "removed_mass": 0.0,
+      "rollout_seed": 712607618
+    },
+    {
+      "base_positive_mass": 26.3325252532959,
+      "env_index": 3,
+      "env_seed": 1422116608,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.9955229088664055,
+      "remaining_mass": 26.3325252532959,
+      "removed_mass": 0.0,
+      "rollout_seed": 405073145
+    },
+    {
+      "base_positive_mass": 0.0,
+      "env_index": 4,
+      "env_seed": 671209925,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 0.0,
+      "removed_mass": 0.0,
+      "rollout_seed": 175250828
+    },
+    {
+      "base_positive_mass": 16.564664840698242,
+      "env_index": 5,
+      "env_seed": 224896980,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 16.533962219953537,
+      "removed_mass": 0.0307026207447052,
+      "rollout_seed": 122603029
+    },
+    {
+      "base_positive_mass": 12.75503921508789,
+      "env_index": 6,
+      "env_seed": 1845844219,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 12.746127158403397,
+      "removed_mass": 0.008912056684494019,
+      "rollout_seed": 376698782
+    },
+    {
+      "base_positive_mass": 12.21436882019043,
+      "env_index": 7,
+      "env_seed": 1426050690,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 11.935619421303272,
+      "removed_mass": 0.27874939888715744,
+      "rollout_seed": 1379243106
+    },
+    {
+      "base_positive_mass": 0.003089454025030136,
+      "env_index": 8,
+      "env_seed": 1098736063,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 0.003089454025030136,
+      "removed_mass": 0.0,
+      "rollout_seed": 1034704523
+    },
+    {
+      "base_positive_mass": 4.1248602867126465,
+      "env_index": 9,
+      "env_seed": 993119803,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 4.1248602867126465,
+      "removed_mass": 0.0,
+      "rollout_seed": 86747796
+    },
+    {
+      "base_positive_mass": 0.06359566748142242,
+      "env_index": 10,
+      "env_seed": 497748661,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 0.06359566748142242,
+      "removed_mass": 0.0,
+      "rollout_seed": 292475123
+    },
+    {
+      "base_positive_mass": 0.24867019057273865,
+      "env_index": 11,
+      "env_seed": 150327249,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 0.24867019057273865,
+      "removed_mass": 0.0,
+      "rollout_seed": 1106573764
+    },
+    {
+      "base_positive_mass": 21.54016876220703,
+      "env_index": 12,
+      "env_seed": 787425143,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 21.54016876220703,
+      "removed_mass": 0.0,
+      "rollout_seed": 1419953343
+    },
+    {
+      "base_positive_mass": 3.192674398422241,
+      "env_index": 13,
+      "env_seed": 858469659,
+      "objective_terminal_reset_count": 1,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 3.1681099142879248,
+      "removed_mass": 0.024564484134316444,
+      "rollout_seed": 966801183
+    },
+    {
+      "base_positive_mass": 0.0,
+      "env_index": 14,
+      "env_seed": 282252270,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 0.0,
+      "removed_mass": 0.0,
+      "rollout_seed": 1265126920
+    },
+    {
+      "base_positive_mass": 1.3155490159988403,
+      "env_index": 15,
+      "env_seed": 405619005,
+      "objective_terminal_reset_count": 0,
+      "objective_token_count": 102,
+      "pre_vs_zero_suffix_gap": 0.0,
+      "remaining_mass": 1.3155490159988403,
+      "removed_mass": 0.0,
+      "rollout_seed": 317615330
+    }
+  ],
+  "heldout_suite_summary": {
+    "action_dim_mean": 13.8125,
+    "batch_size": 16,
+    "family_counts": {
+      "scm": 16
+    },
+    "fingerprint": "41ede11a0fafcda9",
+    "obs_dim_mean": 117.3125,
+    "state_dim_mean": 218.0625,
+    "suite_seed": 67890,
+    "top_structures": [
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 104, 15, 12, 43, 253, 400, 30, 2, 136, <class 'torch.nn.modules.activation.ReLU'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 116, 105, 7, 72, 212, 400, 30, 2, 270, 'sin')"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 136, 46, 2, 227, 37, 400, 30, 8, 40, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 181, 155, 21, 177, 42, 400, 30, 3, 65, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 220, 210, 11, 48, 132, 400, 30, 2, 184, 'sin')"
+      }
+    ],
+    "unique_structures": 16
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  },
+  "post_reset_tail_dist2_late_ablation_summary": {
+    "corr_vs_pre_suffix_gap": 0.2787528932094574,
+    "corr_vs_terminal_resets": -0.13442343473434448,
+    "mass_total": 119.6487225908786
+  },
+  "train_suite_summary": {
+    "action_dim_mean": 16.625,
+    "batch_size": 16,
+    "family_counts": {
+      "scm": 16
+    },
+    "fingerprint": "04f3f0c11c71cff0",
+    "obs_dim_mean": 106.875,
+    "state_dim_mean": 219.125,
+    "suite_seed": 12345,
+    "top_structures": [
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 1, 1, 27, 104, 295, 400, 30, 2, 200, <class 'torch.nn.modules.activation.ReLU'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 120, 117, 5, 264, 16, 400, 30, 8, 26, 'sin')"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 126, 83, 17, 200, 74, 400, 30, 3, 33, 'sin')"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 162, 9, 11, 12, 226, 400, 30, 2, 44, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 165, 62, 9, 180, 55, 400, 30, 7, 45, <class 'torch.nn.modules.activation.ReLU'>)"
+      }
+    ],
+    "unique_structures": 16
+  }
+}

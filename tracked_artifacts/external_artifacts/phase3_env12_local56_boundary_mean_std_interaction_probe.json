@@ -1,0 +1,73 @@
+{
+  "audit_entry": "phase3_env12_local56_boundary_mean_std_interaction_probe",
+  "comparison_rows": [
+    {
+      "boundary_magnitude_delta": 0.5294616333068787,
+      "counter_boundary_shift_norm": -1.689461457277777,
+      "counter_mean_over_std": 1.689461457277777,
+      "counter_mean_raw": 6.666291747625698,
+      "counter_std_raw": 3.9458087184581703,
+      "counterfactual_boundary_magnitude": 1.689461457277777,
+      "current_boundary_magnitude": 1.1599998239708984,
+      "current_boundary_shift_norm": -1.1599998239708984,
+      "current_mean_over_std": 1.1599998239708984,
+      "current_mean_raw": 16.339805603027344,
+      "current_std_raw": 14.086041450500488,
+      "dominant_worsening_driver": "std_too_small",
+      "interaction_delta": -1.7648475268415935,
+      "mean_only_delta": -0.6867446677191155,
+      "reconstruction_error": 2.220446049250313e-16,
+      "scope_name": "objective_all_tokens",
+      "std_only_delta": 2.981053827867588
+    },
+    {
+      "boundary_magnitude_delta": 3.3926696804658194,
+      "counter_boundary_shift_norm": -4.552669504436718,
+      "counter_mean_over_std": 4.552669504436718,
+      "counter_mean_raw": 9.704221123143247,
+      "counter_std_raw": 2.1315452645280275,
+      "counterfactual_boundary_magnitude": 4.552669504436718,
+      "current_boundary_magnitude": 1.1599998239708984,
+      "current_boundary_shift_norm": -1.1599998239708984,
+      "current_mean_over_std": 1.1599998239708984,
+      "current_mean_raw": 16.339805603027344,
+      "current_std_raw": 14.086041450500488,
+      "dominant_worsening_driver": "std_too_small",
+      "interaction_delta": -2.6419642637953706,
+      "mean_only_delta": -0.47107517773549706,
+      "reconstruction_error": -4.440892098500626e-16,
+      "scope_name": "objective_episode0_only",
+      "std_only_delta": 6.505709121996687
+    },
+    {
+      "boundary_magnitude_delta": 0.4568958737750688,
+      "counter_boundary_shift_norm": -1.6168956977459672,
+      "counter_mean_over_std": 1.6168956977459672,
+      "counter_mean_raw": 2.818247871970137,
+      "counter_std_raw": 1.742999177930224,
+      "counterfactual_boundary_magnitude": 1.6168956977459672,
+      "current_boundary_magnitude": 1.1599998239708984,
+      "current_boundary_shift_norm": -1.1599998239708984,
+      "current_mean_over_std": 1.1599998239708984,
+      "current_mean_raw": 16.339805603027344,
+      "current_std_raw": 14.086041450500488,
+      "dominant_worsening_driver": "std_too_small",
+      "interaction_delta": -6.7977125946971855,
+      "mean_only_delta": -0.9599260216983655,
+      "reconstruction_error": -2.220446049250313e-16,
+      "scope_name": "objective_episode1_only",
+      "std_only_delta": 8.21453449017062
+    }
+  ],
+  "conclusions": {
+    "episode0_worsening_is_std_dominated": true,
+    "episode1_worsening_is_std_dominated": true,
+    "interaction_offsets_part_of_std_worsening_in_all_objective_scopes": true,
+    "mean_change_alone_would_shrink_penalty_in_all_objective_scopes": true,
+    "objective_all_worsening_is_std_dominated": true,
+    "std_change_alone_would_worsen_penalty_in_all_objective_scopes": true
+  },
+  "config": {
+    "source_boundary_scope_counterfactual_json": "/home/chen/RLPFN/artifacts/phase3_env12_local56_boundary_scope_counterfactual_probe.json"
+  }
+}

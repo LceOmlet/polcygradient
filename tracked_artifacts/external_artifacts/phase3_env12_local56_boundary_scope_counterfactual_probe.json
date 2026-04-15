@@ -1,0 +1,70 @@
+{
+  "audit_entry": "phase3_env12_local56_boundary_scope_counterfactual_probe",
+  "conclusions": {
+    "naive_objective_aligned_scope_change_should_not_be_promoted_to_fix": true,
+    "no_objective_aligned_scope_shrinks_local56_boundary_penalty": true,
+    "objective_all_centering_worsens_boundary_penalty_vs_current": true,
+    "objective_episode0_centering_worsens_boundary_penalty_vs_current": true,
+    "objective_episode1_centering_worsens_boundary_penalty_vs_current": true
+  },
+  "config": {
+    "env_index": 12,
+    "source_boundary_contract_json": "/home/chen/RLPFN/artifacts/phase3_env12_local56_boundary_contract_probe.json",
+    "source_gae_path_json": "/home/chen/RLPFN/artifacts/phase3_residual_anchor_gae_path_probe.json",
+    "suite_name": "pair2"
+  },
+  "local56_readout": {
+    "current_boundary_shift_norm": -1.1599998239708984,
+    "current_reward_norm_before_value_term": -1.1878736386941755,
+    "current_reward_over_std": -0.027873814723277174,
+    "global_step": 2002,
+    "objective_local_index": 56,
+    "reward_raw": -0.3926317095756531
+  },
+  "scope_rows": [
+    {
+      "boundary_magnitude_ratio_vs_current": 1.0,
+      "local56_boundary_shift_norm": -1.1599998239708984,
+      "local56_reward_norm_before_value_term": -1.1878736386941755,
+      "local56_reward_over_std": -0.027873814723277174,
+      "mean_over_std": 1.1599998239708984,
+      "mean_raw": 16.339805603027344,
+      "scope_name": "current_full_rollout",
+      "std_raw": 14.086041450500488,
+      "token_count": 2048
+    },
+    {
+      "boundary_magnitude_ratio_vs_current": 1.45643251176921,
+      "local56_boundary_shift_norm": -1.689461457277777,
+      "local56_reward_norm_before_value_term": -1.7889674743178212,
+      "local56_reward_over_std": -0.09950601704004405,
+      "mean_over_std": 1.689461457277777,
+      "mean_raw": 6.666291747625698,
+      "scope_name": "objective_all_tokens",
+      "std_raw": 3.9458087184581703,
+      "token_count": 102
+    },
+    {
+      "boundary_magnitude_ratio_vs_current": 3.924715685604219,
+      "local56_boundary_shift_norm": -4.552669504436718,
+      "local56_reward_norm_before_value_term": -4.736870007287681,
+      "local56_reward_over_std": -0.18420050285096368,
+      "mean_over_std": 4.552669504436718,
+      "mean_raw": 9.704221123143247,
+      "scope_name": "objective_episode0_only",
+      "std_raw": 2.1315452645280275,
+      "token_count": 57
+    },
+    {
+      "boundary_magnitude_ratio_vs_current": 1.3938758130247193,
+      "local56_boundary_shift_norm": -1.6168956977459672,
+      "local56_reward_norm_before_value_term": -1.8421578289891358,
+      "local56_reward_over_std": -0.22526213124316857,
+      "mean_over_std": 1.6168956977459672,
+      "mean_raw": 2.818247871970137,
+      "scope_name": "objective_episode1_only",
+      "std_raw": 1.742999177930224,
+      "token_count": 45
+    }
+  ]
+}

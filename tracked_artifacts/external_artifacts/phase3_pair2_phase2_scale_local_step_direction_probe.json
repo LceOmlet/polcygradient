@@ -1,0 +1,119 @@
+{
+  "actor_only": {
+    "aux_flow_weight": 0.2,
+    "aux_q_weight": 0.0,
+    "clip_grad_norm_total_pre_clip": 0.11292485892772675,
+    "delta_norm": 0.0360880121588707,
+    "ent_coef": 0.0,
+    "entropy_loss": -22.15822410583496,
+    "env_index": 12,
+    "grad_norm_pre_clip_flat": 0.11291873455047607,
+    "loss_mode": "actor_only",
+    "loss_total_scalar": 0.00015528748917859048,
+    "objective_total": 192,
+    "policy_loss": 0.00015528748917859048,
+    "value_loss": 1.149062991142273,
+    "vf_coef": 0.5
+  },
+  "alignment": {
+    "delta_actor_vs_full": {
+      "candidate_norm": 0.04133513942360878,
+      "cosine": 0.8892663378371908,
+      "dot": 0.0013265212764963508,
+      "projection_on_reference": 1.0185639457613322,
+      "reference_norm": 0.0360880121588707
+    },
+    "delta_residual_vs_actor": {
+      "candidate_norm": 0.019048403948545456,
+      "cosine": 0.031602329955936204,
+      "dot": 2.1724043108406477e-05,
+      "projection_on_reference": 0.016680717798082487,
+      "reference_norm": 0.0360880121588707
+    },
+    "grad_actor_vs_full": {
+      "candidate_norm": 6.695580005645752,
+      "cosine": 0.017400420572603232,
+      "dot": 0.013155699707567692,
+      "projection_on_reference": 1.0317677446488707,
+      "reference_norm": 0.11291873455047607
+    },
+    "grad_residual_vs_actor": {
+      "candidate_norm": 6.694566249847412,
+      "cosine": 0.0005345376653355044,
+      "dot": 0.00040407944470643997,
+      "projection_on_reference": 0.031690913185248866,
+      "reference_norm": 0.11291873455047607
+    }
+  },
+  "conclusions": {
+    "auxiliary_shared_core_path_is_still_unchecked_in_this_compare": true,
+    "full_main_loss_delta_is_not_opposed_to_actor_only_step": true,
+    "full_main_loss_gradient_is_dominated_by_non_actor_component": true,
+    "full_main_loss_residual_is_roughly_orthogonal_not_opposing": true,
+    "shared_core_value_path_simple_opposition_is_not_supported": true
+  },
+  "config": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "compare_scope": "actor_only vs policy+entropy+value main_loss on the same pre-batch13 state",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "n_steps": 256,
+    "outer_epochs_reference": 2,
+    "pre_branch_prefix_steps": 12,
+    "read_only_branch_compare": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_outer_batch_idx": 13,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "full_main_loss": {
+    "aux_flow_weight": 0.2,
+    "aux_q_weight": 0.0,
+    "clip_grad_norm_total_pre_clip": 6.696481704711914,
+    "delta_norm": 0.04133513942360878,
+    "ent_coef": 0.0,
+    "entropy_loss": -22.15822410583496,
+    "env_index": 12,
+    "grad_norm_pre_clip_flat": 6.695580005645752,
+    "loss_mode": "full_main_loss",
+    "loss_total_scalar": 0.5746867656707764,
+    "objective_total": 192,
+    "policy_loss": 0.00015528748917859048,
+    "value_loss": 1.149062991142273,
+    "vf_coef": 0.5
+  },
+  "phase2_reference_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "ppo_reset_env_state_at_sep": true,
+    "shared_actor_critic_backbone": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_local_step_direction_probe",
+  "recommendation": {
+    "next_focus": "local_step_component_split",
+    "reason": "This compare does not support a simple opposite-direction value interference story. The next narrow question is whether the non-actor local-step component is mainly value-path or auxiliary shared-core traffic."
+  },
+  "runtime": {
+    "elapsed_wall_time_sec": 27.70612142700702
+  },
+  "target_batch": {
+    "env_index": 12,
+    "objective_total": 192,
+    "outer_batch_idx": 13
+  }
+}

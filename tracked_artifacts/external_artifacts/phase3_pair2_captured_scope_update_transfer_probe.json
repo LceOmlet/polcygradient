@@ -1,0 +1,144 @@
+{
+  "available_snapshot_scope": {
+    "objective_segments": [
+      {
+        "env_index": 0,
+        "objective_episode_index": 2,
+        "objective_position_max": 101,
+        "objective_position_min": 0,
+        "token_count": 102
+      }
+    ],
+    "selected_scope": {
+      "env_index": 0,
+      "objective_episode_index": 2,
+      "objective_position_max": 101,
+      "objective_position_min": 0,
+      "token_count": 102
+    },
+    "selected_scope_equals_whole_batch_objective": true,
+    "selected_scope_is_single_env_single_episode": true,
+    "selected_scope_reason": "single_available_objective_segment"
+  },
+  "baseline": {
+    "captured_scope": {
+      "policy_num_from_clipped_objective": {
+        "abs_mass": 77.33426445908844,
+        "mean": 1.9042898772978315e-05,
+        "negative_mass": 38.6661610417068,
+        "positive_mass": 38.668103417381644,
+        "signed_sum": 0.0019423756748437881,
+        "token_count": 102
+      },
+      "post_normalization_advantages": {
+        "abs_mass": 77.3797246045433,
+        "mean": -6.706435598579108e-09,
+        "negative_mass": 38.689862644299865,
+        "positive_mass": 38.689861960243434,
+        "signed_sum": -6.84056431055069e-07,
+        "token_count": 102
+      },
+      "pre_normalization_actor_advantages": {
+        "abs_mass": 7.23355102352798,
+        "mean": -0.07091716689733314,
+        "negative_mass": 7.23355102352798,
+        "positive_mass": 0.0,
+        "signed_sum": -7.23355102352798,
+        "token_count": 102
+      }
+    },
+    "ratio_and_clipping": {
+      "clip_active_fraction": 0.5784313725490197,
+      "ratio_mean": 0.9993933608718947
+    }
+  },
+  "conclusions": {
+    "captured_scope_equals_whole_batch_objective": true,
+    "captured_scope_is_non_target_env": true,
+    "captured_scope_policy_stage_changed": false,
+    "captured_scope_post_stage_changed": false,
+    "captured_scope_pre_stage_changed": false,
+    "captured_scope_ratio_or_clip_changed": false,
+    "current_snapshot_cannot_support_in_batch_many_env_dilution_claim": true,
+    "current_snapshot_is_not_the_transfer_site_for_env12_branch_specific_gain": true
+  },
+  "delta": {
+    "captured_scope": {
+      "policy_num_from_clipped_objective": {
+        "abs_mass_delta": 0.0,
+        "mean_delta": 0.0,
+        "negative_mass_delta": 0.0,
+        "positive_mass_delta": 0.0,
+        "signed_sum_delta": 0.0
+      },
+      "post_normalization_advantages": {
+        "abs_mass_delta": 0.0,
+        "mean_delta": 0.0,
+        "negative_mass_delta": 0.0,
+        "positive_mass_delta": 0.0,
+        "signed_sum_delta": 0.0
+      },
+      "pre_normalization_actor_advantages": {
+        "abs_mass_delta": 0.0,
+        "mean_delta": 0.0,
+        "negative_mass_delta": 0.0,
+        "positive_mass_delta": 0.0,
+        "signed_sum_delta": 0.0
+      }
+    },
+    "ratio_and_clipping": {
+      "clip_active_fraction_delta": 0.0,
+      "ratio_mean_delta": 0.0
+    }
+  },
+  "inputs": {
+    "exact_update_aggregation_audit_json": "/home/chen/RLPFN/artifacts/phase3_pair2_exact_update_aggregation_audit.json"
+  },
+  "override": {
+    "captured_scope": {
+      "policy_num_from_clipped_objective": {
+        "abs_mass": 77.33426445908844,
+        "mean": 1.9042898772978315e-05,
+        "negative_mass": 38.6661610417068,
+        "positive_mass": 38.668103417381644,
+        "signed_sum": 0.0019423756748437881,
+        "token_count": 102
+      },
+      "post_normalization_advantages": {
+        "abs_mass": 77.3797246045433,
+        "mean": -6.706435598579108e-09,
+        "negative_mass": 38.689862644299865,
+        "positive_mass": 38.689861960243434,
+        "signed_sum": -6.84056431055069e-07,
+        "token_count": 102
+      },
+      "pre_normalization_actor_advantages": {
+        "abs_mass": 7.23355102352798,
+        "mean": -0.07091716689733314,
+        "negative_mass": 7.23355102352798,
+        "positive_mass": 0.0,
+        "signed_sum": -7.23355102352798,
+        "token_count": 102
+      }
+    },
+    "ratio_and_clipping": {
+      "clip_active_fraction": 0.5784313725490197,
+      "ratio_mean": 0.9993933608718947
+    }
+  },
+  "probe_entry": "phase3_pair2_captured_scope_update_transfer_probe",
+  "recommendation": {
+    "next_focus": "target_present_train_side_selector_trace_or_snapshot",
+    "reason": "The current captured strict outer batch is a single env0 objective segment that already equals the whole-batch objective, and the branch-specific override leaves its pre/post/policy stages unchanged. This snapshot can rule out transfer occurring inside this captured batch, but it cannot quantify many-env mixing for env12 because env12 is not present here."
+  },
+  "strict_contract": {
+    "baseline_actor_objective_mode": "tokenwise",
+    "batch_size_flat": 256,
+    "epoch_idx": 1,
+    "normalize_advantage": true,
+    "objective_total": 102,
+    "outer_batch_idx": 8,
+    "override_actor_objective_mode": "tokenwise_scale_env12_mid_episode_extension_block",
+    "runtime_suite_name": "pair2"
+  }
+}

@@ -1,0 +1,52 @@
+{
+  "audit_entry": "phase3_future_carry_source_chain_compare_pack",
+  "comparison": {
+    "dominant_source_difference": true,
+    "env1": {
+      "dominant_negative_source": "true_negative_future_residual",
+      "env_index": 1,
+      "negative_contribution_total": 1.0961287939466946,
+      "negative_source_shares": {
+        "baseline_bootstrap_semantic_mismatch": 0.26676411147412926,
+        "true_negative_future_residual": 0.7332358885258707
+      },
+      "start_token_count": 7
+    },
+    "env12": {
+      "dominant_negative_source": "terminal_reset_tail_semantic_mismatch",
+      "env_index": 12,
+      "negative_contribution_total": 15.738703311659943,
+      "negative_source_shares": {
+        "baseline_bootstrap_semantic_mismatch": 0.25829536613335724,
+        "terminal_reset_tail_semantic_mismatch": 0.7417046338666428
+      },
+      "start_token_count": 23
+    },
+    "shared_negative_sources": [
+      "baseline_bootstrap_semantic_mismatch"
+    ],
+    "shared_source_summary": {
+      "baseline_bootstrap_semantic_mismatch": {
+        "env12_share": 0.25829536613335724,
+        "env1_share": 0.26676411147412926,
+        "mean_share": 0.26252973880374325,
+        "min_share": 0.25829536613335724
+      }
+    }
+  },
+  "conclusions": {
+    "branch_specific_targets_remain": true,
+    "env12_branch_specific_dominant_source_is_terminal_reset_tail": true,
+    "env1_branch_specific_dominant_source_is_true_negative_future_residual": true,
+    "future_carry_source_chain_is_not_single_dominant_bucket": true,
+    "shared_small_fix_candidate_is_baseline_bootstrap_semantic_mismatch": true
+  },
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_fix_target": "baseline_bootstrap_semantic_mismatch",
+    "reason": "The only shared negative source across env12 and env1 is the baseline bootstrap semantic mismatch; dominant sources differ, so any narrow repair must stay branch-aware.",
+    "shared_candidate_supported": true
+  },
+  "source_env12_json": "/home/chen/RLPFN/artifacts/phase3_future_carry_source_chain_probe_pair2_env12.json",
+  "source_env1_json": "/home/chen/RLPFN/artifacts/phase3_future_carry_source_chain_probe_pair2_env1.json"
+}

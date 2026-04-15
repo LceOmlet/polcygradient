@@ -1,0 +1,293 @@
+{
+  "allowed_next_differences": [
+    "many-env n_envs/env_rng_seeds/rollout_rng_seeds",
+    "exactly one explicitly declared narrow actor-objective adjustment in a later A/B"
+  ],
+  "audit_entry": "phase3_preflight_contract_check",
+  "built_runtime": {
+    "actor_core_force_native_eval_forward_step": true,
+    "algo_deterministic_actor_sampling": true,
+    "algo_deterministic_batch_plan": true,
+    "algo_strict_fixed_env_mode": true,
+    "algo_strict_native_rollout": true,
+    "rollout_buffer_actor_baseline_mode": "learned",
+    "rollout_buffer_actor_gae_space": "normalized",
+    "rollout_buffer_actor_objective_mode": "tokenwise",
+    "rollout_buffer_deterministic_batch_plan": true,
+    "value_core_force_native_eval_forward_step": null,
+    "vec_env_num_envs": 16,
+    "vec_env_sample_seed_list": [
+      1969722475,
+      1333015435,
+      106507308,
+      1644004828,
+      641563549,
+      1147437554,
+      635494866,
+      1151777022,
+      291981711,
+      1925053562,
+      968158028,
+      1995554707,
+      52348860,
+      813573471,
+      458281484,
+      2129455893
+    ]
+  },
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "contract_args": {
+    "batch_size": 256,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_samples": 256,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "train_profile": "phase2_shared_backbone_contract"
+  },
+  "contract_diff": {
+    "all_diff": {
+      "env_rng_seeds": {
+        "phase2": [
+          2020
+        ],
+        "phase3": [
+          1969722475,
+          1333015435,
+          106507308,
+          1644004828,
+          641563549,
+          1147437554,
+          635494866,
+          1151777022,
+          291981711,
+          1925053562,
+          968158028,
+          1995554707,
+          52348860,
+          813573471,
+          458281484,
+          2129455893
+        ]
+      },
+      "n_envs": {
+        "phase2": 1,
+        "phase3": 16
+      },
+      "rollout_rng_seeds": {
+        "phase2": [
+          4040
+        ],
+        "phase3": [
+          1934431487,
+          674693019,
+          2061019613,
+          591143702,
+          1643873512,
+          220389510,
+          1076620996,
+          120552648,
+          1736602171,
+          393249907,
+          1399540930,
+          1032139217,
+          2056709386,
+          49253520,
+          937446903,
+          401686884
+        ]
+      }
+    },
+    "allowed_diff": {
+      "env_rng_seeds": {
+        "phase2": [
+          2020
+        ],
+        "phase3": [
+          1969722475,
+          1333015435,
+          106507308,
+          1644004828,
+          641563549,
+          1147437554,
+          635494866,
+          1151777022,
+          291981711,
+          1925053562,
+          968158028,
+          1995554707,
+          52348860,
+          813573471,
+          458281484,
+          2129455893
+        ]
+      },
+      "n_envs": {
+        "phase2": 1,
+        "phase3": 16
+      },
+      "rollout_rng_seeds": {
+        "phase2": [
+          4040
+        ],
+        "phase3": [
+          1934431487,
+          674693019,
+          2061019613,
+          591143702,
+          1643873512,
+          220389510,
+          1076620996,
+          120552648,
+          1736602171,
+          393249907,
+          1399540930,
+          1032139217,
+          2056709386,
+          49253520,
+          937446903,
+          401686884
+        ]
+      }
+    },
+    "allowed_diff_keys": [
+      "env_rng_seeds",
+      "n_envs",
+      "rollout_rng_seeds"
+    ],
+    "unexpected_diff": {},
+    "unexpected_diff_count": 0,
+    "unexpected_diff_free": true
+  },
+  "device": "cuda:0",
+  "elapsed_wall_time_sec": 1.6969194570556283,
+  "forbidden_drift": [
+    "actor-only substitution",
+    "aux-flow/q-runtime override drift",
+    "pooled weighting repair",
+    "unguarded official eval shortcut in trusted compare",
+    "normalize_advantage=True",
+    "separate value backbone"
+  ],
+  "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+  "milestone_compare_path": "/home/chen/RLPFN/artifacts/phase3_phase2_milestone_contract_gradient_compare.json",
+  "phase2_signature": {
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "actor_objective_runtime_current_suite_name": null,
+    "batch_size": 256,
+    "clip_range": 0.2,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "ent_coef": 0.0,
+    "env_rng_seeds": [
+      2020
+    ],
+    "gae_lambda": 0.95,
+    "gamma": 1.0,
+    "learning_rate": 0.0002,
+    "max_grad_norm": 0.5,
+    "n_envs": 1,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "normalize_advantage": false,
+    "reset_env_state_at_sep": true,
+    "restore_validation_policy_state": false,
+    "rollout_rng_seeds": [
+      4040
+    ],
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "separate_value_backbone": false,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "vf_coef": 0.5
+  },
+  "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+  "phase3_many_env_signature": {
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "actor_objective_runtime_current_suite_name": null,
+    "batch_size": 256,
+    "clip_range": 0.2,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "ent_coef": 0.0,
+    "env_rng_seeds": [
+      1969722475,
+      1333015435,
+      106507308,
+      1644004828,
+      641563549,
+      1147437554,
+      635494866,
+      1151777022,
+      291981711,
+      1925053562,
+      968158028,
+      1995554707,
+      52348860,
+      813573471,
+      458281484,
+      2129455893
+    ],
+    "gae_lambda": 0.95,
+    "gamma": 1.0,
+    "learning_rate": 0.0002,
+    "max_grad_norm": 0.5,
+    "n_envs": 16,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "normalize_advantage": false,
+    "reset_env_state_at_sep": true,
+    "restore_validation_policy_state": false,
+    "rollout_rng_seeds": [
+      1934431487,
+      674693019,
+      2061019613,
+      591143702,
+      1643873512,
+      220389510,
+      1076620996,
+      120552648,
+      1736602171,
+      393249907,
+      1399540930,
+      1032139217,
+      2056709386,
+      49253520,
+      937446903,
+      401686884
+    ],
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "separate_value_backbone": false,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "vf_coef": 0.5
+  },
+  "preflight_passed": true,
+  "runtime_checks": {
+    "actor_core_force_native_enabled": true,
+    "build_strict_native_rollout_enabled": true,
+    "deterministic_actor_sampling_enabled": true,
+    "deterministic_batch_plan_enabled": true,
+    "milestone_gradient_exact_match": true,
+    "phase2_guardrail_passed": true,
+    "strict_fixed_env_mode_enabled": true,
+    "strict_native_rollout_enabled": true,
+    "suite_batch_matches_n_envs": true,
+    "suite_seed_lengths_match_n_envs": true,
+    "unexpected_contract_diff_free": true,
+    "vec_env_seed_binding_matches_suite": true
+  },
+  "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+}

@@ -1,0 +1,115 @@
+{
+  "audit_entry": "phase3_train_rollout_quality_mode_side_effect_compare_pack",
+  "baseline_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe_seed13579.json",
+  "comparison": {
+    "max_abs_metric_delta": 0.0,
+    "metric_deltas": {
+      "normalized_actor_adv_abs_mass": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "normalized_actor_adv_first16_positive_share": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "normalized_actor_adv_last16_positive_share": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "normalized_actor_adv_positive_mass": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "objective_episode_count": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "objective_terminal_reset_count": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "pre_vs_zero_suffix_gap": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "raw_actor_adv_abs_mass": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "raw_actor_adv_positive_mass": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      },
+      "raw_value_return_corr": {
+        "max_abs_delta": 0.0,
+        "mean_delta": 0.0
+      }
+    },
+    "most_shifted_env_index": 0,
+    "most_shifted_metric": {
+      "max_abs_delta": 0.0,
+      "mean_delta": 0.0,
+      "name": "normalized_actor_adv_positive_mass"
+    }
+  },
+  "conclusions": {
+    "runtime_mode_no_other_suite_side_effects": true,
+    "same_suite_fingerprint_checked": true,
+    "side_effects_are_detectable_in_train_side_ab": false,
+    "suite_contract_unmodified": true
+  },
+  "override_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe_seed13579_env12_mode.json",
+  "recommendation": {
+    "branch_specific_scope_gate_needed": false,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "reason": "Compare baseline and runtime-mode train-side rollout quality artifacts on the same suite contract to verify whether the branch-specific mode stays local or leaks into other suites.",
+    "shared_core_unchanged": true
+  },
+  "suite_context": {
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "heldout_suite_fingerprint": "fb05feda47dc0f4f",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/heldout_suite.pt",
+    "n_samples": 2048,
+    "single_eval_pos": 1946,
+    "strict_fixed_env_mode": true,
+    "train_env_rng_seeds": [
+      313143644,
+      404077994,
+      723695242,
+      2031096653,
+      1806714602,
+      1940103593,
+      267189469,
+      1934332254,
+      746870533,
+      1133505298,
+      666073955,
+      2074329890,
+      880811437,
+      434916848,
+      1676988979,
+      1009436592
+    ],
+    "train_rollout_rng_seeds": [
+      1538400912,
+      164846267,
+      1648075888,
+      1782898837,
+      756775850,
+      110973976,
+      650451962,
+      1282295264,
+      1219157974,
+      216311621,
+      271053141,
+      318687675,
+      209274024,
+      1395520510,
+      1228782243,
+      292917765
+    ],
+    "train_suite_fingerprint": "d7c6a96c0f77cd30",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline/suites/seed_13579/train_suite.pt"
+  }
+}

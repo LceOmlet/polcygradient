@@ -1,0 +1,78 @@
+{
+  "audit_entry": "phase3_pair2_proxy_to_train_transfer_audit",
+  "batch_mass_context": {
+    "env_count": 16,
+    "total_normalized_actor_adv_abs_mass": 1034.5288772583008,
+    "total_normalized_actor_adv_negative_mass": 517.2644292265177,
+    "total_normalized_actor_adv_positive_mass": 517.264418669045,
+    "total_objective_tokens": 1632
+  },
+  "conclusions": {
+    "local_proxy_gain_did_not_move_suite_suffix_metric": true,
+    "local_proxy_improvement_is_real": true,
+    "local_proxy_improvement_is_too_small_relative_to_batch_mass": true,
+    "local_proxy_improvement_is_too_small_to_flip_env12_negative_mass": true,
+    "proxy_to_train_transfer_failure_is_not_surprising_given_mass_dilution": true,
+    "target_side_train_update_changed_but_not_in_the_desired_direction": true
+  },
+  "inputs": {
+    "env12_counterfactual_json": "/home/chen/RLPFN/artifacts/phase3_env12_mid_episode_extension_counterfactual_pack.json",
+    "pair2_train_rollout_quality_json": "/home/chen/RLPFN/artifacts/phase3_train_rollout_quality_probe_pair2.json",
+    "pair2_train_update_ab_compare_json": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_compare_pack.json",
+    "target_env_index": 12
+  },
+  "local_proxy_vs_batch_weighted_transfer": {
+    "block_abs_future_carry_shrink_per_row": 0.02045608926564456,
+    "block_abs_future_carry_shrink_total": 0.08182435706257823,
+    "block_abs_shrink_share_of_batch_abs_mass": 7.909335240542382e-05,
+    "block_abs_shrink_share_of_batch_negative_mass": 0.00015818670768630438,
+    "block_abs_shrink_share_of_env12_negative_mass": 0.0008619798821655531,
+    "block_row_count": 4,
+    "block_token_fraction_of_batch": 0.0024509803921568627
+  },
+  "recommendation": {
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "next_focus": "proxy_to_train_update_transfer_semantics",
+    "reason": "The env12 branch-specific gate materially improves a local carry proxy, but the affected four-token block accounts for only a tiny fraction of the pair2 batch-weighted actor-advantage mass. The next root-cause step should inspect update aggregation semantics (advantage normalization, clipping, and many-env mixing), not tune the block itself.",
+    "shared_guardrail_unchanged": true
+  },
+  "suite_context": {
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "eval_n_samples": 256,
+    "heldout_suite_fingerprint": "ec11e526e4f6f68d",
+    "n_samples": 2048,
+    "single_eval_pos": 1946,
+    "strict_fixed_env_mode": true,
+    "train_suite_fingerprint": "207a0b2867895288"
+  },
+  "target_env_context": {
+    "env_index": 12,
+    "env_seed": 52348860,
+    "normalized_actor_adv_abs_mass": 114.56297302246094,
+    "normalized_actor_adv_abs_mass_share_of_batch": 0.11073927034890965,
+    "normalized_actor_adv_negative_mass": 94.92606353759766,
+    "normalized_actor_adv_negative_mass_share_of_batch": 0.18351554480470209,
+    "normalized_actor_adv_positive_mass": 19.636905670166016,
+    "normalized_actor_adv_positive_mass_share_of_batch": 0.03796299331914817,
+    "objective_terminal_reset_count": 2,
+    "objective_token_count": 102,
+    "pre_vs_zero_full_gap": 757.0193786621094,
+    "pre_vs_zero_suffix_gap": 37.74213409423828,
+    "raw_value_return_corr": 0.02411716803908348,
+    "rollout_seed": 2056709386
+  },
+  "train_side_outcome": {
+    "post_train_vs_zero_gap_delta": {
+      "full_return_gap": -0.018476486206054688,
+      "suffix_return_gap": 0.0
+    },
+    "pre_train_vs_zero_gap_delta": {
+      "full_return_gap": 0.0,
+      "suffix_return_gap": 0.0
+    },
+    "train_full_return_delta_change": -0.018476486206054688,
+    "train_history_identical": true,
+    "train_suffix_return_delta_change": 0.0
+  }
+}

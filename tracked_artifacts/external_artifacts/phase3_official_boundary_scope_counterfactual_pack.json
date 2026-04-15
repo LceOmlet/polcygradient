@@ -1,0 +1,243 @@
+{
+  "aggregate": {
+    "all_points_current_match_full_rollout_centering_contract": true,
+    "all_points_objective_counterfactual_worsens_boundary_penalty": true,
+    "all_points_replay_stable": true,
+    "all_points_show_low_variance_objective_window": true,
+    "all_points_show_std_collapse_from_truncating_high_variance_prefix": true,
+    "all_points_would_shrink_boundary_abs_under_full_vs_objective": true,
+    "all_points_would_shrink_reward_norm_abs_under_full_vs_objective": true,
+    "boundary_abs_shrink_if_using_full_over_objective": {
+      "max": 0.9142361359189373,
+      "mean": 0.6067988707112554,
+      "min": 0.4359797343367522
+    },
+    "objective_std_ratio_vs_full": {
+      "max": 0.2385823576305029,
+      "mean": 0.13854139745419444,
+      "min": 0.07306772587826439
+    },
+    "official_point_count": 3,
+    "point_names": [
+      "seed13579_env12",
+      "pair2_env13",
+      "pair1_env13"
+    ],
+    "reward_norm_abs_shrink_if_using_full_over_objective": {
+      "max": 2.1710837811894965,
+      "mean": 1.4054061663823496,
+      "min": 0.2850151682358222
+    },
+    "within_prefix_share": {
+      "max": 0.9822020686368395,
+      "mean": 0.9558286725333881,
+      "min": 0.9362299831689823
+    }
+  },
+  "audit_entry": "phase3_official_boundary_scope_counterfactual_pack",
+  "conclusions": {
+    "counterfactual_pack_supports_small_scope_contract_lock_not_broad_objective_rewrite": true,
+    "official_saved_points_support_full_rollout_centering_as_cross_point_guardrail": true,
+    "pack_demonstrates_cross_point_coverage_for_boundary_scope_failure_mode": true,
+    "pack_is_guardrail_evidence_not_yet_new_runtime_fix": true,
+    "pack_proves_current_saved_points_already_use_the_better_contract": true
+  },
+  "config": {
+    "official_saved_points": [
+      {
+        "canonical_json": "/home/chen/RLPFN/artifacts/phase3_seed13579_env12_terminal_scale_chain_probe.json",
+        "point_name": "seed13579_env12",
+        "repeat_json": "/home/chen/RLPFN/artifacts/phase3_seed13579_env12_terminal_scale_chain_probe_repeatB.json"
+      },
+      {
+        "canonical_json": "/home/chen/RLPFN/artifacts/phase3_pair2_env13_terminal_scale_chain_probe.json",
+        "point_name": "pair2_env13",
+        "repeat_json": "/home/chen/RLPFN/artifacts/phase3_pair2_env13_terminal_scale_chain_probe_repeatB.json"
+      },
+      {
+        "canonical_json": "/home/chen/RLPFN/artifacts/phase3_pair1_env13_terminal_scale_chain_probe.json",
+        "point_name": "pair1_env13",
+        "repeat_json": "/home/chen/RLPFN/artifacts/phase3_pair1_env13_terminal_scale_chain_probe_repeatB.json"
+      }
+    ]
+  },
+  "point_summaries": [
+    {
+      "boundary_contract_core": {
+        "full_rollout_mean_over_std": -1.145048093605822,
+        "full_rollout_mean_raw": -28.077289581298825,
+        "full_rollout_std_raw": 24.520620346069336,
+        "objective_subset_gap_vs_full_mean_over_std": -0.4359797343367522,
+        "objective_subset_mean_over_std": -1.5810278279425742,
+        "objective_subset_mean_raw": -4.030845702717118,
+        "objective_subset_std_raw": 2.549509649025308
+      },
+      "contract_checks": {
+        "current_matches_full_rollout_centering_contract": true,
+        "objective_counterfactual_worsens_boundary_penalty": true,
+        "objective_scope_std_collapse_is_explained_by_truncating_high_variance_prefix": true,
+        "objective_window_is_low_variance_slice_not_high_variance_source": true
+      },
+      "env_index": 12,
+      "point_name": "seed13579_env12",
+      "repeat_stability_checks": {
+        "boundary_contract": true,
+        "conclusions": true,
+        "config_subset": true,
+        "mean_source": true,
+        "scale_collapse": true,
+        "selected_target_local_readout": true
+      },
+      "runtime_wall_s_total": {
+        "canonical": 111.82816450297832,
+        "repeatB": 114.70819528284483
+      },
+      "scale_collapse_core": {
+        "between_episode_means_share": 0.16795869337699107,
+        "between_prefix_objective_share": 0.05040761488836315,
+        "dominant_objective_variance_source": "within_episode0",
+        "full_to_objective_variance_multiple": 92.50167276741882,
+        "objective_std_ratio_vs_full": 0.10397410885381599,
+        "objective_variance_ratio_vs_full": 0.010810615311945175,
+        "within_prefix_share": 0.9490539657943426
+      },
+      "scope_counterfactual": {
+        "boundary_abs_ratio_current_over_objective": 0.7242428459313698,
+        "boundary_abs_shrink_if_using_full_over_objective": 0.4359797343367522,
+        "counterfactual_boundary_abs": 1.5810278279425742,
+        "counterfactual_boundary_shift_norm": 1.5810278279425742,
+        "counterfactual_reward_norm_abs": 1.4125454575193064,
+        "counterfactual_reward_norm_before_value_term": 1.4125454575193064,
+        "counterfactual_scope_name": "objective_all_tokens",
+        "current_boundary_abs": 1.145048093605822,
+        "current_boundary_shift_norm": 1.145048093605822,
+        "current_reward_norm_abs": 1.1275302892834842,
+        "current_reward_norm_before_value_term": 1.1275302892834842,
+        "current_scope_name": "current_full_rollout",
+        "reward_norm_abs_ratio_current_over_objective": 0.7982258434809156,
+        "reward_norm_abs_shrink_if_using_full_over_objective": 0.2850151682358222
+      },
+      "selected_target_local_index": 90,
+      "suite_name": "seed13579",
+      "terminal_global_step": 2036
+    },
+    {
+      "boundary_contract_core": {
+        "full_rollout_mean_over_std": -1.2245375758783152,
+        "full_rollout_mean_raw": -3.8278255462646484,
+        "full_rollout_std_raw": 3.1259355545043945,
+        "objective_subset_gap_vs_full_mean_over_std": -0.47018074187807657,
+        "objective_subset_mean_over_std": -1.6947183177563918,
+        "objective_subset_mean_raw": -0.3870821411118788,
+        "objective_subset_std_raw": 0.22840500220964752
+      },
+      "contract_checks": {
+        "current_matches_full_rollout_centering_contract": true,
+        "objective_counterfactual_worsens_boundary_penalty": true,
+        "objective_scope_std_collapse_is_explained_by_truncating_high_variance_prefix": true,
+        "objective_window_is_low_variance_slice_not_high_variance_source": true
+      },
+      "env_index": 13,
+      "point_name": "pair2_env13",
+      "repeat_stability_checks": {
+        "boundary_contract": true,
+        "conclusions": true,
+        "config_subset": true,
+        "mean_source": true,
+        "scale_collapse": true,
+        "selected_target_local_readout": true
+      },
+      "runtime_wall_s_total": {
+        "canonical": 111.54237114987336,
+        "repeatB": 113.2418707581237
+      },
+      "scale_collapse_core": {
+        "between_episode_means_share": 0.004328161910142959,
+        "between_prefix_objective_share": 0.06350411495522075,
+        "dominant_objective_variance_source": "within_episode1",
+        "full_to_objective_variance_multiple": 187.30476176870422,
+        "objective_std_ratio_vs_full": 0.07306772587826439,
+        "objective_variance_ratio_vs_full": 0.005338892565021188,
+        "within_prefix_share": 0.9362299831689823
+      },
+      "scope_counterfactual": {
+        "boundary_abs_ratio_current_over_objective": 0.7225611259689807,
+        "boundary_abs_shrink_if_using_full_over_objective": 0.47018074187807657,
+        "counterfactual_boundary_abs": 1.6947183177563918,
+        "counterfactual_boundary_shift_norm": 1.6947183177563918,
+        "counterfactual_reward_norm_abs": 3.5296992400929437,
+        "counterfactual_reward_norm_before_value_term": 3.5296992400929437,
+        "counterfactual_scope_name": "objective_all_tokens",
+        "current_boundary_abs": 1.2245375758783152,
+        "current_boundary_shift_norm": 1.2245375758783152,
+        "current_reward_norm_abs": 1.3586154589034471,
+        "current_reward_norm_before_value_term": 1.3586154589034471,
+        "current_scope_name": "current_full_rollout",
+        "reward_norm_abs_ratio_current_over_objective": 0.38490969527128105,
+        "reward_norm_abs_shrink_if_using_full_over_objective": 2.1710837811894965
+      },
+      "selected_target_local_index": 37,
+      "suite_name": "pair2",
+      "terminal_global_step": 1983
+    },
+    {
+      "boundary_contract_core": {
+        "full_rollout_mean_over_std": 0.9881759048084255,
+        "full_rollout_mean_raw": 0.5028217434883118,
+        "full_rollout_std_raw": 0.5088382959365845,
+        "objective_subset_gap_vs_full_mean_over_std": 0.9142361359189373,
+        "objective_subset_mean_over_std": 1.9024120407273628,
+        "objective_subset_mean_raw": 0.23095251792384422,
+        "objective_subset_std_raw": 0.12139984029723787
+      },
+      "contract_checks": {
+        "current_matches_full_rollout_centering_contract": true,
+        "objective_counterfactual_worsens_boundary_penalty": true,
+        "objective_scope_std_collapse_is_explained_by_truncating_high_variance_prefix": true,
+        "objective_window_is_low_variance_slice_not_high_variance_source": true
+      },
+      "env_index": 13,
+      "point_name": "pair1_env13",
+      "repeat_stability_checks": {
+        "boundary_contract": true,
+        "conclusions": true,
+        "config_subset": true,
+        "mean_source": true,
+        "scale_collapse": true,
+        "selected_target_local_readout": true
+      },
+      "runtime_wall_s_total": {
+        "canonical": 115.3086905661039,
+        "repeatB": 112.34055848792195
+      },
+      "scale_collapse_core": {
+        "between_episode_means_share": 0.05879026220897509,
+        "between_prefix_objective_share": 0.014962971783083413,
+        "dominant_objective_variance_source": "within_episode1",
+        "full_to_objective_variance_multiple": 17.568041481086954,
+        "objective_std_ratio_vs_full": 0.2385823576305029,
+        "objective_variance_ratio_vs_full": 0.05692154137252919,
+        "within_prefix_share": 0.9822020686368395
+      },
+      "scope_counterfactual": {
+        "boundary_abs_ratio_current_over_objective": 0.5194331636119214,
+        "boundary_abs_shrink_if_using_full_over_objective": 0.9142361359189373,
+        "counterfactual_boundary_abs": 1.9024120407273628,
+        "counterfactual_boundary_shift_norm": -1.9024120407273628,
+        "counterfactual_reward_norm_abs": 3.013344289644582,
+        "counterfactual_reward_norm_before_value_term": -3.013344289644582,
+        "counterfactual_scope_name": "objective_all_tokens",
+        "current_boundary_abs": 0.9881759048084255,
+        "current_boundary_shift_norm": -0.9881759048084255,
+        "current_reward_norm_abs": 1.2532247399228524,
+        "current_reward_norm_before_value_term": -1.2532247399228524,
+        "current_scope_name": "current_full_rollout",
+        "reward_norm_abs_ratio_current_over_objective": 0.415891653744839,
+        "reward_norm_abs_shrink_if_using_full_over_objective": 1.7601195497217297
+      },
+      "selected_target_local_index": 22,
+      "suite_name": "pair1",
+      "terminal_global_step": 1968
+    }
+  ]
+}

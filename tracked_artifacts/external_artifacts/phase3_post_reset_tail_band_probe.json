@@ -1,0 +1,42 @@
+{
+  "audit_entry": "phase3_post_reset_tail_band_probe",
+  "band_summaries": {
+    "tail_band_1": {
+      "corr_vs_pre_suffix_gap": -0.21686014533042908,
+      "corr_vs_terminal_resets": 0.9952080845832825,
+      "mass_total": 5.377303868532181
+    },
+    "tail_band_2": {
+      "corr_vs_pre_suffix_gap": -0.21576522290706635,
+      "corr_vs_terminal_resets": 0.9946826100349426,
+      "mass_total": 4.984886232763529
+    },
+    "tail_band_4": {
+      "corr_vs_pre_suffix_gap": -0.21566596627235413,
+      "corr_vs_terminal_resets": 0.9950355291366577,
+      "mass_total": 9.292123410850763
+    },
+    "tail_band_8": {
+      "corr_vs_pre_suffix_gap": -0.2315235733985901,
+      "corr_vs_terminal_resets": 0.9936273097991943,
+      "mass_total": 16.061763234436512
+    }
+  },
+  "conclusions": {
+    "dominant_band": "tail_band_1"
+  },
+  "config": {
+    "tail_lens": [
+      1,
+      2,
+      4,
+      8
+    ],
+    "tail_mask_probe_json": "/home/chen/RLPFN/artifacts/phase3_terminal_tail_mask_probe.json"
+  },
+  "dominant_band": {
+    "band": "tail_band_1",
+    "corr_vs_pre_suffix_gap": -0.21686014533042908,
+    "corr_vs_terminal_resets": 0.9952080845832825
+  }
+}

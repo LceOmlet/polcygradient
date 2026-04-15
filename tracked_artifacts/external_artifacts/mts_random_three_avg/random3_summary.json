@@ -1,0 +1,8 @@
+{
+  "base_seed": 20260330,
+  "num_datasets": 30,
+  "input_file": "/home/chen/RLPFN/artifacts/mts_random_three_avg/input_table.csv",
+  "sample_file": "/home/chen/RLPFN/artifacts/mts_random_three_avg/random3_samples.csv",
+  "column_file": "/home/chen/RLPFN/artifacts/mts_random_three_avg/random3_column.csv",
+  "latex_file": "/home/chen/RLPFN/artifacts/mts_random_three_avg/random3_column.tex"
+}

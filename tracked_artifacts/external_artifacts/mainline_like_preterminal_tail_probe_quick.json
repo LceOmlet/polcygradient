@@ -1,0 +1,50 @@
+{
+  "audit_entry": "mainline_like_preterminal_tail_probe_quick",
+  "config": {
+    "frozen_h_seed": 12345,
+    "n_envs": 4,
+    "n_steps": 128,
+    "single_eval_pos": 32,
+    "batch_size": 128,
+    "n_epochs": 1,
+    "target_kl": 0.03
+  },
+  "with_post_sep_terminal_count": 4,
+  "total_envs": 4,
+  "overall_corr_adv_vs_delta": 0.0002579895370340867,
+  "preterminal_tail_corr_adv_vs_delta": 0.8775701772867536,
+  "rows": [
+    {
+      "env_idx": 0,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 91,
+      "preterminal_count": 59,
+      "tail_count": 8,
+      "delta_suffix_return": 3.7040863037109375
+    },
+    {
+      "env_idx": 1,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 100,
+      "preterminal_count": 68,
+      "tail_count": 8,
+      "delta_suffix_return": 1.163726806640625
+    },
+    {
+      "env_idx": 2,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 93,
+      "preterminal_count": 61,
+      "tail_count": 8,
+      "delta_suffix_return": 7.854644775390625
+    },
+    {
+      "env_idx": 3,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 96,
+      "preterminal_count": 64,
+      "tail_count": 8,
+      "delta_suffix_return": -7.882438659667969
+    }
+  ]
+}

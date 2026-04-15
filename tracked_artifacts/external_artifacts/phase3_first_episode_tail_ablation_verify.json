@@ -1,0 +1,38 @@
+{
+  "audit_entry": "phase3_first_episode_tail_ablation_verify",
+  "base_summary": {
+    "corr_vs_pre_suffix_gap": -0.042144641280174255,
+    "corr_vs_terminal_resets": 0.7225421071052551,
+    "mass_total": 202.3564695008099
+  },
+  "conclusions": {
+    "non_tail_ablation_improves_pre_gap_alignment": false,
+    "non_tail_ablation_reduces_reset_bias": false,
+    "tail_ablation_improves_pre_gap_alignment": false,
+    "tail_ablation_reduces_reset_bias": true
+  },
+  "config": {
+    "tail_len": 8,
+    "tail_mask_probe_json": "/home/chen/RLPFN/artifacts/phase3_terminal_tail_mask_probe.json"
+  },
+  "deltas": {
+    "non_tail": {
+      "corr_pre_delta": -0.13237810134887695,
+      "corr_reset_delta": 0.14513534307479858
+    },
+    "tail": {
+      "corr_pre_delta": -0.05891159176826477,
+      "corr_reset_delta": -0.0435563325881958
+    }
+  },
+  "first_episode_non_tail_ablation_summary": {
+    "corr_vs_pre_suffix_gap": -0.1745227426290512,
+    "corr_vs_terminal_resets": 0.8676774501800537,
+    "mass_total": 111.38220083992928
+  },
+  "first_episode_tail_ablation_summary": {
+    "corr_vs_pre_suffix_gap": -0.10105623304843903,
+    "corr_vs_terminal_resets": 0.6789857745170593,
+    "mass_total": 163.11478398833424
+  }
+}

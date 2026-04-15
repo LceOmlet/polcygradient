@@ -1,0 +1,70 @@
+{
+  "audit_entry": "critic_free_preterminal_tail_drop_quick",
+  "config": {
+    "frozen_h_seed": 12345,
+    "n_envs": 4,
+    "n_steps": 128,
+    "single_eval_pos": 32,
+    "batch_size": 128,
+    "n_epochs": 1,
+    "target_kl": 0.03,
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "normalize_advantage": false
+  },
+  "results": {
+    "tokenwise": {
+      "delta_smp_gap": 0.5386581420898438,
+      "delta_det_gap": 0.526031494140625,
+      "selected": []
+    },
+    "drop_preterminal_tail8": {
+      "delta_smp_gap": 0.7921273708343506,
+      "delta_det_gap": 0.7921273708343506,
+      "selected": [
+        {
+          "env_idx": 0,
+          "first_terminal_step": 115,
+          "tail_steps": [
+            107,
+            108,
+            109,
+            110,
+            111,
+            112,
+            113,
+            114
+          ]
+        },
+        {
+          "env_idx": 2,
+          "first_terminal_step": 79,
+          "tail_steps": [
+            71,
+            72,
+            73,
+            74,
+            75,
+            76,
+            77,
+            78
+          ]
+        },
+        {
+          "env_idx": 3,
+          "first_terminal_step": 119,
+          "tail_steps": [
+            111,
+            112,
+            113,
+            114,
+            115,
+            116,
+            117,
+            118
+          ]
+        }
+      ]
+    }
+  }
+}

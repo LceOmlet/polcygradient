@@ -1,0 +1,156 @@
+{
+  "audit_entry": "phase3_post_eval_hotspot_profile",
+  "bundle_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "heldout_suite_fingerprint": "41ede11a0fafcda9",
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_samples": 2048,
+    "ppo_actor_baseline_mode": "learned",
+    "ppo_actor_gae_space": "normalized",
+    "ppo_normalize_advantage": true,
+    "ppo_reset_env_state_at_sep": true,
+    "ppo_separate_value_backbone": false,
+    "ppo_vf_coef": 0.5,
+    "rollout_backend": "serial",
+    "single_eval_pos": 1946,
+    "target_kl": 0.03,
+    "train_profile": "trusted_sep_reset_mainline",
+    "train_suite_fingerprint": "04f3f0c11c71cff0"
+  },
+  "config": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "env_index": 0,
+    "n_samples": 2048,
+    "post_policy_bundle_path": "/home/chen/RLPFN/artifacts/phase3_pair1_post_policy_bundle/phase3_pair1_post_policy_bundle.pt",
+    "profile_build_batch_size": 1,
+    "profile_build_n_envs": 1,
+    "profile_build_n_steps": 1,
+    "rollout_backend": "serial",
+    "single_eval_pos": 1946,
+    "suite_target": "heldout",
+    "train_profile": "trusted_sep_reset_mainline"
+  },
+  "hotspots": {
+    "_apply_state_full_rms": {
+      "calls": 2048,
+      "mean_s": 0.0003293000341955121,
+      "share_of_wall": 0.01715265081815813,
+      "total_s": 0.6744064700324088
+    },
+    "_apply_terminal_reset_step": {
+      "calls": 2048,
+      "mean_s": 0.002634788098930585,
+      "share_of_wall": 0.13724140767614573,
+      "total_s": 5.396046026609838
+    },
+    "_build_obs_from_rollout_step_inputs": {
+      "calls": 2048,
+      "mean_s": 0.002311619153715583,
+      "share_of_wall": 0.12040811433596255,
+      "total_s": 4.734196026809514
+    },
+    "_terminal_tail_event_from_signal": {
+      "calls": 2048,
+      "mean_s": 0.0021647307590910714,
+      "share_of_wall": 0.11275696012825248,
+      "total_s": 4.433368594618514
+    }
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  },
+  "profile": {
+    "aggregate": {
+      "full_return_mean": 21.83742332458496,
+      "full_return_std": 0.0,
+      "suffix_return_mean": 1.105542540550232,
+      "suffix_return_std": 0.0,
+      "total_env_build_s": 0.017401688965037465,
+      "total_rollout_s": 39.30001339595765,
+      "total_wall_s": 39.317415084922686
+    },
+    "env_profiles": [
+      {
+        "env_build_s": 0.017401688965037465,
+        "env_index": 0,
+        "env_seed": 2108174692,
+        "full_return_sum": 21.837421417236328,
+        "n_reward_steps": 2048,
+        "n_suffix_steps": 102,
+        "rollout_s": 39.30001339595765,
+        "rollout_seed": 1026265284,
+        "suffix_return_sum": 1.1055426597595215,
+        "total_s": 39.317415084922686
+      }
+    ],
+    "infos": [
+      {
+        "action_dim": 12,
+        "action_noise_eval_std": 0.0,
+        "action_noise_train_std": 0.0,
+        "action_slot_dim": 30,
+        "family": "scm",
+        "noise_dim": 43,
+        "obs_dim": 15,
+        "obs_slot_dim": 400,
+        "reward_drop_frac_realized": 0.0,
+        "reward_dropout_ratio": 0.0,
+        "reward_max": 0.48672670125961304,
+        "reward_min": -0.2610170841217041,
+        "reward_std": 0.028208870440721512,
+        "single_eval_pos": 1946,
+        "state_abs_max": 3.394763708114624,
+        "state_dim": 104,
+        "state_highway_enabled": false,
+        "state_highway_lambda": 0.0,
+        "zero_pad_dim": 253
+      }
+    ],
+    "profiled_env_count": 1,
+    "suite_batch_size": 1
+  },
+  "suite_summary": {
+    "action_dim_mean": 13.8125,
+    "batch_size": 16,
+    "family_counts": {
+      "scm": 16
+    },
+    "fingerprint": "41ede11a0fafcda9",
+    "obs_dim_mean": 117.3125,
+    "state_dim_mean": 218.0625,
+    "suite_seed": 67890,
+    "top_structures": [
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 104, 15, 12, 43, 253, 400, 30, 2, 136, <class 'torch.nn.modules.activation.ReLU'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 116, 105, 7, 72, 212, 400, 30, 2, 270, 'sin')"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 136, 46, 2, 227, 37, 400, 30, 8, 40, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 181, 155, 21, 177, 42, 400, 30, 3, 65, <class 'torch.nn.modules.linear.Identity'>)"
+      },
+      {
+        "count": 1,
+        "signature": "('scm', True, True, 220, 210, 11, 48, 132, 400, 30, 2, 184, 'sin')"
+      }
+    ],
+    "unique_structures": 16
+  },
+  "wall_s": 39.317915183026344
+}

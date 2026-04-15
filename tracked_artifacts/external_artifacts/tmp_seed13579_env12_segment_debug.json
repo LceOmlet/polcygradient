@@ -1,0 +1,42 @@
+{
+  "objective_token_count": 102,
+  "objective_steps_head": [
+    1946,
+    1947,
+    1948,
+    1949,
+    1950,
+    1951,
+    1952,
+    1953,
+    1954,
+    1955
+  ],
+  "objective_steps_tail": [
+    2038,
+    2039,
+    2040,
+    2041,
+    2042,
+    2043,
+    2044,
+    2045,
+    2046,
+    2047
+  ],
+  "compressed_segment_starts": [
+    0
+  ],
+  "compressed_segments": [
+    [
+      0,
+      102
+    ]
+  ],
+  "objective_terminal_reset_count_from_segments": 0,
+  "episode_starts_on_objective_positions": [],
+  "terminal_rows_within_objective_global_steps": [],
+  "terminal_row_count_within_objective": 0,
+  "global_episode_starts_near_objective_head": [],
+  "global_episode_starts_near_objective_tail": []
+}

@@ -1,0 +1,161 @@
+{
+  "audit_entry": "phase3_env12_boundary_stepdown_root_probe",
+  "cluster_stepdown": {
+    "aggregate": {
+      "all_local_peaks": true,
+      "late_preterminal_peak_count": 1,
+      "mean_aggregated_negative_source_contribution": 0.4128043522151839,
+      "mean_bootstrap_term_norm": -0.06992994745572408,
+      "mean_delta_norm": -0.06065331537486177,
+      "mean_next_drop_norm": 0.06992994745572408,
+      "mean_prev_gap_norm": 0.046179513136545815,
+      "mean_reward_norm": 0.009276632080862296,
+      "oscillatory_peak_count": 2,
+      "pattern_counts": {
+        "late_preterminal_peak": 1,
+        "oscillatory_peak": 2
+      },
+      "positive_reward_and_negative_delta_count": 2,
+      "token_count": 3
+    },
+    "cluster_rows": [
+      {
+        "aggregated_negative_source_contribution": 0.45479097668533774,
+        "bootstrap_term_norm": -0.06747220456600189,
+        "delta_norm": -0.06808296849009425,
+        "is_local_peak": true,
+        "late_preterminal": false,
+        "next_drop_norm": 0.06747220456600189,
+        "next_value_norm": 0.15062804520130157,
+        "objective_local_index": 29,
+        "pattern_class": "oscillatory_peak",
+        "prev_gap_norm": 0.016425862908363342,
+        "prev_value_norm": 0.20167438685894012,
+        "rebound_within_2_steps_above_current": true,
+        "rebound_within_3_steps_above_current": false,
+        "reward_norm": -0.0006107639240923584,
+        "tokens_to_objective_episode_end": 27,
+        "value_norm": 0.21810024976730347
+      },
+      {
+        "aggregated_negative_source_contribution": 0.3658182873856207,
+        "bootstrap_term_norm": -0.05776482820510864,
+        "delta_norm": -0.04880613385696302,
+        "is_local_peak": true,
+        "late_preterminal": false,
+        "next_drop_norm": 0.05776482820510864,
+        "next_value_norm": 0.16417373716831207,
+        "objective_local_index": 38,
+        "pattern_class": "oscillatory_peak",
+        "prev_gap_norm": 0.055127426981925964,
+        "prev_value_norm": 0.16681113839149475,
+        "rebound_within_2_steps_above_current": true,
+        "rebound_within_3_steps_above_current": false,
+        "reward_norm": 0.008958694348145618,
+        "tokens_to_objective_episode_end": 18,
+        "value_norm": 0.22193856537342072
+      },
+      {
+        "aggregated_negative_source_contribution": 0.4178037925745932,
+        "bootstrap_term_norm": -0.0845528095960617,
+        "delta_norm": -0.06507084377752807,
+        "is_local_peak": true,
+        "late_preterminal": true,
+        "next_drop_norm": 0.0845528095960617,
+        "next_value_norm": 0.1498139351606369,
+        "objective_local_index": 51,
+        "pattern_class": "late_preterminal_peak",
+        "prev_gap_norm": 0.06698524951934814,
+        "prev_value_norm": 0.16738149523735046,
+        "rebound_within_2_steps_above_current": false,
+        "rebound_within_3_steps_above_current": false,
+        "reward_norm": 0.01948196581853363,
+        "tokens_to_objective_episode_end": 5,
+        "value_norm": 0.2343667447566986
+      }
+    ],
+    "conclusions": {
+      "cluster_contains_positive_reward_peak_failures": true,
+      "cluster_is_not_single_pattern": true,
+      "cluster_stepdown_exceeds_reward_on_average": true,
+      "cluster_tokens_are_local_value_peaks": true
+    }
+  },
+  "conclusions": {
+    "cluster_contains_multiple_subpatterns": true,
+    "cluster_local_value_peak_stepdown_confirmed": true,
+    "local56_terminal_boundary_shift_confirmed": true,
+    "local56_terminal_shift_absent_on_nonterminal_contrast": true
+  },
+  "config": {
+    "env_index": 12,
+    "source_gae_path_json": "/home/chen/RLPFN/artifacts/phase3_residual_anchor_gae_path_probe.json",
+    "source_negative_delta_json": "/home/chen/RLPFN/artifacts/phase3_env12_negative_delta_probe.json",
+    "suite_name": "pair2"
+  },
+  "local56_boundary": {
+    "conclusions": {
+      "local101_has_no_terminal_boundary_shift": true,
+      "local56_boundary_shift_dwarfs_immediate_reward": true,
+      "local56_boundary_shift_is_most_of_delta_magnitude": true,
+      "local56_boundary_shift_is_most_of_reward_norm": true
+    },
+    "derived_metrics": {
+      "boundary_share_of_delta_magnitude": 0.8609402796854854,
+      "boundary_share_of_reward_norm_magnitude": 0.9765346971131386,
+      "boundary_to_immediate_reward_ratio": 41.61611302532599,
+      "local56_boundary_shift_present_only_on_terminal_reset": true
+    },
+    "env_constant_stats": {
+      "env_std": 14.086041450500488,
+      "mean_over_std": 1.1599998239708984
+    },
+    "nonterminal_contrast_row": {
+      "bootstrap_term_norm": -0.07404924929141998,
+      "boundary_shift_norm": 0.0,
+      "delta_norm": -0.07339905647502375,
+      "next_non_terminal": 1.0,
+      "objective_local_index": 101,
+      "reward_norm": 0.0006501928163962306,
+      "reward_over_std": 0.0006501928163962306
+    },
+    "terminal_row": {
+      "aggregated_negative_source_contribution": 11.673469177310457,
+      "bootstrap_term_norm": -0.15949022769927979,
+      "boundary_shift_norm": -1.1599998239708984,
+      "delta_norm": -1.3473638663934553,
+      "objective_local_index": 56,
+      "reward_norm": -1.1878736386941755,
+      "reward_over_std": -0.027873814723277174
+    },
+    "window_rows": [
+      {
+        "delta_norm": -0.023436565198594477,
+        "flip_cause": "bootstrap_term_negative",
+        "next_non_terminal": 1.0,
+        "next_value_norm": 0.15949022769927979,
+        "objective_local_index": 55,
+        "reward_norm": 0.0077616234639345145,
+        "value_norm": 0.19068841636180878
+      },
+      {
+        "delta_norm": -1.3473638663934553,
+        "flip_cause": "delta_negative_mixed",
+        "next_non_terminal": 0.0,
+        "next_value_norm": 0.16498097777366638,
+        "objective_local_index": 56,
+        "reward_norm": -1.1878736386941755,
+        "value_norm": 0.15949022769927979
+      },
+      {
+        "delta_norm": -0.05471359513514098,
+        "flip_cause": "not_flip",
+        "next_non_terminal": 1.0,
+        "next_value_norm": 0.11532051116228104,
+        "objective_local_index": 57,
+        "reward_norm": -0.005053128523755635,
+        "value_norm": 0.16498097777366638
+      }
+    ]
+  }
+}

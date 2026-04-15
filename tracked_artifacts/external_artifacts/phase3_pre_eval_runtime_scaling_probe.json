@@ -1,0 +1,97 @@
+{
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "n_samples": 256,
+  "results": [
+    {
+      "batch_size": 1,
+      "full_return_mean": -3.708009958267212,
+      "per_env_s": 1.3791775109712034,
+      "per_env_step_ms": 5.3874121522312635,
+      "policy": "zero",
+      "suffix_return_mean": 0.0,
+      "wall_s": 1.3791775109712034
+    },
+    {
+      "batch_size": 1,
+      "full_return_mean": -3.7371044158935547,
+      "per_env_s": 5.527974607888609,
+      "per_env_step_ms": 21.59365081206488,
+      "policy": "validation_ppo",
+      "suffix_return_mean": 0.0,
+      "wall_s": 5.527974607888609
+    },
+    {
+      "batch_size": 2,
+      "full_return_mean": -2.5437209606170654,
+      "per_env_s": 1.0363807155517861,
+      "per_env_step_ms": 4.0483621701241645,
+      "policy": "zero",
+      "suffix_return_mean": 0.0,
+      "wall_s": 2.0727614311035722
+    },
+    {
+      "batch_size": 2,
+      "full_return_mean": -2.768465518951416,
+      "per_env_s": 4.268336977926083,
+      "per_env_step_ms": 16.67319132002376,
+      "policy": "validation_ppo",
+      "suffix_return_mean": 0.0,
+      "wall_s": 8.536673955852166
+    },
+    {
+      "batch_size": 4,
+      "full_return_mean": -6.164035797119141,
+      "per_env_s": 1.0036287792026997,
+      "per_env_step_ms": 3.9204249187605456,
+      "policy": "zero",
+      "suffix_return_mean": 0.0,
+      "wall_s": 4.014515116810799
+    },
+    {
+      "batch_size": 4,
+      "full_return_mean": -6.207209587097168,
+      "per_env_s": 4.160564287216403,
+      "per_env_step_ms": 16.252204246939073,
+      "policy": "validation_ppo",
+      "suffix_return_mean": 0.0,
+      "wall_s": 16.64225714886561
+    },
+    {
+      "batch_size": 8,
+      "full_return_mean": -3.180225372314453,
+      "per_env_s": 1.014085641130805,
+      "per_env_step_ms": 3.961272035667207,
+      "policy": "zero",
+      "suffix_return_mean": 0.0,
+      "wall_s": 8.11268512904644
+    },
+    {
+      "batch_size": 8,
+      "full_return_mean": -3.1743454933166504,
+      "per_env_s": 4.113268175133271,
+      "per_env_step_ms": 16.06745380911434,
+      "policy": "validation_ppo",
+      "suffix_return_mean": 0.0,
+      "wall_s": 32.90614540106617
+    },
+    {
+      "batch_size": 16,
+      "full_return_mean": -1.7963604927062988,
+      "per_env_s": 1.0501748020615196,
+      "per_env_step_ms": 4.102245320552811,
+      "policy": "zero",
+      "suffix_return_mean": 0.0,
+      "wall_s": 16.802796832984313
+    },
+    {
+      "batch_size": 16,
+      "full_return_mean": -1.7627818584442139,
+      "per_env_s": 4.214153005057597,
+      "per_env_step_ms": 16.461535176006237,
+      "policy": "validation_ppo",
+      "suffix_return_mean": 0.0,
+      "wall_s": 67.42644808092155
+    }
+  ],
+  "single_eval_pos": 1946
+}

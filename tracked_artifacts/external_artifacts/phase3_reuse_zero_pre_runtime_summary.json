@@ -1,0 +1,39 @@
+{
+  "conclusion": {
+    "current_blocker_phase": "post_train",
+    "pre_policy_recompute_removed": true,
+    "train_loop_completed": true,
+    "zero_control_recompute_removed": true
+  },
+  "monitor_summary_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/monitor_summary.json",
+  "phase_events": [
+    {
+      "event": "phase_start",
+      "phase": "train_loop",
+      "t": 1693849.397823226
+    },
+    {
+      "event": "phase_end",
+      "phase": "train_loop",
+      "t": 1693952.484610318,
+      "wall_s": 103.08678709203377
+    },
+    {
+      "event": "phase_start",
+      "phase": "pre_train",
+      "t": 1693952.484696598
+    },
+    {
+      "error": "",
+      "error_type": "KeyboardInterrupt",
+      "event": "phase_error",
+      "phase": "pre_train",
+      "t": 1694024.607034129,
+      "wall_s": 72.12233753106557
+    }
+  ],
+  "phase_log_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/phase_log.jsonl",
+  "runtime_json_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/runtime.json",
+  "stack_dump_log_path": "/home/chen/RLPFN/artifacts/phase3_pair1_restored_policy_serial_reuse_zero_pre/stack_dump.log",
+  "status": "phase3_reuse_zero_pre_runtime_progress"
+}

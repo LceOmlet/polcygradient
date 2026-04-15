@@ -1,0 +1,164 @@
+{
+  "conclusions": {
+    "downstream_steps_fully_reverse_target_direction": false,
+    "downstream_steps_have_net_negative_projection_on_target_direction": false,
+    "downstream_steps_overwrite_more_than_half_of_target_direction": false,
+    "downstream_steps_reduce_target_step_retention": false
+  },
+  "config": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "following_outer_batch_idxs": [
+      14,
+      15,
+      16
+    ],
+    "n_steps": 256,
+    "outer_epochs_reference": 2,
+    "policy_only_read_only_simulation": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_outer_batch_idx": 13,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "overwrite_report": {
+    "downstream_cumulative_alignment_vs_target": {
+      "candidate_norm": 0.01994842104613781,
+      "cosine": 0.8566248050119049,
+      "dot": 0.00014930182078387588,
+      "projection_on_reference": 1.955839623062271,
+      "reference_norm": 0.008737072348594666
+    },
+    "net_alignment_after_target_plus_downstream": {
+      "candidate_norm": 0.027788251638412476,
+      "cosine": 0.9301610752054383,
+      "dot": 0.00022583191457670182,
+      "projection_on_reference": 2.9583765580495096,
+      "reference_norm": 0.008737072348594666
+    },
+    "pairwise_downstream_alignment": {
+      "14": {
+        "delta_alignment_vs_target": {
+          "candidate_norm": 0.007353780325502157,
+          "cosine": 0.7779969016740984,
+          "dot": 4.998669828637503e-05,
+          "projection_on_reference": 0.6548209835704135,
+          "reference_norm": 0.008737072348594666
+        },
+        "env_index": 13,
+        "outer_batch_idx": 14
+      },
+      "15": {
+        "delta_alignment_vs_target": {
+          "candidate_norm": 0.006853992119431496,
+          "cosine": 0.85268642774419,
+          "dot": 5.106212483951822e-05,
+          "projection_on_reference": 0.668908968923087,
+          "reference_norm": 0.008737072348594666
+        },
+        "env_index": 14,
+        "outer_batch_idx": 15
+      },
+      "16": {
+        "delta_alignment_vs_target": {
+          "candidate_norm": 0.006189723499119282,
+          "cosine": 0.8921939052438096,
+          "dot": 4.82499017380178e-05,
+          "projection_on_reference": 0.6320691143122877,
+          "reference_norm": 0.008737072348594666
+        },
+        "env_index": 15,
+        "outer_batch_idx": 16
+      }
+    },
+    "selected_outer_batches": {
+      "13": {
+        "clip_grad_norm_total_pre_clip": 0.09391716867685318,
+        "clip_range": 0.2,
+        "delta_norm": 0.008737072348594666,
+        "env_index": 12,
+        "grad_norm_pre_clip_flat": 0.09391123801469803,
+        "objective_env_indices_present": [
+          12
+        ],
+        "objective_total": 192,
+        "outer_batch_idx": 13,
+        "policy_loss": -9.789317846298218e-05,
+        "policy_num": 0.018795490264892578
+      },
+      "14": {
+        "clip_grad_norm_total_pre_clip": 0.059333547949790955,
+        "clip_range": 0.2,
+        "delta_norm": 0.007353780325502157,
+        "env_index": 13,
+        "grad_norm_pre_clip_flat": 0.05933159589767456,
+        "objective_env_indices_present": [
+          13
+        ],
+        "objective_total": 192,
+        "outer_batch_idx": 14,
+        "policy_loss": 1.3024856343690772e-05,
+        "policy_num": -0.002500772476196289
+      },
+      "15": {
+        "clip_grad_norm_total_pre_clip": 0.038823191076517105,
+        "clip_range": 0.2,
+        "delta_norm": 0.006853992119431496,
+        "env_index": 14,
+        "grad_norm_pre_clip_flat": 0.038821522146463394,
+        "objective_env_indices_present": [
+          14
+        ],
+        "objective_total": 192,
+        "outer_batch_idx": 15,
+        "policy_loss": -6.499389655800769e-06,
+        "policy_num": 0.0012478828430175781
+      },
+      "16": {
+        "clip_grad_norm_total_pre_clip": 0.022117307409644127,
+        "clip_range": 0.2,
+        "delta_norm": 0.006189723499119282,
+        "env_index": 15,
+        "grad_norm_pre_clip_flat": 0.02211710251867771,
+        "objective_env_indices_present": [
+          15
+        ],
+        "objective_total": 192,
+        "outer_batch_idx": 16,
+        "policy_loss": -1.6864389181137085e-05,
+        "policy_num": 0.0032379627227783203
+      }
+    },
+    "total_outer_batches": 16
+  },
+  "phase2_reference_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "ppo_reset_env_state_at_sep": true,
+    "shared_actor_critic_backbone": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_cross_batch_overwrite_probe",
+  "recommendation": {
+    "next_focus": "cross_batch_overwrite_localization",
+    "reason": "If the downstream steps have a negative projection on the target step direction, the next narrow question is which later env-step is responsible for the overwrite and whether that overwrite is shared-core or branch-specific."
+  },
+  "runtime": {
+    "elapsed_wall_time_sec": 23.347357381135225
+  }
+}

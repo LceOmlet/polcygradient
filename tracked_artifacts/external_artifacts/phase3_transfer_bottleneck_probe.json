@@ -1,0 +1,141 @@
+{
+  "audit_entry": "phase3_transfer_bottleneck_probe",
+  "bucket_positive_mass_corrs": {
+    "heldout": {
+      "q1": 0.4197411835193634,
+      "q2": 0.8896645307540894,
+      "q3": -0.12133970111608505,
+      "q4": -0.8492471575737
+    },
+    "train": {
+      "q1": -0.6809900403022766,
+      "q2": -0.6538011431694031,
+      "q3": 0.8468202948570251,
+      "q4": 0.6420256495475769
+    }
+  },
+  "comparisons": {
+    "heldout_positive_pre_gap_minus_nonpositive": -0.43295997132857644,
+    "heldout_positive_q12_minus_q34": 0.921870803690532,
+    "sign_flip_buckets": [
+      "q1",
+      "q2",
+      "q3",
+      "q4"
+    ],
+    "train_positive_pre_gap_minus_nonpositive": 3.9575169334808984,
+    "train_positive_q12_minus_q34": -0.3584101174149683
+  },
+  "conclusions": {
+    "all_bucket_alignment_signs_flip_between_train_and_heldout": true,
+    "diagnostic_only": true,
+    "heldout_positive_cases_are_q12_dominated": true,
+    "heldout_positive_cases_have_lower_pre_gap_than_heldout_nonpositive": true,
+    "late_bucket_success_signature_transfers_to_heldout": false,
+    "new_phase3_trusted_baseline_established": false,
+    "phase3_transfer_pattern_is_mode_inversion_not_simple_weakening": true,
+    "train_positive_cases_are_q34_dominated": true,
+    "train_positive_cases_have_higher_pre_gap_than_train_nonpositive": true
+  },
+  "config": {
+    "heldout_token_bucket_json": "/home/chen/RLPFN/artifacts/phase3_heldout_token_bucket_probe.json",
+    "runtime_wall_s": 0.0016589569859206676,
+    "train_token_bucket_json": "/home/chen/RLPFN/artifacts/phase3_train_token_bucket_probe.json"
+  },
+  "group_summaries": {
+    "heldout_nonpositive": {
+      "bucket_positive_mass_share_means": {
+        "q1": 0.24291740561399042,
+        "q2": 0.19665582497012468,
+        "q3": 0.29219255080533657,
+        "q4": 0.2682341708427809
+      },
+      "bucket_value_corr_means": {
+        "q1": -0.060141269117593765,
+        "q2": 0.038988073666890465,
+        "q3": -0.08132151141762733,
+        "q4": -0.026592791080474854
+      },
+      "count": 3,
+      "env_indices": [
+        0,
+        2,
+        3
+      ],
+      "mean_pre_vs_zero_suffix_gap": 0.7288095330198606,
+      "mean_suffix_gap_delta": -0.19614040851593018
+    },
+    "heldout_positive": {
+      "bucket_positive_mass_share_means": {
+        "q1": 0.6107580142175596,
+        "q2": 0.3501774396868804,
+        "q3": 0.002558507289670444,
+        "q4": 0.036506142924237546
+      },
+      "bucket_value_corr_means": {
+        "q1": 0.24630671739578247,
+        "q2": -0.025674419477581978,
+        "q3": -0.008325368165969849,
+        "q4": 0.10523701459169388
+      },
+      "count": 1,
+      "env_indices": [
+        1
+      ],
+      "mean_pre_vs_zero_suffix_gap": 0.2958495616912842,
+      "mean_suffix_gap_delta": 0.11295825242996216
+    },
+    "train_nonpositive": {
+      "bucket_positive_mass_share_means": {
+        "q1": 0.5936677680632793,
+        "q2": 0.3432931078871834,
+        "q3": 0.037316754224740505,
+        "q4": 0.025722367642072967
+      },
+      "bucket_value_corr_means": {
+        "q1": -0.3977031111717224,
+        "q2": -0.22108416259288788,
+        "q3": 0.07638142257928848,
+        "q4": 0.3430536091327667
+      },
+      "count": 1,
+      "env_indices": [
+        1
+      ],
+      "mean_pre_vs_zero_suffix_gap": -0.6799580752849579,
+      "mean_suffix_gap_delta": -0.30400633811950684
+    },
+    "train_positive": {
+      "bucket_positive_mass_share_means": {
+        "q1": 0.19646591065941968,
+        "q2": 0.1243290026991809,
+        "q3": 0.10763984800101849,
+        "q4": 0.5715651827725504
+      },
+      "bucket_value_corr_means": {
+        "q1": 0.11847303621470928,
+        "q2": -0.05882329245408376,
+        "q3": -0.1146894743045171,
+        "q4": -0.03881353512406349
+      },
+      "count": 3,
+      "env_indices": [
+        0,
+        2,
+        3
+      ],
+      "mean_pre_vs_zero_suffix_gap": 3.2775588581959405,
+      "mean_suffix_gap_delta": 0.1572192907333374
+    }
+  },
+  "phase2_preflight": {
+    "phase2_all_checks_pass": true,
+    "phase2_pass_flags": {
+      "official_vs_monkey_numeric_match": true,
+      "shared_learned_beats_zero": true,
+      "shared_learned_post_return_positive": true
+    },
+    "required": true,
+    "summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json"
+  }
+}

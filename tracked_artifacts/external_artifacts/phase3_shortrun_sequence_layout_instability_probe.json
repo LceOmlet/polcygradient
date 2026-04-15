@@ -1,0 +1,45 @@
+{
+  "audit_entry": "phase3_shortrun_sequence_layout_instability_probe",
+  "conclusion": {
+    "head_initialization_stable": true,
+    "obs_and_old_log_prob_can_match_while_sequence_layout_drifts": true,
+    "shortrun_numeric_contract_trusted": false
+  },
+  "contract": {
+    "batch_size": 2048,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "env_rng_seed": 2020,
+    "frozen_h_seed": 12345,
+    "n_steps": 2048,
+    "rollout_rng_seed": 2020,
+    "single_eval_pos": 1946,
+    "strict_fixed_env_mode": true
+  },
+  "repeated_collects": [
+    {
+      "actions": "71ef7defd6bb614d498c0da8fc69cc910552ea366cd79ffbedd74d033fcdae38",
+      "actor_advantages": "aef32011ecf33b7b1af3a14e660341a11846b61a95c468fe29a4f722865fdf64",
+      "advantages": "63587ed5538967700d26b195579fa660c11e2b58aafa25e99bcf2efd64ab112f",
+      "objective_masks": "10ee9837a82f122c2c8eb009f74996a6aa8a440f7066fa04ad328f6fda0fe68d",
+      "obs": "6e6256e3f036db79eb7e3d6d11aa7054a566889aaa40c3d6b98fb788b300d80a",
+      "old_log_prob": "dd97b051aec5d665ed9e3db7eb056371783328d6225afb72b4efdd4540483914",
+      "returns": "33cf9402c5de06b1f21ae9f68e9fe5280a4acd9fc77c6677a9b5605085548bcc",
+      "run_id": 1,
+      "seq_lengths": "31a264cb361024ee6723fb6fed79adf46b9ec9ef54a1b4a14151e526836c771e",
+      "seq_start_indices": "d0d05134e90206824843f8c65c1406b59bfbbc205b00194eca6f44250071ef37"
+    },
+    {
+      "actions": "74054d8bac69504f50f06efa882f109a18e04e3bdf33f956e8cc330601c740f9",
+      "actor_advantages": "51ccd33e62d994869d9ea770f040f02d1fba63f8d6e10ff34ffc37840eacf953",
+      "advantages": "00bab95291c1e62ed7d2f6113197dfecc759a7c301f503cb24cdbae24282e2df",
+      "objective_masks": "10ee9837a82f122c2c8eb009f74996a6aa8a440f7066fa04ad328f6fda0fe68d",
+      "obs": "6e6256e3f036db79eb7e3d6d11aa7054a566889aaa40c3d6b98fb788b300d80a",
+      "old_log_prob": "dd97b051aec5d665ed9e3db7eb056371783328d6225afb72b4efdd4540483914",
+      "returns": "02826e1fc6a6edfd6e02ed89a75857e70eff86cf2442ba3c031047f17a17324d",
+      "run_id": 2,
+      "seq_lengths": "54a3638ddd9c2dafe621b76d2d17653b94ead00868eb7142384f9a8eaae83918",
+      "seq_start_indices": "cd9788bafd3316723d575fd935354b87f2ba5d41aa9505784a40bffec24628af"
+    }
+  ]
+}

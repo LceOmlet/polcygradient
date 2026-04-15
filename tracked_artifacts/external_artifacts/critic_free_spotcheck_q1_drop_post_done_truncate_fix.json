@@ -1,0 +1,20 @@
+[
+  {
+    "actor_objective_mode": "tokenwise",
+    "pre_det_gap": -0.03692293167114258,
+    "post_det_gap": -0.149824857711792,
+    "delta_det_gap": -0.11290192604064941,
+    "pre_smp_gap": -0.03691744804382324,
+    "post_smp_gap": -0.149824857711792,
+    "delta_smp_gap": -0.11290740966796875
+  },
+  {
+    "actor_objective_mode": "tokenwise_drop_q1_early",
+    "pre_det_gap": -0.0213470458984375,
+    "post_det_gap": -1.5580101013183594,
+    "delta_det_gap": -1.5366630554199219,
+    "pre_smp_gap": -0.0213470458984375,
+    "post_smp_gap": -1.5580101013183594,
+    "delta_smp_gap": -1.5366630554199219
+  }
+]

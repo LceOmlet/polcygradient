@@ -1,0 +1,88 @@
+{
+  "audit_entry": "mainline_like_preterminal_tail_probe",
+  "config": {
+    "frozen_h_seed": 12345,
+    "n_envs": 8,
+    "n_steps": 256,
+    "single_eval_pos": 64,
+    "batch_size": 256,
+    "n_epochs": 1,
+    "target_kl": 0.03,
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "normalize_advantage": false
+  },
+  "with_post_sep_terminal_count": 4,
+  "total_envs": 8,
+  "overall_corr_adv_vs_delta": 0.009196413515471458,
+  "preterminal_tail_corr_adv_vs_delta": 0.8911144402368866,
+  "overall_adv_mean": 0.05674999261949173,
+  "preterminal_adv_mean": -0.45853549242019653,
+  "rows": [
+    {
+      "env_idx": 0,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 160,
+      "preterminal_count": 96,
+      "tail_count": 8,
+      "delta_suffix_return": -1.8675012588500977,
+      "tail_adv_mean": -1.209573745727539,
+      "suffix_adv_mean": 0.08526337891817093
+    },
+    {
+      "env_idx": 1,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 225,
+      "preterminal_count": 161,
+      "tail_count": 8,
+      "delta_suffix_return": 6.523760795593262,
+      "tail_adv_mean": 1.2657748460769653,
+      "suffix_adv_mean": -0.012440006248652935
+    },
+    {
+      "env_idx": 2,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 151,
+      "preterminal_count": 87,
+      "tail_count": 8,
+      "delta_suffix_return": -2.0678727626800537,
+      "tail_adv_mean": -0.9205561876296997,
+      "suffix_adv_mean": 0.20389218628406525
+    },
+    {
+      "env_idx": 3,
+      "has_post_sep_terminal": false,
+      "delta_suffix_return": -0.15427207946777344,
+      "suffix_adv_mean": -0.21764351427555084
+    },
+    {
+      "env_idx": 4,
+      "has_post_sep_terminal": false,
+      "delta_suffix_return": 0.6293091773986816,
+      "suffix_adv_mean": 0.2830665707588196
+    },
+    {
+      "env_idx": 5,
+      "has_post_sep_terminal": false,
+      "delta_suffix_return": -3.7956161499023438,
+      "suffix_adv_mean": -0.21255433559417725
+    },
+    {
+      "env_idx": 6,
+      "has_post_sep_terminal": false,
+      "delta_suffix_return": 0.49877285957336426,
+      "suffix_adv_mean": 0.20821459591388702
+    },
+    {
+      "env_idx": 7,
+      "has_post_sep_terminal": true,
+      "first_terminal_step": 157,
+      "preterminal_count": 93,
+      "tail_count": 8,
+      "delta_suffix_return": -5.475828289985657,
+      "tail_adv_mean": -0.9697868824005127,
+      "suffix_adv_mean": 0.11620110273361206
+    }
+  ]
+}

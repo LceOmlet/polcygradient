@@ -1,0 +1,200 @@
+{
+  "audit_entry": "phase3_pair2_phase2_scale_exact_update_aggregation_audit",
+  "conclusions": {
+    "ratio_and_clipping_preserve_most_target_negative_mass": true,
+    "target_scope_is_a_small_fraction_of_whole_batch_negative_mass_after_clipping": false,
+    "target_scope_negative_mass_is_amplified_by_normalization": true,
+    "trusted_target_scope_present_in_snapshot": true
+  },
+  "inputs": {
+    "snapshot_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_snapshot.json"
+  },
+  "recommendation": {
+    "next_focus": "trusted_scale_update_transfer_interpretation",
+    "reason": "The trusted snapshot now pins the exact train-side target scope. The next read-only step is to interpret whether this scope is too small to move the whole batch, or whether later aggregation stages still suppress it."
+  },
+  "stage_report": {
+    "policy_num_from_clipped_objective": {
+      "env12": {
+        "abs_mass": 149.7243334662635,
+        "mean": -0.00014773344325173335,
+        "negative_mass": 74.87634914368391,
+        "positive_mass": 74.84798432257958,
+        "signed_sum": -0.028364821104332805,
+        "token_count": 192
+      },
+      "episode": {
+        "abs_mass": 13.329894781112671,
+        "mean": -1.6662368476390839,
+        "negative_mass": 13.329894781112671,
+        "positive_mass": 0.0,
+        "signed_sum": -13.329894781112671,
+        "token_count": 8
+      },
+      "target_scope": {
+        "abs_mass": 13.329894781112671,
+        "mean": -1.6662368476390839,
+        "negative_mass": 13.329894781112671,
+        "positive_mass": 0.0,
+        "signed_sum": -13.329894781112671,
+        "token_count": 8
+      },
+      "target_scope_share_of_batch_abs_mass": 0.08902958171536104,
+      "target_scope_share_of_batch_negative_mass": 0.17802543705133486,
+      "target_scope_share_of_env12_abs_mass": 0.08902958171536104,
+      "target_scope_share_of_env12_negative_mass": 0.17802543705133486,
+      "target_scope_share_of_episode_abs_mass": 1.0,
+      "target_scope_share_of_episode_negative_mass": 1.0,
+      "whole_batch": {
+        "abs_mass": 149.7243334662635,
+        "mean": -0.00014773344325173335,
+        "negative_mass": 74.87634914368391,
+        "positive_mass": 74.84798432257958,
+        "signed_sum": -0.028364821104332805,
+        "token_count": 192
+      }
+    },
+    "post_normalization_advantages": {
+      "env12": {
+        "abs_mass": 158.76149138901383,
+        "mean": 1.634665143986543e-09,
+        "negative_mass": 79.38074553757906,
+        "positive_mass": 79.38074585143477,
+        "signed_sum": 3.1385570764541626e-07,
+        "token_count": 192
+      },
+      "episode": {
+        "abs_mass": 14.139300107955933,
+        "mean": -1.7674125134944916,
+        "negative_mass": 14.139300107955933,
+        "positive_mass": 0.0,
+        "signed_sum": -14.139300107955933,
+        "token_count": 8
+      },
+      "target_scope": {
+        "abs_mass": 14.139300107955933,
+        "mean": -1.7674125134944916,
+        "negative_mass": 14.139300107955933,
+        "positive_mass": 0.0,
+        "signed_sum": -14.139300107955933,
+        "token_count": 8
+      },
+      "target_scope_share_of_batch_abs_mass": 0.08906001061246242,
+      "target_scope_share_of_batch_negative_mass": 0.17812002157705045,
+      "target_scope_share_of_env12_abs_mass": 0.08906001061246242,
+      "target_scope_share_of_env12_negative_mass": 0.17812002157705045,
+      "target_scope_share_of_episode_abs_mass": 1.0,
+      "target_scope_share_of_episode_negative_mass": 1.0,
+      "whole_batch": {
+        "abs_mass": 158.76149138901383,
+        "mean": 1.634665143986543e-09,
+        "negative_mass": 79.38074553757906,
+        "positive_mass": 79.38074585143477,
+        "signed_sum": 3.1385570764541626e-07,
+        "token_count": 192
+      }
+    },
+    "pre_normalization_actor_advantages": {
+      "env12": {
+        "abs_mass": 94.10936189256608,
+        "mean": 0.08100619169999845,
+        "negative_mass": 39.27808654308319,
+        "positive_mass": 54.831275349482894,
+        "signed_sum": 15.553188806399703,
+        "token_count": 192
+      },
+      "episode": {
+        "abs_mass": 7.032025098800659,
+        "mean": -0.8790031373500824,
+        "negative_mass": 7.032025098800659,
+        "positive_mass": 0.0,
+        "signed_sum": -7.032025098800659,
+        "token_count": 8
+      },
+      "target_scope": {
+        "abs_mass": 7.032025098800659,
+        "mean": -0.8790031373500824,
+        "negative_mass": 7.032025098800659,
+        "positive_mass": 0.0,
+        "signed_sum": -7.032025098800659,
+        "token_count": 8
+      },
+      "target_scope_share_of_batch_abs_mass": 0.07472184443061382,
+      "target_scope_share_of_batch_negative_mass": 0.17903176345129235,
+      "target_scope_share_of_env12_abs_mass": 0.07472184443061382,
+      "target_scope_share_of_env12_negative_mass": 0.17903176345129235,
+      "target_scope_share_of_episode_abs_mass": 1.0,
+      "target_scope_share_of_episode_negative_mass": 1.0,
+      "whole_batch": {
+        "abs_mass": 94.10936189256608,
+        "mean": 0.08100619169999845,
+        "negative_mass": 39.27808654308319,
+        "positive_mass": 54.831275349482894,
+        "signed_sum": 15.553188806399703,
+        "token_count": 192
+      }
+    },
+    "ratio_and_clipping": {
+      "env12_clip_active_fraction": 0.6822916666666666,
+      "env12_ratio_mean": 0.9429953281457225,
+      "episode_clip_active_fraction": 1.0,
+      "episode_ratio_mean": 0.9427475333213806,
+      "target_scope_clip_active_fraction": 1.0,
+      "target_scope_ratio_mean": 0.9427475333213806,
+      "whole_batch_clip_active_fraction": 0.6822916666666666,
+      "whole_batch_ratio_mean": 0.9429953281457225
+    }
+  },
+  "stage_transition": {
+    "target_negative_mass": {
+      "normalization_delta": 7.107275009155273,
+      "pipeline_delta": 6.297869682312012,
+      "policy_num": 13.329894781112671,
+      "policy_over_post_retention": 0.9427549227569034,
+      "policy_over_pre_retention": 1.8955982940655516,
+      "post": 14.139300107955933,
+      "post_over_pre_retention": 2.0107010298310013,
+      "pre": 7.032025098800659,
+      "ratio_and_clipping_delta": -0.8094053268432617
+    },
+    "target_share_of_batch_negative_mass": {
+      "normalization_delta": -0.0009117418742418948,
+      "policy_num": 0.17802543705133486,
+      "post": 0.17812002157705045,
+      "pre": 0.17903176345129235,
+      "ratio_and_clipping_delta": -9.458452571559084e-05
+    },
+    "target_share_of_env12_negative_mass": {
+      "normalization_delta": -0.0009117418742418948,
+      "policy_num": 0.17802543705133486,
+      "post": 0.17812002157705045,
+      "pre": 0.17903176345129235,
+      "ratio_and_clipping_delta": -9.458452571559084e-05
+    }
+  },
+  "strict_contract": {
+    "actor_objective_mode": "tokenwise",
+    "batch_size_flat": 256,
+    "epoch_idx": 1,
+    "normalize_advantage": true,
+    "objective_total": 192,
+    "outer_batch_idx": 13,
+    "runtime_suite_name": "pair2"
+  },
+  "target_scope": {
+    "objective_global_position_max": 29,
+    "objective_global_position_min": 22,
+    "objective_position_max": 7,
+    "objective_position_min": 0,
+    "selector": {
+      "env_index": 12,
+      "objective_episode_index": 10,
+      "objective_position_end": 7,
+      "objective_position_start": 0,
+      "outer_batch_idx": 13
+    },
+    "step_index_max": 93,
+    "step_index_min": 86,
+    "token_count": 8
+  }
+}

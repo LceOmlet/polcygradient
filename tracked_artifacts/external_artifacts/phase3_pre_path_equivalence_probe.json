@@ -1,0 +1,32 @@
+{
+  "batch_size": 1,
+  "canonical_ppo_baseline_path": {
+    "full_return_mean": -22.512123107910156,
+    "full_return_per_env": [
+      -22.512123107910156
+    ],
+    "suffix_return_mean": -0.5081862211227417,
+    "suffix_return_per_env": [
+      -0.5081862211227417
+    ]
+  },
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "current_pre_path": {
+    "full_return_mean": -22.51203155517578,
+    "full_return_per_env": [
+      -22.51203155517578
+    ],
+    "suffix_return_mean": -0.5081825852394104,
+    "suffix_return_per_env": [
+      -0.5081825852394104
+    ]
+  },
+  "diff": {
+    "full_return_mean_abs_diff": 9.1552734375e-05,
+    "full_return_per_env_max_abs_diff": 9.1552734375e-05,
+    "suffix_return_mean_abs_diff": 3.635883331298828e-06,
+    "suffix_return_per_env_max_abs_diff": 3.635883331298828e-06
+  },
+  "n_samples": 2048,
+  "single_eval_pos": 1946
+}

@@ -1,0 +1,55 @@
+{
+  "bucket_alignment": {
+    "q1": {
+      "corr_delta_vs_negative_mass_share": 0.3917294144630432,
+      "corr_delta_vs_positive_mass_share": -0.6809900403022766,
+      "corr_delta_vs_value_corr": 0.46305814385414124
+    },
+    "q2": {
+      "corr_delta_vs_negative_mass_share": 0.8873786926269531,
+      "corr_delta_vs_positive_mass_share": -0.6538011431694031,
+      "corr_delta_vs_value_corr": 0.16129061579704285
+    },
+    "q3": {
+      "corr_delta_vs_negative_mass_share": -0.5239306092262268,
+      "corr_delta_vs_positive_mass_share": 0.8468202948570251,
+      "corr_delta_vs_value_corr": -0.5050829648971558
+    },
+    "q4": {
+      "corr_delta_vs_negative_mass_share": -0.5218150615692139,
+      "corr_delta_vs_positive_mass_share": 0.6420256495475769,
+      "corr_delta_vs_value_corr": -0.6666391491889954
+    }
+  },
+  "bucket_contrast_low_mass_positive_minus_high_mass_nonpositive": {
+    "q1": {
+      "negative_mass_share": 0.19752096782281567,
+      "positive_mass_share": -0.2989689020741497,
+      "value_corr": 0.5607968838885427
+    },
+    "q2": {
+      "negative_mass_share": 0.14813342449438946,
+      "positive_mass_share": -0.15732050441370413,
+      "value_corr": 0.07388697564601898
+    },
+    "q3": {
+      "negative_mass_share": -0.16298777125906616,
+      "positive_mass_share": 0.06147356666483098,
+      "value_corr": -0.16024000197649002
+    },
+    "q4": {
+      "negative_mass_share": -0.18266656508816778,
+      "positive_mass_share": 0.39481579632930863,
+      "value_corr": -0.29788473062217236
+    }
+  },
+  "locked_interpretation": {
+    "early_positive_mass_q1_q2_is_not_success_signal": true,
+    "late_positive_mass_q3_q4_aligns_better_with_positive_delta": true,
+    "q3_aligns_stronger_than_q4": true,
+    "successful_low_mass_envs_have_better_q1_value_corr_than_failed_high_mass_envs": true,
+    "successful_low_mass_envs_shift_positive_mass_from_q1_q2_to_q4": true
+  },
+  "runtime_wall_s": 101.0446338520851,
+  "source_artifact": "/home/chen/RLPFN/artifacts/phase3_train_token_bucket_probe.json"
+}

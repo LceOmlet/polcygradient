@@ -1,0 +1,161 @@
+{
+  "conclusion": {
+    "deterministic_algorithms_alone_fix_shortrun": false,
+    "longrun_numeric_contract_stable": true,
+    "shortrun_profile_numeric_contract_stable": false
+  },
+  "phase3_longrun_stability": {
+    "longrun_canonical": {
+      "driver_collect_wall_s": null,
+      "driver_policy_loss": null,
+      "driver_returns_std": null,
+      "grad_compare": {
+        "cosine_similarity": 1.000220775604248,
+        "l2_delta_norm": 3.819410994765349e-05,
+        "phase3_isolated_grad_norm": 8.315511703491211,
+        "resume_grad_norm": 8.315512657165527
+      },
+      "mtime_ns": 1775780270603064526,
+      "path": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare.json",
+      "phase3_isolated_collect_wall_s": 48.10491962800734,
+      "phase3_isolated_policy_loss": -0.128927543759346
+    },
+    "longrun_deterministic_tmp": {
+      "driver_collect_wall_s": null,
+      "driver_policy_loss": null,
+      "driver_returns_std": null,
+      "grad_compare": {
+        "cosine_similarity": 1.000220775604248,
+        "l2_delta_norm": 3.819410994765349e-05,
+        "phase3_isolated_grad_norm": 8.315511703491211,
+        "resume_grad_norm": 8.315512657165527
+      },
+      "mtime_ns": 1775780151918884445,
+      "path": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare_deterministic_algo_tmp.json",
+      "phase3_isolated_collect_wall_s": 76.65905999811366,
+      "phase3_isolated_policy_loss": -0.128927543759346
+    },
+    "longrun_strict_tmp": {
+      "driver_collect_wall_s": null,
+      "driver_policy_loss": null,
+      "driver_returns_std": null,
+      "grad_compare": {
+        "cosine_similarity": 1.000220775604248,
+        "l2_delta_norm": 3.819410994765349e-05,
+        "phase3_isolated_grad_norm": 8.315511703491211,
+        "resume_grad_norm": 8.315512657165527
+      },
+      "mtime_ns": 1775779271653859580,
+      "path": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare_strict_tmp.json",
+      "phase3_isolated_collect_wall_s": 50.252567877061665,
+      "phase3_isolated_policy_loss": -0.128927543759346
+    },
+    "longrun_strict_tmp2": {
+      "driver_collect_wall_s": null,
+      "driver_policy_loss": null,
+      "driver_returns_std": null,
+      "grad_compare": {
+        "cosine_similarity": 1.000220775604248,
+        "l2_delta_norm": 3.819410994765349e-05,
+        "phase3_isolated_grad_norm": 8.315511703491211,
+        "resume_grad_norm": 8.315512657165527
+      },
+      "mtime_ns": 1775779403404617004,
+      "path": "/home/chen/RLPFN/artifacts/phase3_longrun_gradient_compare_strict_tmp2.json",
+      "phase3_isolated_collect_wall_s": 48.10491962800734,
+      "phase3_isolated_policy_loss": -0.128927543759346
+    },
+    "strict_tmp1": {
+      "driver_collect_wall_s": 51.641078198794276,
+      "driver_policy_loss": -125.3319320678711,
+      "driver_returns_std": 0.11341869086027145,
+      "grad_compare": {
+        "cosine_similarity": 1.0000022649765015,
+        "driver_grad_norm": 677.810302734375,
+        "l2_delta_norm": 0.022177403792738914,
+        "reference_grad_norm": 677.8110961914062
+      },
+      "mtime_ns": 1775779268287268107,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2_strict_tmp.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    },
+    "strict_tmp2": {
+      "driver_collect_wall_s": 52.48535700305365,
+      "driver_policy_loss": 1.1956639289855957,
+      "driver_returns_std": 0.13139890134334564,
+      "grad_compare": {
+        "cosine_similarity": 1.0000059604644775,
+        "driver_grad_norm": 6.328612804412842,
+        "l2_delta_norm": 0.0001718089188216254,
+        "reference_grad_norm": 6.328620910644531
+      },
+      "mtime_ns": 1775779406015124980,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2_strict_tmp2.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    },
+    "strict_tmp3": {
+      "driver_collect_wall_s": 44.43869234691374,
+      "driver_policy_loss": 3.251784324645996,
+      "driver_returns_std": 0.14202962815761566,
+      "grad_compare": {
+        "cosine_similarity": 1.000003457069397,
+        "driver_grad_norm": 17.220685958862305,
+        "l2_delta_norm": 0.0005920693511143327,
+        "reference_grad_norm": 17.220726013183594
+      },
+      "mtime_ns": 1775779559707656979,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2_strict_tmp3.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    }
+  },
+  "phase3_shortrun_instability": {
+    "canonical_shortrun": {
+      "driver_collect_wall_s": 44.43869234691374,
+      "driver_policy_loss": 3.251784324645996,
+      "driver_returns_std": 0.14202962815761566,
+      "grad_compare": {
+        "cosine_similarity": 1.000003457069397,
+        "driver_grad_norm": 17.220685958862305,
+        "l2_delta_norm": 0.0005920693511143327,
+        "reference_grad_norm": 17.220726013183594
+      },
+      "mtime_ns": 1775780270611426229,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    },
+    "deterministic_tmp1": {
+      "driver_collect_wall_s": 79.74887372204103,
+      "driver_policy_loss": 1.1956639289855957,
+      "driver_returns_std": 0.13139890134334564,
+      "grad_compare": {
+        "cosine_similarity": 1.0000059604644775,
+        "driver_grad_norm": 6.328612804412842,
+        "l2_delta_norm": 0.0001718089188216254,
+        "reference_grad_norm": 6.328620910644531
+      },
+      "mtime_ns": 1775779965287968926,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2_deterministic_algo_tmp.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    },
+    "deterministic_tmp2": {
+      "driver_collect_wall_s": 71.81508227810264,
+      "driver_policy_loss": -125.3319320678711,
+      "driver_returns_std": 0.11341869086027145,
+      "grad_compare": {
+        "cosine_similarity": 1.0000022649765015,
+        "driver_grad_norm": 677.810302734375,
+        "l2_delta_norm": 0.022177403792738914,
+        "reference_grad_norm": 677.8110961914062
+      },
+      "mtime_ns": 1775780315873054257,
+      "path": "/home/chen/RLPFN/artifacts/phase3_shortrun_profile_gradient_regression_v2_deterministic_algo_tmp2.json",
+      "phase3_isolated_collect_wall_s": null,
+      "phase3_isolated_policy_loss": null
+    }
+  }
+}

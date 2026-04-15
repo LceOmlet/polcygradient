@@ -1,0 +1,4 @@
+{"event": "phase_start", "phase": "train_loop", "t": 1694876.563815217}
+{"event": "phase_end", "phase": "train_loop", "t": 1694981.772545686, "wall_s": 105.20873046899214}
+{"event": "phase_start", "phase": "post_train", "t": 1694982.008321448}
+{"error": "", "error_type": "KeyboardInterrupt", "event": "phase_error", "phase": "post_train", "t": 1695011.746984247, "wall_s": 29.73866279888898}

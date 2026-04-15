@@ -1,0 +1,158 @@
+{
+  "audit_entry": "phase3_phase2_milestone_contract_gradient_compare",
+  "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+  "conclusions": {
+    "gradient_exact_match": true,
+    "initial_policy_state_exact_match": true,
+    "rollout_tensors_exact_match": true,
+    "scalar_measures_exact_match": true,
+    "signature_exact_match": true
+  },
+  "contract_args": {
+    "batch_size": 256,
+    "build_seed": 4040,
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "single_eval_pos": 64,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "device": "cuda:0",
+  "grad_compare": {
+    "cosine_similarity": 1.0002700090408325,
+    "l2_delta_norm": 0.0,
+    "max_abs_grad_delta": 0.0,
+    "phase2_grad_norm": 5.755584239959717,
+    "phase3_grad_norm": 5.755584239959717
+  },
+  "initial_param_diff": {
+    "differing_tensors": [],
+    "num_param_tensors_with_diff": 0,
+    "policy_param_max_abs_diff": 0.0
+  },
+  "phase2_guardrail_passed": true,
+  "phase2_measure": {
+    "approx_kl": 5.061738193035126e-07,
+    "aux_flow_weight": 0.0,
+    "aux_q_weight": 0.0,
+    "clip_fraction": 0.0,
+    "entropy_loss": -39.73027801513672,
+    "grad_norm": 5.755584239959717,
+    "objective_total": 192,
+    "policy_loss": -0.17480118572711945,
+    "total_loss": 1.272348403930664,
+    "value_loss": 2.894299268722534
+  },
+  "phase2_signature": {
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "actor_objective_runtime_current_suite_name": null,
+    "batch_size": 256,
+    "clip_range": 0.2,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "ent_coef": 0.0,
+    "env_rng_seeds": [
+      2020
+    ],
+    "gae_lambda": 0.95,
+    "gamma": 1.0,
+    "learning_rate": 0.0002,
+    "max_grad_norm": 0.5,
+    "n_envs": 1,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "normalize_advantage": false,
+    "reset_env_state_at_sep": true,
+    "restore_validation_policy_state": false,
+    "rollout_rng_seeds": [
+      4040
+    ],
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "separate_value_backbone": false,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "vf_coef": 0.5
+  },
+  "phase2_summary_path": "/home/chen/RLPFN/artifacts/phase2_regression_pack/phase2_regression_suite_summary.json",
+  "phase3_measure": {
+    "approx_kl": 5.061738193035126e-07,
+    "aux_flow_weight": 0.0,
+    "aux_q_weight": 0.0,
+    "clip_fraction": 0.0,
+    "entropy_loss": -39.73027801513672,
+    "grad_norm": 5.755584239959717,
+    "objective_total": 192,
+    "policy_loss": -0.17480118572711945,
+    "total_loss": 1.272348403930664,
+    "value_loss": 2.894299268722534
+  },
+  "phase3_signature": {
+    "actor_baseline_mode": "learned",
+    "actor_gae_space": "normalized",
+    "actor_objective_mode": "tokenwise",
+    "actor_objective_runtime_current_suite_name": null,
+    "batch_size": 256,
+    "clip_range": 0.2,
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "ent_coef": 0.0,
+    "env_rng_seeds": [
+      2020
+    ],
+    "gae_lambda": 0.95,
+    "gamma": 1.0,
+    "learning_rate": 0.0002,
+    "max_grad_norm": 0.5,
+    "n_envs": 1,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "normalize_advantage": false,
+    "reset_env_state_at_sep": true,
+    "restore_validation_policy_state": false,
+    "rollout_rng_seeds": [
+      4040
+    ],
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "separate_value_backbone": false,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "target_kl": 0.03,
+    "vf_coef": 0.5
+  },
+  "recommendation": {
+    "next_focus": "many_env_target_side_ab_only_after_contract_match",
+    "reason": "Only after this single-env contract compare is exact can the many-env baseline vs narrow-adjustment A/B be interpreted as isolating the two intended differences."
+  },
+  "rollout_tensor_max_abs_diff": {
+    "actions": 0.0,
+    "advantages": 0.0,
+    "episode_starts": 0.0,
+    "objective_masks": 0.0,
+    "observations": 0.0,
+    "old_log_prob": 0.0,
+    "old_values": 0.0,
+    "returns": 0.0
+  },
+  "scalar_measure_abs_diff": {
+    "approx_kl": 0.0,
+    "aux_flow_weight": 0.0,
+    "aux_q_weight": 0.0,
+    "clip_fraction": 0.0,
+    "entropy_loss": 0.0,
+    "grad_norm": 0.0,
+    "objective_total": 0.0,
+    "policy_loss": 0.0,
+    "total_loss": 0.0,
+    "value_loss": 0.0
+  },
+  "signature_diff": {}
+}

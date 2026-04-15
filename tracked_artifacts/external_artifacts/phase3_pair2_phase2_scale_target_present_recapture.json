@@ -1,0 +1,69 @@
+{
+  "capture": {
+    "first_match": {
+      "epoch_idx": 1,
+      "outer_batch_idx": 13,
+      "target_match_count": 8
+    },
+    "same_hit_relationship_preserved": false,
+    "selector_trace_written": true,
+    "snapshot_objective_total": 192,
+    "snapshot_outer_batch_idx": 13,
+    "snapshot_target_match_count": 8,
+    "snapshot_target_selector": {
+      "target_env_index": 12,
+      "target_objective_episode_index": 10,
+      "target_objective_position_end": 7,
+      "target_objective_position_start": 0,
+      "target_outer_batch_idx": 13
+    },
+    "snapshot_written": true,
+    "target_appeared": true
+  },
+  "config": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "output_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture.json",
+    "selector_trace_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_selector_trace.json",
+    "single_eval_pos": 64,
+    "snapshot_json": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_snapshot.json",
+    "strict_fixed_env_mode": true,
+    "target_env_index": 12,
+    "target_objective_episode_index": 10,
+    "target_objective_position_end": 7,
+    "target_objective_position_start": 0,
+    "target_outer_batch_idx": 13,
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "phase2_reference_contract": {
+    "batch_size": 256,
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "device": "cuda:0",
+    "frozen_h_seed": 12345,
+    "learning_rate": 0.0002,
+    "n_epochs": 1,
+    "n_steps": 256,
+    "outer_epochs": 2,
+    "ppo_reset_env_state_at_sep": true,
+    "shared_actor_critic_backbone": true,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "target_kl": 0.03,
+    "train_env_seed": 2020,
+    "train_rollout_seed": 4040
+  },
+  "probe_entry": "phase3_pair2_phase2_scale_target_present_capture",
+  "runtime": {
+    "elapsed_wall_time_sec": 23.308994076913223,
+    "last_update_wall_time_sec": 5.456477575004101
+  },
+  "selector_trace_path": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_selector_trace.json",
+  "snapshot_path": "/home/chen/RLPFN/artifacts/phase3_pair2_phase2_scale_target_present_recapture_snapshot.json"
+}

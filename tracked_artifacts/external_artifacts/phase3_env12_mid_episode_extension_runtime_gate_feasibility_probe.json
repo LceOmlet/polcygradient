@@ -1,0 +1,93 @@
+{
+  "audit_entry": "phase3_env12_mid_episode_extension_runtime_gate_feasibility_probe",
+  "conclusions": {
+    "exact_existing_actor_objective_mode_support_absent": true,
+    "runtime_gate_feasible_without_shared_core_edit": true,
+    "runtime_gate_requires_new_actor_objective_mode": true,
+    "runtime_gate_stays_branch_specific": true
+  },
+  "control_block": {
+    "branch_specific": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "dominant_source": "baseline_bootstrap_semantic_mismatch",
+    "future_chain_step_count": [
+      38,
+      37,
+      36,
+      35
+    ],
+    "local_indices": [
+      18,
+      19,
+      20,
+      21
+    ],
+    "negative_source_shares_reference": {
+      "baseline_bootstrap_semantic_mismatch": 0.5491065753155423,
+      "terminal_reset_tail_semantic_mismatch": 0.45089342468445764
+    },
+    "row_count": 4,
+    "runtime_control_granularity": "contiguous_four_token_block",
+    "tokens_to_objective_episode_end": [
+      38,
+      37,
+      36,
+      35
+    ]
+  },
+  "material_counterfactual": {
+    "mean_start_gae_future_carry_norm": {
+      "abs_shrink": 0.02045608926564456,
+      "counterfactual_abs": 0.06972909942269324,
+      "counterfactual_over_observed_ratio": 0.7731768424154796,
+      "observed_abs": 0.0901851886883378,
+      "observed_over_counterfactual_ratio": 1.2933651722882735
+    },
+    "mean_start_raw_rollout_residual_norm": {
+      "abs_shrink": 0.7392120670826595,
+      "counterfactual_abs": 0.0648687719972905,
+      "counterfactual_over_observed_ratio": 0.08067444073349021,
+      "observed_abs": 0.80408083907995,
+      "observed_over_counterfactual_ratio": 12.39549962674699
+    },
+    "mean_weighted_delta_sum": {
+      "abs_shrink": 0.020455745239239626,
+      "counterfactual_abs": 0.06972909895965959,
+      "counterfactual_over_observed_ratio": 0.7731797906738602,
+      "observed_abs": 0.09018484419889922,
+      "observed_over_counterfactual_ratio": 1.2933602404797155
+    }
+  },
+  "mode_support": {
+    "block_is_branch_specific": true,
+    "block_is_contiguous": true,
+    "branch_specific_scope_only": true,
+    "can_be_minimally_implemented_as_runtime_gate": true,
+    "exact_existing_actor_objective_mode_supported": false,
+    "exact_matching_builtin_mode": null,
+    "minimal_runtime_edit_surface": "MaskedRecurrentPPO._apply_actor_objective_postprocess",
+    "nearest_builtin_family": "tokenwise_drop_q1_early",
+    "nearest_builtin_family_is_too_broad": true,
+    "nearest_builtin_family_supported": true,
+    "requires_new_actor_objective_mode": true,
+    "requires_shared_core_edit": false
+  },
+  "recommendation": {
+    "branch_specific_followup_needed": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "minimal_runtime_edit_surface": "MaskedRecurrentPPO._apply_actor_objective_postprocess",
+    "reason": "Current runtime modes do not exactly encode this internal four-token block, but the existing actor-objective postprocess hook is sufficient for a minimal branch-specific implementation. That keeps the control local to runtime objective handling and avoids any shared-core edit.",
+    "runtime_gate_kind": "new_branch_specific_actor_objective_mode",
+    "shared_guardrail_unchanged": true
+  },
+  "runtime_semantic_checks": {
+    "branch_specific_followup_needed": true,
+    "can_be_minimally_realized_as_runtime_control": true,
+    "no_finer_split_supported": true,
+    "payloads_match": true,
+    "requires_branch_specific_scope_only": true,
+    "requires_shared_core_edit": false,
+    "shared_guardrail_unchanged": true
+  },
+  "source_runtime_control_json": "/home/chen/RLPFN/artifacts/phase3_env12_mid_episode_extension_runtime_control_probe.json"
+}

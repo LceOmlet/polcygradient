@@ -1,0 +1,36 @@
+{
+  "obs": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0,
+    "first_diff_step": null
+  },
+  "values": {
+    "max_abs_diff": 0.7685420513153076,
+    "mean_abs_diff": 0.13978871703147888,
+    "first_diff_step": 0
+  },
+  "actions": {
+    "max_abs_diff": 0.01927729696035385,
+    "mean_abs_diff": 0.0019621422979980707,
+    "first_diff_step": 0
+  },
+  "terminal": {
+    "max_abs_diff": 1.0,
+    "mean_abs_diff": 0.36328125,
+    "first_diff_step": 32
+  },
+  "next_state": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0,
+    "first_diff_step": null
+  },
+  "final_obs": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0,
+    "first_diff_step": null
+  },
+  "final_terminal": {
+    "max_abs_diff": 0.0,
+    "mean_abs_diff": 0.0
+  }
+}

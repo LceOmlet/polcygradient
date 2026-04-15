@@ -1,0 +1,277 @@
+{
+  "audit_entry": "phase3_pair2_train_update_ab_compare_pack",
+  "baseline": {
+    "comparison": {
+      "heldout_full_return_delta": null,
+      "heldout_suffix_return_delta": null,
+      "post_heldout_vs_zero": null,
+      "post_train_vs_zero": {
+        "full_return_gap": -0.05390644073486328,
+        "suffix_return_gap": -0.07329177856445312
+      },
+      "pre_heldout_vs_zero": null,
+      "pre_train_vs_zero": {
+        "full_return_gap": -0.07050371170043945,
+        "suffix_return_gap": -0.07167959213256836
+      },
+      "train_full_return_delta": 0.016597270965576172,
+      "train_suffix_return_delta": -0.0016121864318847656
+    },
+    "train_history": [
+      {
+        "actor_baseline_mode": "learned",
+        "critic_explained_variance_raw": 0.9712179899215698,
+        "critic_objective_total": 3072,
+        "critic_raw_corr": 0.991511344909668,
+        "outer_epoch": 1,
+        "switches_to_learned_next": false
+      }
+    ]
+  },
+  "comparison": {
+    "heldout_eval_skipped": true,
+    "post_train_vs_zero_gap_delta": {
+      "full_return_gap": 0.04026937484741211,
+      "suffix_return_gap": 0.04336738586425781
+    },
+    "pre_train_vs_zero_gap_delta": {
+      "full_return_gap": 0.0,
+      "suffix_return_gap": 0.0
+    },
+    "train_full_return_delta_change": 0.04026937484741211,
+    "train_history_delta": {
+      "epoch_deltas": [
+        {
+          "actor_baseline_mode_changed": false,
+          "critic_explained_variance_raw_delta": -0.008797287940979004,
+          "critic_objective_total_delta": 0,
+          "critic_raw_corr_delta": -0.001204371452331543,
+          "outer_epoch": 1,
+          "switches_to_learned_next_changed": false
+        }
+      ],
+      "histories_identical": false,
+      "max_abs_metric_delta": 0.008797287940979004
+    },
+    "train_suffix_return_delta_change": 0.04336738586425781
+  },
+  "conclusions": {
+    "pre_metrics_unchanged": true,
+    "runtime_mode_local_to_pair2": true,
+    "shared_core_unchanged": true,
+    "target_side_train_update_changes_trajectory": true
+  },
+  "override": {
+    "comparison": {
+      "heldout_full_return_delta": null,
+      "heldout_suffix_return_delta": null,
+      "post_heldout_vs_zero": null,
+      "post_train_vs_zero": {
+        "full_return_gap": -0.013637065887451172,
+        "suffix_return_gap": -0.029924392700195312
+      },
+      "pre_heldout_vs_zero": null,
+      "pre_train_vs_zero": {
+        "full_return_gap": -0.07050371170043945,
+        "suffix_return_gap": -0.07167959213256836
+      },
+      "train_full_return_delta": 0.05686664581298828,
+      "train_suffix_return_delta": 0.04175519943237305
+    },
+    "train_history": [
+      {
+        "actor_baseline_mode": "learned",
+        "critic_explained_variance_raw": 0.9624207019805908,
+        "critic_objective_total": 3072,
+        "critic_raw_corr": 0.9903069734573364,
+        "outer_epoch": 1,
+        "switches_to_learned_next": false
+      }
+    ]
+  },
+  "override_target_context": {
+    "actor_objective_mode_override": "tokenwise_scale_env12_mid_episode_extension_block",
+    "actor_objective_runtime_current_suite_name": "pair2"
+  },
+  "post_policy_bundles": {
+    "baseline": {
+      "resumed": false,
+      "save_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_post_policy_bundle.pt",
+      "saved": true,
+      "source_path": null
+    },
+    "baseline_requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_post_policy_bundle.pt",
+    "override": {
+      "resumed": false,
+      "save_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_post_policy_bundle.pt",
+      "saved": true,
+      "source_path": null
+    },
+    "override_requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_post_policy_bundle.pt"
+  },
+  "preflight": {
+    "allowed_diff": {
+      "env_rng_seeds": {
+        "phase2": [
+          2020
+        ],
+        "phase3": [
+          1969722475,
+          1333015435,
+          106507308,
+          1644004828,
+          641563549,
+          1147437554,
+          635494866,
+          1151777022,
+          291981711,
+          1925053562,
+          968158028,
+          1995554707,
+          52348860,
+          813573471,
+          458281484,
+          2129455893
+        ]
+      },
+      "n_envs": {
+        "phase2": 1,
+        "phase3": 16
+      },
+      "rollout_rng_seeds": {
+        "phase2": [
+          4040
+        ],
+        "phase3": [
+          1934431487,
+          674693019,
+          2061019613,
+          591143702,
+          1643873512,
+          220389510,
+          1076620996,
+          120552648,
+          1736602171,
+          393249907,
+          1399540930,
+          1032139217,
+          2056709386,
+          49253520,
+          937446903,
+          401686884
+        ]
+      }
+    },
+    "contract_args": {
+      "batch_size": 256,
+      "deterministic_actor_sampling": true,
+      "deterministic_batch_plan": true,
+      "learning_rate": 0.0002,
+      "n_epochs": 1,
+      "n_samples": 256,
+      "single_eval_pos": 64,
+      "strict_fixed_env_mode": true,
+      "strict_native_rollout": true,
+      "target_kl": 0.03,
+      "train_profile": "phase2_shared_backbone_contract"
+    },
+    "preflight_passed": true,
+    "source_path": "/home/chen/RLPFN/artifacts/phase3_preflight_contract_check_pair2.json",
+    "unexpected_diff": {}
+  },
+  "recommendation": {
+    "branch_specific_scope_gate_needed": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "reason": "Compare pair2 baseline and branch-specific target-side train-update audits under the same strict contract to see whether the runtime-feasible small control changes actual optimization trajectory.",
+    "shared_core_unchanged": true
+  },
+  "shared_contract_context": {
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "eval_n_samples": 256,
+    "heldout_suite_fingerprint": "ec11e526e4f6f68d",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+    "n_samples": 256,
+    "ppo_actor_baseline_mode": "learned",
+    "ppo_actor_gae_space": "normalized",
+    "ppo_normalize_advantage": false,
+    "ppo_reset_env_state_at_sep": true,
+    "ppo_separate_value_backbone": false,
+    "ppo_vf_coef": 0.5,
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "train_profile": "phase2_shared_backbone_contract",
+    "train_suite_fingerprint": "207a0b2867895288",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "suite_context": {
+    "actor_objective_mode_override": null,
+    "actor_objective_runtime_current_suite_name": "None",
+    "checkpoint_path": "/home/chen/RLPFN/rwkv/models_diff/rlpfn_03_30_2026_22_37_53_epoch_13.cpkt",
+    "deterministic_actor_sampling": true,
+    "deterministic_batch_plan": true,
+    "eval_n_samples": 256,
+    "heldout_suite_fingerprint": "ec11e526e4f6f68d",
+    "heldout_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/heldout_suite.pt",
+    "n_samples": 256,
+    "ppo_actor_baseline_mode": "learned",
+    "ppo_actor_gae_space": "normalized",
+    "ppo_normalize_advantage": false,
+    "ppo_reset_env_state_at_sep": true,
+    "ppo_separate_value_backbone": false,
+    "ppo_vf_coef": 0.5,
+    "runtime_next_state_flow_matching_weight_override": null,
+    "runtime_normalized_q_value_weight_override": null,
+    "single_eval_pos": 64,
+    "strict_fixed_env_mode": true,
+    "strict_native_rollout": true,
+    "train_profile": "phase2_shared_backbone_contract",
+    "train_suite_fingerprint": "207a0b2867895288",
+    "train_suite_path": "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/suites/train_suite.pt"
+  },
+  "target_control": {
+    "branch_specific": true,
+    "candidate_small_control_target": "env12_mid_episode_extension_block",
+    "runtime_control_shape": "contiguous_four_token_branch_specific_gate",
+    "runtime_mode_activated": true
+  },
+  "train_outer_batch_snapshots": {
+    "baseline": {
+      "requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_outer_batch_snapshot.json",
+      "selector": {
+        "target_env_index": 12,
+        "target_objective_episode_index": 0,
+        "target_objective_position_end": 21,
+        "target_objective_position_start": 18,
+        "target_outer_batch_idx": null
+      },
+      "written": false,
+      "written_path": null
+    },
+    "baseline_requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_baseline_outer_batch_snapshot.json",
+    "override": {
+      "requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_outer_batch_snapshot.json",
+      "selector": {
+        "target_env_index": 12,
+        "target_objective_episode_index": 0,
+        "target_objective_position_end": 21,
+        "target_objective_position_start": 18,
+        "target_outer_batch_idx": null
+      },
+      "written": false,
+      "written_path": null
+    },
+    "override_requested_path": "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_outer_batch_snapshot.json",
+    "selector": {
+      "target_env_index": 12,
+      "target_objective_episode_index": 0,
+      "target_objective_position_end": 21,
+      "target_objective_position_start": 18,
+      "target_outer_batch_idx": null
+    }
+  }
+}

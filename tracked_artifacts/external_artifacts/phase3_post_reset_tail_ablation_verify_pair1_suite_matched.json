@@ -1,0 +1,25 @@
+{
+  "audit_entry": "phase3_post_reset_tail_ablation_verify",
+  "base_summary": {
+    "corr_vs_pre_suffix_gap": 0.2532004117965698,
+    "corr_vs_terminal_resets": 0.7225421071052551,
+    "mass_total": 202.3564695008099
+  },
+  "conclusions": {
+    "post_reset_tail_ablation_improves_pre_gap_alignment": false,
+    "post_reset_tail_ablation_reduces_reset_bias": true
+  },
+  "config": {
+    "tail_len": 8,
+    "tail_mask_probe_json": "/home/chen/RLPFN/artifacts/phase3_terminal_tail_mask_probe_pair1_suite_matched.json"
+  },
+  "deltas": {
+    "corr_pre_delta": -0.25904811080545187,
+    "corr_reset_delta": -0.31913405656814575
+  },
+  "post_reset_tail_ablation_summary": {
+    "corr_vs_pre_suffix_gap": -0.005847699008882046,
+    "corr_vs_terminal_resets": 0.4034080505371094,
+    "mass_total": 166.64039275422692
+  }
+}

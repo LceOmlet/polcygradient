@@ -1,0 +1,45 @@
+{
+  "audit_entry": "mainline_like_objective_alignment_compare_tokenwise_vs_post_first_terminal_only",
+  "post_first_terminal_only_path": "/home/chen/RLPFN/artifacts/mainline_like_objective_alignment_compare_post_first_terminal_only_clean.json",
+  "post_first_terminal_only_summary": {
+    "corr_mean_vs_delta": 0.06596194689317741,
+    "corr_mean_vs_post": -0.07388141803683766,
+    "corr_pos_frac_vs_delta": 0.10692119413531836,
+    "corr_pos_mass_vs_delta": 0.11828113562593376,
+    "high_count": 8,
+    "high_nonpositive_delta_count": 3,
+    "low_positive_delta_count": 11,
+    "spearman_mean_vs_delta": 0.13526392961876832,
+    "spearman_mean_vs_post": -0.00439882697947214
+  },
+  "post_first_terminal_only_trajectory_level_summary": {
+    "corr_raw_suffix_vs_delta": -0.2695203994664736,
+    "corr_raw_suffix_vs_post": 0.9824521001900453,
+    "high_count": 8,
+    "high_nonpositive_delta_count": 3,
+    "low_positive_delta_count": 5,
+    "spearman_raw_suffix_vs_delta": -0.18621700879765396,
+    "spearman_raw_suffix_vs_post": 0.9901026392961876
+  },
+  "tokenwise_path": "/home/chen/RLPFN/artifacts/mainline_like_objective_alignment_compare_tokenwise.json",
+  "tokenwise_summary": {
+    "corr_mean_vs_delta": 0.29120871426391476,
+    "corr_mean_vs_post": -0.024450161394586948,
+    "corr_pos_frac_vs_delta": 0.3101088003539444,
+    "corr_pos_mass_vs_delta": 0.1949644567562144,
+    "high_count": 8,
+    "high_nonpositive_delta_count": 2,
+    "low_positive_delta_count": 2,
+    "spearman_mean_vs_delta": 0.34970674486803516,
+    "spearman_mean_vs_post": 0.25183284457478
+  },
+  "tokenwise_trajectory_level_summary": {
+    "corr_raw_suffix_vs_delta": 0.17869284267045787,
+    "corr_raw_suffix_vs_post": 0.9995673345061523,
+    "high_count": 8,
+    "high_nonpositive_delta_count": 3,
+    "low_positive_delta_count": 5,
+    "spearman_raw_suffix_vs_delta": 0.17485337243401758,
+    "spearman_raw_suffix_vs_post": 0.9882697947214076
+  }
+}

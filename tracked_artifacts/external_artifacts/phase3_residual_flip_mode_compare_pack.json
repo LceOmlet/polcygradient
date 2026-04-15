@@ -1,0 +1,116 @@
+{
+  "audit_entry": "phase3_residual_flip_mode_compare_pack",
+  "comparison": {
+    "bootstrap_dominant": {
+      "env_counts": {
+        "env1": 9,
+        "env12": 21,
+        "env4": 12,
+        "env7": 27
+      },
+      "flip_cause_counts": {
+        "bootstrap_term_negative": 57,
+        "delta_negative_mixed": 12
+      },
+      "flip_mode": "bootstrap_dominant",
+      "mean_actor_adv_norm": -0.18311849062371513,
+      "mean_bootstrap_term_norm": -0.036853876126849136,
+      "mean_delta_norm": -0.05774141832134764,
+      "mean_gae_future_carry_norm": -0.12537707349865873,
+      "mean_mc_future_carry_equiv_norm": 0.2561119704025227,
+      "mean_objective_episode_index": 0.057971014492753624,
+      "mean_pre_vs_zero_suffix_gap": 8.010536797668623,
+      "mean_raw_rollout_residual_norm": 0.19837055208117502,
+      "mean_reward_norm": -0.020887542194498523,
+      "mean_steps_until_next_objective": 1.0,
+      "mean_token_in_objective_episode": 57.333333333333336,
+      "mean_tokens_to_objective_episode_end": 29.27536231884058,
+      "next_step_nonobjective_share": 0.057971014492753624,
+      "objective_episode_counts": {
+        "episode0": 65,
+        "episode1": 4
+      },
+      "share_within_target_tokens": 0.5702479338842975,
+      "token_count": 69
+    },
+    "bootstrap_mode_has_some_next_step_nonobjective_share": true,
+    "bootstrap_mode_is_more_locally_negative": true,
+    "differences": {
+      "mean_actor_adv_norm": -0.0003736008785627798,
+      "mean_bootstrap_term_norm": 0.06068341263934322,
+      "mean_delta_norm": 0.08811540529147861,
+      "mean_gae_future_carry_norm": -0.08848900507017862,
+      "mean_pre_vs_zero_suffix_gap": 2.708945907901562,
+      "mean_raw_rollout_residual_norm": 0.11635034516080614,
+      "mean_reward_norm": 0.027431992652135417,
+      "mean_token_in_objective_episode": -1.8910256410256423,
+      "mean_tokens_to_objective_episode_end": -3.852285395763655,
+      "next_step_nonobjective_share": -0.057971014492753624,
+      "token_share": -0.14049586776859502
+    },
+    "future_carry_dominant": {
+      "env_counts": {
+        "env1": 7,
+        "env12": 23,
+        "env4": 6,
+        "env7": 16
+      },
+      "flip_cause_counts": {
+        "negative_gae_future_carry": 52
+      },
+      "flip_mode": "future_carry_dominant",
+      "mean_actor_adv_norm": -0.1834920915022779,
+      "mean_bootstrap_term_norm": 0.023829536512494087,
+      "mean_delta_norm": 0.03037398697013097,
+      "mean_gae_future_carry_norm": -0.21386607856883735,
+      "mean_mc_future_carry_equiv_norm": 0.28434691027185033,
+      "mean_objective_episode_index": 0.019230769230769232,
+      "mean_pre_vs_zero_suffix_gap": 10.719482705570185,
+      "mean_raw_rollout_residual_norm": 0.31472089724198116,
+      "mean_reward_norm": 0.006544450457636892,
+      "mean_steps_until_next_objective": 1.0,
+      "mean_token_in_objective_episode": 55.44230769230769,
+      "mean_tokens_to_objective_episode_end": 25.423076923076923,
+      "next_step_nonobjective_share": 0.0,
+      "objective_episode_counts": {
+        "episode0": 51,
+        "episode1": 1
+      },
+      "share_within_target_tokens": 0.4297520661157025,
+      "token_count": 52
+    },
+    "future_mode_dominates_pre_gap_and_residual": true,
+    "future_mode_has_zero_next_step_nonobjective_share": true,
+    "future_mode_is_more_future_carry_negative": true,
+    "shared_actor_adv_magnitude": true
+  },
+  "conclusions": {
+    "bootstrap_mode_is_locally_more_negative": true,
+    "bootstrap_only_fix_not_enough": true,
+    "future_carry_chain_is_primary_active_search_target": true,
+    "future_carry_mode_carries_more_negative_recursive_signal": true,
+    "future_carry_mode_has_stronger_anchor_and_residual_signal": true,
+    "residual_flip_modes_have_nearly_same_final_actor_adv_magnitude": true
+  },
+  "recommendation": {
+    "bootstrap_only_fix_insufficient": true,
+    "candidate_small_fix_target": "future_carry_source_chain",
+    "reason": "Future-carry tokens carry the stronger heldout-gain anchors and stronger raw residuals, while final actor-adv magnitude is nearly identical to bootstrap-dominant tokens. That makes future-carry recursion the narrower active search target.",
+    "regime_split_guardrail_required": true
+  },
+  "source_residual_flip_split_json": "/home/chen/RLPFN/artifacts/phase3_pair2_flip_mode_split_probe.json",
+  "token_distribution": {
+    "bootstrap_dominant": {
+      "1": 9,
+      "12": 21,
+      "4": 12,
+      "7": 27
+    },
+    "future_carry_dominant": {
+      "1": 7,
+      "12": 23,
+      "4": 6,
+      "7": 16
+    }
+  }
+}
