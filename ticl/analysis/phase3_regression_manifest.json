@@ -1,0 +1,50 @@
+{
+  "phase3_claims_trusted": false,
+  "phase3_trust_reason": "Phase 3 longrun and optimization artifacts are currently quarantined. The only trusted branch is the maintained Phase 2 shared actor-critic backbone contract.",
+  "trusted_longrun_gradient_compare": {
+    "exact_match_required": true,
+    "cosine_similarity_min": 0.9999,
+    "l2_delta_norm_max": 0.01,
+    "resume_grad_norm_expected": 8.315512657165527,
+    "phase3_isolated_grad_norm_expected": 8.315511703491211,
+    "collect_wall_s_max": 80.0,
+    "backward_wall_s_max": 1.0,
+    "collect_ratio_max": 1.5,
+    "backward_ratio_max": 2.0,
+    "abs_tol": 1e-06
+  },
+  "legacy_shortrun_profile_gradient_compare": {
+    "enabled": false,
+    "reason": "Quarantined: current strict fixed-env contract still shows cross-run numeric instability in shortrun profile regression.",
+    "exact_match_required": true,
+    "cosine_similarity_min": 0.9999,
+    "l2_delta_norm_max": 0.5,
+    "driver_grad_norm_expected": 0.0,
+    "reference_grad_norm_expected": 0.0,
+    "abs_tol": 1e-06
+  },
+  "checkpoint_generalization": {
+    "abs_tol": 1e-06,
+    "pair1": {
+      "train_full_gap": -12.389642596244812,
+      "train_suffix_gap": -0.5169562138617039,
+      "heldout_full_gap": 59.01048278808594,
+      "heldout_suffix_gap": 2.8122913241386414
+    },
+    "pair2": {
+      "train_full_gap": 66.80872344970703,
+      "train_suffix_gap": 3.2046568989753723,
+      "heldout_full_gap": 26.168006896972656,
+      "heldout_suffix_gap": 1.5457842350006104
+    }
+  },
+  "legacy_pair1_optimization": {
+    "enabled": false,
+    "reason": "Quarantined: historical pair1 optimization artifact used a fresh-built PPO policy rather than restoring the checkpoint validation PPO policy state, so its pre/post optimization deltas are not a trusted semantic baseline.",
+    "abs_tol": 1e-06,
+    "train_full_return_delta": -1.0401105880737305,
+    "train_suffix_return_delta": -0.07944512367248535,
+    "heldout_full_return_delta": -0.2744731903076172,
+    "heldout_suffix_return_delta": 0.019055277109146118
+  }
+}

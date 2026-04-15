@@ -1,0 +1,40 @@
+{
+  "official_vs_monkey": {
+    "exact_zero_keys": [
+      "policy_loss_abs_diff",
+      "grad_l2_delta",
+      "actions_max_abs_diff",
+      "returns_max_abs_diff",
+      "values_max_abs_diff",
+      "advantages_max_abs_diff",
+      "log_probs_max_abs_diff"
+    ],
+    "grad_cosine_min": 0.99999,
+    "timing_ratio_min": 0.9,
+    "timing_ratio_max": 1.1,
+    "first_step_action_mean_max_abs_diff_max": 0.001,
+    "first_step_values_max_abs_diff_max": 0.001,
+    "expected_unsynced_tensor_names": [
+      "action_net.weight",
+      "value_net.weight"
+    ]
+  },
+  "shared_milestone": {
+    "abs_tol": 1e-06,
+    "zero_suffix_return_mean": -0.5634000301361084,
+    "learned": {
+      "pre_smp_gap": -0.028345704078674316,
+      "post_smp_gap": 0.6964260339736938,
+      "delta_smp_gap": 0.7247717380523682,
+      "pre_return": -0.5917457342147827,
+      "post_return": 0.13302600383758545
+    },
+    "zero": {
+      "pre_smp_gap": 0.032540202140808105,
+      "post_smp_gap": 0.18433082103729248,
+      "delta_smp_gap": 0.15179061889648438,
+      "pre_return": -0.5308598279953003,
+      "post_return": -0.3790692090988159
+    }
+  }
+}

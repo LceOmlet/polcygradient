@@ -206,7 +206,12 @@ class HumanOutputFormat(KVWriter, SeqWriter):
             if len(tag) > 0 and tag in key:
                 key = f"{'':3}{key[len(tag) :]}"
 
-            truncated_key = self._truncate(key)
+            existing_truncated_keys = {
+                existing_key
+                for existing_tag, existing_key in key2str.keys()
+                if existing_tag == tag
+            }
+            truncated_key = self._truncate_key_uniquely(key, existing_truncated_keys)
             if (tag, truncated_key) in key2str:
                 raise ValueError(
                     f"Key '{key}' truncated to '{truncated_key}' that already exists. Consider increasing `max_length`."
@@ -241,8 +246,22 @@ class HumanOutputFormat(KVWriter, SeqWriter):
         self.file.flush()
 
     def _truncate(self, string: str) -> str:
-        if len(string) > self.max_length:
-            string = string[: self.max_length - 3] + "..."
+        return self._truncate_with_length(string, self.max_length)
+
+    @staticmethod
+    def _truncate_with_length(string: str, max_length: int) -> str:
+        if len(string) > max_length:
+            string = string[: max_length - 3] + "..."
+        return string
+
+    def _truncate_key_uniquely(self, string: str, existing_keys: set[str]) -> str:
+        truncated = self._truncate(string)
+        if truncated not in existing_keys:
+            return truncated
+        for max_length in range(self.max_length + 1, len(string) + 1):
+            candidate = self._truncate_with_length(string, max_length)
+            if candidate not in existing_keys:
+                return candidate
         return string
 
     def write_sequence(self, sequence: list[str]) -> None:

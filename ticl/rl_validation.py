@@ -78,6 +78,13 @@ def _pack_token(
     return token
 
 
+def _raise_removed_candidate_action_scoring():
+    raise RuntimeError(
+        "RL validation candidate-action scoring has been removed. "
+        "Validation must now use either PPO validation math or a model exposing forward_policy_step."
+    )
+
+
 def _score_candidate_action_jobs(
     *,
     model,
@@ -89,66 +96,15 @@ def _score_candidate_action_jobs(
     terminal_token_enabled,
     max_parallel_columns=None,
 ):
-    if not jobs:
-        return []
-
-    grouped = {}
-    for job_idx, job in enumerate(jobs):
-        t = int(len(job["x_hist"]))
-        grouped.setdefault(t, []).append((job_idx, job))
-
-    score_list = [None] * len(jobs)
-    with torch.no_grad():
-        for t, entries in grouped.items():
-            n_candidates = int(entries[0][1]["action_candidates"].shape[0])
-            if t <= 0:
-                for job_idx, _ in entries:
-                    score_list[job_idx] = np.zeros((n_candidates,), dtype=np.float32)
-                continue
-            if max_parallel_columns is None:
-                max_entries_per_call = len(entries)
-            else:
-                max_cols = int(max_parallel_columns)
-                if max_cols <= 0:
-                    max_entries_per_call = len(entries)
-                else:
-                    max_entries_per_call = max(1, max_cols // max(1, n_candidates))
-
-            for chunk_start in range(0, len(entries), max_entries_per_call):
-                chunk_entries = entries[chunk_start: chunk_start + max_entries_per_call]
-                total_columns = len(chunk_entries) * n_candidates
-                x_stack = np.zeros((t + 1, total_columns, int(num_features)), dtype=np.float32)
-                y_stack = np.zeros((t + 1, total_columns), dtype=np.float32)
-
-                for entry_idx, (job_idx, job) in enumerate(chunk_entries):
-                    col_start = entry_idx * n_candidates
-                    col_end = col_start + n_candidates
-                    x_prev = np.asarray(job["x_hist"], dtype=np.float32)
-                    y_prev = np.asarray(job["y_hist"], dtype=np.float32)
-                    x_stack[:t, col_start:col_end, :] = np.repeat(x_prev[:, None, :], n_candidates, axis=1)
-                    y_stack[:t, col_start:col_end] = np.repeat(y_prev[:, None], n_candidates, axis=1)
-                    for candidate_idx in range(n_candidates):
-                        x_stack[t, col_start + candidate_idx, :] = _pack_token(
-                            obs=job["obs"],
-                            action=job["action_candidates"][candidate_idx],
-                            reward=job["prev_reward"],
-                            reward_mask=1.0,
-                            obs_slot_dim=obs_slot_dim,
-                            action_slot_dim=action_slot_dim,
-                            num_features=num_features,
-                            phase=job["phase"],
-                            terminal=job["terminal"],
-                            terminal_token_enabled=terminal_token_enabled,
-                        )
-
-                x_tensor = torch.from_numpy(x_stack).to(device=device)
-                y_tensor = torch.from_numpy(y_stack).to(device=device)
-                out = model((x_tensor, y_tensor), single_eval_pos=t)
-                scores = out[0, :, 0].detach().float().cpu().numpy().reshape(len(chunk_entries), n_candidates)
-                for entry_idx, (job_idx, _) in enumerate(chunk_entries):
-                    score_list[job_idx] = scores[entry_idx]
-
-    return score_list
+    del model
+    del device
+    del jobs
+    del obs_slot_dim
+    del action_slot_dim
+    del num_features
+    del terminal_token_enabled
+    del max_parallel_columns
+    _raise_removed_candidate_action_scoring()
 
 
 def _score_candidate_actions(
@@ -166,35 +122,20 @@ def _score_candidate_actions(
     terminal=0.0,
     terminal_token_enabled=False,
 ):
-    return _score_candidate_action_jobs(
-        model=model,
-        device=device,
-        jobs=[
-            {
-                "x_hist": x_hist,
-                "y_hist": y_hist,
-                "obs": obs,
-                "prev_reward": prev_reward,
-                "terminal": terminal,
-                "phase": phase,
-                "action_candidates": action_candidates,
-            }
-        ],
-        obs_slot_dim=obs_slot_dim,
-        action_slot_dim=action_slot_dim,
-        num_features=num_features,
-        terminal_token_enabled=terminal_token_enabled,
-    )[0]
-
-
-def _sample_action_candidates(rng, action_low, action_high, n_candidates):
-    candidates = rng.uniform(
-        low=action_low,
-        high=action_high,
-        size=(max(1, int(n_candidates)), action_low.shape[0]),
-    ).astype(np.float32)
-    candidates[0] = np.clip(np.zeros_like(action_low), action_low, action_high)
-    return candidates
+    del model
+    del device
+    del x_hist
+    del y_hist
+    del obs
+    del prev_reward
+    del action_candidates
+    del obs_slot_dim
+    del action_slot_dim
+    del num_features
+    del phase
+    del terminal
+    del terminal_token_enabled
+    _raise_removed_candidate_action_scoring()
 
 
 def _resolve_validation_vector_env_cls(gym):
@@ -386,21 +327,21 @@ def _resolve_validation_recurrent_ppo_policy(*, model, config, env_cfg, device, 
         return live_policy
 
     policy_state_dict = _resolve_validation_model_attr(model, "_validation_ppo_policy_state")
-    if not isinstance(policy_state_dict, dict):
-        raise ValueError(
-            "PPO gym validation requires saved SB3 policy-head state. "
-            "Expected model._validation_sb3_policy_live or model._validation_ppo_policy_state."
-        )
 
     from ticl.sb3_recurrent_ppo import build_validation_recurrent_ppo_policy
 
-    return build_validation_recurrent_ppo_policy(
+    policy = build_validation_recurrent_ppo_policy(
         model=model,
         env_cfg=env_cfg,
         device=device,
         num_features=int(num_features),
-        policy_state_dict=policy_state_dict,
+        policy_state_dict=policy_state_dict if isinstance(policy_state_dict, dict) else None,
     )
+    for target in (model, getattr(model, "module", None), getattr(model, "_orig_mod", None)):
+        if target is None:
+            continue
+        target.__dict__["_validation_sb3_policy_live"] = policy
+    return policy
 
 
 def _require_validation_policy_action_head(model):
@@ -1097,12 +1038,9 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     env_names = parse_env_list(orch.get("rl_validate_envs", None))
     episodes = int(orch.get("rl_validate_episodes", 3))
     max_steps = int(orch.get("rl_validate_max_steps", 1000))
-    n_candidates = int(orch.get("rl_validate_action_candidates", 16))
     base_seed = int(orch.get("rl_validate_seed", 1))
     context_lower_bound = int(orch.get("rl_validate_context_lower_bound", 2048))
     max_parallel_columns = int(orch.get("rl_validate_max_parallel_columns", 96))
-    if max_parallel_columns > 0:
-        max_parallel_columns = max(int(n_candidates), max_parallel_columns)
 
     env_cfg = config.get("prior", {}).get("environment", {})
     layout = resolve_rlpfn_token_layout(
@@ -1120,6 +1058,8 @@ def evaluate_rlpfn_on_gym_envs(model, config):
     ppo_policy_step_fn = None
     policy_step_fn = None
     use_policy_step_validation = bool((not use_ppo_validation) and _model_supports_policy_step(model))
+    if (not use_ppo_validation) and (not use_policy_step_validation):
+        _raise_removed_candidate_action_scoring()
     if bool(use_ppo_validation):
         ppo_validation_policy = _resolve_validation_recurrent_ppo_policy(
             model=model,
@@ -1258,79 +1198,7 @@ def evaluate_rlpfn_on_gym_envs(model, config):
                         context_lower_bound=context_lower_bound,
                     )
                 else:
-                    jobs = []
-                    job_states = []
-                    for env_name in env_names:
-                        states = env_states.get(env_name, None)
-                        if not isinstance(states, list):
-                            continue
-                        action_bounds = env_action_bounds.get(env_name, None)
-                        if action_bounds is None:
-                            continue
-                        action_low, action_high = action_bounds
-                        for state in states:
-                            if bool(state["done"]):
-                                continue
-                            if int(state["current_rollout_len"]) >= int(max_steps):
-                                _finalize_validation_rollout(state, context_lower_bound)
-                                continue
-                            candidates = _sample_action_candidates(
-                                rng=state["rng"],
-                                action_low=action_low,
-                                action_high=action_high,
-                                n_candidates=n_candidates,
-                            )
-                            jobs.append(
-                                {
-                                    "x_hist": state["x_hist"],
-                                    "y_hist": state["y_hist"],
-                                    "obs": state["obs"],
-                                    "prev_reward": state["prev_reward"],
-                                    "terminal": state["prev_terminal"],
-                                    "phase": state["phase_flag"],
-                                    "action_candidates": candidates,
-                                }
-                            )
-                            job_states.append((state, candidates))
-
-                    if jobs:
-                        score_list = _score_candidate_action_jobs(
-                            model=model,
-                            device=device,
-                            jobs=jobs,
-                            obs_slot_dim=obs_slot_dim,
-                            action_slot_dim=action_slot_dim,
-                            num_features=num_features,
-                            terminal_token_enabled=terminal_token_enabled,
-                            max_parallel_columns=max_parallel_columns,
-                        )
-                    else:
-                        score_list = []
-
-                    action_pairs = []
-                    for (state, candidates), scores in zip(job_states, score_list):
-                        action = candidates[int(np.argmax(scores))]
-                        state["x_hist"].append(
-                            _pack_token(
-                                obs=state["obs"],
-                                action=action,
-                                reward=state["prev_reward"],
-                                reward_mask=1.0,
-                                obs_slot_dim=obs_slot_dim,
-                                action_slot_dim=action_slot_dim,
-                                num_features=num_features,
-                                phase=state["phase_flag"],
-                                terminal=state["prev_terminal"],
-                                terminal_token_enabled=terminal_token_enabled,
-                            )
-                        )
-                        action_pairs.append((state, action.astype(np.float32)))
-                    _advance_validation_state_action_pairs(
-                        action_pairs=action_pairs,
-                        device=device,
-                        max_steps=max_steps,
-                        context_lower_bound=context_lower_bound,
-                    )
+                    _raise_removed_candidate_action_scoring()
 
             for env_name in env_names:
                 states = env_states.get(env_name, None)

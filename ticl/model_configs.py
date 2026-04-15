@@ -51,6 +51,12 @@ def get_optimizer_config():
         "ppo_clip_range": 0.2,
         "ppo_clip_range_vf": None,
         "ppo_normalize_advantage": True,
+        "ppo_actor_gae_space": "normalized",
+        "ppo_actor_baseline_mode": "learned",
+        "ppo_separate_value_backbone": False,
+        "ppo_reset_env_state_at_sep": True,
+        "ppo_runtime_normalized_q_value_weight_override": None,
+        "ppo_runtime_next_state_flow_matching_weight_override": None,
         "ppo_ent_coef": 0.0,
         "ppo_vf_coef": 0.5,
         "ppo_max_grad_norm": 0.5,
@@ -274,13 +280,12 @@ def get_prior_config(max_features=100, n_samples=2048):
         "reinforce_advantage_norm_clip": 10.0,
         "policy_gradient_weight": 0.4,
         "reinforce_aux_enabled": True,
-        # Keep aux losses enabled by default, but route them through action-conditioned
-        # heads on the policy replay hidden states instead of a separate aux-only
-        # backbone/query pass. Legacy aux backbone replay remains opt-in for
-        # comparisons and ablations.
+        # Keep the auxiliary replay path available, but default the normalized-Q
+        # head off so PPO runs stay centered on the main value objective unless a
+        # caller explicitly opts into q-aux experiments.
         "reinforce_aux_backbone_query_pass_enabled": False,
-        "normalized_q_value_weight": 1.0,
-        "next_state_flow_matching_weight": 1.0,
+        "normalized_q_value_weight": 0.0,
+        "next_state_flow_matching_weight": 0.2,
         "next_state_flow_head_type": "cfmi_resnet",
         # Keep legacy replay next-state/next-obs targets opt-in only; the maintained
         # action-conditioned aux path uses flow_* targets instead.

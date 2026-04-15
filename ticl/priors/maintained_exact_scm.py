@@ -165,7 +165,7 @@ def resolve_survival_reward_enable_prob(h):
 
 def resolve_reinforce_action_transform(h):
     mode = str(h.get("reinforce_action_transform", "none")).strip().lower()
-    if mode not in {"tanh", "rms", "none"}:
+    if mode not in {"tanh", "rms", "none", "clip"}:
         mode = "none"
     return mode
 
@@ -174,6 +174,13 @@ def resolve_reinforce_action_rms_eps(h):
     v = resolve_scalar(h.get("reinforce_action_rms_eps", 1e-6))
     if (not math.isfinite(v)) or v <= 0.0:
         return 1e-6
+    return float(v)
+
+
+def resolve_reinforce_action_clip_bound(h):
+    v = resolve_scalar(h.get("reinforce_action_clip_bound", 5.0))
+    if (not math.isfinite(v)) or v <= 0.0:
+        return 5.0
     return float(v)
 
 

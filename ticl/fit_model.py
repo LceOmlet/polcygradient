@@ -419,7 +419,10 @@ def main(argv, extra_config=None):
 
     model_state, optimizer_state, scheduler = None, None, None
     if warm_start_weights is not None:
-        loaded_states = torch.load(warm_start_weights, map_location='cpu')
+        # PyTorch 2.6 changed torch.load() default to weights_only=True.
+        # Our training checkpoints store config / optimizer / scheduler state,
+        # so warm-start loading must opt back into full checkpoint loading.
+        loaded_states = torch.load(warm_start_weights, map_location='cpu', weights_only=False)
         if isinstance(loaded_states, (list, tuple)) and len(loaded_states) >= 5:
             model_state, old_optimizer_state, old_scheduler, old_config = loaded_states[:4]
         else:
@@ -461,6 +464,12 @@ def main(argv, extra_config=None):
         else:
             print("WARNING warm starting with new settings")
             compare_dicts(config, old_config)
+
+    # Continue-run restores the checkpoint config above, so apply extra_config
+    # again here to make caller-supplied overrides authoritative for resumed
+    # training as well.
+    if extra_config is not None:
+        update_config(config, extra_config)
 
     if config['orchestration']['detect_anomaly']:
         print("ENABLING GRADIENT DEBUGGING (detect-anomaly)! Don't use for training.")

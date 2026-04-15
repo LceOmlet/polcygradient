@@ -16,7 +16,7 @@ from ticl.model_configs import get_model_default_config
 from ticl.models.tabpfn import TabPFN
 from ticl.models.tabpfn_bar_distribution import make_standardized_full_support_bar_distribution
 from ticl.priors.maintained_fast_runner import dispatch_policy_rollout
-from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn, RWKVTwoLayerFlowMatchingHead
+from ticl.models.rwkv7_pfn import _load_official_rwkv7_demo_rnn, RWKVTwoLayerFlowMatchingHead, _prepend_env_bin_to_path
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rl_validation import evaluate_rlpfn_on_gym_envs
 from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
@@ -95,6 +95,21 @@ def test_reinforce_aux_disabled_overrides_aux_weights():
 
     assert EnvironmentPrior._resolve_normalized_q_value_weight(env_cfg) == 0.0
     assert EnvironmentPrior._resolve_next_state_flow_matching_weight(env_cfg) == 0.0
+
+
+def test_prepend_env_bin_to_path_puts_current_python_bin_first(monkeypatch):
+    monkeypatch.setenv("PATH", "/usr/bin:/bin")
+    monkeypatch.setattr(
+        "ticl.models.rwkv7_pfn.sys.executable",
+        "/opt/conda/envs/rlpfn/bin/python",
+        raising=True,
+    )
+
+    _prepend_env_bin_to_path()
+
+    path_parts = os.environ["PATH"].split(os.pathsep)
+    assert path_parts[0] == "/opt/conda/envs/rlpfn/bin"
+    assert "/usr/bin" in path_parts
 
 
 def test_rwkv7_aux_heads_condition_on_action_query():

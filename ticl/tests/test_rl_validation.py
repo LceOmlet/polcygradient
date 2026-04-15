@@ -87,7 +87,7 @@ def test_validation_cache_helpers_normalize_official_eval_flat_cache():
     assert merged[0][2].shape == (2, 32)
 
 
-def test_score_candidate_actions_bootstrap_step_no_prefix_no_crash():
+def test_score_candidate_actions_raise_after_candidate_scoring_removal():
     model = _build_small_causal_model()
     candidates = np.array(
         [
@@ -97,22 +97,19 @@ def test_score_candidate_actions_bootstrap_step_no_prefix_no_crash():
         ],
         dtype=np.float32,
     )
-    scores = _score_candidate_actions(
-        model=model,
-        device="cpu",
-        x_hist=[],
-        y_hist=[],
-        obs=np.zeros((4,), dtype=np.float32),
-        prev_reward=0.0,
-        action_candidates=candidates,
-        obs_slot_dim=8,
-        action_slot_dim=2,
-        num_features=12,
-    )
-
-    assert scores.shape == (3,)
-    assert np.all(np.isfinite(scores))
-    assert np.allclose(scores, 0.0)
+    with pytest.raises(RuntimeError, match="candidate-action scoring has been removed"):
+        _score_candidate_actions(
+            model=model,
+            device="cpu",
+            x_hist=[],
+            y_hist=[],
+            obs=np.zeros((4,), dtype=np.float32),
+            prev_reward=0.0,
+            action_candidates=candidates,
+            obs_slot_dim=8,
+            action_slot_dim=2,
+            num_features=12,
+        )
 
 
 class _FakeBox:
@@ -500,7 +497,7 @@ def test_evaluate_rlpfn_on_gym_envs_switches_to_eval_rollout_after_context_thres
         monkeypatch,
         lambda env_name: _ScriptedEnv([3, 4], [1.0, 2.0]),
     )
-    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
+    model = _PolicyStepRecordingModel(obs_total_dim=8, action_dim=1)
     cfg = {
         "device": "cpu",
         "prior": {
@@ -509,13 +506,21 @@ def test_evaluate_rlpfn_on_gym_envs_switches_to_eval_rollout_after_context_thres
                 "obs_slot_dim": 4,
                 "action_slot_dim": 1,
                 "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
             },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
         },
         "orchestration": {
             "rl_validate_envs": "DummyEnv-v0",
             "rl_validate_episodes": 1,
             "rl_validate_max_steps": 32,
-            "rl_validate_action_candidates": 1,
             "rl_validate_seed": 1,
             "rl_validate_context_lower_bound": 5,
         },
@@ -529,8 +534,10 @@ def test_evaluate_rlpfn_on_gym_envs_switches_to_eval_rollout_after_context_thres
     assert per_env["DummyEnv-v0"]["context_len_before_eval_mean"] == 3.0
     assert per_env["DummyEnv-v0"]["explore_rollout_count_mean"] == 1.0
     assert per_env["DummyEnv-v0"]["explore_rollout_len_mean"] == 3.0
-    assert model.phase_calls == [0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
-    assert model.terminal_calls == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    assert model.reward_mask_calls == [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
+    assert model.phase_calls == [0.0, 0.0, 0.0, 1.0, 1.0, 1.0, 1.0]
+    assert model.terminal_calls == [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0]
+    assert model.cache_seen == [False, True, True, True, True, True, True]
 
 
 def test_evaluate_rlpfn_on_gym_envs_policy_step_path_reuses_cache_and_reports_single_return(monkeypatch):
@@ -580,17 +587,10 @@ def test_evaluate_rlpfn_on_gym_envs_policy_step_path_reuses_cache_and_reports_si
     assert model.cache_seen == [False, True, True, True, True, True, True]
 
 
-def test_evaluate_rlpfn_on_gym_envs_reports_reward_term_breakdown_for_candidate_path(monkeypatch):
+def test_evaluate_rlpfn_on_gym_envs_requires_ppo_or_policy_step_validation_backend(monkeypatch):
     _install_fake_gym(
         monkeypatch,
-        lambda env_name: _RewardInfoEnv(
-            [2, 3],
-            [1.0, 2.0],
-            [
-                {"reward_forward": 0.25, "reward_ctrl": -0.10, "x_position": 1.0},
-                {"reward_forward": 0.50, "reward_ctrl": -0.20, "x_position": 2.0},
-            ],
-        ),
+        lambda env_name: _ScriptedEnv([2, 3], [1.0, 2.0]),
     )
     model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
     cfg = {
@@ -607,21 +607,13 @@ def test_evaluate_rlpfn_on_gym_envs_reports_reward_term_breakdown_for_candidate_
             "rl_validate_envs": "DummyEnv-vRewardTerms",
             "rl_validate_episodes": 1,
             "rl_validate_max_steps": 32,
-            "rl_validate_action_candidates": 1,
             "rl_validate_seed": 1,
             "rl_validate_context_lower_bound": 3,
         },
     }
 
-    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
-
-    assert mean_ret == 6.0
-    assert per_env["DummyEnv-vRewardTerms"]["return"] == 6.0
-    assert per_env["DummyEnv-vRewardTerms"]["reward_forward"] == pytest.approx(1.5)
-    assert per_env["DummyEnv-vRewardTerms"]["reward_forward_mean"] == pytest.approx(1.5)
-    assert per_env["DummyEnv-vRewardTerms"]["reward_ctrl"] == pytest.approx(-0.6)
-    assert per_env["DummyEnv-vRewardTerms"]["reward_ctrl_mean"] == pytest.approx(-0.6)
-    assert "x_position_mean" not in per_env["DummyEnv-vRewardTerms"]
+    with pytest.raises(RuntimeError, match="candidate-action scoring has been removed"):
+        evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
 
 
 def test_evaluate_rlpfn_on_gym_envs_reports_reward_term_breakdown_for_policy_step_path(monkeypatch):
@@ -986,7 +978,7 @@ def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_thresho
         monkeypatch,
         lambda env_name: _ScriptedEnv([2, 4, 3], [1.0, 1.5, 5.0]),
     )
-    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
+    model = _PolicyStepRecordingModel(obs_total_dim=8, action_dim=1)
     cfg = {
         "device": "cpu",
         "prior": {
@@ -995,13 +987,21 @@ def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_thresho
                 "obs_slot_dim": 4,
                 "action_slot_dim": 1,
                 "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
             },
+        },
+        "optimizer": {
+            "pg_kv_cache_mode": "auto",
+            "pg_kv_cache_page_size": None,
         },
         "orchestration": {
             "rl_validate_envs": "DummyEnv-v1",
             "rl_validate_episodes": 1,
             "rl_validate_max_steps": 32,
-            "rl_validate_action_candidates": 1,
             "rl_validate_seed": 1,
             "rl_validate_context_lower_bound": 6,
         },
@@ -1015,78 +1015,10 @@ def test_evaluate_rlpfn_on_gym_envs_uses_mean_explore_rollout_length_for_thresho
     assert per_env["DummyEnv-v1"]["context_len_before_eval_mean"] == 6.0
     assert per_env["DummyEnv-v1"]["explore_rollout_count_mean"] == 2.0
     assert per_env["DummyEnv-v1"]["explore_rollout_len_mean"] == 3.0
-    assert model.phase_calls == [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
-    assert model.terminal_calls == [0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
-
-
-def test_evaluate_rlpfn_on_gym_envs_batches_across_envs_when_cap_allows(monkeypatch):
-    _install_fake_gym(
-        monkeypatch,
-        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
-    )
-    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
-    cfg = {
-        "device": "cpu",
-        "prior": {
-            "num_features": 9,
-            "environment": {
-                "obs_slot_dim": 4,
-                "action_slot_dim": 1,
-                "terminal_reset_enabled": True,
-            },
-        },
-        "orchestration": {
-            "rl_validate_envs": "DummyEnv-vA,DummyEnv-vB",
-            "rl_validate_episodes": 1,
-            "rl_validate_max_steps": 8,
-            "rl_validate_action_candidates": 1,
-            "rl_validate_seed": 1,
-            "rl_validate_context_lower_bound": 1,
-            "rl_validate_max_parallel_columns": 2,
-        },
-    }
-
-    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
-
-    assert np.isfinite(mean_ret)
-    assert per_env["DummyEnv-vA"]["return_mean"] == 2.0
-    assert per_env["DummyEnv-vB"]["return_mean"] == 2.0
-    assert max(model.call_widths) == 2
-
-
-def test_evaluate_rlpfn_on_gym_envs_respects_parallel_column_cap(monkeypatch):
-    _install_fake_gym(
-        monkeypatch,
-        lambda env_name: _ScriptedEnv([2, 2], [1.0, 1.0]),
-    )
-    model = _PhaseRecordingModel(phase_idx=6, terminal_idx=7)
-    cfg = {
-        "device": "cpu",
-        "prior": {
-            "num_features": 9,
-            "environment": {
-                "obs_slot_dim": 4,
-                "action_slot_dim": 1,
-                "terminal_reset_enabled": True,
-            },
-        },
-        "orchestration": {
-            "rl_validate_envs": "DummyEnv-vC,DummyEnv-vD",
-            "rl_validate_episodes": 1,
-            "rl_validate_max_steps": 8,
-            "rl_validate_action_candidates": 1,
-            "rl_validate_seed": 1,
-            "rl_validate_context_lower_bound": 1,
-            "rl_validate_max_parallel_columns": 1,
-        },
-    }
-
-    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
-
-    assert np.isfinite(mean_ret)
-    assert per_env["DummyEnv-vC"]["return_mean"] == 2.0
-    assert per_env["DummyEnv-vD"]["return_mean"] == 2.0
-    assert max(model.call_widths) == 1
+    assert model.reward_mask_calls == [1.0] * 9
+    assert model.phase_calls == [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 1.0, 1.0]
+    assert model.terminal_calls == [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0]
+    assert model.cache_seen == [False, True, True, True, True, True, True, True, True]
 
 
 def test_evaluate_rlpfn_on_gym_envs_ppo_validation_uses_sb3_policy_math_and_batches(monkeypatch):
@@ -1294,3 +1226,83 @@ def test_evaluate_rlpfn_on_gym_envs_ppo_validation_rebuilds_saved_policy(monkeyp
     assert builder_calls["num_features"] == 9
     assert "dummy_weight" in builder_calls["policy_state_dict"]
     assert action_log[-2:] == pytest.approx([0.25, 0.25], abs=1e-6)
+
+
+def test_evaluate_rlpfn_on_gym_envs_ppo_validation_builds_and_caches_fresh_policy_by_default(monkeypatch):
+    action_log = []
+    _install_fake_gym(
+        monkeypatch,
+        lambda env_name: _ActionRecordingEnv([2, 2], [0.0, 0.0], action_log, obs_dim=4, action_dim=1),
+    )
+    model = _MinimalValidationModel()
+
+    import ticl.train as train_mod
+    import ticl.rl_validation as rl_validation_mod
+
+    fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.75, action_std=0.05)
+    builder_calls = {"count": 0}
+
+    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict):
+        del model
+        del env_cfg
+        builder_calls["count"] += 1
+        builder_calls["device"] = device
+        builder_calls["num_features"] = int(num_features)
+        builder_calls["policy_state_dict"] = policy_state_dict
+        return fake_policy
+
+    def _forbid_fastpath(*args, **kwargs):
+        raise AssertionError("PPO validation default path must not build the generic policy_step fastpath")
+
+    def _forbid_old_scoring(*args, **kwargs):
+        raise AssertionError("PPO validation default path must not fall back to candidate-action scoring")
+
+    fake_ppo_mod = types.ModuleType("ticl.sb3_recurrent_ppo")
+    fake_ppo_mod.build_validation_recurrent_ppo_policy = _fake_builder
+    monkeypatch.setitem(sys.modules, "ticl.sb3_recurrent_ppo", fake_ppo_mod)
+    monkeypatch.setattr(train_mod, "_build_policy_step_fn", _forbid_fastpath)
+    monkeypatch.setattr(rl_validation_mod, "_score_candidate_action_jobs", _forbid_old_scoring)
+
+    cfg = {
+        "device": "cpu",
+        "prior": {
+            "num_features": 9,
+            "environment": {
+                "obs_slot_dim": 4,
+                "action_slot_dim": 1,
+                "terminal_reset_enabled": True,
+                "init_action_std": 0.0,
+                "action_noise_train_std": 0.0,
+                "action_noise_eval_std": 0.0,
+                "reinforce_action_transform": "none",
+                "reinforce_reward_transform": "none",
+            },
+        },
+        "optimizer": {
+            "rl_objective": "ppo",
+        },
+        "orchestration": {
+            "rl_validate_envs": "DummyEnv-vFreshPPO",
+            "rl_validate_episodes": 1,
+            "rl_validate_max_steps": 8,
+            "rl_validate_action_candidates": 1,
+            "rl_validate_seed": 1,
+            "rl_validate_context_lower_bound": 1,
+        },
+    }
+
+    mean_ret, per_env = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+    mean_ret_2, per_env_2 = evaluate_rlpfn_on_gym_envs(model=model, config=cfg)
+
+    assert np.isfinite(mean_ret)
+    assert np.isfinite(mean_ret_2)
+    assert per_env["DummyEnv-vFreshPPO"]["return_mean"] == 0.0
+    assert per_env_2["DummyEnv-vFreshPPO"]["return_mean"] == 0.0
+    assert builder_calls["count"] == 1
+    assert builder_calls["device"] == "cpu"
+    assert builder_calls["num_features"] == 9
+    assert builder_calls["policy_state_dict"] is None
+    assert model.__dict__["_validation_sb3_policy_live"] is fake_policy
+    assert len(action_log) == 8
+    assert action_log[-2:] == pytest.approx([0.75, 0.75], abs=1e-6)
+    assert fake_policy.sample_calls >= 2

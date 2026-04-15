@@ -121,6 +121,21 @@ class BarDistribution(nn.Module):
         target_sample[y == self.borders[-1]] = self.num_bars - 1
         return target_sample
 
+    def nll_from_bucket_idx(self, logits: torch.Tensor, target_sample: torch.Tensor) -> torch.Tensor:
+        target_sample = target_sample.clone().view(*logits.shape[:-1]).to(device=logits.device, dtype=torch.long)
+        assert (target_sample >= 0).all()
+        assert (target_sample < self.num_bars).all(), (
+            f"target_sample {target_sample} not in support set for borders (min_y, max_y) {self.borders}"
+        )
+        last_dim = logits.shape[-1]
+        assert last_dim == self.num_bars, f"{last_dim} v {self.num_bars}"
+
+        scaled_bucket_log_probs = self.compute_scaled_log_probs(logits)
+        return -scaled_bucket_log_probs.gather(
+            -1,
+            target_sample[..., None],
+        ).squeeze(-1)
+
     def ignore_init(self, y: torch.Tensor) -> torch.Tensor:
         ignore_loss_mask = torch.isnan(y)
         if ignore_loss_mask.any() and not self.ignore_nan_targets:
@@ -145,19 +160,7 @@ class BarDistribution(nn.Module):
         y = y.clone().view(*logits.shape[:-1])
         ignore_loss_mask = self.ignore_init(y)
         target_sample = self.map_to_bucket_idx(y)
-        assert (target_sample >= 0).all()
-        assert (target_sample < self.num_bars).all(), (
-            f"y {y} not in support set for borders (min_y, max_y) {self.borders}"
-        )
-
-        last_dim = logits.shape[-1]
-        assert last_dim == self.num_bars, f"{last_dim} v {self.num_bars}"
-
-        scaled_bucket_log_probs = self.compute_scaled_log_probs(logits)
-        nll_loss = -scaled_bucket_log_probs.gather(
-            -1,
-            target_sample[..., None],
-        ).squeeze(-1)
+        nll_loss = self.nll_from_bucket_idx(logits, target_sample)
 
         if mean_prediction_logits is not None:
             nll_loss = torch.cat(

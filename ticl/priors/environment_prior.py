@@ -31,6 +31,7 @@ from ticl.priors.maintained_exact_scm import (
     merge_env_semantics_summary as maintained_merge_env_semantics_summary,
     new_env_semantics_accumulator as maintained_new_env_semantics_accumulator,
     resolve_reference_semantics_enabled as maintained_resolve_reference_semantics_enabled,
+    resolve_reinforce_action_clip_bound as maintained_resolve_reinforce_action_clip_bound,
     resolve_reinforce_action_rms_eps as maintained_resolve_reinforce_action_rms_eps,
     resolve_reinforce_action_transform as maintained_resolve_reinforce_action_transform,
     resolve_reinforce_reward_rms_eps as maintained_resolve_reinforce_reward_rms_eps,
@@ -1482,8 +1483,9 @@ class EnvironmentPrior:
         cfg.setdefault("reinforce_reward_rms_eps", 1e-6)
         cfg.setdefault("reinforce_reward_tanh_c", 1.0)
         cfg.setdefault("reinforce_reward_tanh_bound", {"distribution": "uniform", "min": 0.0, "max": 2.0})
-        cfg.setdefault("reinforce_action_transform", "none")
+        cfg.setdefault("reinforce_action_transform", "clip")
         cfg.setdefault("reinforce_action_rms_eps", 1e-6)
+        cfg.setdefault("reinforce_action_clip_bound", 5.0)
         cfg.setdefault("first_policy_gradient_state_grad_clip_norm", 0.0)
         cfg.setdefault("first_policy_gradient_action_grad_clip_value", 0.0)
         cfg.setdefault("first_policy_gradient_action_grad_clip_norm", 0.0)
@@ -1540,7 +1542,7 @@ class EnvironmentPrior:
             "prior_mlp_activations",
             {"distribution": "meta_choice", "choice_values": [torch.nn.Tanh, torch.nn.ReLU, torch.nn.Identity]},
         )
-        cfg.setdefault("scm_standard_linear_init_enabled", False)
+        cfg.setdefault("scm_standard_linear_init_enabled", True)
         cfg.setdefault("init_std", {"distribution": "log_uniform", "min": 1e-3, "max": 1.0})
         cfg.setdefault("noise_std", {"distribution": "log_uniform", "min": 1e-4, "max": 0.2})
 
@@ -4438,6 +4440,10 @@ class EnvironmentPrior:
         return maintained_resolve_reinforce_action_rms_eps(h)
 
     @staticmethod
+    def _resolve_reinforce_action_clip_bound(h):
+        return maintained_resolve_reinforce_action_clip_bound(h)
+
+    @staticmethod
     def _resolve_reinforce_sequence_replay_enabled(h):
         return bool(EnvironmentPrior._coerce_bool(h.get("reinforce_sequence_replay_enabled", False)))
 
@@ -5086,10 +5092,16 @@ class EnvironmentPrior:
         return tensor
 
     @staticmethod
-    def _transform_reinforce_action(action_raw, *, mode="rms", rms_eps=1e-6, mask=None):
+    def _transform_reinforce_action(action_raw, *, mode="clip", rms_eps=1e-6, clip_bound=5.0, mask=None):
         mode = str(mode).strip().lower()
         if mode == "tanh":
             action_next = torch.tanh(action_raw)
+        elif mode == "clip":
+            bound_t = torch.as_tensor(clip_bound, device=action_raw.device, dtype=action_raw.dtype)
+            while bound_t.ndim < action_raw.ndim:
+                bound_t = bound_t.unsqueeze(0)
+            bound_t = torch.clamp(bound_t, min=1e-6)
+            action_next = torch.clamp(action_raw, min=-bound_t, max=bound_t)
         elif mode == "rms":
             if mask is None:
                 mask_t = torch.ones_like(action_raw, dtype=action_raw.dtype)
@@ -5163,8 +5175,9 @@ class EnvironmentPrior:
         sample_action,
         action_eps_t,
         action_mask=None,
-        action_transform_mode="rms",
+        action_transform_mode="clip",
         action_rms_eps=1e-6,
+        action_clip_bound=5.0,
         collect_log_probs=False,
         collect_log_prob_score=False,
         legacy_action_std=None,
@@ -5191,6 +5204,7 @@ class EnvironmentPrior:
                 action_raw,
                 mode=action_transform_mode,
                 rms_eps=action_rms_eps,
+                clip_bound=action_clip_bound,
                 mask=action_mask,
             )
             action_std_for_storage = self._reduce_action_std_for_storage(
@@ -5262,6 +5276,7 @@ class EnvironmentPrior:
                 action_pre_tanh,
                 mode=action_transform_mode,
                 rms_eps=action_rms_eps,
+                clip_bound=action_clip_bound,
                 mask=action_mask,
             )
             reinforce_log_prob_t = None
@@ -5295,6 +5310,7 @@ class EnvironmentPrior:
             action_mean,
             mode=action_transform_mode,
             rms_eps=action_rms_eps,
+            clip_bound=action_clip_bound,
             mask=action_mask,
         )
         return {
@@ -5835,6 +5851,7 @@ class EnvironmentPrior:
         reinforce_reward_tanh_bound = float(self._resolve_reinforce_reward_tanh_bound(h))
         reinforce_action_transform = self._resolve_reinforce_action_transform(h)
         reinforce_action_rms_eps = float(self._resolve_reinforce_action_rms_eps(h))
+        reinforce_action_clip_bound = float(self._resolve_reinforce_action_clip_bound(h))
         terminal_reset_count_target = float(self._resolve_terminal_reset_count_target(h))
         terminal_bonus_tanh_c = float(self._resolve_terminal_bonus_tanh_c(h))
         terminal_bonus_scale_min = float(self._resolve_terminal_bonus_scale_min(h))
@@ -5924,6 +5941,7 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "reinforce_action_transform": reinforce_action_transform,
             "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
@@ -8828,6 +8846,11 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_action_clip_bound = torch.tensor(
+            [float(self._resolve_reinforce_action_clip_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         reinforce_reward_tanh_c = torch.tensor(
             [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
             device=device,
@@ -8928,6 +8951,11 @@ class EnvironmentPrior:
         )
         reinforce_action_rms_eps = torch.tensor(
             [float(self._resolve_reinforce_action_rms_eps(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        reinforce_action_clip_bound = torch.tensor(
+            [float(self._resolve_reinforce_action_clip_bound(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -9103,6 +9131,7 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
             "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
@@ -9415,6 +9444,11 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        reinforce_action_clip_bound = torch.tensor(
+            [float(self._resolve_reinforce_action_clip_bound(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         reinforce_reward_tanh_c = torch.tensor(
             [float(self._resolve_reinforce_reward_tanh_c(h)) for h in h_list],
             device=device,
@@ -9578,6 +9612,7 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
             "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
@@ -12272,8 +12307,9 @@ class EnvironmentPrior:
                     f"policy action dim mismatch: expected {action_dim}, got {action_next.shape[-1]}"
                 )
             action_mean = action_next
-            action_transform_mode = env.get("reinforce_action_transform", "rms")
+            action_transform_mode = env.get("reinforce_action_transform", "clip")
             action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
+            action_clip_bound = env.get("reinforce_action_clip_bound", 5.0)
             reinforce_log_prob_t = None
             reinforce_log_prob_score_t = None
             if collect_action_trace:
@@ -12335,6 +12371,7 @@ class EnvironmentPrior:
                     action_eps_t=action_eps_t,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=collect_log_probs,
                     collect_log_prob_score=collect_log_prob_score,
                     legacy_action_std=legacy_action_std_t,
@@ -12351,6 +12388,7 @@ class EnvironmentPrior:
                     action_eps_t=None,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=False,
                     collect_log_prob_score=False,
                     legacy_action_std=(
@@ -13038,6 +13076,7 @@ class EnvironmentPrior:
         reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_action_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_action_clip_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_reset_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         terminal_reset_count_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
@@ -13199,6 +13238,7 @@ class EnvironmentPrior:
                 reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
                 reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
                 reinforce_action_rms_eps[group_idx] = env_batch["reinforce_action_rms_eps"]
+                reinforce_action_clip_bound[group_idx] = env_batch["reinforce_action_clip_bound"]
                 terminal_reset_enabled[group_idx] = env_batch["terminal_reset_enabled"]
                 terminal_reset_count_target[group_idx] = env_batch["terminal_reset_count_target"].to(dtype=torch.float32)
                 terminal_bonus_tanh_c[group_idx] = env_batch["terminal_bonus_tanh_c"].to(dtype=torch.float32)
@@ -14185,8 +14225,9 @@ class EnvironmentPrior:
                         sample_action=True,
                         action_eps_t=action_eps_t_replay,
                         action_mask=action_mask,
-                        action_transform_mode=env_info.get("reinforce_action_transform", "rms"),
+                        action_transform_mode=env_info.get("reinforce_action_transform", "clip"),
                         action_rms_eps=env_info.get("reinforce_action_rms_eps", 1e-6),
+                        action_clip_bound=env_info.get("reinforce_action_clip_bound", 5.0),
                         collect_log_probs=True,
                         collect_log_prob_score=collect_log_prob_score,
                         legacy_action_std=legacy_action_std_t_replay,
@@ -14593,6 +14634,7 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
             "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
@@ -14891,14 +14933,19 @@ class EnvironmentPrior:
                 )
             action_mean = action_next
             values_t = None
+            value_logits_t = None
             if stream_ppo_steps or (ppo_value_steps is not None):
                 values_t = None if actor_outputs is None else actor_outputs.get("values", None)
+                value_logits_t = None if actor_outputs is None else actor_outputs.get("value_logits", None)
                 if values_t is None:
                     raise RuntimeError("PPO rollout trace requires policy_step_fn to return per-step values.")
+                if stream_ppo_steps and value_logits_t is None:
+                    raise RuntimeError("PPO rollout step sink requires policy_step_fn to return per-step value_logits.")
             if ppo_value_steps is not None:
                 ppo_value_steps[t].copy_(values_t.detach().reshape(batch_size), non_blocking=False)
-            action_transform_mode = env_info.get("reinforce_action_transform", "rms")
+            action_transform_mode = env_info.get("reinforce_action_transform", "clip")
             action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
+            action_clip_bound = env_info.get("reinforce_action_clip_bound", 5.0)
             reinforce_log_prob_t = None
             reinforce_log_prob_score_t = None
             if collect_action_trace:
@@ -14943,6 +14990,7 @@ class EnvironmentPrior:
                     action_mask=action_mask,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=True,
                     collect_log_prob_score=collect_log_prob_score,
                     legacy_action_std=legacy_action_std_t,
@@ -14969,6 +15017,7 @@ class EnvironmentPrior:
                     action_mask=action_mask,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=False,
                     collect_log_prob_score=False,
                     legacy_action_std=(action_noise_train_std if t < single_eval_pos else action_noise_eval_std),
@@ -15488,8 +15537,9 @@ class EnvironmentPrior:
                 target=state_full_rms_target,
                 state_mask=state_mask,
             )
+            reward_terminal_bonus_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
             if terminal_token_enabled:
-                state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
+                state_next, reward_next, terminal_next, terminal_aux = self._apply_terminal_reset_step(
                     state_next=state_next,
                     reward_next=reward_next,
                     terminal_draw=terminal_draw_t,
@@ -15504,6 +15554,11 @@ class EnvironmentPrior:
                     terminal_bonus_base=terminal_bonus_base_next,
                     terminal_signal_history=terminal_signal_history,
                     history_index=t,
+                    return_aux=True,
+                )
+                reward_terminal_bonus_next = terminal_aux["terminal_bonus_applied"].to(
+                    device=device,
+                    dtype=reward_next.dtype,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -15536,12 +15591,18 @@ class EnvironmentPrior:
                         "obs": token_row.detach(),
                         "action": action_next.detach(),
                         "reward": reward_next.detach(),
+                        "reward_mask": reward_mask_next.detach(),
+                        "reward_env": reward_env_next.detach(),
+                        "reward_ctrl": reward_next_ctrl.detach(),
+                        "reward_survival": reward_next_survival.detach(),
+                        "reward_terminal_bonus": reward_terminal_bonus_next.detach(),
                         "episode_starts": (
                             torch.ones((batch_size,), device=device, dtype=torch.float32)
                             if int(t) == 0
                             else terminal_t.detach().to(dtype=torch.float32)
                         ),
                         "values": values_t.detach().reshape(batch_size),
+                        "value_logits": value_logits_t.detach(),
                         "log_probs": reinforce_log_prob_t.detach().reshape(batch_size),
                         "action_mask": action_mask.detach(),
                         "next_state": (state_next[:, :max_state_dim].detach() * state_mask.to(dtype=state_next.dtype)),
@@ -15610,6 +15671,11 @@ class EnvironmentPrior:
                     reward_component_eval_steps["survival"][eval_t] = reward_next_survival.detach()
                 self._accumulate_reward_component_profile_stats(
                     reward_component_profile_accum,
+                    "total",
+                    reward_next,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
                     "env",
                     reward_env_next,
                 )
@@ -15622,6 +15688,11 @@ class EnvironmentPrior:
                     reward_component_profile_accum,
                     "survival",
                     reward_next_survival,
+                )
+                self._accumulate_reward_component_profile_stats(
+                    reward_component_profile_accum,
+                    "terminal_bonus",
+                    reward_terminal_bonus_next,
                 )
 
             if tbptt_window_active:
@@ -16397,10 +16468,33 @@ class EnvironmentPrior:
             env_obs_start = env_layout["obs_start"]
             env_action_start = env_layout["action_start"]
             env_noise_start = env_layout["noise_start"]
-        action_transform_mode = env.get("reinforce_action_transform", "rms")
+        action_transform_mode = env.get("reinforce_action_transform", "clip")
         action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
+        action_clip_bound = env.get("reinforce_action_clip_bound", 5.0)
+
+        audit_force_episode_reset_at_sep = bool(
+            getattr(self, "_audit_force_episode_reset_at_sep", False)
+        )
+        audit_reset_env_state_at_sep_keep_actor_history = bool(
+            getattr(self, "_audit_reset_env_state_at_sep_keep_actor_history", False)
+        )
+        reset_env_state_at_sep_keep_actor_history = bool(
+            getattr(self, "_rwkv_reset_env_state_at_sep_keep_actor_history", False)
+        )
 
         for t in range(n_samples):
+            if audit_force_episode_reset_at_sep and int(t) == int(single_eval_pos):
+                state_t = _randn((state_dim,), dtype=torch.float32) * env["init_state_std"]
+                action_t = _randn((action_dim,), dtype=torch.float32) * env["init_action_std"]
+                reward_t = torch.zeros((), device=device, dtype=state_t.dtype)
+                reward_mask_t = torch.ones((), device=device, dtype=state_t.dtype)
+                terminal_t = torch.zeros((), device=device, dtype=state_t.dtype)
+                cache = None
+            elif (
+                audit_reset_env_state_at_sep_keep_actor_history
+                or reset_env_state_at_sep_keep_actor_history
+            ) and int(t) == int(single_eval_pos):
+                state_t = _randn((state_dim,), dtype=torch.float32) * env["init_state_std"]
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
                 window_start_idx = int(t)
                 window_end_idx = int(min(n_samples, window_start_idx + int(tbptt_window_size)))
@@ -16487,6 +16581,7 @@ class EnvironmentPrior:
                     env["policy_generator"](policy_in, generator=local_generator).squeeze(0),
                     mode=action_transform_mode,
                     rms_eps=action_rms_eps,
+                    clip_bound=action_clip_bound,
                 )
             else:
                 if terminal_reset_enabled:
@@ -16593,6 +16688,7 @@ class EnvironmentPrior:
                     action_eps_t=action_eps_t,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=collect_log_probs,
                     collect_log_prob_score=collect_log_prob_score,
                     legacy_action_std=torch.full(
@@ -16615,6 +16711,7 @@ class EnvironmentPrior:
                         action_eps_t=None,
                         action_transform_mode=action_transform_mode,
                         action_rms_eps=action_rms_eps,
+                        action_clip_bound=action_clip_bound,
                         collect_log_probs=False,
                         collect_log_prob_score=False,
                         legacy_action_std=torch.full((1,), float(action_noise_std), device=action_mean.device, dtype=action_mean.dtype),
@@ -16627,12 +16724,14 @@ class EnvironmentPrior:
                             action_next + action_noise_train[t] * action_noise_std,
                             mode=action_transform_mode,
                             rms_eps=action_rms_eps,
+                            clip_bound=action_clip_bound,
                         )
                     elif t >= single_eval_pos and action_noise_eval is not None:
                         action_next = self._transform_reinforce_action(
                             action_next + action_noise_eval[t] * action_noise_std,
                             mode=action_transform_mode,
                             rms_eps=action_rms_eps,
+                            clip_bound=action_clip_bound,
                         )
                     elif t < single_eval_pos and env["action_noise_train_std"] > 0:
                         if action_noise_train_generator is None:
@@ -16648,6 +16747,7 @@ class EnvironmentPrior:
                             action_next + action_noise_t * action_noise_std,
                             mode=action_transform_mode,
                             rms_eps=action_rms_eps,
+                            clip_bound=action_clip_bound,
                         )
                     elif t >= single_eval_pos and env["action_noise_eval_std"] > 0:
                         if action_noise_eval_generator is None:
@@ -16663,6 +16763,7 @@ class EnvironmentPrior:
                             action_next + action_noise_t * action_noise_std,
                             mode=action_transform_mode,
                             rms_eps=action_rms_eps,
+                            clip_bound=action_clip_bound,
                         )
                 else:
                     # Learned-policy rollout uses the configured action transform. Keep
@@ -19999,7 +20100,7 @@ class EnvironmentPrior:
         reinforce_reward_transform = self._resolve_reinforce_reward_transform(self.config)
         reinforce_reward_tanh_c = self._resolve_reinforce_reward_tanh_c(self.config)
         reinforce_reward_tanh_bound = self._resolve_reinforce_reward_tanh_bound(self.config)
-        reinforce_action_transform = str(self.config.get("reinforce_action_transform", "rms")).strip().lower()
+        reinforce_action_transform = str(self.config.get("reinforce_action_transform", "clip")).strip().lower()
         reinforce_adv_normalized = bool(self.config.get("reinforce_normalize_advantages", False))
         reinforce_adv_suffix_episode_scaled = bool(
             self.config.get("reinforce_scale_advantages_by_suffix_episode_count", False)
@@ -20726,6 +20827,7 @@ class EnvironmentPrior:
         reinforce_reward_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_reward_tanh_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reinforce_action_rms_eps = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        reinforce_action_clip_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_reset_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         terminal_reset_count_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
@@ -20850,6 +20952,7 @@ class EnvironmentPrior:
                 reinforce_reward_tanh_c[group_idx] = env_batch["reinforce_reward_tanh_c"]
                 reinforce_reward_tanh_bound[group_idx] = env_batch["reinforce_reward_tanh_bound"]
                 reinforce_action_rms_eps[group_idx] = env_batch["reinforce_action_rms_eps"]
+                reinforce_action_clip_bound[group_idx] = env_batch["reinforce_action_clip_bound"]
                 terminal_reset_enabled[group_idx] = env_batch["terminal_reset_enabled"]
                 terminal_reset_count_target[group_idx] = env_batch["terminal_reset_count_target"].to(dtype=torch.float32)
                 terminal_bonus_tanh_c[group_idx] = env_batch["terminal_bonus_tanh_c"].to(dtype=torch.float32)
@@ -21301,6 +21404,7 @@ class EnvironmentPrior:
             "reinforce_reward_tanh_bound": reinforce_reward_tanh_bound,
             "reinforce_action_transform": self._resolve_reinforce_action_transform(self.config),
             "reinforce_action_rms_eps": reinforce_action_rms_eps,
+            "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
@@ -21342,8 +21446,9 @@ class EnvironmentPrior:
         first_pg_state_grad_clip_norm = self._resolve_first_policy_gradient_state_grad_clip_norm(self.config)
         first_pg_action_grad_clip_value = self._resolve_first_policy_gradient_action_grad_clip_value(self.config)
         first_pg_action_grad_clip_norm = self._resolve_first_policy_gradient_action_grad_clip_norm(self.config)
-        action_transform_mode = env_info.get("reinforce_action_transform", "rms")
+        action_transform_mode = env_info.get("reinforce_action_transform", "clip")
         action_rms_eps = env_info.get("reinforce_action_rms_eps", 1e-6)
+        action_clip_bound = env_info.get("reinforce_action_clip_bound", 5.0)
         total_eval_steps = int(max(0, n_samples - int(single_eval_pos)))
         phase_train_t = torch.zeros((batch_size, 1), device=device, dtype=torch.float32)
         phase_eval_t = torch.ones((batch_size, 1), device=device, dtype=torch.float32)
@@ -21516,6 +21621,7 @@ class EnvironmentPrior:
                     action_mask=action_mask,
                     action_transform_mode=action_transform_mode,
                     action_rms_eps=action_rms_eps,
+                    action_clip_bound=action_clip_bound,
                     collect_log_probs=True,
                     collect_log_prob_score=alpha_grad_enabled,
                     legacy_action_std=legacy_action_std_t,

@@ -265,6 +265,17 @@ def test_rlpfn_parser_accepts_rl_validate_max_parallel_columns():
     assert args.orchestration.rl_validate_max_parallel_columns == 128
 
 
+def test_rlpfn_parser_rejects_removed_rl_validate_action_candidates_flag():
+    parser = make_model_level_argparser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "rlpfn",
+                "--rl-validate-action-candidates", "8",
+            ]
+        )
+
+
 def test_rlpfn_parser_accepts_pg_one_hop_replay_flag():
     parser = make_model_level_argparser()
     args = parser.parse_args(
@@ -361,11 +372,12 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
     assert cfg["prior"]["environment"]["state_input_scale_enabled"] is False
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
+    assert cfg["prior"]["environment"]["scm_standard_linear_init_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.4
-    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
-    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
+    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 0.0
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 0.2
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
@@ -387,8 +399,9 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
         "min": 0.0,
         "max": 2.0,
     }
-    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "clip"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_action_clip_bound"] == 5.0
     assert cfg["prior"]["environment"]["reinforce_normalize_advantages"] is True
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_advantage_norm_clip"] == 10.0
@@ -799,12 +812,17 @@ def test_main_continue_run_applies_resume_safe_defaults_and_explicit_cli_overrid
         captured["config"] = config
         return 0.0, object(), None, 0
 
+    def _fake_torch_load(*args, **kwargs):
+        captured["torch_load_args"] = args
+        captured["torch_load_kwargs"] = kwargs
+        return ({}, None, None, old_config)
+
     monkeypatch.setattr(fit_model_mod, "init_device", _fake_init_device)
     monkeypatch.setattr(fit_model_mod, "install_host_rss_limit_guard", _fake_guard)
     monkeypatch.setattr(fit_model_mod, "get_model_string", _fake_model_string)
     monkeypatch.setattr(fit_model_mod, "make_training_callback", _fake_callback)
     monkeypatch.setattr(fit_model_mod, "get_model", _fake_get_model)
-    monkeypatch.setattr(fit_model_mod.torch, "load", lambda *args, **kwargs: ({}, None, None, old_config))
+    monkeypatch.setattr(fit_model_mod.torch, "load", _fake_torch_load)
 
     main(
         [
@@ -825,6 +843,70 @@ def test_main_continue_run_applies_resume_safe_defaults_and_explicit_cli_overrid
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.25
     assert cfg["prior"]["environment"]["terminal_bonus_scale_max"] == 1.5
+    assert captured["torch_load_kwargs"]["weights_only"] is False
+
+
+def test_main_continue_run_applies_extra_config_after_resume_config(tmp_path, monkeypatch):
+    ckpt_path = tmp_path / "resume_test.cpkt"
+    parser = make_model_level_argparser()
+    default_args = parser.parse_args(["rlpfn"])
+    old_config = get_model_default_config("rlpfn")
+    old_config["prior"]["environment"]["next_state_flow_matching_weight"] = 0.2
+    old_config["optimizer"]["ppo_reset_env_state_at_sep"] = False
+    old_config["orchestration"] = vars(default_args.orchestration).copy()
+
+    captured = {}
+
+    def _fake_init_device(gpu_id, use_cpu):
+        del gpu_id, use_cpu
+        return "cpu", 0, 1
+
+    def _fake_guard(**kwargs):
+        del kwargs
+        return None, {"enabled": False}
+
+    def _fake_model_string(config, num_gpus, device, parser):
+        del config, num_gpus, device, parser
+        return "resume_test_model"
+
+    def _fake_callback(*args, **kwargs):
+        del args, kwargs
+        return lambda *cb_args, **cb_kwargs: None
+
+    def _fake_get_model(config, device, should_train=True, **kwargs):
+        del device, should_train, kwargs
+        captured["config"] = config
+        return 0.0, object(), None, 0
+
+    monkeypatch.setattr(fit_model_mod, "init_device", _fake_init_device)
+    monkeypatch.setattr(fit_model_mod, "install_host_rss_limit_guard", _fake_guard)
+    monkeypatch.setattr(fit_model_mod, "get_model_string", _fake_model_string)
+    monkeypatch.setattr(fit_model_mod, "make_training_callback", _fake_callback)
+    monkeypatch.setattr(fit_model_mod, "get_model", _fake_get_model)
+    monkeypatch.setattr(
+        fit_model_mod.torch,
+        "load",
+        lambda *args, **kwargs: ({}, None, None, old_config),
+    )
+
+    main(
+        [
+            "rlpfn",
+            "-f", str(ckpt_path),
+            "-c",
+            "--stop-after-epochs", "1",
+            "--validate", "false",
+            "--rl-validate-enabled", "false",
+        ],
+        extra_config={
+            "prior": {"environment": {"next_state_flow_matching_weight": 0.0}},
+            "optimizer": {"ppo_reset_env_state_at_sep": True},
+        },
+    )
+
+    cfg = captured["config"]
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 0.0
+    assert cfg["optimizer"]["ppo_reset_env_state_at_sep"] is True
 
 
 def test_main_continue_run_clears_stale_pg_phase_log_file_when_not_explicit(tmp_path, monkeypatch):

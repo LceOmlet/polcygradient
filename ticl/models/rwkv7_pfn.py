@@ -94,6 +94,18 @@ _OFFICIAL_RWKV7_DEMO_RNN = None
 _OFFICIAL_RWKV7_TRAIN_TEMP = {}
 
 
+def _prepend_env_bin_to_path() -> None:
+    env_bin = str(Path(sys.executable).resolve().parent)
+    path = os.environ.get("PATH", "")
+    parts = [p for p in path.split(os.pathsep) if p]
+    if parts and parts[0] == env_bin:
+        return
+    if env_bin in parts:
+        parts.remove(env_bin)
+    parts.insert(0, env_bin)
+    os.environ["PATH"] = os.pathsep.join(parts) if parts else env_bin
+
+
 def _load_official_rwkv7_demo_rnn():
     global _OFFICIAL_RWKV7_DEMO_RNN
     if _OFFICIAL_RWKV7_DEMO_RNN is not None:
@@ -143,10 +155,12 @@ def _load_official_rwkv7_train_temp(head_size: int):
         "RWKV_JIT_ON": os.environ.get("RWKV_JIT_ON"),
         "RWKV_MY_TESTING": os.environ.get("RWKV_MY_TESTING"),
         "RWKV_HEAD_SIZE": os.environ.get("RWKV_HEAD_SIZE"),
+        "PATH": os.environ.get("PATH"),
     }
     os.environ["RWKV_JIT_ON"] = "0"
     os.environ["RWKV_MY_TESTING"] = "x070"
     os.environ["RWKV_HEAD_SIZE"] = str(head_size)
+    _prepend_env_bin_to_path()
 
     injected = {}
     if "pytorch_lightning" not in sys.modules:
@@ -640,6 +654,7 @@ class RWKV7Core(nn.Module):
         self.ln_out = nn.LayerNorm(self.emb_dim)
         self._official_eval_core = None
         self._official_eval_core_device = None
+        self.force_native_eval_forward_step = False
 
     def train(self, mode: bool = True):
         self._official_eval_core = None
@@ -788,6 +803,7 @@ class RWKV7Core(nn.Module):
             and token.is_cuda
             and (not self.training)
             and (not torch.is_grad_enabled())
+            and not bool(getattr(self, "force_native_eval_forward_step", False))
         ):
             return self._forward_step_official_eval(token, state)
         if state is None:

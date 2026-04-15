@@ -609,6 +609,44 @@ def make_training_callback(
                                 diag_fields.append(f"{k}={str(v)}")
                         if diag_fields:
                             f.write(f"Epoch {epoch} pg_diag {' '.join(diag_fields)}\n")
+                    ppo_diag = getattr(model, "last_ppo_epoch_metrics", None)
+                    if isinstance(ppo_diag, dict) and len(ppo_diag) > 0:
+                        diag_fields = []
+                        for k in sorted(ppo_diag.keys()):
+                            v = ppo_diag.get(k, None)
+                            if v is None:
+                                continue
+                            if isinstance(v, (bool, np.bool_)):
+                                diag_fields.append(f"{k}={int(v)}")
+                            elif isinstance(v, (int, np.integer)):
+                                diag_fields.append(f"{k}={int(v)}")
+                            elif isinstance(v, (float, np.floating)):
+                                fv = float(v)
+                                if np.isfinite(fv):
+                                    diag_fields.append(f"{k}={fv:.6g}")
+                            else:
+                                diag_fields.append(f"{k}={str(v)}")
+                        if diag_fields:
+                            f.write(f"Epoch {epoch} ppo_diag {' '.join(diag_fields)}\n")
+                    ppo_logger_metrics = getattr(model, "last_ppo_logger_metrics", None)
+                    if isinstance(ppo_logger_metrics, dict) and len(ppo_logger_metrics) > 0:
+                        def _ppo_metric_sort_key(key):
+                            key_str = str(key)
+                            if key_str.startswith("rollout/"):
+                                return (0, key_str)
+                            if key_str.startswith("time/"):
+                                return (1, key_str)
+                            if key_str.startswith("train/"):
+                                return (2, key_str)
+                            return (3, key_str)
+
+                        for key in sorted(ppo_logger_metrics.keys(), key=_ppo_metric_sort_key):
+                            value = ppo_logger_metrics.get(key, None)
+                            if value is None:
+                                continue
+                            f.write(
+                                f"Epoch {epoch} ppo_metric {key} {_format_log_scalar(value)}\n"
+                            )
                 else:
                     f.write(f'Epoch {epoch} loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
         except Exception as e:

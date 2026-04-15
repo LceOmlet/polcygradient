@@ -1,0 +1,7 @@
+{
+  "metric": "loss",
+  "mode": "min",
+  "scores": {
+    "./models_diff/rlpfn_b64_E10_l0_nsamples128_03_23_2026_13_05_23_epoch_10.cpkt": 0.014658757485449314
+  }
+}

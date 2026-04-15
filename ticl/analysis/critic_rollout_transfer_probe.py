@@ -1,0 +1,260 @@
+import argparse
+import json
+from pathlib import Path
+
+import torch
+
+from ticl.analysis.critic_value_fit_probe import (
+    _build_algo,
+    _build_fixed_env_h,
+    _collect_fixed_rollout,
+    _critic_only_step,
+    _measure_critic,
+)
+from ticl.analysis.critic_free_single_env_audit import _build_audit_env_cfg
+from ticl.model_builder import load_model
+from ticl.priors.environment_prior import EnvironmentPrior
+from ticl.sb3_recurrent_ppo import _recover_raw_from_value_space
+
+
+def _default_device() -> str:
+    return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _masked_corrcoef(x: torch.Tensor, y: torch.Tensor, mask: torch.Tensor) -> float:
+    mask = mask.bool().reshape(-1)
+    if int(mask.sum().item()) <= 1:
+        return 0.0
+    x = x.reshape(-1)[mask].float()
+    y = y.reshape(-1)[mask].float()
+    x = x - x.mean()
+    y = y - y.mean()
+    denom = torch.linalg.vector_norm(x) * torch.linalg.vector_norm(y)
+    if float(denom.item()) <= 0.0:
+        return 0.0
+    return float((x @ y / denom).item())
+
+
+def _rollout_targets(rollout_data) -> dict:
+    objective_mask = rollout_data.objective_masks > 1e-8
+    raw_returns = _recover_raw_from_value_space(
+        rollout_data.returns.detach(),
+        value_means=rollout_data.rollout_return_means.detach(),
+        value_stds=rollout_data.rollout_return_stds.detach(),
+    ).reshape(-1)
+    normalized_returns = rollout_data.returns.detach().reshape(-1)
+    objective_flat = objective_mask.detach().reshape(-1)
+    return {
+        "objective_mask": objective_flat,
+        "raw_returns": raw_returns,
+        "normalized_returns": normalized_returns,
+        "raw_return_mean": float(raw_returns[objective_flat].float().mean().item()) if int(objective_flat.sum().item()) > 0 else 0.0,
+        "raw_return_std": float(raw_returns[objective_flat].float().std().item()) if int(objective_flat.sum().item()) > 1 else 0.0,
+        "normalized_return_mean": float(normalized_returns[objective_flat].float().mean().item()) if int(objective_flat.sum().item()) > 0 else 0.0,
+        "normalized_return_std": float(normalized_returns[objective_flat].float().std().item()) if int(objective_flat.sum().item()) > 1 else 0.0,
+    }
+
+
+def _pairwise_target_compare(anchor: dict, other: dict) -> dict:
+    mask = anchor["objective_mask"] & other["objective_mask"]
+    return {
+        "objective_total": int(mask.sum().item()),
+        "raw_target_corr": _masked_corrcoef(anchor["raw_returns"], other["raw_returns"], mask),
+        "normalized_target_corr": _masked_corrcoef(anchor["normalized_returns"], other["normalized_returns"], mask),
+        "raw_return_mean_delta": float(other["raw_return_mean"] - anchor["raw_return_mean"]),
+        "raw_return_std_delta": float(other["raw_return_std"] - anchor["raw_return_std"]),
+    }
+
+
+def _snapshot_named_params(policy) -> dict[str, torch.Tensor]:
+    out: dict[str, torch.Tensor] = {}
+    with torch.no_grad():
+        for name, param in policy.named_parameters():
+            out[str(name)] = param.detach().cpu().clone()
+    return out
+
+
+def _param_delta_metrics(before: dict[str, torch.Tensor], after: dict[str, torch.Tensor]) -> dict:
+    actor_sq = 0.0
+    value_sq = 0.0
+    actor_count = 0
+    value_count = 0
+    for name, prev in before.items():
+        curr = after[name]
+        delta = (curr - prev).float()
+        delta_sq = float(torch.dot(delta.reshape(-1), delta.reshape(-1)).item())
+        if name.startswith("value_rlpfn_model.") or name.startswith("value_net."):
+            value_sq += delta_sq
+            value_count += int(delta.numel())
+        else:
+            actor_sq += delta_sq
+            actor_count += int(delta.numel())
+    return {
+        "actor_param_delta_l2": float(actor_sq ** 0.5),
+        "value_param_delta_l2": float(value_sq ** 0.5),
+        "actor_param_count": int(actor_count),
+        "value_param_count": int(value_count),
+    }
+
+
+def run_critic_rollout_transfer_probe(
+    *,
+    checkpoint_path: str,
+    device: str | None = None,
+    frozen_h_seed: int = 12345,
+    train_env_seed: int = 2020,
+    single_eval_pos: int = 64,
+    n_steps: int = 256,
+    batch_size: int = 256,
+    n_epochs: int = 1,
+    learning_rate: float = 2e-4,
+    target_kl: float = 0.03,
+    ppo_reset_env_state_at_sep: bool = True,
+    ppo_separate_value_backbone: bool = True,
+    critic_fit_steps: int = 200,
+    num_postfit_rollouts: int = 3,
+    deterministic_actor_sampling: bool = False,
+):
+    device_obj = torch.device(str(device or _default_device()))
+    load_model.cache_clear()
+    _, config = load_model(checkpoint_path, device=device_obj, verbose=False)
+    env_cfg = _build_audit_env_cfg(config["prior"]["environment"])
+    frozen_h = _build_fixed_env_h(prior_cfg=env_cfg, frozen_h_seed=int(frozen_h_seed))
+
+    algo, callback, vec_env, prior, _ = _build_algo(
+        checkpoint_path=checkpoint_path,
+        device_obj=device_obj,
+        frozen_h=frozen_h,
+        train_env_seed=int(train_env_seed),
+        single_eval_pos=int(single_eval_pos),
+        n_steps=int(n_steps),
+        batch_size=int(batch_size),
+        n_epochs=int(n_epochs),
+        learning_rate=float(learning_rate),
+        target_kl=float(target_kl),
+        ppo_reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+        ppo_separate_value_backbone=bool(ppo_separate_value_backbone),
+    )
+    try:
+        if bool(deterministic_actor_sampling):
+            original_make_step_fn = algo.policy.make_vectorized_rollout_step_fn
+
+            def _wrapped_make_step_fn():
+                fn = original_make_step_fn()
+                fn._policy_actor_sample_fn = (  # type: ignore[attr-defined]
+                    lambda actor_outputs, noise: actor_outputs["action_mean"]
+                )
+                return fn
+
+            algo.policy.make_vectorized_rollout_step_fn = _wrapped_make_step_fn  # type: ignore[method-assign]
+        base_rollout = _collect_fixed_rollout(algo, callback, vec_env)
+        base_targets = _rollout_targets(base_rollout)
+        prefit_quality = _measure_critic(algo, base_rollout)
+        param_before = _snapshot_named_params(algo.policy)
+        for _ in range(int(critic_fit_steps)):
+            _critic_only_step(algo, base_rollout)
+        param_after = _snapshot_named_params(algo.policy)
+        postfit_same_buffer_quality = _measure_critic(algo, base_rollout)
+
+        postfit_rollouts: list[dict] = []
+        for rollout_idx in range(int(num_postfit_rollouts)):
+            new_rollout = _collect_fixed_rollout(algo, callback, vec_env)
+            new_targets = _rollout_targets(new_rollout)
+            target_compare = _pairwise_target_compare(base_targets, new_targets)
+            postfit_rollouts.append(
+                {
+                    "rollout_idx": int(rollout_idx + 1),
+                    "critic_quality": _measure_critic(algo, new_rollout),
+                    "target_compare_vs_anchor": target_compare,
+                    "raw_return_mean": float(new_targets["raw_return_mean"]),
+                    "raw_return_std": float(new_targets["raw_return_std"]),
+                    "normalized_return_mean": float(new_targets["normalized_return_mean"]),
+                    "normalized_return_std": float(new_targets["normalized_return_std"]),
+                }
+            )
+
+        return {
+            "audit_entry": "critic_rollout_transfer_probe",
+            "checkpoint_path": str(Path(checkpoint_path).expanduser().resolve()),
+            "device": str(device_obj),
+            "frozen_h_seed": int(frozen_h_seed),
+            "train_env_seed": int(train_env_seed),
+            "single_eval_pos": int(single_eval_pos),
+            "n_steps": int(n_steps),
+            "batch_size": int(batch_size),
+            "n_epochs": int(n_epochs),
+            "learning_rate": float(learning_rate),
+            "target_kl": float(target_kl),
+            "ppo_reset_env_state_at_sep": bool(ppo_reset_env_state_at_sep),
+            "ppo_separate_value_backbone": bool(ppo_separate_value_backbone),
+            "critic_fit_steps": int(critic_fit_steps),
+            "num_postfit_rollouts": int(num_postfit_rollouts),
+            "deterministic_actor_sampling": bool(deterministic_actor_sampling),
+            "anchor_rollout": {
+                "critic_quality_prefit": prefit_quality,
+                "critic_quality_postfit_same_buffer": postfit_same_buffer_quality,
+                "raw_return_mean": float(base_targets["raw_return_mean"]),
+                "raw_return_std": float(base_targets["raw_return_std"]),
+                "normalized_return_mean": float(base_targets["normalized_return_mean"]),
+                "normalized_return_std": float(base_targets["normalized_return_std"]),
+            },
+            "param_delta": _param_delta_metrics(param_before, param_after),
+            "postfit_rollouts": postfit_rollouts,
+        }
+    finally:
+        vec_env.close()
+        del algo, callback, vec_env, prior
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("checkpoint_path", type=str)
+    parser.add_argument("--device", type=str, default=None)
+    parser.add_argument("--frozen-h-seed", type=int, default=12345)
+    parser.add_argument("--train-env-seed", type=int, default=2020)
+    parser.add_argument("--single-eval-pos", type=int, default=64)
+    parser.add_argument("--n-steps", type=int, default=256)
+    parser.add_argument("--batch-size", type=int, default=256)
+    parser.add_argument("--n-epochs", type=int, default=1)
+    parser.add_argument("--learning-rate", type=float, default=2e-4)
+    parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--ppo-reset-env-state-at-sep", action="store_true")
+    parser.add_argument("--ppo-separate-value-backbone", action="store_true")
+    parser.add_argument("--critic-fit-steps", type=int, default=200)
+    parser.add_argument("--num-postfit-rollouts", type=int, default=3)
+    parser.add_argument("--deterministic-actor-sampling", action="store_true")
+    parser.add_argument(
+        "--output-json",
+        type=str,
+        default="/home/chen/RLPFN/artifacts/critic_rollout_transfer_probe.json",
+    )
+    args = parser.parse_args()
+
+    report = run_critic_rollout_transfer_probe(
+        checkpoint_path=args.checkpoint_path,
+        device=args.device,
+        frozen_h_seed=args.frozen_h_seed,
+        train_env_seed=args.train_env_seed,
+        single_eval_pos=args.single_eval_pos,
+        n_steps=args.n_steps,
+        batch_size=args.batch_size,
+        n_epochs=args.n_epochs,
+        learning_rate=args.learning_rate,
+        target_kl=args.target_kl,
+        ppo_reset_env_state_at_sep=bool(args.ppo_reset_env_state_at_sep),
+        ppo_separate_value_backbone=bool(args.ppo_separate_value_backbone),
+        critic_fit_steps=int(args.critic_fit_steps),
+        num_postfit_rollouts=int(args.num_postfit_rollouts),
+        deterministic_actor_sampling=bool(args.deterministic_actor_sampling),
+    )
+    payload = json.dumps(report, sort_keys=True)
+    out_path = Path(args.output_json).expanduser().resolve()
+    out_path.parent.mkdir(parents=True, exist_ok=True)
+    out_path.write_text(payload + "\n", encoding="utf-8")
+    print(payload)
+
+
+if __name__ == "__main__":
+    main()

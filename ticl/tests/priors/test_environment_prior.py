@@ -2827,6 +2827,31 @@ def test_environment_prior_action_rms_masks_inactive_dims():
     assert math.isclose(float(rms_1), 1.0, rel_tol=1e-5, abs_tol=1e-5)
 
 
+def test_environment_prior_action_clip_preserves_in_range_magnitude():
+    action_raw = torch.tensor(
+        [
+            [-9.0, -4.0, 2.5],
+            [1.0, 7.5, -12.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    transformed = EnvironmentPrior._transform_reinforce_action(
+        action_raw,
+        mode="clip",
+        clip_bound=5.0,
+    )
+
+    expected = torch.tensor(
+        [
+            [-5.0, -4.0, 2.5],
+            [1.0, 5.0, -5.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(transformed, expected)
+
+
 def test_environment_prior_state_grad_clip_norm_clips_per_row_global_norm():
     state_next = torch.tensor(
         [
@@ -2952,6 +2977,7 @@ def test_environment_prior_rollout_applies_action_rms_before_scm_input():
     cfg["obs_slot_dim"] = 4
     cfg["action_slot_dim"] = 2
     cfg["strict_joint_transition_enabled"] = True
+    cfg["batch_parallel_backend"] = "python_thread"
     cfg["reinforce_action_transform"] = "rms"
     cfg["reinforce_action_rms_eps"] = 1e-6
     prior = EnvironmentPrior(cfg)
@@ -2966,16 +2992,53 @@ def test_environment_prior_rollout_applies_action_rms_before_scm_input():
         policy_step_fn=FixedPolicy().step,
         batch_size=2,
         n_samples=3,
-        num_features=8,
+        num_features=9,
         device="cpu",
         single_eval_pos=1,
         collect_x=True,
     )
     x = rollout["x"]
-    action_start = int(cfg["obs_slot_dim"]) + 2
+    action_start = int(cfg["obs_slot_dim"]) + 3
     action_tokens = x[1, :, action_start: action_start + 2]
     expected = torch.tensor([3.0, 4.0], dtype=torch.float32)
     expected = expected / torch.sqrt(expected.square().mean())
+    assert torch.allclose(action_tokens, expected.unsqueeze(0).expand_as(action_tokens), atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_rollout_applies_action_clip_before_scm_input():
+    cfg = dict(get_prior_config()["prior"]["environment"])
+    cfg["family"] = "scm"
+    cfg["obs_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["noise_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 0, "max": 0}
+    cfg["obs_slot_dim"] = 4
+    cfg["action_slot_dim"] = 2
+    cfg["strict_joint_transition_enabled"] = True
+    cfg["batch_parallel_backend"] = "python_thread"
+    cfg["reinforce_action_transform"] = "clip"
+    cfg["reinforce_action_clip_bound"] = 5.0
+    prior = EnvironmentPrior(cfg)
+
+    class FixedPolicy:
+        def step(self, obs_t, action_t, reward_t, cache, step_idx, env_info):
+            batch = obs_t.shape[0]
+            del action_t, reward_t, cache, step_idx, env_info
+            return torch.tensor([[3.0, 9.0]], dtype=torch.float32).expand(batch, -1)
+
+    rollout = prior.rollout_with_policy(
+        policy_step_fn=FixedPolicy().step,
+        batch_size=2,
+        n_samples=3,
+        num_features=9,
+        device="cpu",
+        single_eval_pos=1,
+        collect_x=True,
+    )
+    x = rollout["x"]
+    action_start = int(cfg["obs_slot_dim"]) + 3
+    action_tokens = x[1, :, action_start: action_start + 2]
+    expected = torch.tensor([3.0, 5.0], dtype=torch.float32)
     assert torch.allclose(action_tokens, expected.unsqueeze(0).expand_as(action_tokens), atol=1e-6, rtol=1e-6)
 
 

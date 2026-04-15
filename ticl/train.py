@@ -1155,6 +1155,9 @@ def _freeze_env_h_list_for_replay(env_prior, h_list):
     if h_list is None:
         return None
     ratio_sampler = getattr(env_prior, "_sample_reward_dropout_ratio", None)
+    constrained_dim_enabled = getattr(env_prior, "_resolve_constrained_dim_sampling_enabled", None)
+    latent_uniform_sampler = getattr(env_prior, "_latent_uniform_from_h", None)
+    exact_reward_term_sampler = getattr(env_prior, "_sample_exact_scm_reward_term_enabled", None)
     frozen = []
     for h in h_list:
         if isinstance(h, dict):
@@ -1171,6 +1174,24 @@ def _freeze_env_h_list_for_replay(env_prior, h_list):
                     ratio = float(h_frozen.get("reward_dropout_ratio", 0.0))
                 h_frozen["reward_dropout_randomize"] = False
                 h_frozen["reward_dropout_ratio"] = float(max(0.0, min(1.0, ratio)))
+            if callable(constrained_dim_enabled) and bool(constrained_dim_enabled(h_frozen)):
+                if callable(latent_uniform_sampler):
+                    latent_uniform_sampler(h_frozen, "_constrained_obs_u")
+                    state_dim = int(max(1, min(400, int(h_frozen.get("state_dim", 1)))))
+                    total_budget = int(max(1, min(400, int(h_frozen.get("constrained_dim_sampling_total_budget", 400)))))
+                    if total_budget > state_dim:
+                        latent_uniform_sampler(h_frozen, "_constrained_noise_u")
+            if callable(exact_reward_term_sampler):
+                exact_reward_term_sampler(
+                    h_frozen,
+                    prob_key="ctrl_reward_enable_prob",
+                    latent_key="_ctrl_reward_enable_u",
+                )
+                exact_reward_term_sampler(
+                    h_frozen,
+                    prob_key="survival_reward_enable_prob",
+                    latent_key="_survival_reward_enable_u",
+                )
         frozen.append(h_frozen)
     return frozen
 
@@ -6828,34 +6849,63 @@ def train_epoch_official_recurrent_ppo(
 
     logger_values = dict(getattr(ppo_algo.logger, "name_to_value", {}))
 
-    ep_rew_mean = None
-    ep_len_mean = None
+    full_ep_rew_mean = None
+    full_ep_len_mean = None
     ep_infos = list(getattr(ppo_algo, "ep_info_buffer", []) or [])
     if len(ep_infos) > 0:
         try:
-            ep_rew_mean = float(np.mean([float(ep["r"]) for ep in ep_infos if "r" in ep]))
+            full_ep_rew_mean = float(np.mean([float(ep["r"]) for ep in ep_infos if "r" in ep]))
         except Exception:
-            ep_rew_mean = None
+            full_ep_rew_mean = None
         try:
-            ep_len_mean = float(np.mean([float(ep["l"]) for ep in ep_infos if "l" in ep]))
+            full_ep_len_mean = float(np.mean([float(ep["l"]) for ep in ep_infos if "l" in ep]))
         except Exception:
-            ep_len_mean = None
+            full_ep_len_mean = None
 
     target_model = model.module if hasattr(model, "module") else model
     target_model.last_pg_epoch_metrics = None
+    reward_component_stats = dict(getattr(ppo_algo, "_rwkv_last_reward_component_stats", {}) or {})
+    # Older/fake algos may only expose SB3's full-episode buffer. Keep that as
+    # an explicit fallback under full_* names without overriding objective-
+    # aligned rollout stats emitted by the strict PPO collector.
+    if full_ep_rew_mean is not None:
+        reward_component_stats.setdefault("full_ep_rew_mean", float(full_ep_rew_mean))
+    if full_ep_len_mean is not None:
+        reward_component_stats.setdefault("full_ep_len_mean", float(full_ep_len_mean))
+    if reward_component_stats.get("ep_rew_mean", None) is None and full_ep_rew_mean is not None:
+        reward_component_stats["ep_rew_mean"] = float(full_ep_rew_mean)
+    if reward_component_stats.get("ep_len_mean", None) is None and full_ep_len_mean is not None:
+        reward_component_stats["ep_len_mean"] = float(full_ep_len_mean)
+    ppo_logger_metrics = dict(logger_values)
+    ppo_logger_metrics.setdefault("time/total_timesteps", int(getattr(ppo_algo, "num_timesteps", 0)))
+    for key, value in reward_component_stats.items():
+        if value is not None:
+            ppo_logger_metrics.setdefault(f"rollout/{key}", float(value))
+    target_model.last_ppo_logger_metrics = ppo_logger_metrics
+    episode_reward_mean = reward_component_stats.get("ep_rew_mean", None)
+    episode_length_mean = reward_component_stats.get("ep_len_mean", None)
     target_model.last_ppo_epoch_metrics = {
         "policy_total_loss_mean": logger_values.get("train/loss", None),
         "policy_gradient_loss_mean": logger_values.get("train/policy_gradient_loss", None),
         "value_loss_mean": logger_values.get("train/value_loss", None),
         "entropy_loss_mean": logger_values.get("train/entropy_loss", None),
+        "normalized_q_value_loss_mean": logger_values.get("train/normalized_q_value_loss", None),
+        "next_state_flow_matching_loss_mean": logger_values.get("train/next_state_flow_matching_loss", None),
         "approx_kl_mean": logger_values.get("train/approx_kl", None),
         "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
         "explained_variance": logger_values.get("train/explained_variance", None),
         "clip_range": logger_values.get("train/clip_range", None),
         "clip_range_vf": logger_values.get("train/clip_range_vf", None),
+        "policy_loss_weight": 1.0,
+        "entropy_loss_weight": float(getattr(ppo_algo, "ent_coef", 0.0)),
+        "value_loss_weight": float(getattr(ppo_algo, "vf_coef", 0.0)),
+        "normalized_q_value_weight": float(getattr(ppo_algo, "_rwkv_aux_q_weight", 0.0)),
+        "next_state_flow_matching_weight": float(getattr(ppo_algo, "_rwkv_aux_flow_weight", 0.0)),
         "n_updates": logger_values.get("train/n_updates", None),
-        "episode_reward_mean": ep_rew_mean,
-        "episode_length_mean": ep_len_mean,
+        "episode_reward_mean": episode_reward_mean,
+        "episode_length_mean": episode_length_mean,
+        "full_episode_reward_mean": reward_component_stats.get("full_ep_rew_mean", None),
+        "full_episode_length_mean": reward_component_stats.get("full_ep_len_mean", None),
         "num_timesteps": int(getattr(ppo_algo, "num_timesteps", 0)),
         "rollout_wall_time_sec": rollout_wall_s,
         "update_wall_time_sec": train_wall_s,
@@ -6863,6 +6913,31 @@ def train_epoch_official_recurrent_ppo(
         "outer_batches": logger_values.get("train/outer_batches", None),
         "subbatches": logger_values.get("train/subbatches", None),
     }
+    for key, value in reward_component_stats.items():
+        target_model.last_ppo_epoch_metrics[key] = value
+    for reward_key in (
+        "reward_mean",
+        "reward_std",
+        "reward_return_mean",
+        "reward_return_std",
+        "reward_env_mean",
+        "reward_env_std",
+        "reward_env_return_mean",
+        "reward_env_return_std",
+        "reward_ctrl_mean",
+        "reward_ctrl_std",
+        "reward_ctrl_return_mean",
+        "reward_ctrl_return_std",
+        "reward_survival_mean",
+        "reward_survival_std",
+        "reward_survival_return_mean",
+        "reward_survival_return_std",
+        "reward_terminal_bonus_mean",
+        "reward_terminal_bonus_std",
+        "reward_terminal_bonus_return_mean",
+        "reward_terminal_bonus_return_std",
+    ):
+        target_model.last_ppo_epoch_metrics.setdefault(reward_key, None)
     mean_loss = logger_values.get("train/loss", 0.0)
     return float(mean_loss), 0.0, 0.0
 
@@ -6966,6 +7041,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ppo_clip_range=0.2,
           ppo_clip_range_vf=None,
           ppo_normalize_advantage=True,
+          ppo_actor_gae_space="normalized",
+          ppo_actor_baseline_mode="learned",
+          ppo_separate_value_backbone=False,
+          ppo_reset_env_state_at_sep=True,
+          ppo_runtime_normalized_q_value_weight_override=None,
+          ppo_runtime_next_state_flow_matching_weight_override=None,
           ppo_ent_coef=0.0,
           ppo_vf_coef=0.5,
           ppo_max_grad_norm=0.5,
@@ -7674,6 +7755,12 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             clip_range=ppo_clip_range,
             clip_range_vf=ppo_clip_range_vf,
             normalize_advantage=bool(ppo_normalize_advantage),
+            actor_gae_space=str(ppo_actor_gae_space),
+            actor_baseline_mode=str(ppo_actor_baseline_mode),
+            separate_value_backbone=bool(ppo_separate_value_backbone),
+            reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+            runtime_normalized_q_value_weight_override=ppo_runtime_normalized_q_value_weight_override,
+            runtime_next_state_flow_matching_weight_override=ppo_runtime_next_state_flow_matching_weight_override,
             ent_coef=float(ppo_ent_coef),
             vf_coef=float(ppo_vf_coef),
             max_grad_norm=float(ppo_max_grad_norm),
@@ -8029,11 +8116,44 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                             f"clip_frac { _fmt_ppo_value('clip_fraction_mean') }"
                         )
                         print(
+                            " ppo-aux "
+                            f"qaux { _fmt_ppo_value('normalized_q_value_loss_mean') } | "
+                            f"fmaux { _fmt_ppo_value('next_state_flow_matching_loss_mean') }"
+                        )
+                        print(
+                            " ppo-reward "
+                            f"reward { _fmt_ppo_value('reward_mean') } | "
+                            f"reward_std { _fmt_ppo_value('reward_std') } | "
+                            f"reward_ret { _fmt_ppo_value('reward_return_mean') } | "
+                            f"ep_rew { _fmt_ppo_value('episode_reward_mean') } | "
+                            f"full_ep_rew { _fmt_ppo_value('full_episode_reward_mean') }"
+                        )
+                        print(
+                            " ppo-components "
+                            f"env { _fmt_ppo_value('reward_env_mean') } | "
+                            f"env_ret { _fmt_ppo_value('reward_env_return_mean') } | "
+                            f"ctrl { _fmt_ppo_value('reward_ctrl_mean') } | "
+                            f"ctrl_ret { _fmt_ppo_value('reward_ctrl_return_mean') } | "
+                            f"surv { _fmt_ppo_value('reward_survival_mean') } | "
+                            f"surv_ret { _fmt_ppo_value('reward_survival_return_mean') } | "
+                            f"term_bonus { _fmt_ppo_value('reward_terminal_bonus_mean') }"
+                        )
+                        print(
+                            " ppo-weights "
+                            f"pg { _fmt_ppo_value('policy_loss_weight') } | "
+                            f"ent { _fmt_ppo_value('entropy_loss_weight') } | "
+                            f"value { _fmt_ppo_value('value_loss_weight') } | "
+                            f"qaux { _fmt_ppo_value('normalized_q_value_weight') } | "
+                            f"fmaux { _fmt_ppo_value('next_state_flow_matching_weight') }"
+                        )
+                        print(
                             " ppo-phases "
                             f"rollout_s { _fmt_ppo_value('rollout_wall_time_sec') } | "
                             f"update_s { _fmt_ppo_value('update_wall_time_sec') } | "
                             f"outer_batches { _fmt_ppo_value('outer_batches') } | "
-                            f"subbatches { _fmt_ppo_value('subbatches') }"
+                            f"subbatches { _fmt_ppo_value('subbatches') } | "
+                            f"sep_state_reset { _fmt_ppo_value('sep_state_reset_enabled') } | "
+                            f"sep_resets { _fmt_ppo_value('sep_state_reset_count') }"
                         )
                 if profile_record is not None:
                     print(

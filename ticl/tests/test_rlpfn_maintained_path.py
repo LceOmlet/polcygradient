@@ -209,7 +209,7 @@ def _legacy_resolve_reinforce_reward_tanh_bound(h):
 
 def _legacy_resolve_reinforce_action_transform(h):
     mode = str(h.get("reinforce_action_transform", "none")).strip().lower()
-    if mode not in {"tanh", "rms", "none"}:
+    if mode not in {"tanh", "rms", "none", "clip"}:
         mode = "none"
     return mode
 
@@ -1041,6 +1041,7 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["strict_joint_transition_enabled"] is True
     assert cfg["prior"]["environment"]["batch_parallel_backend"] == "torch_vectorized"
     assert cfg["prior"]["environment"]["batch_vectorized_grouping"] == "family"
+    assert cfg["prior"]["environment"]["scm_standard_linear_init_enabled"] is True
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_enabled"] is True
     assert cfg["prior"]["environment"]["reinforce_normalize_advantages"] is True
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
@@ -1049,8 +1050,8 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.4
     assert cfg["prior"]["environment"]["reinforce_aux_enabled"] is True
     assert cfg["prior"]["environment"]["reinforce_aux_backbone_query_pass_enabled"] is False
-    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 1.0
-    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 1.0
+    assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 0.0
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 0.2
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_store_legacy_targets"] is False
     assert cfg["prior"]["environment"]["reinforce_sequence_replay_share_train_token_encoding"] is True
@@ -1063,6 +1064,9 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
     assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "clip"
+    assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
+    assert cfg["prior"]["environment"]["reinforce_action_clip_bound"] == 5.0
     assert cfg["optimizer"]["rl_objective"] == "ppo"
     assert cfg["optimizer"]["pg_tbptt_window"] is None
     assert cfg["optimizer"]["policy_rollout_checkpoint"] is False
@@ -1465,6 +1469,7 @@ def test_rlpfn_maintained_exact_scm_numeric_resolve_helpers_match_legacy_inline_
         {"reinforce_reward_transform": "tanh", "reinforce_action_transform": "none"},
         {"reinforce_reward_transform": "bad", "reinforce_action_transform": "bad"},
         {"reinforce_reward_transform": "CLIP", "reinforce_action_transform": "TANH"},
+        {"reinforce_reward_transform": "none", "reinforce_action_transform": "clip"},
     ]
     for h in transform_cases:
         assert resolve_reinforce_reward_transform(h) == _legacy_resolve_reinforce_reward_transform(h)

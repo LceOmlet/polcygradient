@@ -13,6 +13,7 @@ from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.train import (
     _build_policy_step_fn,
     _compute_policy_rollout_chunk_loss,
+    _freeze_env_h_list_for_replay,
     _is_oom_exception,
     _set_policy_inner_recompute_attn,
     train_epoch_policy_gradient,
@@ -310,6 +311,52 @@ def _assert_exact_stat_and_grad_match(
     assert len(grads_a) == len(grads_b)
     for grad_a, grad_b in zip(grads_a, grads_b):
         assert torch.equal(grad_a, grad_b)
+
+
+def test_freeze_env_h_list_for_replay_locks_env_construction_latents():
+    prior = EnvironmentPrior(_fixed_env_cfg())
+    h = {
+        "family": "scm",
+        "action_dim": 28,
+        "state_dim": 271,
+        "obs_dim": 349,
+        "noise_dim": 48,
+        "zero_pad_dim": 11,
+        "obs_slot_dim": 400,
+        "action_slot_dim": 30,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_total_budget": 400,
+        "ctrl_reward_enable_prob": 0.5,
+        "survival_reward_enable_prob": 0.5,
+        "reward_dropout_enabled": False,
+    }
+
+    frozen = _freeze_env_h_list_for_replay(prior, [h])[0]
+
+    assert "_constrained_obs_u" in frozen
+    assert "_constrained_noise_u" in frozen
+    assert "_ctrl_reward_enable_u" in frozen
+    assert "_survival_reward_enable_u" in frozen
+
+    assert prior._sample_dims(frozen) == prior._sample_dims(frozen)
+    assert prior._sample_exact_scm_reward_term_enabled(
+        frozen,
+        prob_key="ctrl_reward_enable_prob",
+        latent_key="_ctrl_reward_enable_u",
+    ) == prior._sample_exact_scm_reward_term_enabled(
+        frozen,
+        prob_key="ctrl_reward_enable_prob",
+        latent_key="_ctrl_reward_enable_u",
+    )
+    assert prior._sample_exact_scm_reward_term_enabled(
+        frozen,
+        prob_key="survival_reward_enable_prob",
+        latent_key="_survival_reward_enable_u",
+    ) == prior._sample_exact_scm_reward_term_enabled(
+        frozen,
+        prob_key="survival_reward_enable_prob",
+        latent_key="_survival_reward_enable_u",
+    )
 
 
 def test_train_keeps_aggregate_k_gradients_fixed_when_adaptive_batch_size_is_enabled(monkeypatch):

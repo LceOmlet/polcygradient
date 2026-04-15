@@ -19,13 +19,15 @@ Custom code here is limited to:
 from __future__ import annotations
 
 import copy
+import json
 import math
 import os
+import re
 import sys
 import time
-from contextlib import nullcontext
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
-from typing import Any, NamedTuple, Optional
+from typing import Any, NamedTuple, Optional, Sequence
 
 import numpy as np
 import torch
@@ -79,11 +81,22 @@ from stable_baselines3.common.type_aliases import Schedule  # noqa: E402
 from stable_baselines3.common.utils import explained_variance, obs_as_tensor  # noqa: E402
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvIndices, VecEnvObs, VecEnvStepReturn  # noqa: E402
 
+from ticl.models.tabpfn_bar_distribution import make_standardized_full_support_bar_distribution  # noqa: E402
 from ticl.priors.environment_prior import EnvironmentPrior  # noqa: E402
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout  # noqa: E402
 
 
 STRICT_OFFICIAL_RWKV_PPO_PREFIX = "Strict official RWKV PPO requires"
+PPO_VALUE_TARGET_NORM_EPS = 1e-6
+PPO_VALUE_BARDIST_VALUE_RANGE = 5.0
+
+
+def _make_ppo_value_bardist():
+    # PPO critic targets live in the same standardized value space as the
+    # dedicated normalized-Q head after rollout-level return normalization.
+    return make_standardized_full_support_bar_distribution(
+        value_range=PPO_VALUE_BARDIST_VALUE_RANGE,
+    )
 
 
 def _require(condition: bool, message: str) -> None:
@@ -104,6 +117,28 @@ def _resolve_fixed_scalar(spec: Any, *, name: str) -> float:
     raise ValueError(
         f"{STRICT_OFFICIAL_RWKV_PPO_PREFIX} {name} to be fixed, got dynamic spec {spec!r}"
     )
+
+
+def _normalize_optional_seed_spec(
+    seed_spec: Optional[int | Sequence[int]],
+    *,
+    n_envs: int,
+    name: str,
+) -> Optional[list[int]]:
+    if seed_spec is None:
+        return None
+    if isinstance(seed_spec, (int, np.integer)):
+        values = [int(seed_spec)]
+    else:
+        values = [int(v) for v in seed_spec]
+    if len(values) == 1 and int(n_envs) > 1:
+        values = values * int(n_envs)
+    if len(values) != int(n_envs):
+        raise ValueError(
+            f"{STRICT_OFFICIAL_RWKV_PPO_PREFIX} {name} to have length 1 or n_envs={int(n_envs)}, "
+            f"got length={len(values)}."
+        )
+    return values
 
 
 def _resolve_fixed_int(spec: Any, *, name: str) -> int:
@@ -127,6 +162,783 @@ def _clone_tree(value):
     if isinstance(value, dict):
         return {k: _clone_tree(v) for k, v in value.items()}
     return copy.deepcopy(value)
+
+
+def _masked_mean_std(
+    values: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    mask_f = mask.to(device=values.device, dtype=values.dtype)
+    count = mask_f.sum().clamp_min(1.0)
+    mean = (values * mask_f).sum() / count
+    centered = (values - mean) * mask_f
+    std = torch.sqrt((centered.square().sum() / count).clamp_min(float(eps)))
+    return mean, std
+
+
+def _normalize_advantages_with_mask(
+    advantages: torch.Tensor,
+    mask: torch.Tensor,
+    *,
+    eps: float = 1e-8,
+) -> torch.Tensor:
+    if advantages.numel() == 0:
+        return advantages
+    if not bool(mask.any()):
+        return torch.zeros_like(advantages)
+    mean, std = _masked_mean_std(advantages, mask, eps=eps)
+    return (advantages - mean) / (std + float(eps))
+
+
+def _resolve_actor_advantages(
+    rollout_data: MaskedRecurrentRolloutBufferSamples | MaskedRecurrentFlatBatchSamples,
+) -> torch.Tensor:
+    actor_advantages = getattr(rollout_data, "actor_advantages", None)
+    if actor_advantages is None:
+        return rollout_data.advantages
+    return actor_advantages
+
+
+def _explained_variance_with_mask(
+    predictions: np.ndarray | torch.Tensor,
+    targets: np.ndarray | torch.Tensor,
+    *,
+    mask: Optional[np.ndarray | torch.Tensor] = None,
+) -> float:
+    predictions_np = np.asarray(predictions).reshape(-1)
+    targets_np = np.asarray(targets).reshape(-1)
+    if mask is None:
+        return explained_variance(predictions_np, targets_np)
+    mask_np = np.asarray(mask).reshape(-1) > 1e-8
+    if not bool(np.any(mask_np)):
+        return float("nan")
+    return explained_variance(predictions_np[mask_np], targets_np[mask_np])
+
+
+def _discounted_returns_from_rewards(
+    rewards: np.ndarray,
+    *,
+    episode_starts: np.ndarray,
+    dones: np.ndarray,
+    gamma: float,
+) -> np.ndarray:
+    rewards = np.asarray(rewards, dtype=np.float32)
+    episode_starts = np.asarray(episode_starts, dtype=np.float32)
+    dones = np.asarray(dones, dtype=bool).reshape((-1,))
+    if rewards.ndim != 2:
+        raise ValueError(f"rewards must have shape (T, B), got {tuple(rewards.shape)}")
+    if episode_starts.shape != rewards.shape:
+        raise ValueError(
+            "episode_starts must match rewards shape, "
+            f"got {tuple(episode_starts.shape)} vs {tuple(rewards.shape)}"
+        )
+    if int(dones.shape[0]) != int(rewards.shape[1]):
+        raise ValueError(f"dones must have shape (B,), got {tuple(dones.shape)} vs B={int(rewards.shape[1])}")
+    gamma = float(gamma)
+    returns = np.zeros_like(rewards, dtype=np.float32)
+    next_return = np.zeros((rewards.shape[1],), dtype=np.float32)
+    for step in reversed(range(int(rewards.shape[0]))):
+        if step == int(rewards.shape[0]) - 1:
+            next_non_terminal = 1.0 - dones.astype(np.float32, copy=False)
+        else:
+            next_non_terminal = 1.0 - episode_starts[step + 1].astype(np.float32, copy=False)
+        next_return = rewards[step] + (gamma * next_non_terminal * next_return)
+        returns[step] = next_return
+    return returns
+
+
+def _rollout_return_norm_stats_from_raw_returns(
+    raw_returns: np.ndarray,
+    *,
+    eps: float = PPO_VALUE_TARGET_NORM_EPS,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_returns = np.asarray(raw_returns, dtype=np.float32)
+    if raw_returns.ndim != 2:
+        raise ValueError(f"raw_returns must have shape (T, B), got {tuple(raw_returns.shape)}")
+    means = raw_returns.mean(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    stds = raw_returns.std(axis=0, dtype=np.float64).astype(np.float32, copy=False)
+    stds = np.maximum(stds, float(eps))
+    return means, stds
+
+
+def _rollout_return_norm_stats_from_raw_returns_with_mask(
+    raw_returns: np.ndarray,
+    *,
+    mask: np.ndarray,
+    eps: float = PPO_VALUE_TARGET_NORM_EPS,
+    fallback_means: np.ndarray | None = None,
+    fallback_stds: np.ndarray | None = None,
+) -> tuple[np.ndarray, np.ndarray]:
+    raw_returns = np.asarray(raw_returns, dtype=np.float32)
+    mask = np.asarray(mask, dtype=np.float32) > 1e-8
+    if raw_returns.ndim != 2:
+        raise ValueError(f"raw_returns must have shape (T, B), got {tuple(raw_returns.shape)}")
+    if mask.shape != raw_returns.shape:
+        raise ValueError(
+            f"mask must match raw_returns shape, got {tuple(mask.shape)} vs {tuple(raw_returns.shape)}"
+        )
+    means = np.zeros((raw_returns.shape[1],), dtype=np.float32)
+    stds = np.zeros((raw_returns.shape[1],), dtype=np.float32)
+    for env_idx in range(int(raw_returns.shape[1])):
+        env_mask = mask[:, env_idx]
+        if bool(np.any(env_mask)):
+            env_values = raw_returns[env_mask, env_idx].astype(np.float64, copy=False)
+            means[env_idx] = np.float32(env_values.mean())
+            stds[env_idx] = np.float32(env_values.std())
+            continue
+        if fallback_means is not None:
+            means[env_idx] = np.asarray(fallback_means, dtype=np.float32)[env_idx]
+        if fallback_stds is not None:
+            stds[env_idx] = np.asarray(fallback_stds, dtype=np.float32)[env_idx]
+    stds = np.maximum(stds, float(eps))
+    return means, stds
+
+
+def _episode_starts_synced_to_objective_mask(
+    episode_starts: np.ndarray,
+    objective_masks: np.ndarray,
+) -> np.ndarray:
+    episode_starts = np.asarray(episode_starts, dtype=np.float32)
+    objective_masks = np.asarray(objective_masks, dtype=np.float32)
+    if episode_starts.shape != objective_masks.shape:
+        raise ValueError(
+            f"episode_starts must match objective_masks shape, got {tuple(episode_starts.shape)} vs {tuple(objective_masks.shape)}"
+        )
+    adjusted = np.array(episode_starts, copy=True, dtype=np.float32)
+    objective_mask_bool = objective_masks > 1e-8
+    for env_idx in range(int(adjusted.shape[1])):
+        valid_steps = np.flatnonzero(objective_mask_bool[:, env_idx])
+        if int(valid_steps.size) == 0:
+            continue
+        adjusted[int(valid_steps[0]), env_idx] = 1.0
+    return adjusted
+
+
+def _compute_suffix_scores_from_objective_mask(
+    rewards: np.ndarray,
+    objective_masks: np.ndarray,
+) -> np.ndarray:
+    rewards = np.asarray(rewards, dtype=np.float32)
+    objective_masks = np.asarray(objective_masks, dtype=np.float32)
+    return (rewards * (objective_masks > 1e-8).astype(np.float32, copy=False)).sum(
+        axis=0,
+        dtype=np.float32,
+    )
+
+
+def _drop_early_objective_bucket(
+    objective_masks: np.ndarray,
+    *,
+    fraction: float = 0.25,
+) -> np.ndarray:
+    adjusted = np.array(objective_masks, copy=True, dtype=np.float32)
+    objective_mask_bool = adjusted > 1e-8
+    for env_idx in range(int(adjusted.shape[1])):
+        valid_steps = np.flatnonzero(objective_mask_bool[:, env_idx])
+        if int(valid_steps.size) == 0:
+            continue
+        drop_count = max(1, int(math.ceil(float(valid_steps.size) * float(fraction))))
+        adjusted[valid_steps[:drop_count], env_idx] = 0.0
+    return adjusted
+
+
+def _keep_only_post_first_terminal_objective_mask(
+    objective_masks: np.ndarray,
+    *,
+    episode_starts: np.ndarray,
+) -> np.ndarray:
+    adjusted = np.zeros_like(np.asarray(objective_masks, dtype=np.float32))
+    objective_mask_bool = np.asarray(objective_masks, dtype=np.float32) > 1e-8
+    episode_starts_bool = np.asarray(episode_starts, dtype=np.float32) > 1e-8
+    if objective_mask_bool.shape != episode_starts_bool.shape:
+        raise ValueError(
+            f"objective_masks and episode_starts must match, got {tuple(objective_mask_bool.shape)} vs {tuple(episode_starts_bool.shape)}"
+        )
+    for env_idx in range(int(adjusted.shape[1])):
+        valid_steps = np.flatnonzero(objective_mask_bool[:, env_idx])
+        if int(valid_steps.size) <= 1:
+            continue
+        subsequent_steps = valid_steps[1:]
+        subsequent_starts = episode_starts_bool[subsequent_steps, env_idx]
+        if not bool(np.any(subsequent_starts)):
+            continue
+        first_start_idx = int(np.flatnonzero(subsequent_starts)[0])
+        kept_steps = subsequent_steps[first_start_idx:]
+        adjusted[kept_steps, env_idx] = 1.0
+    return adjusted
+
+
+def _parse_boundary_local_actor_objective_mode(actor_objective_mode: str) -> tuple[str, int] | None:
+    actor_objective_mode = str(actor_objective_mode).strip().lower()
+    match = re.match(r"^tokenwise_drop_first_(\d+)_suffix_steps$", actor_objective_mode)
+    if match is not None:
+        return ("drop_first_k", max(1, int(match.group(1))))
+    match = re.match(r"^tokenwise_linear_ramp_first_(\d+)_suffix_steps$", actor_objective_mode)
+    if match is not None:
+        return ("linear_ramp_first_k", max(1, int(match.group(1))))
+    return None
+
+
+def _build_objective_position_metadata(
+    episode_starts: np.ndarray,
+    objective_masks: np.ndarray,
+) -> dict[str, np.ndarray]:
+    episode_starts_bool = np.asarray(episode_starts, dtype=np.float32) > 1e-8
+    objective_mask_bool = np.asarray(objective_masks, dtype=np.float32) > 1e-8
+    if episode_starts_bool.shape != objective_mask_bool.shape:
+        raise ValueError(
+            f"episode_starts and objective_masks must match, got {tuple(episode_starts_bool.shape)} vs {tuple(objective_mask_bool.shape)}"
+        )
+    if episode_starts_bool.ndim != 2:
+        raise ValueError(
+            f"objective position metadata expects 2D [steps, envs] arrays, got ndim={episode_starts_bool.ndim}"
+        )
+
+    n_steps, n_envs = episode_starts_bool.shape
+    env_indices = np.broadcast_to(
+        np.arange(n_envs, dtype=np.int64).reshape((1, n_envs)),
+        (n_steps, n_envs),
+    ).copy()
+    step_indices = np.broadcast_to(
+        np.arange(n_steps, dtype=np.int64).reshape((n_steps, 1)),
+        (n_steps, n_envs),
+    ).copy()
+    objective_episode_indices = np.full((n_steps, n_envs), -1, dtype=np.int64)
+    objective_episode_positions = np.full((n_steps, n_envs), -1, dtype=np.int64)
+    objective_global_positions = np.full((n_steps, n_envs), -1, dtype=np.int64)
+
+    for env_idx in range(int(n_envs)):
+        objective_episode_index = -1
+        objective_episode_position = -1
+        objective_global_position = -1
+        for step_idx in range(int(n_steps)):
+            if bool(episode_starts_bool[step_idx, env_idx]):
+                objective_episode_index += 1
+                objective_episode_position = -1
+            objective_episode_indices[step_idx, env_idx] = int(objective_episode_index)
+            if not bool(objective_mask_bool[step_idx, env_idx]):
+                continue
+            objective_episode_position += 1
+            objective_global_position += 1
+            objective_episode_positions[step_idx, env_idx] = int(objective_episode_position)
+            objective_global_positions[step_idx, env_idx] = int(objective_global_position)
+
+    return {
+        "env_indices": env_indices,
+        "step_indices": step_indices,
+        "objective_episode_indices": objective_episode_indices,
+        "objective_episode_positions": objective_episode_positions,
+        "objective_global_positions": objective_global_positions,
+    }
+
+
+def _resolve_train_outer_batch_snapshot_target_mask(
+    *,
+    objective_mask: np.ndarray,
+    flat_env_indices: np.ndarray,
+    flat_objective_episode_indices: np.ndarray,
+    flat_objective_episode_positions: np.ndarray,
+    target_env_index: int | None = None,
+    target_objective_episode_index: int | None = None,
+    target_objective_position_start: int | None = None,
+    target_objective_position_end: int | None = None,
+) -> np.ndarray | None:
+    objective_mask_bool = np.asarray(objective_mask, dtype=bool).reshape(-1)
+    if not bool(np.any(objective_mask_bool)):
+        return None
+    candidate = np.array(objective_mask_bool, copy=True)
+    has_segment_selector = False
+
+    if target_env_index is not None:
+        has_segment_selector = True
+        candidate &= np.asarray(flat_env_indices, dtype=np.int64).reshape(-1) == int(target_env_index)
+    if target_objective_episode_index is not None:
+        has_segment_selector = True
+        candidate &= (
+            np.asarray(flat_objective_episode_indices, dtype=np.int64).reshape(-1)
+            == int(target_objective_episode_index)
+        )
+    if target_objective_position_start is not None:
+        has_segment_selector = True
+        candidate &= (
+            np.asarray(flat_objective_episode_positions, dtype=np.int64).reshape(-1)
+            >= int(target_objective_position_start)
+        )
+    if target_objective_position_end is not None:
+        has_segment_selector = True
+        candidate &= (
+            np.asarray(flat_objective_episode_positions, dtype=np.int64).reshape(-1)
+            <= int(target_objective_position_end)
+        )
+    if not has_segment_selector:
+        return None
+    return candidate
+
+
+def _build_train_outer_batch_selector_trace_row(
+    *,
+    objective_mask: np.ndarray,
+    flat_env_indices: np.ndarray,
+    flat_objective_episode_indices: np.ndarray,
+    flat_objective_episode_positions: np.ndarray,
+    epoch_idx: int,
+    outer_batch_idx: int,
+    total_outer_batches: int,
+    selector: dict[str, int | None],
+) -> dict[str, Any]:
+    objective_mask_bool = np.asarray(objective_mask, dtype=bool).reshape(-1)
+    flat_env_indices_np = np.asarray(flat_env_indices, dtype=np.int64).reshape(-1)
+    flat_objective_episode_indices_np = np.asarray(
+        flat_objective_episode_indices,
+        dtype=np.int64,
+    ).reshape(-1)
+    flat_objective_episode_positions_np = np.asarray(
+        flat_objective_episode_positions,
+        dtype=np.int64,
+    ).reshape(-1)
+
+    objective_total = int(objective_mask_bool.sum())
+    objective_env_indices_present = sorted(
+        int(v)
+        for v in np.unique(flat_env_indices_np[objective_mask_bool]).tolist()
+    ) if objective_total > 0 else []
+
+    target_env_index = selector.get("target_env_index", None)
+    target_objective_episode_index = selector.get("target_objective_episode_index", None)
+    target_objective_position_start = selector.get("target_objective_position_start", None)
+    target_objective_position_end = selector.get("target_objective_position_end", None)
+
+    if target_env_index is None:
+        target_env_mask = np.array(objective_mask_bool, copy=True)
+    else:
+        target_env_mask = objective_mask_bool & (flat_env_indices_np == int(target_env_index))
+    target_env_objective_token_count = int(target_env_mask.sum())
+
+    target_env_episode_indices_present = sorted(
+        int(v)
+        for v in np.unique(flat_objective_episode_indices_np[target_env_mask]).tolist()
+    ) if target_env_objective_token_count > 0 else []
+
+    target_env_episode_spans: list[dict[str, int]] = []
+    for episode_idx in target_env_episode_indices_present:
+        episode_mask = target_env_mask & (flat_objective_episode_indices_np == int(episode_idx))
+        positions = flat_objective_episode_positions_np[episode_mask]
+        if positions.size <= 0:
+            continue
+        target_env_episode_spans.append(
+            {
+                "objective_episode_index": int(episode_idx),
+                "token_count": int(positions.size),
+                "objective_position_min": int(positions.min()),
+                "objective_position_max": int(positions.max()),
+            }
+        )
+
+    if target_objective_episode_index is None:
+        target_episode_mask = np.array(target_env_mask, copy=True)
+    else:
+        target_episode_mask = target_env_mask & (
+            flat_objective_episode_indices_np == int(target_objective_episode_index)
+        )
+    target_episode_token_count = int(target_episode_mask.sum())
+    target_episode_positions_present = sorted(
+        int(v)
+        for v in np.unique(flat_objective_episode_positions_np[target_episode_mask]).tolist()
+    ) if target_episode_token_count > 0 else []
+
+    target_match_mask = _resolve_train_outer_batch_snapshot_target_mask(
+        objective_mask=objective_mask_bool,
+        flat_env_indices=flat_env_indices_np,
+        flat_objective_episode_indices=flat_objective_episode_indices_np,
+        flat_objective_episode_positions=flat_objective_episode_positions_np,
+        target_env_index=target_env_index,
+        target_objective_episode_index=target_objective_episode_index,
+        target_objective_position_start=target_objective_position_start,
+        target_objective_position_end=target_objective_position_end,
+    )
+    target_match_count = 0 if target_match_mask is None else int(np.asarray(target_match_mask, dtype=bool).sum())
+    target_match_positions = (
+        sorted(
+            int(v)
+            for v in np.unique(flat_objective_episode_positions_np[np.asarray(target_match_mask, dtype=bool)]).tolist()
+        )
+        if target_match_count > 0
+        else []
+    )
+
+    if objective_total <= 0:
+        target_status = "no_objective_tokens"
+    elif target_env_index is not None and target_env_objective_token_count <= 0:
+        target_status = "target_env_absent"
+    elif target_objective_episode_index is not None and target_episode_token_count <= 0:
+        target_status = "target_episode_absent"
+    elif target_match_count > 0:
+        target_status = "target_present"
+    elif target_objective_position_start is not None or target_objective_position_end is not None:
+        target_status = "target_position_range_absent"
+    else:
+        target_status = "selector_unmatched"
+
+    return {
+        "epoch_idx": int(epoch_idx),
+        "outer_batch_idx": int(outer_batch_idx),
+        "total_outer_batches": int(total_outer_batches),
+        "objective_total": int(objective_total),
+        "objective_env_indices_present": objective_env_indices_present,
+        "target_status": str(target_status),
+        "target_env_index": None if target_env_index is None else int(target_env_index),
+        "target_env_objective_token_count": int(target_env_objective_token_count),
+        "target_env_objective_episode_indices_present": target_env_episode_indices_present,
+        "target_env_objective_episode_spans": target_env_episode_spans,
+        "target_objective_episode_index": None
+        if target_objective_episode_index is None
+        else int(target_objective_episode_index),
+        "target_episode_token_count": int(target_episode_token_count),
+        "target_episode_positions_present": target_episode_positions_present,
+        "target_objective_position_start": None
+        if target_objective_position_start is None
+        else int(target_objective_position_start),
+        "target_objective_position_end": None
+        if target_objective_position_end is None
+        else int(target_objective_position_end),
+        "target_match_count": int(target_match_count),
+        "target_match_positions": target_match_positions,
+    }
+
+
+ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE = 0.7731768424154796
+ENV12_MID_EPISODE_EXTENSION_BLOCK_OBJECTIVE_EPISODE_INDEX = 0
+ENV12_MID_EPISODE_EXTENSION_BLOCK_POSITION_START = 18
+ENV12_MID_EPISODE_EXTENSION_BLOCK_POSITION_END = 21
+ENV12_MID_EPISODE_EXTENSION_BLOCK_TARGET_SUITE_NAME = "pair2"
+
+
+def _env12_mid_episode_extension_branch_specific_scale_mask(
+    objective_masks: np.ndarray,
+    *,
+    episode_starts: np.ndarray,
+) -> np.ndarray:
+    adjusted = np.ones_like(np.asarray(objective_masks, dtype=np.float32))
+    objective_mask_bool = np.asarray(objective_masks, dtype=np.float32) > 1e-8
+    episode_starts_bool = np.asarray(episode_starts, dtype=np.float32) > 1e-8
+    if objective_mask_bool.shape != episode_starts_bool.shape:
+        raise ValueError(
+            f"objective_masks and episode_starts must match, got {tuple(objective_mask_bool.shape)} vs {tuple(episode_starts_bool.shape)}"
+        )
+    for env_idx in range(int(adjusted.shape[1])):
+        objective_episode_index = -1
+        objective_position = -1
+        for step in range(int(adjusted.shape[0])):
+            if episode_starts_bool[step, env_idx]:
+                objective_episode_index += 1
+                objective_position = -1
+            if not bool(objective_mask_bool[step, env_idx]):
+                continue
+            objective_position += 1
+            if (
+                objective_episode_index == ENV12_MID_EPISODE_EXTENSION_BLOCK_OBJECTIVE_EPISODE_INDEX
+                and ENV12_MID_EPISODE_EXTENSION_BLOCK_POSITION_START
+                <= objective_position
+                <= ENV12_MID_EPISODE_EXTENSION_BLOCK_POSITION_END
+            ):
+                adjusted[step, env_idx] = np.float32(ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE)
+    return adjusted
+
+
+def _resolve_runtime_scoped_actor_objective_mode(
+    actor_objective_mode: str,
+    *,
+    current_suite_name: str | None = None,
+) -> str:
+    actor_objective_mode = str(actor_objective_mode).strip().lower()
+    suite_name = str(current_suite_name or "").strip().lower()
+    if (
+        actor_objective_mode == "tokenwise_scale_env12_mid_episode_extension_block"
+        and suite_name != ENV12_MID_EPISODE_EXTENSION_BLOCK_TARGET_SUITE_NAME
+    ):
+        return "tokenwise"
+    return actor_objective_mode
+
+
+def _is_supported_actor_objective_mode(actor_objective_mode: str) -> bool:
+    actor_objective_mode = str(actor_objective_mode).strip().lower()
+    if actor_objective_mode in {
+        "tokenwise",
+        "trajectory_suffix_return",
+        "tokenwise_suffix_return_correction",
+        "tokenwise_drop_q1_early",
+        "tokenwise_post_first_terminal_only",
+        "tokenwise_scale_env12_mid_episode_extension_block",
+        "tokenwise_shift_q1_contract",
+    }:
+        return True
+    return _parse_boundary_local_actor_objective_mode(actor_objective_mode) is not None
+
+
+def _apply_actor_objective_postprocess(
+    actor_advantages: np.ndarray,
+    *,
+    rewards: np.ndarray,
+    objective_masks: np.ndarray,
+    episode_starts: np.ndarray,
+    actor_objective_mode: str,
+) -> np.ndarray:
+    actor_objective_mode = str(actor_objective_mode).strip().lower()
+    actor_advantages = np.asarray(actor_advantages, dtype=np.float32)
+    if actor_objective_mode == "tokenwise":
+        return actor_advantages
+    if actor_objective_mode == "tokenwise_suffix_return_correction":
+        suffix_scores = _compute_suffix_scores_from_objective_mask(rewards, objective_masks)
+        if int(actor_advantages.shape[1]) > 1:
+            centered_scores = suffix_scores - float(suffix_scores.mean())
+            denom = max(float(suffix_scores.std()), 1e-6)
+        else:
+            centered_scores = suffix_scores
+            denom = max(abs(float(suffix_scores[0])), 1.0)
+        correction = 1.0 + np.tanh(centered_scores / denom)
+        return (actor_advantages * correction.reshape((1, int(actor_advantages.shape[1])))).astype(
+            np.float32,
+            copy=False,
+        )
+    if actor_objective_mode == "tokenwise_drop_q1_early":
+        adjusted = np.array(actor_advantages, copy=True, dtype=np.float32)
+        adjusted_masks = _drop_early_objective_bucket(objective_masks, fraction=0.25)
+        dropped_mask = (np.asarray(objective_masks, dtype=np.float32) > 1e-8) & ~(adjusted_masks > 1e-8)
+        adjusted[dropped_mask] = 0.0
+        return adjusted
+    if actor_objective_mode == "tokenwise_post_first_terminal_only":
+        adjusted = np.array(actor_advantages, copy=True, dtype=np.float32)
+        kept_masks = _keep_only_post_first_terminal_objective_mask(
+            objective_masks,
+            episode_starts=episode_starts,
+        )
+        dropped_mask = (np.asarray(objective_masks, dtype=np.float32) > 1e-8) & ~(kept_masks > 1e-8)
+        adjusted[dropped_mask] = 0.0
+        return adjusted
+    if actor_objective_mode == "tokenwise_scale_env12_mid_episode_extension_block":
+        adjusted = np.array(actor_advantages, copy=True, dtype=np.float32)
+        scaling_mask = _env12_mid_episode_extension_branch_specific_scale_mask(
+            objective_masks,
+            episode_starts=episode_starts,
+        )
+        adjusted *= scaling_mask.astype(np.float32, copy=False)
+        return adjusted
+    boundary_local = _parse_boundary_local_actor_objective_mode(actor_objective_mode)
+    if boundary_local is not None:
+        mode_kind, step_count = boundary_local
+        adjusted = np.array(actor_advantages, copy=True, dtype=np.float32)
+        objective_mask_bool = np.asarray(objective_masks, dtype=np.float32) > 1e-8
+        for env_idx in range(int(adjusted.shape[1])):
+            valid_steps = np.flatnonzero(objective_mask_bool[:, env_idx])
+            if int(valid_steps.size) == 0:
+                continue
+            local_count = min(int(step_count), int(valid_steps.size))
+            early_steps = valid_steps[:local_count]
+            if mode_kind == "drop_first_k":
+                adjusted[early_steps, env_idx] = 0.0
+                continue
+            if mode_kind == "linear_ramp_first_k":
+                ramp = (np.arange(local_count, dtype=np.float32) + 1.0) / float(local_count)
+                adjusted[early_steps, env_idx] *= ramp
+                continue
+            raise ValueError(f"Unsupported boundary-local actor objective mode kind: {mode_kind}")
+        return adjusted
+    raise ValueError(f"Unsupported PPO actor objective postprocess mode: {actor_objective_mode}")
+
+
+def _recover_raw_from_value_space(
+    value_space_tensor: torch.Tensor,
+    *,
+    value_means: torch.Tensor | np.ndarray | float,
+    value_stds: torch.Tensor | np.ndarray | float,
+    eps: float = PPO_VALUE_TARGET_NORM_EPS,
+) -> torch.Tensor:
+    targets = value_space_tensor.to(dtype=torch.float32)
+    if torch.is_tensor(value_means):
+        means = value_means.to(device=targets.device, dtype=targets.dtype)
+    else:
+        means = torch.as_tensor(value_means, device=targets.device, dtype=targets.dtype)
+    if torch.is_tensor(value_stds):
+        stds = value_stds.to(device=targets.device, dtype=targets.dtype)
+    else:
+        stds = torch.as_tensor(value_stds, device=targets.device, dtype=targets.dtype)
+    while means.ndim < targets.ndim:
+        means = means.unsqueeze(-1)
+    while stds.ndim < targets.ndim:
+        stds = stds.unsqueeze(-1)
+    if int(means.numel()) == 1:
+        means = means.expand_as(targets)
+    if int(stds.numel()) == 1:
+        stds = stds.expand_as(targets)
+    return means + stds.clamp_min(float(eps)) * targets
+
+
+class _RolloutScalarAccumulator:
+    def __init__(self) -> None:
+        self.sum = 0.0
+        self.sumsq = 0.0
+        self.count = 0
+
+    def add(self, values: np.ndarray | list[float] | float) -> None:
+        arr = np.asarray(values, dtype=np.float64).reshape(-1)
+        if int(arr.size) <= 0:
+            return
+        self.sum += float(arr.sum())
+        self.sumsq += float(np.square(arr).sum())
+        self.count += int(arr.size)
+
+    def mean_std(self) -> tuple[Optional[float], Optional[float]]:
+        if int(self.count) <= 0:
+            return None, None
+        mean = float(self.sum / float(self.count))
+        var = max(0.0, (self.sumsq / float(self.count)) - (mean ** 2))
+        return mean, float(math.sqrt(var))
+
+
+class _PpoRolloutLogAccumulator:
+    _COMPONENT_KEYS = (
+        "reward",
+        "reward_env",
+        "reward_ctrl",
+        "reward_survival",
+        "reward_terminal_bonus",
+    )
+
+    def __init__(self, n_envs: int) -> None:
+        self.n_envs = int(n_envs)
+        self._objective_step_stats = {
+            key: _RolloutScalarAccumulator()
+            for key in self._COMPONENT_KEYS
+        }
+        self._objective_episode_stats = {
+            key: _RolloutScalarAccumulator()
+            for key in self._COMPONENT_KEYS
+        }
+        self._full_episode_stats = {
+            key: _RolloutScalarAccumulator()
+            for key in self._COMPONENT_KEYS
+        }
+        self._objective_length_stats = _RolloutScalarAccumulator()
+        self._full_length_stats = _RolloutScalarAccumulator()
+        self._objective_current = {
+            key: np.zeros((self.n_envs,), dtype=np.float64)
+            for key in self._COMPONENT_KEYS
+        }
+        self._full_current = {
+            key: np.zeros((self.n_envs,), dtype=np.float64)
+            for key in self._COMPONENT_KEYS
+        }
+        self._objective_lengths = np.zeros((self.n_envs,), dtype=np.int64)
+        self._full_lengths = np.zeros((self.n_envs,), dtype=np.int64)
+
+    def observe_step(
+        self,
+        *,
+        reward: np.ndarray,
+        reward_env: np.ndarray,
+        reward_ctrl: np.ndarray,
+        reward_survival: np.ndarray,
+        reward_terminal_bonus: np.ndarray,
+        objective_mask: np.ndarray,
+        dones: np.ndarray,
+    ) -> None:
+        values = {
+            "reward": np.asarray(reward, dtype=np.float64).reshape((self.n_envs,)),
+            "reward_env": np.asarray(reward_env, dtype=np.float64).reshape((self.n_envs,)),
+            "reward_ctrl": np.asarray(reward_ctrl, dtype=np.float64).reshape((self.n_envs,)),
+            "reward_survival": np.asarray(reward_survival, dtype=np.float64).reshape((self.n_envs,)),
+            "reward_terminal_bonus": np.asarray(reward_terminal_bonus, dtype=np.float64).reshape((self.n_envs,)),
+        }
+        objective_mask_np = np.asarray(objective_mask, dtype=bool).reshape((self.n_envs,))
+        dones_np = np.asarray(dones, dtype=bool).reshape((self.n_envs,))
+
+        for key, arr in values.items():
+            self._full_current[key] += arr
+        self._full_lengths += 1
+
+        if bool(np.any(objective_mask_np)):
+            active_idx = np.nonzero(objective_mask_np)[0]
+            for key, arr in values.items():
+                self._objective_step_stats[key].add(arr[active_idx])
+                self._objective_current[key][active_idx] += arr[active_idx]
+            self._objective_lengths[active_idx] += 1
+
+        for env_idx in np.nonzero(dones_np)[0].tolist():
+            self._flush_full_episode(int(env_idx))
+            self._flush_objective_episode(int(env_idx))
+
+    def finalize(self) -> dict[str, Optional[float]]:
+        for env_idx in range(self.n_envs):
+            self._flush_objective_episode(env_idx)
+        stats: dict[str, Optional[float]] = {}
+        for key, accum in self._objective_step_stats.items():
+            mean, std = accum.mean_std()
+            stats[f"{key}_mean"] = mean
+            stats[f"{key}_std"] = std
+        self._populate_episode_stats(
+            stats,
+            prefix="",
+            episode_stats=self._objective_episode_stats,
+            length_stats=self._objective_length_stats,
+        )
+        self._populate_episode_stats(
+            stats,
+            prefix="full_",
+            episode_stats=self._full_episode_stats,
+            length_stats=self._full_length_stats,
+        )
+        return stats
+
+    def _flush_full_episode(self, env_idx: int) -> None:
+        episode_len = int(self._full_lengths[env_idx])
+        if episode_len <= 0:
+            return
+        self._full_length_stats.add(float(episode_len))
+        for key, current in self._full_current.items():
+            self._full_episode_stats[key].add(float(current[env_idx]))
+            current[env_idx] = 0.0
+        self._full_lengths[env_idx] = 0
+
+    def _flush_objective_episode(self, env_idx: int) -> None:
+        episode_len = int(self._objective_lengths[env_idx])
+        if episode_len <= 0:
+            return
+        self._objective_length_stats.add(float(episode_len))
+        for key, current in self._objective_current.items():
+            self._objective_episode_stats[key].add(float(current[env_idx]))
+            current[env_idx] = 0.0
+        self._objective_lengths[env_idx] = 0
+
+    @staticmethod
+    def _populate_episode_stats(
+        stats: dict[str, Optional[float]],
+        *,
+        prefix: str,
+        episode_stats: dict[str, _RolloutScalarAccumulator],
+        length_stats: _RolloutScalarAccumulator,
+    ) -> None:
+        reward_mean, reward_std = episode_stats["reward"].mean_std()
+        length_mean, length_std = length_stats.mean_std()
+        if prefix:
+            stats[f"{prefix}ep_rew_mean"] = reward_mean
+            stats[f"{prefix}ep_rew_std"] = reward_std
+            stats[f"{prefix}ep_len_mean"] = length_mean
+            stats[f"{prefix}ep_len_std"] = length_std
+        else:
+            stats["ep_rew_mean"] = reward_mean
+            stats["ep_rew_std"] = reward_std
+            stats["ep_len_mean"] = length_mean
+            stats["ep_len_std"] = length_std
+        for key, accum in episode_stats.items():
+            mean, std = accum.mean_std()
+            if prefix:
+                stats[f"{prefix}{key}_return_mean"] = mean
+                stats[f"{prefix}{key}_return_std"] = std
+            else:
+                stats[f"{key}_return_mean"] = mean
+                stats[f"{key}_return_std"] = std
 
 
 def _zero_batch_rows(value, row_mask: torch.Tensor):
@@ -191,13 +1003,18 @@ class MaskedRecurrentRolloutBufferSamples(NamedTuple):
     old_log_prob: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
+    objective_masks: torch.Tensor
+    rollout_return_means: torch.Tensor
+    rollout_return_stds: torch.Tensor
     lstm_states: RNNStates
     episode_starts: torch.Tensor
     mask: torch.Tensor
     action_masks: torch.Tensor
     next_states: torch.Tensor
     next_state_masks: torch.Tensor
+    actor_advantages: Optional[torch.Tensor] = None
     normalized_q_targets: Optional[torch.Tensor] = None
+    value_target_bucket_idx: Optional[torch.Tensor] = None
 
 
 class MaskedRecurrentFlatBatchSamples(NamedTuple):
@@ -207,6 +1024,9 @@ class MaskedRecurrentFlatBatchSamples(NamedTuple):
     old_log_prob: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
+    objective_masks: torch.Tensor
+    rollout_return_means: torch.Tensor
+    rollout_return_stds: torch.Tensor
     lstm_states: RNNStates
     episode_starts: torch.Tensor
     action_masks: torch.Tensor
@@ -214,7 +1034,15 @@ class MaskedRecurrentFlatBatchSamples(NamedTuple):
     next_state_masks: torch.Tensor
     seq_start_indices: np.ndarray
     seq_lengths: np.ndarray
+    actor_advantages: Optional[torch.Tensor] = None
     normalized_q_targets: Optional[torch.Tensor] = None
+    value_target_bucket_idx: Optional[torch.Tensor] = None
+    flat_batch_indices: Optional[np.ndarray] = None
+    flat_env_indices: Optional[np.ndarray] = None
+    flat_step_indices: Optional[np.ndarray] = None
+    flat_objective_episode_indices: Optional[np.ndarray] = None
+    flat_objective_episode_positions: Optional[np.ndarray] = None
+    flat_objective_global_positions: Optional[np.ndarray] = None
 
     @property
     def n_seq(self) -> int:
@@ -305,6 +1133,24 @@ def _slice_masked_rollout_sequence_batch(
             start_seq=int(start_seq),
             end_seq=int(end_seq),
         ),
+        objective_masks=_slice_padded_sequence_tensor(
+            rollout_data.objective_masks,
+            n_seq=n_seq,
+            start_seq=int(start_seq),
+            end_seq=int(end_seq),
+        ),
+        rollout_return_means=_slice_padded_sequence_tensor(
+            rollout_data.rollout_return_means,
+            n_seq=n_seq,
+            start_seq=int(start_seq),
+            end_seq=int(end_seq),
+        ),
+        rollout_return_stds=_slice_padded_sequence_tensor(
+            rollout_data.rollout_return_stds,
+            n_seq=n_seq,
+            start_seq=int(start_seq),
+            end_seq=int(end_seq),
+        ),
         lstm_states=RNNStates(pi_states, vf_states),
         episode_starts=_slice_padded_sequence_tensor(
             rollout_data.episode_starts,
@@ -335,6 +1181,16 @@ def _slice_masked_rollout_sequence_batch(
             n_seq=n_seq,
             start_seq=int(start_seq),
             end_seq=int(end_seq),
+        ),
+        actor_advantages=(
+            None
+            if rollout_data.actor_advantages is None
+            else _slice_padded_sequence_tensor(
+                rollout_data.actor_advantages,
+                n_seq=n_seq,
+                start_seq=int(start_seq),
+                end_seq=int(end_seq),
+            )
         ),
     )
 
@@ -379,6 +1235,18 @@ def _slice_flat_sequence_batch_to_padded(
         flat_batch.returns[flat_start:flat_end],
         seq_start_indices=local_seq_starts,
     )
+    objective_masks_padded, _ = MaskedRecurrentRolloutBuffer._pad_device_tensor(
+        flat_batch.objective_masks[flat_start:flat_end],
+        seq_start_indices=local_seq_starts,
+    )
+    rollout_return_means_padded, _ = MaskedRecurrentRolloutBuffer._pad_device_tensor(
+        flat_batch.rollout_return_means[flat_start:flat_end],
+        seq_start_indices=local_seq_starts,
+    )
+    rollout_return_stds_padded, _ = MaskedRecurrentRolloutBuffer._pad_device_tensor(
+        flat_batch.rollout_return_stds[flat_start:flat_end],
+        seq_start_indices=local_seq_starts,
+    )
     episode_starts_padded, _ = MaskedRecurrentRolloutBuffer._pad_device_tensor(
         flat_batch.episode_starts[flat_start:flat_end],
         seq_start_indices=local_seq_starts,
@@ -414,12 +1282,27 @@ def _slice_flat_sequence_batch_to_padded(
             old_log_prob=old_log_prob_padded.reshape((padded_batch_size,)),
             advantages=returns_padded.new_zeros((padded_batch_size,)),
             returns=returns_padded.reshape((padded_batch_size,)),
+            value_target_bucket_idx=MaskedRecurrentRolloutBuffer._pad_device_tensor(
+                flat_batch.value_target_bucket_idx[flat_start:flat_end],
+                seq_start_indices=local_seq_starts,
+            )[0].reshape((padded_batch_size,)),
+            objective_masks=objective_masks_padded.reshape((padded_batch_size,)),
+            rollout_return_means=rollout_return_means_padded.reshape((padded_batch_size,)),
+            rollout_return_stds=rollout_return_stds_padded.reshape((padded_batch_size,)),
             lstm_states=RNNStates(pi_states, vf_states),
             episode_starts=episode_starts_padded.reshape((padded_batch_size,)),
             mask=valid.reshape((padded_batch_size,)).to(device=returns_padded.device, dtype=returns_padded.dtype),
             action_masks=action_masks_padded.reshape((padded_batch_size, flat_batch.action_masks.shape[-1])),
             next_states=next_states_padded.reshape((padded_batch_size, flat_batch.next_states.shape[-1])),
             next_state_masks=next_state_masks_padded.reshape((padded_batch_size, flat_batch.next_state_masks.shape[-1])),
+            actor_advantages=(
+                None
+                if flat_batch.actor_advantages is None
+                else MaskedRecurrentRolloutBuffer._pad_device_tensor(
+                    flat_batch.actor_advantages[flat_start:flat_end],
+                    seq_start_indices=local_seq_starts,
+                )[0].reshape((padded_batch_size,))
+            ),
         ),
         flat_start,
         flat_end,
@@ -431,9 +1314,17 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
     action_masks: np.ndarray
     next_states: np.ndarray
     next_state_masks: np.ndarray
+    objective_masks: np.ndarray
+    rollout_return_means: np.ndarray
+    rollout_return_stds: np.ndarray
+    actor_advantages: np.ndarray
+    value_target_bucket_idx: np.ndarray
 
     def __init__(self, *args, next_state_dim: int, **kwargs):
         self.next_state_dim = int(next_state_dim)
+        self._actor_gae_space = "normalized"
+        self._actor_baseline_mode = "learned"
+        self._deterministic_batch_plan = False
         super().__init__(*args, **kwargs)
 
     def reset(self):
@@ -444,10 +1335,21 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self.action_masks = np.ones((self.buffer_size, self.n_envs, self.mask_dims), dtype=np.float32)
         self.next_states = np.zeros((self.buffer_size, self.n_envs, self.next_state_dim), dtype=np.float32)
         self.next_state_masks = np.zeros((self.buffer_size, self.n_envs, self.next_state_dim), dtype=np.float32)
+        self.objective_masks = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.rollout_return_means = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.rollout_return_stds = np.ones((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.actor_advantages = np.zeros((self.buffer_size, self.n_envs), dtype=np.float32)
+        self.value_target_bucket_idx = np.full((self.buffer_size, self.n_envs), -1, dtype=np.int64)
         self._enable_q_target_cache = enable_q_target_cache
         self._global_normalized_q_targets_flat = None
         self._global_q_target_seq_ids_flat = None
         self._global_q_target_seq_lengths = None
+        self._global_value_target_bucket_idx_flat = None
+        self._flat_env_indices = None
+        self._flat_step_indices = None
+        self._flat_objective_episode_indices = None
+        self._flat_objective_episode_positions = None
+        self._flat_objective_global_positions = None
         super().reset()
 
     def clear_device_cache(self) -> None:
@@ -456,6 +1358,27 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
     def _ensure_generator_ready(self) -> None:
         if self.generator_ready:
             return
+        position_metadata = _build_objective_position_metadata(
+            self.episode_starts,
+            self.objective_masks,
+        )
+        self._flat_env_indices = self.swap_and_flatten(position_metadata["env_indices"]).reshape(-1).astype(
+            np.int64,
+            copy=False,
+        )
+        self._flat_step_indices = self.swap_and_flatten(position_metadata["step_indices"]).reshape(-1).astype(
+            np.int64,
+            copy=False,
+        )
+        self._flat_objective_episode_indices = self.swap_and_flatten(
+            position_metadata["objective_episode_indices"]
+        ).reshape(-1).astype(np.int64, copy=False)
+        self._flat_objective_episode_positions = self.swap_and_flatten(
+            position_metadata["objective_episode_positions"]
+        ).reshape(-1).astype(np.int64, copy=False)
+        self._flat_objective_global_positions = self.swap_and_flatten(
+            position_metadata["objective_global_positions"]
+        ).reshape(-1).astype(np.int64, copy=False)
         for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
             self.__dict__[tensor] = self.__dict__[tensor].swapaxes(1, 2)
 
@@ -470,6 +1393,11 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             "cell_states_pi",
             "hidden_states_vf",
             "cell_states_vf",
+            "objective_masks",
+            "rollout_return_means",
+            "rollout_return_stds",
+            "actor_advantages",
+            "value_target_bucket_idx",
             "episode_starts",
             "action_masks",
             "next_states",
@@ -488,16 +1416,25 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         env_change[0, :] = 1.0
         return self.swap_and_flatten(env_change)
 
+    def set_deterministic_batch_plan(self, enabled: bool = True) -> None:
+        self._deterministic_batch_plan = bool(enabled)
+
     @staticmethod
-    def _normalize_sequence_fragment_like_reinforce(
+    def _normalize_sequence_fragment_with_mask_like_reinforce(
         values: torch.Tensor,
+        mask: torch.Tensor,
         *,
         eps: float = 1e-6,
     ) -> torch.Tensor:
-        mean = values.mean()
-        centered = values - mean
-        std = torch.sqrt(centered.square().mean().clamp_min(float(eps)))
-        return (values - mean) / std
+        if values.ndim != 1 or mask.ndim != 1:
+            raise ValueError("values and mask must be flattened 1D tensors.")
+        if values.shape != mask.shape:
+            raise ValueError("values and mask must have identical shapes.")
+        if not bool(mask.any()):
+            return torch.zeros_like(values)
+        mean, std = _masked_mean_std(values, mask, eps=eps)
+        normalized = (values - mean) / std
+        return normalized * mask.to(device=values.device, dtype=values.dtype)
 
     def _ensure_global_q_target_cache(self) -> None:
         if (
@@ -515,7 +1452,8 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         seq_end_exclusive = np.empty_like(seq_start_indices)
         seq_end_exclusive[:-1] = seq_start_indices[1:]
         seq_end_exclusive[-1] = total_steps
-        returns_flat = torch.as_tensor(self.returns, dtype=torch.float32).reshape(-1)
+        returns_flat = self._get_flat_raw_returns_tensor(dtype=torch.float32)
+        objective_masks_flat = torch.as_tensor(self.objective_masks, dtype=torch.bool).reshape(-1)
         normalized_q_targets_flat = torch.empty_like(returns_flat)
         seq_ids_flat = np.empty((total_steps,), dtype=np.int64)
         seq_lengths = np.empty((len(seq_start_indices),), dtype=np.int64)
@@ -523,12 +1461,262 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             seq_start = int(seq_start)
             seq_end = int(seq_end)
             seq_values = returns_flat[seq_start:seq_end]
-            normalized_q_targets_flat[seq_start:seq_end] = self._normalize_sequence_fragment_like_reinforce(seq_values)
+            seq_objective_mask = objective_masks_flat[seq_start:seq_end]
+            normalized_q_targets_flat[seq_start:seq_end] = self._normalize_sequence_fragment_with_mask_like_reinforce(
+                seq_values,
+                seq_objective_mask,
+            )
             seq_ids_flat[seq_start:seq_end] = int(seq_id)
             seq_lengths[int(seq_id)] = int(seq_end - seq_start)
         self._global_normalized_q_targets_flat = normalized_q_targets_flat.cpu().numpy().astype(np.float32, copy=False)
         self._global_q_target_seq_ids_flat = seq_ids_flat
         self._global_q_target_seq_lengths = seq_lengths
+
+    def get_flat_position_metadata(self, batch_inds: np.ndarray) -> dict[str, np.ndarray]:
+        self._ensure_generator_ready()
+        batch_inds = np.asarray(batch_inds, dtype=np.int64)
+        return {
+            "flat_batch_indices": batch_inds.astype(np.int64, copy=True),
+            "flat_env_indices": np.asarray(self._flat_env_indices[batch_inds], dtype=np.int64),
+            "flat_step_indices": np.asarray(self._flat_step_indices[batch_inds], dtype=np.int64),
+            "flat_objective_episode_indices": np.asarray(
+                self._flat_objective_episode_indices[batch_inds],
+                dtype=np.int64,
+            ),
+            "flat_objective_episode_positions": np.asarray(
+                self._flat_objective_episode_positions[batch_inds],
+                dtype=np.int64,
+            ),
+            "flat_objective_global_positions": np.asarray(
+                self._flat_objective_global_positions[batch_inds],
+                dtype=np.int64,
+            ),
+        }
+
+    def _get_flat_raw_returns_tensor(
+        self,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        self._ensure_generator_ready()
+        returns_flat = torch.as_tensor(self.returns, dtype=dtype, device=device).reshape(-1)
+        means_flat = torch.as_tensor(self.rollout_return_means, dtype=dtype, device=device).reshape(-1)
+        stds_flat = torch.as_tensor(self.rollout_return_stds, dtype=dtype, device=device).reshape(-1)
+        return _recover_raw_from_value_space(
+            returns_flat,
+            value_means=means_flat,
+            value_stds=stds_flat,
+        ).reshape(-1)
+
+    def _cache_value_target_bucket_idx(self) -> None:
+        borders = getattr(self, "_value_target_bardist_borders", None)
+        if borders is None:
+            self.value_target_bucket_idx.fill(-1)
+            self._global_value_target_bucket_idx_flat = None
+            return
+        borders = np.asarray(borders, dtype=np.float32).reshape(-1)
+        if borders.ndim != 1 or int(borders.shape[0]) < 2:
+            raise ValueError(f"Invalid cached value borders: {tuple(borders.shape)}")
+        returns_flat = np.asarray(self.returns, dtype=np.float32).reshape(-1)
+        target_sample = np.searchsorted(borders, returns_flat, side="left") - 1
+        target_sample[returns_flat == borders[0]] = 0
+        target_sample[returns_flat == borders[-1]] = int(borders.shape[0]) - 2
+        self.value_target_bucket_idx = target_sample.reshape(self.buffer_size, self.n_envs).astype(np.int64, copy=False)
+        self._global_value_target_bucket_idx_flat = self.value_target_bucket_idx.reshape(-1).astype(np.int64, copy=False)
+
+    def _get_flat_raw_values_tensor(
+        self,
+        *,
+        dtype: torch.dtype = torch.float32,
+        device: Optional[torch.device] = None,
+    ) -> torch.Tensor:
+        self._ensure_generator_ready()
+        values_flat = torch.as_tensor(self.values, dtype=dtype, device=device).reshape(-1)
+        means_flat = torch.as_tensor(self.rollout_return_means, dtype=dtype, device=device).reshape(-1)
+        stds_flat = torch.as_tensor(self.rollout_return_stds, dtype=dtype, device=device).reshape(-1)
+        return _recover_raw_from_value_space(
+            values_flat,
+            value_means=means_flat,
+            value_stds=stds_flat,
+        ).reshape(-1)
+
+    def compute_returns_and_advantage(
+        self,
+        last_values: torch.Tensor,
+        dones: np.ndarray,
+    ) -> None:
+        actor_objective_mode = str(getattr(self, "_actor_objective_mode", "tokenwise")).strip().lower()
+        actor_objective_mode = _resolve_runtime_scoped_actor_objective_mode(
+            actor_objective_mode,
+            current_suite_name=getattr(self, "_actor_objective_runtime_current_suite_name", None),
+        )
+        if actor_objective_mode == "tokenwise_shift_q1_contract":
+            self.objective_masks[:] = _drop_early_objective_bucket(self.objective_masks, fraction=0.25)
+            actor_objective_mode = "tokenwise"
+        last_values_np = last_values.clone().cpu().numpy().flatten().astype(np.float32, copy=False)
+        rollout_raw_returns = _discounted_returns_from_rewards(
+            self.rewards,
+            episode_starts=self.episode_starts,
+            dones=dones,
+            gamma=self.gamma,
+        )
+        rollout_return_means_np, rollout_return_stds_np = _rollout_return_norm_stats_from_raw_returns(
+            rollout_raw_returns,
+            eps=PPO_VALUE_TARGET_NORM_EPS,
+        )
+        # Repeat per-env rollout stats across steps so any sampled sub-batch can
+        # reconstruct raw-space values/returns without extra rollout context.
+        self.rollout_return_means[:] = rollout_return_means_np.reshape((1, self.n_envs))
+        self.rollout_return_stds[:] = rollout_return_stds_np.reshape((1, self.n_envs))
+        rollout_return_mean_over_std = rollout_return_means_np / rollout_return_stds_np
+        last_gae_lam = np.zeros((self.n_envs,), dtype=np.float32)
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - dones.astype(np.float32, copy=False)
+                next_values = last_values_np
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1].astype(np.float32, copy=False)
+                next_values = self.values[step + 1]
+            curr_values = self.values[step]
+            reward_norm = (
+                self.rewards[step] / rollout_return_stds_np
+                + ((self.gamma * next_non_terminal) - 1.0) * rollout_return_mean_over_std
+            )
+            gamma_eff = self.gamma * next_non_terminal
+            delta = reward_norm + gamma_eff * next_values - curr_values
+            last_gae_lam = delta + gamma_eff * self.gae_lambda * last_gae_lam
+            self.advantages[step] = last_gae_lam
+        self.returns = self.advantages + self.values
+        self._cache_value_target_bucket_idx()
+        if actor_objective_mode == "trajectory_suffix_return":
+            suffix_scores = _compute_suffix_scores_from_objective_mask(self.rewards, self.objective_masks)
+            repeated_scores = np.broadcast_to(
+                suffix_scores.reshape((1, self.n_envs)),
+                (self.buffer_size, self.n_envs),
+            ).astype(np.float32, copy=False)
+            self.actor_advantages[:] = repeated_scores
+            return
+        if not _is_supported_actor_objective_mode(actor_objective_mode) or actor_objective_mode in {
+            "trajectory_suffix_return",
+            "tokenwise_shift_q1_contract",
+        }:
+            raise ValueError(
+                f"Unsupported PPO actor objective mode: {actor_objective_mode}"
+            )
+        actor_baseline_mode = str(getattr(self, "_actor_baseline_mode", "learned")).strip().lower()
+        if actor_baseline_mode == "zero":
+            self.actor_advantages[:] = rollout_raw_returns.astype(np.float32, copy=False)
+            return
+        if actor_baseline_mode == "rollout_mean":
+            self.actor_advantages[:] = (
+                rollout_raw_returns - rollout_return_means_np.reshape((1, self.n_envs))
+            ).astype(np.float32, copy=False)
+            return
+        if actor_baseline_mode != "learned":
+            raise ValueError(
+                f"Unsupported PPO actor baseline mode: {actor_baseline_mode}"
+            )
+        actor_gae_space = str(getattr(self, "_actor_gae_space", "normalized")).strip().lower()
+        if actor_gae_space == "normalized":
+            self.actor_advantages[:] = self.advantages
+            self.actor_advantages[:] = _apply_actor_objective_postprocess(
+                self.actor_advantages,
+                rewards=self.rewards,
+                objective_masks=self.objective_masks,
+                episode_starts=self.episode_starts,
+                actor_objective_mode=actor_objective_mode,
+            )
+            return
+        if actor_gae_space == "normalized_sep_synced":
+            actor_episode_starts = _episode_starts_synced_to_objective_mask(
+                self.episode_starts,
+                self.objective_masks,
+            )
+            actor_rollout_raw_returns = _discounted_returns_from_rewards(
+                self.rewards,
+                episode_starts=actor_episode_starts,
+                dones=dones,
+                gamma=self.gamma,
+            )
+            actor_return_means_np, actor_return_stds_np = _rollout_return_norm_stats_from_raw_returns_with_mask(
+                actor_rollout_raw_returns,
+                mask=self.objective_masks,
+                eps=PPO_VALUE_TARGET_NORM_EPS,
+                fallback_means=rollout_return_means_np,
+                fallback_stds=rollout_return_stds_np,
+            )
+            values_raw = (
+                rollout_return_means_np.reshape((1, self.n_envs))
+                + rollout_return_stds_np.reshape((1, self.n_envs)) * self.values.astype(np.float32, copy=False)
+            )
+            last_values_raw = (
+                rollout_return_means_np
+                + rollout_return_stds_np * last_values_np.astype(np.float32, copy=False)
+            )
+            actor_values = (
+                values_raw - actor_return_means_np.reshape((1, self.n_envs))
+            ) / actor_return_stds_np.reshape((1, self.n_envs))
+            actor_last_values = (
+                last_values_raw - actor_return_means_np
+            ) / actor_return_stds_np
+            actor_return_mean_over_std = actor_return_means_np / actor_return_stds_np
+            last_gae_lam_actor = np.zeros((self.n_envs,), dtype=np.float32)
+            for step in reversed(range(self.buffer_size)):
+                if step == self.buffer_size - 1:
+                    next_non_terminal = 1.0 - dones.astype(np.float32, copy=False)
+                    next_values = actor_last_values
+                else:
+                    next_non_terminal = 1.0 - actor_episode_starts[step + 1].astype(np.float32, copy=False)
+                    next_values = actor_values[step + 1]
+                curr_values = actor_values[step]
+                reward_norm = (
+                    self.rewards[step] / actor_return_stds_np
+                    + ((self.gamma * next_non_terminal) - 1.0) * actor_return_mean_over_std
+                )
+                gamma_eff = self.gamma * next_non_terminal
+                delta = reward_norm + gamma_eff * next_values - curr_values
+                last_gae_lam_actor = delta + gamma_eff * self.gae_lambda * last_gae_lam_actor
+                self.actor_advantages[step] = last_gae_lam_actor
+            self.actor_advantages[:] = _apply_actor_objective_postprocess(
+                self.actor_advantages,
+                rewards=self.rewards,
+                objective_masks=self.objective_masks,
+                episode_starts=actor_episode_starts,
+                actor_objective_mode=actor_objective_mode,
+            )
+            return
+        if actor_gae_space != "raw":
+            raise ValueError(f"Unsupported PPO actor GAE space: {actor_gae_space}")
+
+        values_raw = (
+            rollout_return_means_np.reshape((1, self.n_envs))
+            + rollout_return_stds_np.reshape((1, self.n_envs)) * self.values.astype(np.float32, copy=False)
+        )
+        last_values_raw = (
+            rollout_return_means_np
+            + rollout_return_stds_np * last_values_np.astype(np.float32, copy=False)
+        )
+        last_gae_lam_raw = np.zeros((self.n_envs,), dtype=np.float32)
+        for step in reversed(range(self.buffer_size)):
+            if step == self.buffer_size - 1:
+                next_non_terminal = 1.0 - dones.astype(np.float32, copy=False)
+                next_values_raw = last_values_raw
+            else:
+                next_non_terminal = 1.0 - self.episode_starts[step + 1].astype(np.float32, copy=False)
+                next_values_raw = values_raw[step + 1]
+            curr_values_raw = values_raw[step]
+            gamma_eff = self.gamma * next_non_terminal
+            delta_raw = self.rewards[step] + gamma_eff * next_values_raw - curr_values_raw
+            last_gae_lam_raw = delta_raw + gamma_eff * self.gae_lambda * last_gae_lam_raw
+            self.actor_advantages[step] = last_gae_lam_raw
+        self.actor_advantages[:] = _apply_actor_objective_postprocess(
+            self.actor_advantages,
+            rewards=self.rewards,
+            objective_masks=self.objective_masks,
+            episode_starts=self.episode_starts,
+            actor_objective_mode=actor_objective_mode,
+        )
 
     def _get_cached_flat_normalized_q_targets(
         self,
@@ -537,12 +1725,14 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         seq_start_indices: np.ndarray,
         seq_lengths: np.ndarray,
         returns_flat: torch.Tensor,
+        objective_masks_flat: torch.Tensor,
         eps: float = 1e-6,
     ) -> torch.Tensor:
         self._ensure_global_q_target_cache()
         batch_inds = np.asarray(batch_inds, dtype=np.int64)
         seq_start_indices = np.asarray(seq_start_indices, dtype=np.int64)
         seq_lengths = np.asarray(seq_lengths, dtype=np.int64)
+        objective_masks_flat = objective_masks_flat.to(device=returns_flat.device, dtype=torch.bool).reshape(-1)
         cached_targets = torch.as_tensor(
             self._global_normalized_q_targets_flat[batch_inds],
             device=returns_flat.device,
@@ -558,8 +1748,9 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             global_seq_id = int(local_seq_ids[0])
             if np.all(local_seq_ids == global_seq_id) and seq_len == int(global_seq_lengths[global_seq_id]):
                 continue
-            cached_targets[seq_start:seq_end] = self._normalize_sequence_fragment_like_reinforce(
+            cached_targets[seq_start:seq_end] = self._normalize_sequence_fragment_with_mask_like_reinforce(
                 returns_flat[seq_start:seq_end],
+                objective_masks_flat[seq_start:seq_end],
                 eps=eps,
             ).to(dtype=cached_targets.dtype)
         return cached_targets
@@ -569,14 +1760,18 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self._ensure_generator_ready()
         batch_size = self._resolve_batch_size(batch_size)
 
-        split_index = np.random.randint(self.buffer_size * self.n_envs)
-        indices = np.arange(self.buffer_size * self.n_envs)
-        indices = np.concatenate((indices[split_index:], indices[:split_index]))
+        total = self.buffer_size * self.n_envs
+        if bool(getattr(self, "_deterministic_batch_plan", False)):
+            indices = np.arange(total, dtype=np.int64)
+        else:
+            split_index = np.random.randint(total)
+            indices = np.arange(total, dtype=np.int64)
+            indices = np.concatenate((indices[split_index:], indices[:split_index]))
 
         env_change = self._build_env_change_flat()
 
         start_idx = 0
-        while start_idx < self.buffer_size * self.n_envs:
+        while start_idx < total:
             batch_inds = indices[start_idx : start_idx + batch_size]
             yield batch_inds, env_change
             start_idx += batch_size
@@ -618,16 +1813,48 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         action_masks: Optional[np.ndarray] = None,
         next_states: Optional[np.ndarray] = None,
         next_state_masks: Optional[np.ndarray] = None,
+        objective_masks: Optional[np.ndarray] = None,
         **kwargs,
     ) -> None:
+        if len(args) >= 2:
+            obs_arg = args[0]
+            action_arg = np.asarray(args[1], dtype=np.float32)
+            if action_arg.ndim == 1:
+                action_arg = action_arg.reshape(self.n_envs, -1)
+            elif action_arg.ndim > 2:
+                action_arg = action_arg.reshape(self.n_envs, -1)
+            if int(action_arg.shape[0]) != int(self.n_envs):
+                raise ValueError(
+                    f"action batch mismatch: expected n_envs={int(self.n_envs)}, got shape={tuple(action_arg.shape)}"
+                )
+            padded_action = np.zeros((self.n_envs, self.action_dim), dtype=np.float32)
+            copy_dim = int(min(int(action_arg.shape[-1]), int(self.action_dim)))
+            if copy_dim > 0:
+                padded_action[:, :copy_dim] = action_arg[:, :copy_dim]
+            args = (obs_arg, padded_action, *args[2:])
         if action_masks is not None:
-            self.action_masks[self.pos] = np.asarray(action_masks, dtype=np.float32).reshape((self.n_envs, self.mask_dims))
+            action_masks_np = np.asarray(action_masks, dtype=np.float32)
+            if action_masks_np.ndim == 1:
+                action_masks_np = action_masks_np.reshape(self.n_envs, -1)
+            elif action_masks_np.ndim > 2:
+                action_masks_np = action_masks_np.reshape(self.n_envs, -1)
+            if int(action_masks_np.shape[0]) != int(self.n_envs):
+                raise ValueError(
+                    f"action_masks batch mismatch: expected n_envs={int(self.n_envs)}, got shape={tuple(action_masks_np.shape)}"
+                )
+            padded_action_masks = np.zeros((self.n_envs, self.mask_dims), dtype=np.float32)
+            copy_dim = int(min(int(action_masks_np.shape[-1]), int(self.mask_dims)))
+            if copy_dim > 0:
+                padded_action_masks[:, :copy_dim] = action_masks_np[:, :copy_dim]
+            self.action_masks[self.pos] = padded_action_masks
         if next_states is not None:
             self.next_states[self.pos] = np.asarray(next_states, dtype=np.float32).reshape((self.n_envs, self.next_state_dim))
         if next_state_masks is not None:
             self.next_state_masks[self.pos] = np.asarray(next_state_masks, dtype=np.float32).reshape(
                 (self.n_envs, self.next_state_dim)
             )
+        if objective_masks is not None:
+            self.objective_masks[self.pos] = np.asarray(objective_masks, dtype=np.float32).reshape((self.n_envs,))
         super().add(*args, **kwargs)
 
     def get(self, batch_size: Optional[int] = None):
@@ -658,12 +1885,17 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             old_log_prob=self.pad_and_flatten(self.log_probs[batch_inds]),
             advantages=self.pad_and_flatten(self.advantages[batch_inds]),
             returns=self.pad_and_flatten(self.returns[batch_inds]),
+            value_target_bucket_idx=self.pad_and_flatten(self.value_target_bucket_idx[batch_inds]),
+            objective_masks=self.pad_and_flatten(self.objective_masks[batch_inds]),
+            rollout_return_means=self.pad_and_flatten(self.rollout_return_means[batch_inds]),
+            rollout_return_stds=self.pad_and_flatten(self.rollout_return_stds[batch_inds]),
             lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
             episode_starts=self.pad_and_flatten(self.episode_starts[batch_inds]),
             mask=self.pad_and_flatten(np.ones_like(self.returns[batch_inds])),
             action_masks=self.pad(self.action_masks[batch_inds]).reshape((padded_batch_size, self.mask_dims)),
             next_states=self.pad(self.next_states[batch_inds]).reshape((padded_batch_size, self.next_state_dim)),
             next_state_masks=self.pad(self.next_state_masks[batch_inds]).reshape((padded_batch_size, self.next_state_dim)),
+            actor_advantages=self.pad_and_flatten(self.actor_advantages[batch_inds]),
         )
 
     def get_gpu(self, batch_size: Optional[int] = None):
@@ -686,7 +1918,12 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         values_flat = self.to_torch(self.values[batch_inds]).reshape(-1).contiguous()
         log_probs_flat = self.to_torch(self.log_probs[batch_inds]).reshape(-1).contiguous()
         advantages_flat = self.to_torch(self.advantages[batch_inds]).reshape(-1).contiguous()
+        actor_advantages_flat = self.to_torch(self.actor_advantages[batch_inds]).reshape(-1).contiguous()
         returns_flat = self.to_torch(self.returns[batch_inds]).reshape(-1).contiguous()
+        value_target_bucket_idx_flat = self.to_torch(self.value_target_bucket_idx[batch_inds]).reshape(-1).contiguous()
+        objective_masks_flat = self.to_torch(self.objective_masks[batch_inds]).reshape(-1).contiguous()
+        rollout_return_means_flat = self.to_torch(self.rollout_return_means[batch_inds]).reshape(-1).contiguous()
+        rollout_return_stds_flat = self.to_torch(self.rollout_return_stds[batch_inds]).reshape(-1).contiguous()
         episode_starts_flat = self.to_torch(self.episode_starts[batch_inds]).reshape(-1).contiguous()
         action_masks_flat = self.to_torch(self.action_masks[batch_inds]).contiguous()
         next_states_flat = self.to_torch(self.next_states[batch_inds]).contiguous()
@@ -707,6 +1944,7 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
                 seq_start_indices=seq_start_indices,
                 seq_lengths=seq_lengths,
                 returns_flat=returns_flat,
+                objective_masks_flat=objective_masks_flat,
             )
 
         observations_padded, valid = self._pad_device_tensor(
@@ -729,8 +1967,24 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             advantages_flat,
             seq_start_indices=self.seq_start_indices,
         )
+        actor_advantages_padded, _ = self._pad_device_tensor(
+            actor_advantages_flat,
+            seq_start_indices=self.seq_start_indices,
+        )
         returns_padded, _ = self._pad_device_tensor(
             returns_flat,
+            seq_start_indices=self.seq_start_indices,
+        )
+        objective_masks_padded, _ = self._pad_device_tensor(
+            objective_masks_flat,
+            seq_start_indices=self.seq_start_indices,
+        )
+        rollout_return_means_padded, _ = self._pad_device_tensor(
+            rollout_return_means_flat,
+            seq_start_indices=self.seq_start_indices,
+        )
+        rollout_return_stds_padded, _ = self._pad_device_tensor(
+            rollout_return_stds_flat,
             seq_start_indices=self.seq_start_indices,
         )
         episode_starts_padded, _ = self._pad_device_tensor(
@@ -775,12 +2029,20 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             old_log_prob=log_probs_padded.reshape((padded_batch_size,)),
             advantages=advantages_padded.reshape((padded_batch_size,)),
             returns=returns_padded.reshape((padded_batch_size,)),
+            value_target_bucket_idx=MaskedRecurrentRolloutBuffer._pad_device_tensor(
+                flat_batch.value_target_bucket_idx[flat_start:flat_end],
+                seq_start_indices=local_seq_starts,
+            )[0].reshape((padded_batch_size,)),
+            objective_masks=objective_masks_padded.reshape((padded_batch_size,)),
+            rollout_return_means=rollout_return_means_padded.reshape((padded_batch_size,)),
+            rollout_return_stds=rollout_return_stds_padded.reshape((padded_batch_size,)),
             lstm_states=RNNStates(lstm_states_pi, lstm_states_vf),
             episode_starts=episode_starts_padded.reshape((padded_batch_size,)),
             mask=valid.reshape((padded_batch_size,)).to(device=self.device, dtype=returns_flat.dtype),
             action_masks=action_masks_padded.reshape((padded_batch_size, self.mask_dims)),
             next_states=next_states_padded.reshape((padded_batch_size, self.next_state_dim)),
             next_state_masks=next_state_masks_padded.reshape((padded_batch_size, self.next_state_dim)),
+            actor_advantages=actor_advantages_padded.reshape((padded_batch_size,)),
             normalized_q_targets=(
                 None
                 if normalized_q_targets_padded is None
@@ -805,7 +2067,12 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         values_flat = self.to_torch(self.values[batch_inds]).reshape(-1).contiguous()
         log_probs_flat = self.to_torch(self.log_probs[batch_inds]).reshape(-1).contiguous()
         advantages_flat = self.to_torch(self.advantages[batch_inds]).reshape(-1).contiguous()
+        actor_advantages_flat = self.to_torch(self.actor_advantages[batch_inds]).reshape(-1).contiguous()
         returns_flat = self.to_torch(self.returns[batch_inds]).reshape(-1).contiguous()
+        value_target_bucket_idx_flat = self.to_torch(self.value_target_bucket_idx[batch_inds]).reshape(-1).contiguous()
+        objective_masks_flat = self.to_torch(self.objective_masks[batch_inds]).reshape(-1).contiguous()
+        rollout_return_means_flat = self.to_torch(self.rollout_return_means[batch_inds]).reshape(-1).contiguous()
+        rollout_return_stds_flat = self.to_torch(self.rollout_return_stds[batch_inds]).reshape(-1).contiguous()
         episode_starts_flat = self.to_torch(self.episode_starts[batch_inds]).reshape(-1).contiguous()
         action_masks_flat = self.to_torch(self.action_masks[batch_inds]).contiguous()
         next_states_flat = self.to_torch(self.next_states[batch_inds]).contiguous()
@@ -819,7 +2086,9 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
                 seq_start_indices=seq_start_indices,
                 seq_lengths=seq_lengths,
                 returns_flat=returns_flat,
+                objective_masks_flat=objective_masks_flat,
             )
+        position_metadata = self.get_flat_position_metadata(batch_inds)
 
         return MaskedRecurrentFlatBatchSamples(
             observations=observations_flat,
@@ -828,6 +2097,10 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             old_log_prob=log_probs_flat,
             advantages=advantages_flat,
             returns=returns_flat,
+            value_target_bucket_idx=value_target_bucket_idx_flat,
+            objective_masks=objective_masks_flat,
+            rollout_return_means=rollout_return_means_flat,
+            rollout_return_stds=rollout_return_stds_flat,
             lstm_states=RNNStates(
                 (dummy_lstm_state, dummy_lstm_state),
                 (dummy_lstm_state, dummy_lstm_state),
@@ -838,7 +2111,14 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
             next_state_masks=next_state_masks_flat,
             seq_start_indices=seq_start_indices,
             seq_lengths=seq_lengths,
+            actor_advantages=actor_advantages_flat,
             normalized_q_targets=normalized_q_targets_flat,
+            flat_batch_indices=position_metadata["flat_batch_indices"],
+            flat_env_indices=position_metadata["flat_env_indices"],
+            flat_step_indices=position_metadata["flat_step_indices"],
+            flat_objective_episode_indices=position_metadata["flat_objective_episode_indices"],
+            flat_objective_episode_positions=position_metadata["flat_objective_episode_positions"],
+            flat_objective_global_positions=position_metadata["flat_objective_global_positions"],
         )
 
     def _create_sequencers(self, batch_inds: np.ndarray, env_change: np.ndarray):
@@ -866,6 +2146,272 @@ class MaskedRecurrentPPO(RecurrentPPO):
             gae_lambda=self.gae_lambda,
             n_envs=self.n_envs,
         )
+        if bool(getattr(self.policy, "has_value_bardist", lambda: False)()):
+            self.rollout_buffer._value_target_bardist_borders = (
+                self.policy.get_value_bardist().borders.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+
+    def _should_capture_train_outer_batch_snapshot(self) -> bool:
+        snapshot_path = getattr(self, "_rwkv_train_outer_batch_snapshot_path", None)
+        return snapshot_path is not None and not bool(
+            getattr(self, "_rwkv_train_outer_batch_snapshot_written", False)
+        )
+
+    def _should_capture_train_outer_batch_selector_trace(self) -> bool:
+        return getattr(self, "_rwkv_train_outer_batch_selector_trace_path", None) is not None
+
+    def _get_train_outer_batch_snapshot_selector(self) -> dict[str, int | None]:
+        return {
+            "target_outer_batch_idx": getattr(
+                self,
+                "_rwkv_train_outer_batch_snapshot_target_outer_batch_idx",
+                None,
+            ),
+            "target_env_index": getattr(
+                self,
+                "_rwkv_train_outer_batch_snapshot_target_env_index",
+                None,
+            ),
+            "target_objective_episode_index": getattr(
+                self,
+                "_rwkv_train_outer_batch_snapshot_target_objective_episode_index",
+                None,
+            ),
+            "target_objective_position_start": getattr(
+                self,
+                "_rwkv_train_outer_batch_snapshot_target_objective_position_start",
+                None,
+            ),
+            "target_objective_position_end": getattr(
+                self,
+                "_rwkv_train_outer_batch_snapshot_target_objective_position_end",
+                None,
+            ),
+        }
+
+    def _resolve_train_outer_batch_snapshot_match_mask_flat(
+        self,
+        *,
+        rollout_data: MaskedRecurrentFlatBatchSamples,
+        objective_mask: torch.Tensor,
+        outer_batch_idx: int,
+    ) -> np.ndarray | None:
+        if not self._should_capture_train_outer_batch_snapshot():
+            return None
+        selector = self._get_train_outer_batch_snapshot_selector()
+        target_outer_batch_idx = selector["target_outer_batch_idx"]
+        if target_outer_batch_idx is not None and int(outer_batch_idx) != int(target_outer_batch_idx):
+            return None
+
+        objective_mask_np = objective_mask.detach().to(dtype=torch.bool).cpu().numpy().reshape(-1)
+        target_mask = _resolve_train_outer_batch_snapshot_target_mask(
+            objective_mask=objective_mask_np,
+            flat_env_indices=rollout_data.flat_env_indices,
+            flat_objective_episode_indices=rollout_data.flat_objective_episode_indices,
+            flat_objective_episode_positions=rollout_data.flat_objective_episode_positions,
+            target_env_index=selector["target_env_index"],
+            target_objective_episode_index=selector["target_objective_episode_index"],
+            target_objective_position_start=selector["target_objective_position_start"],
+            target_objective_position_end=selector["target_objective_position_end"],
+        )
+        if target_mask is None:
+            return objective_mask_np
+        if not bool(np.any(target_mask)):
+            return None
+        return target_mask
+
+    def _write_train_outer_batch_snapshot(self, payload: dict[str, Any]) -> None:
+        snapshot_path = getattr(self, "_rwkv_train_outer_batch_snapshot_path", None)
+        if snapshot_path is None:
+            return
+        resolved = Path(str(snapshot_path)).expanduser().resolve()
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        self._rwkv_train_outer_batch_snapshot_written = True
+        self._rwkv_last_train_outer_batch_snapshot_path = str(resolved)
+
+    def _write_train_outer_batch_selector_trace(self) -> None:
+        trace_path = getattr(self, "_rwkv_train_outer_batch_selector_trace_path", None)
+        if trace_path is None:
+            return
+        resolved = Path(str(trace_path)).expanduser().resolve()
+        rows = list(getattr(self, "_rwkv_train_outer_batch_selector_trace_rows", []) or [])
+        matched_rows = [
+            {
+                "epoch_idx": int(row["epoch_idx"]),
+                "outer_batch_idx": int(row["outer_batch_idx"]),
+                "target_match_count": int(row["target_match_count"]),
+            }
+            for row in rows
+            if int(row.get("target_match_count", 0)) > 0
+        ]
+        payload = {
+            "trace_entry": "phase3_train_outer_batch_selector_trace",
+            "selector": {
+                key: (None if value is None else int(value))
+                for key, value in self._get_train_outer_batch_snapshot_selector().items()
+            },
+            "summary": {
+                "row_count": int(len(rows)),
+                "target_appeared": bool(matched_rows),
+                "matched_outer_batches": matched_rows,
+                "first_match": None if not matched_rows else dict(matched_rows[0]),
+            },
+            "completed": bool(getattr(self, "_rwkv_train_outer_batch_selector_trace_completed", False)),
+            "rows": rows,
+        }
+        resolved.parent.mkdir(parents=True, exist_ok=True)
+        resolved.write_text(json.dumps(payload, indent=2, sort_keys=True))
+        self._rwkv_last_train_outer_batch_selector_trace_path = str(resolved)
+
+    def _append_train_outer_batch_selector_trace_row_flat(
+        self,
+        *,
+        rollout_data: MaskedRecurrentFlatBatchSamples,
+        objective_mask: torch.Tensor,
+        epoch_idx: int,
+        outer_batch_idx: int,
+        total_outer_batches: int,
+    ) -> None:
+        if not self._should_capture_train_outer_batch_selector_trace():
+            return
+        metadata_fields = {
+            "flat_env_indices": rollout_data.flat_env_indices,
+            "flat_objective_episode_indices": rollout_data.flat_objective_episode_indices,
+            "flat_objective_episode_positions": rollout_data.flat_objective_episode_positions,
+        }
+        missing = [name for name, value in metadata_fields.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Train outer-batch selector trace requires flat batch metadata, missing "
+                f"{missing!r}"
+            )
+        objective_mask_np = objective_mask.detach().to(dtype=torch.bool).cpu().numpy().reshape(-1)
+        row = _build_train_outer_batch_selector_trace_row(
+            objective_mask=objective_mask_np,
+            flat_env_indices=np.asarray(metadata_fields["flat_env_indices"], dtype=np.int64),
+            flat_objective_episode_indices=np.asarray(
+                metadata_fields["flat_objective_episode_indices"],
+                dtype=np.int64,
+            ),
+            flat_objective_episode_positions=np.asarray(
+                metadata_fields["flat_objective_episode_positions"],
+                dtype=np.int64,
+            ),
+            epoch_idx=int(epoch_idx),
+            outer_batch_idx=int(outer_batch_idx),
+            total_outer_batches=int(total_outer_batches),
+            selector=self._get_train_outer_batch_snapshot_selector(),
+        )
+        rows = getattr(self, "_rwkv_train_outer_batch_selector_trace_rows", None)
+        if rows is None:
+            rows = []
+            self._rwkv_train_outer_batch_selector_trace_rows = rows
+        rows.append(row)
+        self._write_train_outer_batch_selector_trace()
+
+    def _finalize_train_outer_batch_selector_trace(self) -> None:
+        if not self._should_capture_train_outer_batch_selector_trace():
+            return
+        self._rwkv_train_outer_batch_selector_trace_completed = True
+        self._write_train_outer_batch_selector_trace()
+
+    def _maybe_capture_train_outer_batch_snapshot_flat(
+        self,
+        *,
+        rollout_data: MaskedRecurrentFlatBatchSamples,
+        objective_mask: torch.Tensor,
+        pre_normalization_actor_advantages: np.ndarray,
+        post_normalization_advantages: np.ndarray,
+        ratio_snapshot: np.ndarray,
+        clipped_objective_snapshot: np.ndarray,
+        clip_range: float,
+        outer_batch_idx: int,
+        epoch_idx: int,
+        matched_target_mask: np.ndarray | None = None,
+    ) -> None:
+        if not self._should_capture_train_outer_batch_snapshot():
+            return
+        metadata_fields = {
+            "flat_batch_indices": rollout_data.flat_batch_indices,
+            "flat_env_indices": rollout_data.flat_env_indices,
+            "flat_step_indices": rollout_data.flat_step_indices,
+            "flat_objective_episode_indices": rollout_data.flat_objective_episode_indices,
+            "flat_objective_episode_positions": rollout_data.flat_objective_episode_positions,
+            "flat_objective_global_positions": rollout_data.flat_objective_global_positions,
+        }
+        missing = [name for name, value in metadata_fields.items() if value is None]
+        if missing:
+            raise ValueError(
+                "Train outer-batch snapshot requires flat batch metadata, missing "
+                f"{missing!r}"
+            )
+        objective_mask_np = objective_mask.detach().to(dtype=torch.bool).cpu().numpy().reshape(-1)
+        payload = {
+            "snapshot_entry": "phase3_train_outer_batch_snapshot",
+            "summary": {
+                "outer_batch_idx": int(outer_batch_idx),
+                "epoch_idx": int(epoch_idx),
+                "batch_size_flat": int(len(pre_normalization_actor_advantages)),
+                "objective_total": int(objective_mask_np.sum()),
+                "actor_objective_mode": str(getattr(self, "_rwkv_actor_objective_mode", "")),
+                "actor_objective_runtime_current_suite_name": str(
+                    getattr(self.rollout_buffer, "_actor_objective_runtime_current_suite_name", "")
+                ),
+                "normalize_advantage": bool(self.normalize_advantage),
+                "clip_range": float(clip_range),
+            },
+            "snapshot_target_selector": {
+                key: (None if value is None else int(value))
+                for key, value in self._get_train_outer_batch_snapshot_selector().items()
+            },
+            "snapshot_target_match_count": 0
+            if matched_target_mask is None
+            else int(np.asarray(matched_target_mask, dtype=bool).sum()),
+            "flat_batch_indices": np.asarray(
+                metadata_fields["flat_batch_indices"],
+                dtype=np.int64,
+            ).tolist(),
+            "flat_env_indices": np.asarray(
+                metadata_fields["flat_env_indices"],
+                dtype=np.int64,
+            ).tolist(),
+            "flat_step_indices": np.asarray(
+                metadata_fields["flat_step_indices"],
+                dtype=np.int64,
+            ).tolist(),
+            "flat_objective_episode_indices": np.asarray(
+                metadata_fields["flat_objective_episode_indices"],
+                dtype=np.int64,
+            ).tolist(),
+            "flat_objective_episode_positions": np.asarray(
+                metadata_fields["flat_objective_episode_positions"],
+                dtype=np.int64,
+            ).tolist(),
+            "flat_objective_global_positions": np.asarray(
+                metadata_fields["flat_objective_global_positions"],
+                dtype=np.int64,
+            ).tolist(),
+            "objective_mask": objective_mask_np.astype(np.int64, copy=False).tolist(),
+            "pre_normalization_actor_advantages": np.asarray(
+                pre_normalization_actor_advantages,
+                dtype=np.float32,
+            ).tolist(),
+            "post_normalization_advantages": np.asarray(
+                post_normalization_advantages,
+                dtype=np.float32,
+            ).tolist(),
+            "ratio": np.asarray(ratio_snapshot, dtype=np.float32).tolist(),
+            "clipped_objective": np.asarray(clipped_objective_snapshot, dtype=np.float32).tolist(),
+            "seq_start_indices": np.asarray(rollout_data.seq_start_indices, dtype=np.int64).tolist(),
+            "seq_lengths": np.asarray(rollout_data.seq_lengths, dtype=np.int64).tolist(),
+        }
+        if matched_target_mask is not None:
+            payload["snapshot_target_match_mask"] = np.asarray(
+                matched_target_mask,
+                dtype=np.int64,
+            ).tolist()
+        self._write_train_outer_batch_snapshot(payload)
 
     def _progress_logging_enabled(self) -> bool:
         explicit = getattr(self, "_rwkv_progress_log_enabled", None)
@@ -895,7 +2441,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
             return
         stamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
         print(stamped)
-        _append_text_log_line(self._progress_log_file(), stamped)
 
     @staticmethod
     def _normalize_masked_returns_like_reinforce(
@@ -930,6 +2475,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
         *,
         seq_start_indices: np.ndarray,
         seq_lengths: np.ndarray,
+        valid_mask_flat: Optional[torch.Tensor] = None,
         eps: float = 1e-6,
     ) -> torch.Tensor:
         if returns_flat.ndim != 1:
@@ -956,7 +2502,16 @@ class MaskedRecurrentPPO(RecurrentPPO):
         gather_idx = seq_starts.unsqueeze(1) + pos.unsqueeze(0)
         safe_idx = torch.minimum(gather_idx, (seq_ends - 1).unsqueeze(1))
         valid = pos.unsqueeze(0) < seq_lens.unsqueeze(1)
+        valid_mask_flat_t = (
+            torch.ones_like(returns_flat, dtype=torch.bool)
+            if valid_mask_flat is None
+            else valid_mask_flat.to(device=returns_flat.device, dtype=torch.bool)
+        )
+        if valid_mask_flat_t.shape != returns_flat.shape:
+            raise ValueError("valid_mask_flat must match returns_flat when provided.")
         padded = returns_flat.index_select(0, safe_idx.reshape(-1)).reshape(n_seq, max_length)
+        valid_mask_padded = valid_mask_flat_t.index_select(0, safe_idx.reshape(-1)).reshape(n_seq, max_length)
+        valid = valid & valid_mask_padded
         valid_f = valid.to(device=returns_flat.device, dtype=returns_flat.dtype)
         counts = valid_f.sum(dim=1, keepdim=True).clamp_min(1.0)
         mean = (padded * valid_f).sum(dim=1, keepdim=True) / counts
@@ -986,6 +2541,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
         eval_outputs: dict[str, torch.Tensor],
         n_seq: Optional[int] = None,
         normalized_q_targets: Optional[torch.Tensor] = None,
+        objective_mask: Optional[torch.Tensor] = None,
         q_target_denom: Optional[torch.Tensor] = None,
         flow_matching_xt: Optional[torch.Tensor] = None,
         flow_matching_t: Optional[torch.Tensor] = None,
@@ -1008,6 +2564,10 @@ class MaskedRecurrentPPO(RecurrentPPO):
         hidden = eval_outputs["hidden"]
         masked_actions = eval_outputs["actions"]
         valid_mask = rollout_data.mask > 1e-8
+        if objective_mask is None:
+            objective_mask = valid_mask & (rollout_data.objective_masks > 1e-8)
+        else:
+            objective_mask = objective_mask.to(device=hidden.device, dtype=torch.bool)
         if n_seq is None:
             n_seq = int(rollout_data.lstm_states.pi[0].shape[1])
         aux_loss = torch.zeros((), device=hidden.device, dtype=hidden.dtype)
@@ -1038,9 +2598,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 raise RuntimeError("PPO normalized Q aux expected normalized_q_logits from model.")
             q_targets = normalized_q_targets
             if q_targets is None:
-                q_targets = self._normalize_masked_returns_like_reinforce(
+                raw_returns = _recover_raw_from_value_space(
                     rollout_data.returns.detach(),
-                    valid_mask.detach(),
+                    value_means=rollout_data.rollout_return_means.detach(),
+                    value_stds=rollout_data.rollout_return_stds.detach(),
+                )
+                q_targets = self._normalize_masked_returns_like_reinforce(
+                    raw_returns,
+                    objective_mask.detach(),
                     n_seq=n_seq,
                     eps=1e-6,
                 )
@@ -1050,12 +2615,12 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 q_targets.to(device=normalized_q_logits.device, dtype=torch.float32),
             )
             if q_target_denom is None:
-                q_target_denom = valid_mask.sum().clamp_min(1).to(
+                q_target_denom = objective_mask.sum().clamp_min(1).to(
                     device=normalized_q_logits.device,
                     dtype=torch.float32,
                 )
-            valid_mask_f = valid_mask.to(device=q_loss_all.device, dtype=q_loss_all.dtype)
-            q_loss_num = (q_loss_all * valid_mask_f).sum()
+            objective_mask_f = objective_mask.to(device=q_loss_all.device, dtype=q_loss_all.dtype)
+            q_loss_num = (q_loss_all * objective_mask_f).sum()
             q_loss = q_loss_num / q_target_denom.to(device=q_loss_num.device, dtype=q_loss_num.dtype)
             aux_loss = aux_loss + (float(q_weight) * q_loss.to(dtype=aux_loss.dtype))
             aux_stats["normalized_q_value_loss"] = q_loss.detach()
@@ -1088,6 +2653,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
         normalized_q_logits: Optional[torch.Tensor] = None,
         next_state_flow: Optional[torch.Tensor] = None,
         normalized_q_targets: Optional[torch.Tensor] = None,
+        objective_mask: Optional[torch.Tensor] = None,
         q_target_denom: Optional[torch.Tensor] = None,
         flow_matching_xt: Optional[torch.Tensor] = None,
         flow_matching_t: Optional[torch.Tensor] = None,
@@ -1112,7 +2678,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
         aux_loss = torch.zeros((), device=hidden.device, dtype=hidden.dtype)
         aux_stats = {}
         aux_outputs = None
-
         need_q_decode = bool(q_weight > 0.0 and normalized_q_logits is None)
         need_flow_decode = bool(flow_weight > 0.0 and next_state_flow is None)
         if need_q_decode or need_flow_decode:
@@ -1143,14 +2708,22 @@ class MaskedRecurrentPPO(RecurrentPPO):
             q_targets = normalized_q_targets
             if q_targets is None:
                 raise RuntimeError("Flat PPO normalized Q aux requires precomputed normalized_q_targets.")
+            if objective_mask is None:
+                objective_mask = torch.ones_like(q_targets, dtype=torch.bool, device=q_targets.device)
+            else:
+                objective_mask = objective_mask.to(device=q_targets.device, dtype=torch.bool).reshape(-1)
             bardist = model_ref.get_normalized_q_value_bardist()
             q_loss_all = bardist(
                 normalized_q_logits.to(dtype=torch.float32),
                 q_targets.to(device=normalized_q_logits.device, dtype=torch.float32),
             )
             if q_target_denom is None:
-                q_target_denom = q_loss_all.new_tensor(float(max(1, int(q_loss_all.numel()))))
-            q_loss_num = q_loss_all.sum()
+                q_target_denom = objective_mask.sum().clamp_min(1).to(
+                    device=q_loss_all.device,
+                    dtype=q_loss_all.dtype,
+                )
+            objective_mask_f = objective_mask.to(device=q_loss_all.device, dtype=q_loss_all.dtype)
+            q_loss_num = (q_loss_all * objective_mask_f).sum()
             q_loss = q_loss_num / q_target_denom.to(device=q_loss_num.device, dtype=q_loss_num.dtype)
             aux_loss = aux_loss + (float(q_weight) * q_loss.to(dtype=aux_loss.dtype))
             aux_stats["normalized_q_value_loss"] = q_loss.detach()
@@ -1196,6 +2769,35 @@ class MaskedRecurrentPPO(RecurrentPPO):
             )
         )
 
+    def _resolve_collect_rollout_rng_channels(
+        self,
+        env: "EnvironmentPriorPPOBatchVecEnv",
+    ) -> tuple[Optional[list[int]], Optional[list[int]]]:
+        strict_fixed_env_mode = bool(getattr(self, "_rwkv_strict_fixed_env_mode", False))
+        env_seed_spec = getattr(self, "_rwkv_env_rng_seeds", None)
+        rollout_seed_spec = getattr(self, "_rwkv_rollout_rng_seeds", None)
+        if not strict_fixed_env_mode and env_seed_spec is None and rollout_seed_spec is None:
+            self._rwkv_last_collect_rollout_env_rng_seeds = None
+            self._rwkv_last_collect_rollout_rollout_rng_seeds = None
+            return None, None
+
+        env_rng_seeds = (
+            [int(v) for v in env_seed_spec]
+            if env_seed_spec is not None
+            else [int(v) for v in env._sample_seed_list()]
+        )
+        env_prior = getattr(self, "_rwkv_env_prior", None)
+        if env_prior is None:
+            raise RuntimeError("Strict fixed-env rollout mode requires algo._rwkv_env_prior.")
+        rollout_rng_seeds = (
+            [int(v) for v in rollout_seed_spec]
+            if rollout_seed_spec is not None
+            else [int(v) for v in env_prior._sample_seed_list(int(env.num_envs))]
+        )
+        self._rwkv_last_collect_rollout_env_rng_seeds = tuple(env_rng_seeds)
+        self._rwkv_last_collect_rollout_rollout_rng_seeds = tuple(rollout_rng_seeds)
+        return env_rng_seeds, rollout_rng_seeds
+
     def collect_rollouts(
         self,
         env,
@@ -1223,8 +2825,18 @@ class MaskedRecurrentPPO(RecurrentPPO):
         env_prior = self._rwkv_env_prior
         env_prior.clear_rollout_artifacts()
         policy_step_fn = self.policy.make_vectorized_rollout_step_fn()
+        if bool(getattr(self, "_rwkv_deterministic_actor_sampling", False)):
+            policy_step_fn._policy_actor_sample_fn = (  # type: ignore[attr-defined]
+                lambda actor_outputs, noise: actor_outputs["action_mean"]
+            )
         single_eval_pos = int(env_prior._sample_single_eval_pos(int(n_rollout_steps), None))
+        sep_state_reset_enabled = bool(getattr(env_prior, "_rwkv_reset_env_state_at_sep_keep_actor_history", False))
         h_list = env_prior._sample_batch_hypers(int(env.num_envs))
+        env_rng_seeds, rollout_rng_seeds = self._resolve_collect_rollout_rng_channels(env)
+        # PPO optimizes only the suffix after single_eval_pos, so rollout logs
+        # should be aligned to that same suffix. We still keep separate explicit
+        # full-episode diagnostics under full_* keys for debugging.
+        rollout_log_accumulator = _PpoRolloutLogAccumulator(int(env.num_envs))
         episode_returns = np.zeros((env.num_envs,), dtype=np.float32)
         episode_lengths = np.zeros((env.num_envs,), dtype=np.int32)
         dummy_lstm_states = self.policy._dummy_states(env.num_envs)
@@ -1244,9 +2856,24 @@ class MaskedRecurrentPPO(RecurrentPPO):
             obs_np = step_payload["obs"].detach().cpu().numpy()
             actions_np = step_payload["action"].detach().cpu().numpy()
             rewards_np = step_payload["reward"].detach().cpu().numpy()
+            reward_env_np = step_payload["reward_env"].detach().cpu().numpy().astype(np.float32, copy=False)
+            reward_ctrl_np = step_payload["reward_ctrl"].detach().cpu().numpy().astype(np.float32, copy=False)
+            reward_survival_np = (
+                step_payload["reward_survival"].detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            reward_terminal_bonus_np = (
+                step_payload["reward_terminal_bonus"].detach().cpu().numpy().astype(np.float32, copy=False)
+            )
             starts_np = step_payload["episode_starts"].detach().cpu().numpy().astype(np.float32, copy=False)
-            values_t = step_payload["values"]
+            value_logits_t = step_payload["value_logits"]
             log_probs_t = step_payload["log_probs"]
+            step_idx = int(step_payload["step"])
+            objective_masks_np = np.full(
+                (env.num_envs,),
+                1.0 if int(step_idx) >= int(single_eval_pos) else 0.0,
+                dtype=np.float32,
+            )
+            values_t = self.policy._value_from_logits(value_logits_t)
             if action_masks_np is None:
                 action_masks_np = step_payload["action_mask"].detach().cpu().numpy().astype(np.float32, copy=False)
             if next_state_masks_np is None:
@@ -1271,6 +2898,15 @@ class MaskedRecurrentPPO(RecurrentPPO):
 
             episode_returns[:] = episode_returns + rewards_np.astype(np.float32, copy=False)
             episode_lengths[:] = episode_lengths + 1
+            rollout_log_accumulator.observe_step(
+                reward=rewards_np,
+                reward_env=reward_env_np,
+                reward_ctrl=reward_ctrl_np,
+                reward_survival=reward_survival_np,
+                reward_terminal_bonus=reward_terminal_bonus_np,
+                objective_mask=objective_masks_np > 1e-8,
+                dones=dones_np,
+            )
             infos_t = [{} for _ in range(env.num_envs)]
             done_indices = np.nonzero(dones_np)[0].tolist()
             for env_idx in done_indices:
@@ -1299,6 +2935,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 action_masks=action_masks_np,
                 next_states=next_states_np,
                 next_state_masks=next_state_masks_np,
+                objective_masks=objective_masks_np,
             )
             rollout_step_count += 1
             return True
@@ -1313,6 +2950,8 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 self.device,
                 collect_x=False,
                 collect_runtime_info=False,
+                env_rng_seeds=env_rng_seeds,
+                rollout_rng_seeds=rollout_rng_seeds,
                 store_rewards=False,
                 policy_objective_kind="reinforce",
                 _policy_collect_log_probs=True,
@@ -1337,6 +2976,11 @@ class MaskedRecurrentPPO(RecurrentPPO):
             )
         if dones_np is None:
             raise RuntimeError("PPO rollout produced zero steps.")
+        setattr(
+            self,
+            "_rwkv_last_sep_state_reset_count",
+            int(env.num_envs if sep_state_reset_enabled and int(single_eval_pos) < int(n_rollout_steps) else 0),
+        )
         final_obs = final_obs.detach()
         final_terminal = final_terminal.detach().to(dtype=torch.bool)
 
@@ -1354,6 +2998,13 @@ class MaskedRecurrentPPO(RecurrentPPO):
             last_values=last_values,
             dones=self._last_episode_starts,
         )
+        rollout_reward_stats = rollout_log_accumulator.finalize()
+        setattr(self, "_rwkv_last_reward_component_stats", rollout_reward_stats)
+        logger_obj = getattr(self, "_logger", None)
+        if logger_obj is not None:
+            for key, value in rollout_reward_stats.items():
+                if value is not None and math.isfinite(float(value)):
+                    logger_obj.record(f"rollout/{key}", float(value))
         callback.on_rollout_end()
         rollout_wall_s = float(time.perf_counter() - rollout_wall_t0)
         setattr(self, "_rwkv_last_rollout_wall_time_sec", rollout_wall_s)
@@ -1370,8 +3021,11 @@ class MaskedRecurrentPPO(RecurrentPPO):
         self.policy.set_training_mode(True)
         self._update_learning_rate(self.policy.optimizer)
         clip_range = self.clip_range(self._current_progress_remaining)
+        if bool(getattr(self.policy, "has_value_bardist", lambda: False)()) and self.clip_range_vf is not None:
+            raise RuntimeError("PPO bar-distribution value head does not support clip_range_vf; set ppo_clip_range_vf=None.")
         if self.clip_range_vf is not None:
             clip_range_vf = self.clip_range_vf(self._current_progress_remaining)
+        value_bardist = self.policy.get_value_bardist()
         grad_scaler = getattr(self, "_rwkv_grad_scaler", None)
         autocast_dtype = getattr(self, "_rwkv_autocast_dtype", None)
 
@@ -1389,6 +3043,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
         last_progress_t = train_wall_t0 - progress_min_interval_sec
         outer_batches_total_processed = 0
         subbatches_total_processed = 0
+        loss = torch.zeros((), device=self.device, dtype=torch.float32)
         if self._progress_logging_enabled():
             self._emit_progress_log(
                 "[ppo-train-start] "
@@ -1412,7 +3067,19 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 outer_batch_idx += 1
                 outer_batches_total_processed += 1
                 if isinstance(rollout_data, MaskedRecurrentFlatBatchSamples):
-                    valid_total = rollout_data.returns.new_tensor(float(max(1, int(rollout_data.returns.numel()))))
+                    objective_mask = rollout_data.objective_masks > 1e-8
+                    objective_total = int(objective_mask.sum().detach().cpu())
+                    self._append_train_outer_batch_selector_trace_row_flat(
+                        rollout_data=rollout_data,
+                        objective_mask=objective_mask,
+                        epoch_idx=int(epoch + 1),
+                        outer_batch_idx=int(outer_batch_idx),
+                        total_outer_batches=int(total_outer_batches),
+                    )
+                    valid_total = objective_mask.to(
+                        device=rollout_data.returns.device,
+                        dtype=rollout_data.returns.dtype,
+                    ).sum().clamp_min(1.0)
                     n_seq_total = int(rollout_data.n_seq)
                     seq_subbatch_size = self._resolve_sequence_subbatch_size(rollout_data)
                     subbatch_count = int(max(1, math.ceil(float(n_seq_total) / float(max(1, int(seq_subbatch_size))))))
@@ -1429,9 +3096,46 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
                         )
 
-                    advantages = rollout_data.advantages
+                    if objective_total <= 0:
+                        if self._progress_logging_enabled() and (
+                            outer_batch_idx == total_outer_batches
+                            or (outer_batch_idx % progress_every) == 0
+                        ):
+                            self._emit_progress_log(
+                                "[ppo-train-batch-done] "
+                                f"epoch={int(epoch + 1)}/{int(self.n_epochs)} "
+                                f"outer_batch={int(outer_batch_idx)}/{int(total_outer_batches)} "
+                                f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
+                            )
+                        continue
+
+                    advantages = _resolve_actor_advantages(rollout_data)
+                    snapshot_target_mask = self._resolve_train_outer_batch_snapshot_match_mask_flat(
+                        rollout_data=rollout_data,
+                        objective_mask=objective_mask,
+                        outer_batch_idx=int(outer_batch_idx),
+                    )
+                    snapshot_requested = snapshot_target_mask is not None
+                    if snapshot_requested:
+                        pre_normalization_actor_advantages_snapshot = (
+                            advantages.detach().to(dtype=torch.float32).cpu().numpy().copy()
+                        )
                     if self.normalize_advantage:
-                        advantages = (advantages - advantages.mean()) / (advantages.std() + 1e-8)
+                        advantages = _normalize_advantages_with_mask(advantages, objective_mask, eps=1e-8)
+                    if snapshot_requested:
+                        post_normalization_advantages_snapshot = (
+                            advantages.detach().to(dtype=torch.float32).cpu().numpy().copy()
+                        )
+                        ratio_snapshot = np.full(
+                            (int(advantages.shape[0]),),
+                            np.nan,
+                            dtype=np.float32,
+                        )
+                        clipped_objective_snapshot = np.full(
+                            (int(advantages.shape[0]),),
+                            np.nan,
+                            dtype=np.float32,
+                        )
                     self.policy.optimizer.zero_grad()
                     policy_num_total = rollout_data.returns.new_zeros(())
                     value_num_total = rollout_data.returns.new_zeros(())
@@ -1447,10 +3151,16 @@ class MaskedRecurrentPPO(RecurrentPPO):
                     if float(getattr(self, "_rwkv_aux_q_weight", 0.0)) > 0.0:
                         q_targets_full = rollout_data.normalized_q_targets
                         if q_targets_full is None:
-                            q_targets_full = self._normalize_flat_sequence_returns_like_reinforce(
+                            raw_returns_full = _recover_raw_from_value_space(
                                 rollout_data.returns.detach(),
+                                value_means=rollout_data.rollout_return_means.detach(),
+                                value_stds=rollout_data.rollout_return_stds.detach(),
+                            )
+                            q_targets_full = self._normalize_flat_sequence_returns_like_reinforce(
+                                raw_returns_full,
                                 seq_start_indices=rollout_data.seq_start_indices,
                                 seq_lengths=rollout_data.seq_lengths,
+                                valid_mask_flat=objective_mask.detach(),
                                 eps=1e-6,
                             )
                     if float(getattr(self, "_rwkv_aux_flow_weight", 0.0)) > 0.0:
@@ -1480,8 +3190,15 @@ class MaskedRecurrentPPO(RecurrentPPO):
                         sub_advantages = advantages[flat_start:flat_end]
                         sub_actions = rollout_data.actions[flat_start:flat_end]
                         sub_old_log_prob = rollout_data.old_log_prob[flat_start:flat_end]
-                        sub_old_values = rollout_data.old_values[flat_start:flat_end]
                         sub_returns = rollout_data.returns[flat_start:flat_end]
+                        sub_value_target_bucket_idx = getattr(rollout_data, "value_target_bucket_idx", None)
+                        if sub_value_target_bucket_idx is not None:
+                            sub_value_target_bucket_idx = sub_value_target_bucket_idx[flat_start:flat_end]
+                        sub_objective_mask = rollout_data.objective_masks[flat_start:flat_end] > 1e-8
+                        sub_objective_f = sub_objective_mask.to(
+                            device=rollout_data.returns.device,
+                            dtype=rollout_data.returns.dtype,
+                        )
                         sub_action_masks = rollout_data.action_masks[flat_start:flat_end]
                         sub_q_targets = None
                         sub_flow_xt = sub_flow_t = sub_flow_dx = None
@@ -1502,6 +3219,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 flow_matching_t=sub_flow_t,
                             )
                             values = eval_outputs["values"].flatten()
+                            value_logits = eval_outputs["value_logits"]
                             log_prob = eval_outputs["log_prob"]
                             entropy = eval_outputs["entropy"]
 
@@ -1509,26 +3227,43 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             policy_loss_1 = sub_advantages * ratio
                             policy_loss_2 = sub_advantages * torch.clamp(ratio, 1 - clip_range, 1 + clip_range)
                             clipped_objective = torch.min(policy_loss_1, policy_loss_2)
-                            policy_num = clipped_objective.sum()
+                            if snapshot_requested:
+                                ratio_snapshot[flat_start:flat_end] = (
+                                    ratio.detach().to(dtype=torch.float32).cpu().numpy()
+                                )
+                                clipped_objective_snapshot[flat_start:flat_end] = (
+                                    clipped_objective.detach().to(dtype=torch.float32).cpu().numpy()
+                                )
+                            policy_num = (
+                                clipped_objective
+                                * sub_objective_f.to(device=clipped_objective.device, dtype=clipped_objective.dtype)
+                            ).sum()
                             policy_loss = -(policy_num / valid_total.to(device=policy_num.device, dtype=policy_num.dtype))
 
-                            if self.clip_range_vf is None:
-                                values_pred = values
-                            else:
-                                values_pred = sub_old_values + torch.clamp(
-                                    values - sub_old_values,
-                                    -clip_range_vf,
-                                    clip_range_vf,
+                            if sub_value_target_bucket_idx is not None:
+                                value_errors = value_bardist.nll_from_bucket_idx(
+                                    value_logits.to(dtype=torch.float32),
+                                    sub_value_target_bucket_idx,
                                 )
-                            value_errors = (sub_returns - values_pred) ** 2
-                            value_num = value_errors.sum()
+                            else:
+                                value_errors = value_bardist(
+                                    value_logits.to(dtype=torch.float32),
+                                    sub_returns.to(device=value_logits.device, dtype=torch.float32),
+                                )
+                            value_num = (
+                                value_errors
+                                * sub_objective_f.to(device=value_errors.device, dtype=value_errors.dtype)
+                            ).sum()
                             value_loss = value_num / valid_total.to(device=value_num.device, dtype=value_num.dtype)
 
                             if entropy is None:
                                 entropy_terms = -log_prob
                             else:
                                 entropy_terms = entropy
-                            entropy_num = entropy_terms.sum()
+                            entropy_num = (
+                                entropy_terms
+                                * sub_objective_f.to(device=entropy_terms.device, dtype=entropy_terms.dtype)
+                            ).sum()
                             entropy_loss = -(entropy_num / valid_total.to(device=entropy_num.device, dtype=entropy_num.dtype))
 
                             main_loss = policy_loss + self.ent_coef * entropy_loss + self.vf_coef * value_loss
@@ -1542,6 +3277,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                     normalized_q_logits=eval_outputs.get("normalized_q_logits", None),
                                     next_state_flow=eval_outputs.get("next_state_flow", None),
                                     normalized_q_targets=sub_q_targets,
+                                    objective_mask=sub_objective_mask,
                                     q_target_denom=valid_total,
                                     flow_matching_xt=sub_flow_xt,
                                     flow_matching_t=sub_flow_t,
@@ -1596,13 +3332,37 @@ class MaskedRecurrentPPO(RecurrentPPO):
                         with torch.no_grad():
                             log_ratio = log_prob - sub_old_log_prob
                             approx_kl_terms = (torch.exp(log_ratio) - 1) - log_ratio
-                            approx_kl_num = approx_kl_terms.sum()
+                            approx_kl_num = (
+                                approx_kl_terms
+                                * sub_objective_f.to(device=approx_kl_terms.device, dtype=approx_kl_terms.dtype)
+                            ).sum()
                             approx_kl_num_total = approx_kl_num_total + approx_kl_num.detach()
-                            clip_num = (torch.abs(ratio - 1) > clip_range).to(dtype=ratio.dtype).sum()
+                            clip_num = (
+                                (torch.abs(ratio - 1) > clip_range).to(dtype=ratio.dtype)
+                                * sub_objective_f.to(device=ratio.device, dtype=ratio.dtype)
+                            ).sum()
                             clip_num_total = clip_num_total + clip_num.detach()
+                    if snapshot_requested:
+                        self._maybe_capture_train_outer_batch_snapshot_flat(
+                            rollout_data=rollout_data,
+                            objective_mask=objective_mask,
+                            pre_normalization_actor_advantages=pre_normalization_actor_advantages_snapshot,
+                            post_normalization_advantages=post_normalization_advantages_snapshot,
+                            ratio_snapshot=ratio_snapshot,
+                            clipped_objective_snapshot=clipped_objective_snapshot,
+                            clip_range=float(clip_range),
+                            outer_batch_idx=int(outer_batch_idx),
+                            epoch_idx=int(epoch + 1),
+                            matched_target_mask=snapshot_target_mask,
+                        )
                 else:
                     mask = rollout_data.mask > 1e-8
-                    valid_total = mask.sum().clamp_min(1).to(device=rollout_data.returns.device, dtype=rollout_data.returns.dtype)
+                    objective_mask = mask & (rollout_data.objective_masks > 1e-8)
+                    objective_total = int(objective_mask.sum().detach().cpu())
+                    valid_total = objective_mask.sum().clamp_min(1).to(
+                        device=rollout_data.returns.device,
+                        dtype=rollout_data.returns.dtype,
+                    )
                     n_seq_total = int(rollout_data.lstm_states.pi[0].shape[1])
                     seq_subbatch_size = self._resolve_sequence_subbatch_size(rollout_data)
                     subbatch_count = int(max(1, math.ceil(float(n_seq_total) / float(max(1, int(seq_subbatch_size))))))
@@ -1619,9 +3379,22 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
                         )
 
-                    advantages = rollout_data.advantages
+                    if objective_total <= 0:
+                        if self._progress_logging_enabled() and (
+                            outer_batch_idx == total_outer_batches
+                            or (outer_batch_idx % progress_every) == 0
+                        ):
+                            self._emit_progress_log(
+                                "[ppo-train-batch-done] "
+                                f"epoch={int(epoch + 1)}/{int(self.n_epochs)} "
+                                f"outer_batch={int(outer_batch_idx)}/{int(total_outer_batches)} "
+                                f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
+                            )
+                        continue
+
+                    advantages = _resolve_actor_advantages(rollout_data)
                     if self.normalize_advantage:
-                        advantages = (advantages - advantages[mask].mean()) / (advantages[mask].std() + 1e-8)
+                        advantages = _normalize_advantages_with_mask(advantages, objective_mask, eps=1e-8)
                     self.policy.optimizer.zero_grad()
                     policy_num_total = rollout_data.returns.new_zeros(())
                     value_num_total = rollout_data.returns.new_zeros(())
@@ -1637,9 +3410,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
                     if float(getattr(self, "_rwkv_aux_q_weight", 0.0)) > 0.0:
                         q_targets_full = rollout_data.normalized_q_targets
                         if q_targets_full is None:
-                            q_targets_full = self._normalize_masked_returns_like_reinforce(
+                            raw_returns_full = _recover_raw_from_value_space(
                                 rollout_data.returns.detach(),
-                                mask.detach(),
+                                value_means=rollout_data.rollout_return_means.detach(),
+                                value_stds=rollout_data.rollout_return_stds.detach(),
+                            )
+                            q_targets_full = self._normalize_masked_returns_like_reinforce(
+                                raw_returns_full,
+                                objective_mask.detach(),
                                 n_seq=n_seq_total,
                                 eps=1e-6,
                             )
@@ -1667,13 +3445,25 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             end_seq=end_seq,
                         )
                         sub_mask = sub_rollout_data.mask > 1e-8
-                        sub_mask_f = sub_mask.to(device=sub_rollout_data.returns.device, dtype=sub_rollout_data.returns.dtype)
+                        sub_objective_mask = sub_mask & (sub_rollout_data.objective_masks > 1e-8)
+                        sub_mask_f = sub_objective_mask.to(
+                            device=sub_rollout_data.returns.device,
+                            dtype=sub_rollout_data.returns.dtype,
+                        )
                         sub_advantages = _slice_padded_sequence_tensor(
                             advantages,
                             n_seq=n_seq_total,
                             start_seq=start_seq,
                             end_seq=end_seq,
                         )
+                        sub_value_target_bucket_idx = None
+                        if getattr(rollout_data, "value_target_bucket_idx", None) is not None:
+                            sub_value_target_bucket_idx = _slice_padded_sequence_tensor(
+                                rollout_data.value_target_bucket_idx,
+                                n_seq=n_seq_total,
+                                start_seq=start_seq,
+                                end_seq=end_seq,
+                            )
                         sub_q_targets = None if q_targets_full is None else _slice_padded_sequence_tensor(
                             q_targets_full,
                             n_seq=n_seq_total,
@@ -1707,6 +3497,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 action_masks=sub_rollout_data.action_masks,
                             )
                             values = eval_outputs["values"].flatten()
+                            value_logits = eval_outputs["value_logits"]
                             log_prob = eval_outputs["log_prob"]
                             entropy = eval_outputs["entropy"]
 
@@ -1717,15 +3508,16 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             policy_num = (clipped_objective * sub_mask_f.to(device=clipped_objective.device, dtype=clipped_objective.dtype)).sum()
                             policy_loss = -(policy_num / valid_total.to(device=policy_num.device, dtype=policy_num.dtype))
 
-                            if self.clip_range_vf is None:
-                                values_pred = values
-                            else:
-                                values_pred = sub_rollout_data.old_values + torch.clamp(
-                                    values - sub_rollout_data.old_values,
-                                    -clip_range_vf,
-                                    clip_range_vf,
+                            if sub_value_target_bucket_idx is not None:
+                                value_errors = value_bardist.nll_from_bucket_idx(
+                                    value_logits.to(dtype=torch.float32),
+                                    sub_value_target_bucket_idx,
                                 )
-                            value_errors = (sub_rollout_data.returns - values_pred) ** 2
+                            else:
+                                value_errors = value_bardist(
+                                    value_logits.to(dtype=torch.float32),
+                                    sub_rollout_data.returns.to(device=value_logits.device, dtype=torch.float32),
+                                )
                             value_num = (value_errors * sub_mask_f.to(device=value_errors.device, dtype=value_errors.dtype)).sum()
                             value_loss = value_num / valid_total.to(device=value_num.device, dtype=value_num.dtype)
 
@@ -1747,6 +3539,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                     eval_outputs=eval_outputs,
                                     n_seq=int(end_seq - start_seq),
                                     normalized_q_targets=sub_q_targets,
+                                    objective_mask=sub_objective_mask,
                                     q_target_denom=valid_total,
                                     flow_matching_xt=sub_flow_xt,
                                     flow_matching_t=sub_flow_t,
@@ -1858,10 +3651,35 @@ class MaskedRecurrentPPO(RecurrentPPO):
             if not continue_training:
                 break
 
+        self._finalize_train_outer_batch_selector_trace()
         self._n_updates += self.n_epochs
         update_wall_time_sec = float(time.perf_counter() - train_wall_t0)
         setattr(self, "_rwkv_last_update_wall_time_sec", update_wall_time_sec)
-        explained_var = explained_variance(self.rollout_buffer.values.flatten(), self.rollout_buffer.returns.flatten())
+        raw_values_flat = None
+        raw_returns_flat = None
+        if isinstance(self.rollout_buffer, MaskedRecurrentRolloutBuffer):
+            raw_values_flat = self.rollout_buffer._get_flat_raw_values_tensor(dtype=torch.float32).cpu().numpy()
+            raw_returns_flat = self.rollout_buffer._get_flat_raw_returns_tensor(dtype=torch.float32).cpu().numpy()
+        objective_masks_np = getattr(self.rollout_buffer, "objective_masks", None)
+        normalized_values_flat = self.rollout_buffer.values.flatten()
+        normalized_returns_flat = self.rollout_buffer.returns.flatten()
+        if raw_values_flat is not None and raw_returns_flat is not None:
+            explained_var = _explained_variance_with_mask(
+                raw_values_flat,
+                raw_returns_flat,
+                mask=objective_masks_np,
+            )
+        else:
+            explained_var = _explained_variance_with_mask(
+                normalized_values_flat,
+                normalized_returns_flat,
+                mask=objective_masks_np,
+            )
+        explained_var_normalized = _explained_variance_with_mask(
+            normalized_values_flat,
+            normalized_returns_flat,
+            mask=objective_masks_np,
+        )
 
         def _mean_tensor_scalar(values):
             if not values:
@@ -1875,9 +3693,20 @@ class MaskedRecurrentPPO(RecurrentPPO):
         self.logger.record("train/clip_fraction", _mean_tensor_scalar(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var)
+        self.logger.record("train/explained_variance_normalized", explained_var_normalized)
         self.logger.record("train/update_wall_time_sec", update_wall_time_sec)
         self.logger.record("train/outer_batches", int(outer_batches_total_processed))
         self.logger.record("train/subbatches", int(subbatches_total_processed))
+        self.logger.record("train/policy_weight", 1.0)
+        self.logger.record("train/entropy_weight", float(self.ent_coef))
+        self.logger.record("train/value_weight", float(self.vf_coef))
+        self.logger.record("train/normalized_q_value_weight", float(getattr(self, "_rwkv_aux_q_weight", 0.0)))
+        self.logger.record("train/next_state_flow_matching_weight", float(getattr(self, "_rwkv_aux_flow_weight", 0.0)))
+        self.logger.record("train/sep_state_reset_enabled", float(bool(getattr(self, "_rwkv_reset_env_state_at_sep", False))))
+        self.logger.record(
+            "train/sep_state_reset_count",
+            float(int(getattr(self, "_rwkv_last_sep_state_reset_count", 0) or 0)),
+        )
         if hasattr(self.policy, "log_std"):
             self.logger.record("train/std", torch.exp(self.policy.log_std).mean().item())
         if q_aux_losses:
@@ -2070,6 +3899,10 @@ def build_validation_recurrent_ppo_policy(
     policy_state_dict: Optional[dict[str, torch.Tensor]] = None,
 ):
     target_model = _target_model(model)
+    separate_value_backbone = bool(
+        policy_state_dict is not None
+        and any(str(key).startswith("value_rlpfn_model.") for key in policy_state_dict.keys())
+    )
     layout = resolve_rlpfn_token_layout(env_cfg, num_features=num_features)
     obs_slot_dim = int(layout["obs_slot_dim"])
     action_dim = int(layout["action_slot_dim"])
@@ -2092,20 +3925,49 @@ def build_validation_recurrent_ppo_policy(
         rlpfn_model=target_model,
         num_features=int(num_features),
         obs_slot_dim=int(obs_slot_dim),
+        separate_value_backbone=bool(separate_value_backbone),
         net_arch=[],
     )
     if policy_state_dict is not None:
-        missing, unexpected = policy.load_state_dict(policy_state_dict, strict=False)
-        missing_filtered = [str(key) for key in missing if not str(key).startswith("rlpfn_model.")]
-        unexpected_filtered = [str(key) for key in unexpected if not str(key).startswith("rlpfn_model.")]
-        if missing_filtered or unexpected_filtered:
-            raise ValueError(
-                "Failed to restore saved PPO validation policy state. "
-                f"missing={missing_filtered}, unexpected={unexpected_filtered}"
-            )
+        _restore_saved_recurrent_ppo_policy_state(policy, policy_state_dict)
     policy.to(device)
     policy.eval()
     return policy
+
+
+def _restore_saved_recurrent_ppo_policy_state(
+    policy: "OfficialRWKVRecurrentPPOPolicy",
+    policy_state_dict: dict[str, torch.Tensor],
+) -> None:
+    current_state = policy.state_dict()
+    filtered_policy_state_dict = {}
+    dropped_shape_mismatch = set()
+    for key, value in policy_state_dict.items():
+        current_value = current_state.get(str(key), None)
+        if current_value is not None and tuple(current_value.shape) != tuple(value.shape):
+            dropped_shape_mismatch.add(str(key))
+            continue
+        filtered_policy_state_dict[str(key)] = value
+    missing, unexpected = policy.load_state_dict(filtered_policy_state_dict, strict=False)
+    legacy_scalar_value_head = "value_bardist.borders" not in policy_state_dict
+    mismatched_value_head = any(
+        str(key).startswith("value_net.") or str(key).startswith("value_bardist.")
+        for key in dropped_shape_mismatch
+    )
+    missing_filtered = [str(key) for key in missing if not str(key).startswith("rlpfn_model.")]
+    if legacy_scalar_value_head or mismatched_value_head:
+        missing_filtered = [
+            str(key)
+            for key in missing_filtered
+            if not (str(key).startswith("value_net.") or str(key).startswith("value_bardist."))
+        ]
+    missing_filtered = [str(key) for key in missing_filtered if str(key) not in dropped_shape_mismatch]
+    unexpected_filtered = [str(key) for key in unexpected if not str(key).startswith("rlpfn_model.")]
+    if missing_filtered or unexpected_filtered:
+        raise ValueError(
+            "Failed to restore saved PPO validation policy state. "
+            f"missing={missing_filtered}, unexpected={unexpected_filtered}"
+        )
 
 
 def _resolve_official_ppo_sequence_batch_capacity(
@@ -2403,6 +4265,17 @@ class EnvironmentPriorPPOGymEnv(Env):
         else:
             terminal_next = torch.zeros((), device=self.device, dtype=reward_next.dtype)
 
+        sep_state_reset_applied = bool(
+            getattr(self.env_prior, "_rwkv_reset_env_state_at_sep_keep_actor_history", False)
+        ) and int(self._step_idx + 1) == int(self._single_eval_pos)
+        if sep_state_reset_applied:
+            state_next = torch.randn(
+                (state_dim,),
+                device=self.device,
+                dtype=torch.float32,
+                generator=self._generator,
+            ) * float(self._env.get("init_state_std", 0.0))
+
         self._state_t = state_next
         self._action_t = action_t
         self._reward_t = reward_next.reshape(())
@@ -2410,16 +4283,20 @@ class EnvironmentPriorPPOGymEnv(Env):
         self._terminal_t = terminal_next.reshape(())
 
         self._step_idx += 1
+        terminated = bool(float(self._terminal_t.detach().cpu().item()) > 1e-8)
         truncated = bool(self._step_idx >= self.n_steps)
         obs_next = self._build_obs_token()
         next_state_target, next_state_mask = self._build_next_state_target(self._state_t)
         info = {
+            "step_idx": int(self._step_idx),
             "single_eval_pos": int(self._single_eval_pos),
             "terminal_flag": float(self._terminal_t.detach().cpu().item()),
+            "sep_state_reset": bool(sep_state_reset_applied),
             "next_state_target": next_state_target.detach().cpu().numpy().astype(np.float32, copy=False),
             "next_state_mask": next_state_mask.detach().cpu().numpy().astype(np.float32, copy=False),
+            "TimeLimit.truncated": bool(truncated and not terminated),
         }
-        return obs_next, float(self._reward_t.detach().cpu().item()), False, truncated, info
+        return obs_next, float(self._reward_t.detach().cpu().item()), terminated, truncated, info
 
 
 class EnvironmentPriorPPOBatchVecEnv(VecEnv):
@@ -2786,31 +4663,102 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         else:
             terminal_next = torch.zeros((self.num_envs,), device=self.device, dtype=reward_next.dtype)
 
-        self._state_t = state_next
-        self._action_t = action_t
-        self._reward_t = reward_next
-        self._reward_mask_t = reward_mask_next
-        self._terminal_t = terminal_next.to(dtype=reward_next.dtype)
+        reward_return = reward_next
+        audit_force_episode_reset_at_sep = bool(
+            getattr(self.env_prior, "_audit_force_episode_reset_at_sep", False)
+        )
+        audit_reset_env_state_at_sep_keep_actor_history = bool(
+            getattr(self.env_prior, "_audit_reset_env_state_at_sep_keep_actor_history", False)
+        )
+        reset_env_state_at_sep_keep_actor_history = bool(
+            getattr(self.env_prior, "_rwkv_reset_env_state_at_sep_keep_actor_history", False)
+        )
+        sep_forced_reset = np.zeros((self.num_envs,), dtype=bool)
+        sep_state_only_reset = np.zeros((self.num_envs,), dtype=bool)
+        next_step_idx = int(self._step_idx + 1)
+        if (
+            audit_force_episode_reset_at_sep
+            or audit_reset_env_state_at_sep_keep_actor_history
+            or reset_env_state_at_sep_keep_actor_history
+        ):
+            single_eval_pos_np = self._single_eval_pos_np
+            if single_eval_pos_np is None:
+                single_eval_pos_np = self._single_eval_pos.detach().cpu().numpy().astype(np.int64, copy=True)
+                self._single_eval_pos_np = single_eval_pos_np
+            sep_mask = (single_eval_pos_np == next_step_idx)
+            if audit_force_episode_reset_at_sep:
+                sep_forced_reset = sep_mask
+            if audit_reset_env_state_at_sep_keep_actor_history or reset_env_state_at_sep_keep_actor_history:
+                sep_state_only_reset = sep_mask
+        state_store = state_next
+        action_store = action_t
+        reward_store = reward_next
+        reward_mask_store = reward_mask_next
+        terminal_store = terminal_next.to(dtype=reward_next.dtype)
+        if bool(sep_forced_reset.any()) or bool(sep_state_only_reset.any()):
+            reset_mask_t = torch.as_tensor(sep_forced_reset, device=self.device, dtype=torch.bool)
+            state_only_reset_mask_t = torch.as_tensor(sep_state_only_reset, device=self.device, dtype=torch.bool)
+            reset_state = self.env_prior._stack_randn_with_generators(
+                self._rollout_generators,
+                (self.num_envs, int(self._env["state_dim"])),
+                device=self.device,
+                dtype=torch.float32,
+            ) * self._env["init_state_std"][:, None]
+            state_store = state_next.clone()
+            if bool(state_only_reset_mask_t.any()):
+                state_store[state_only_reset_mask_t] = reset_state[state_only_reset_mask_t]
+            if bool(reset_mask_t.any()):
+                reset_action = self.env_prior._stack_randn_with_generators(
+                    self._rollout_generators,
+                    (self.num_envs, self.action_dim),
+                    device=self.device,
+                    dtype=torch.float32,
+                ) * self._env["init_action_std"][:, None]
+                reset_action = reset_action * torch.as_tensor(
+                    self._vector_action_masks(),
+                    device=self.device,
+                    dtype=torch.float32,
+                )
+                action_store = action_t.clone()
+                reward_store = reward_next.clone()
+                reward_mask_store = reward_mask_next.clone()
+                terminal_store = terminal_store.clone()
+                state_store[reset_mask_t] = reset_state[reset_mask_t]
+                action_store[reset_mask_t] = reset_action[reset_mask_t]
+                reward_store[reset_mask_t] = 0.0
+                reward_mask_store[reset_mask_t] = 1.0
+                terminal_store[reset_mask_t] = 0.0
+
+        self._state_t = state_store
+        self._action_t = action_store
+        self._reward_t = reward_store
+        self._reward_mask_t = reward_mask_store
+        self._terminal_t = terminal_store
         self._step_idx += 1
 
         obs_next = self._build_obs_batch()
         next_state_target, next_state_mask = self._build_next_state_targets()
-        rewards_np = self._reward_t.detach().cpu().numpy().astype(np.float32, copy=False)
+        rewards_np = reward_return.detach().cpu().numpy().astype(np.float32, copy=False)
         terminal_flags_np = self._terminal_t.detach().cpu().numpy().astype(np.float32, copy=False)
         single_eval_pos_np = self._single_eval_pos_np
         if single_eval_pos_np is None:
             single_eval_pos_np = self._single_eval_pos.detach().cpu().numpy().astype(np.int64, copy=True)
             self._single_eval_pos_np = single_eval_pos_np
-        dones = np.full((self.num_envs,), bool(self._step_idx >= self.n_steps), dtype=bool)
+        terminated = np.logical_or(terminal_flags_np > 1e-8, sep_forced_reset)
+        truncated = np.full((self.num_envs,), bool(self._step_idx >= self.n_steps), dtype=bool)
+        dones = np.logical_or(terminated, truncated)
         self._episode_returns += rewards_np
         self._episode_lengths += 1
         infos = [
             {
+                "step_idx": int(self._step_idx),
                 "single_eval_pos": int(single_eval_pos_np[env_idx]),
                 "terminal_flag": float(terminal_flags_np[env_idx]),
+                "sep_forced_reset": bool(sep_forced_reset[env_idx]),
+                "sep_state_reset": bool(sep_state_only_reset[env_idx]),
                 "next_state_target": next_state_target[env_idx],
                 "next_state_mask": next_state_mask[env_idx],
-                "TimeLimit.truncated": bool(dones[env_idx]),
+                "TimeLimit.truncated": bool(truncated[env_idx] and not terminated[env_idx]),
             }
             for env_idx in range(self.num_envs)
         ]
@@ -2818,12 +4766,18 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         if bool(dones.any()):
             terminal_obs = obs_next.copy()
             for env_idx in range(self.num_envs):
+                if not bool(dones[env_idx]):
+                    continue
                 infos[env_idx]["episode"] = {
                     "r": float(self._episode_returns[env_idx]),
                     "l": int(self._episode_lengths[env_idx]),
                 }
-                infos[env_idx]["terminal_observation"] = terminal_obs[env_idx].copy()
-            obs_next = self._full_reset_batch()
+                if bool(truncated[env_idx]):
+                    infos[env_idx]["terminal_observation"] = terminal_obs[env_idx].copy()
+                self._episode_returns[env_idx] = 0.0
+                self._episode_lengths[env_idx] = 0
+            if bool(truncated.any()):
+                obs_next = self._full_reset_batch()
 
         self._pending_actions = None
         return obs_next, rewards_np.copy(), dones, infos
@@ -2879,6 +4833,7 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         rlpfn_model,
         num_features: int,
         obs_slot_dim: int,
+        separate_value_backbone: bool = False,
         net_arch=None,
         **kwargs,
     ):
@@ -2893,8 +4848,14 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
             **kwargs,
         )
         self.rlpfn_model = rlpfn_model
+        self.separate_value_backbone = bool(separate_value_backbone)
+        self.value_rlpfn_model = copy.deepcopy(rlpfn_model) if self.separate_value_backbone else None
         self.num_features = int(num_features)
         self.obs_slot_dim = int(obs_slot_dim)
+        self.value_bardist = _make_ppo_value_bardist()
+        self.value_net = nn.Linear(self.mlp_extractor.latent_dim_vf, self.value_bardist.num_bars)
+        if self.ortho_init:
+            self.value_net.apply(lambda module: self.init_weights(module, gain=1))
         self.lstm_actor = _PlaceholderLSTM()
         self.lstm_critic = None
         self.critic = nn.Identity()
@@ -2902,6 +4863,74 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         self.optimizer = self.optimizer_class(self.parameters(), lr=lr_schedule(1), **self.optimizer_kwargs)
         self._rollout_kv_cache = None
         self._rollout_cache_batch_size = None
+        self._value_rollout_kv_cache = None
+        self._value_rollout_cache_batch_size = None
+
+    def has_value_bardist(self) -> bool:
+        return isinstance(getattr(self, "value_bardist", None), nn.Module)
+
+    def get_value_bardist(self):
+        if not self.has_value_bardist():
+            raise RuntimeError("PPO value_bardist is not initialized.")
+        return self.value_bardist
+
+    def _value_logits_from_latent(self, latent_vf: torch.Tensor) -> torch.Tensor:
+        value_param = next(self.value_net.parameters())
+        if latent_vf.dtype != value_param.dtype:
+            latent_vf = latent_vf.to(dtype=value_param.dtype)
+        value_logits = self.value_net(latent_vf)
+        if int(value_logits.shape[-1]) != int(self.value_bardist.num_bars):
+            raise RuntimeError(
+                "PPO value_net must emit one logit per bar bucket, "
+                f"got {tuple(value_logits.shape)} for {int(self.value_bardist.num_bars)} bars."
+            )
+        return value_logits
+
+    @staticmethod
+    def _coerce_value_affine_tensor(
+        value: Optional[torch.Tensor | np.ndarray | float],
+        *,
+        reference: torch.Tensor,
+        default: float,
+        name: str,
+    ) -> torch.Tensor:
+        if value is None:
+            return torch.full_like(reference, float(default))
+        if torch.is_tensor(value):
+            out = value.to(device=reference.device, dtype=reference.dtype)
+        else:
+            out = torch.as_tensor(value, device=reference.device, dtype=reference.dtype)
+        while out.ndim < reference.ndim:
+            out = out.unsqueeze(-1)
+        if tuple(out.shape) == tuple(reference.shape):
+            return out
+        if int(out.numel()) == 1:
+            return out.expand_as(reference)
+        raise ValueError(
+            f"{name} must broadcast to {tuple(reference.shape)}, got {tuple(out.shape)}"
+        )
+
+    def _value_from_logits(
+        self,
+        value_logits: torch.Tensor,
+        *,
+        value_means: Optional[torch.Tensor | np.ndarray | float] = None,
+        value_stds: Optional[torch.Tensor | np.ndarray | float] = None,
+    ) -> torch.Tensor:
+        value_mean_scaled = self.value_bardist.mean(value_logits.to(dtype=torch.float32)).unsqueeze(-1)
+        means = self._coerce_value_affine_tensor(
+            value_means,
+            reference=value_mean_scaled,
+            default=0.0,
+            name="value_means",
+        )
+        stds = self._coerce_value_affine_tensor(
+            value_stds,
+            reference=value_mean_scaled,
+            default=1.0,
+            name="value_stds",
+        ).clamp_min(PPO_VALUE_TARGET_NORM_EPS)
+        return means + stds * value_mean_scaled
 
     def _coerce_action_masks(self, action_masks, batch_size: int, *, device: torch.device) -> Optional[torch.Tensor]:
         if action_masks is None:
@@ -2941,6 +4970,61 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         log_prob = (per_dim_log_prob * mask_f).sum(dim=1)
         entropy = (per_dim_entropy * mask_f).sum(dim=1)
         return log_prob, entropy
+
+    @contextmanager
+    def _value_backbone_context(self):
+        if not bool(getattr(self, "separate_value_backbone", False)):
+            yield
+            return
+        actor_model = self.rlpfn_model
+        actor_cache = self._rollout_kv_cache
+        actor_cache_batch_size = self._rollout_cache_batch_size
+        self.rlpfn_model = self.value_rlpfn_model
+        self._rollout_kv_cache = self._value_rollout_kv_cache
+        self._rollout_cache_batch_size = self._value_rollout_cache_batch_size
+        try:
+            yield
+        finally:
+            self._value_rollout_kv_cache = self._rollout_kv_cache
+            self._value_rollout_cache_batch_size = self._rollout_cache_batch_size
+            self.rlpfn_model = actor_model
+            self._rollout_kv_cache = actor_cache
+            self._rollout_cache_batch_size = actor_cache_batch_size
+
+    def _value_rollout_hidden(
+        self,
+        obs: torch.Tensor,
+        episode_starts: torch.Tensor,
+        *,
+        mutate_cache: bool,
+    ) -> torch.Tensor:
+        if not bool(getattr(self, "separate_value_backbone", False)):
+            return self._official_rollout_hidden(obs, episode_starts, mutate_cache=mutate_cache)
+        with self._value_backbone_context():
+            return self._official_rollout_hidden(obs, episode_starts, mutate_cache=mutate_cache)
+
+    def _value_sequence_hidden(
+        self,
+        obs: torch.Tensor,
+        episode_starts: torch.Tensor,
+        *,
+        n_seq: int,
+    ) -> torch.Tensor:
+        if not bool(getattr(self, "separate_value_backbone", False)):
+            return self._official_sequence_hidden(obs, episode_starts, n_seq=n_seq)
+        with self._value_backbone_context():
+            return self._official_sequence_hidden(obs, episode_starts, n_seq=n_seq)
+
+    def _value_sequence_hidden_flat(
+        self,
+        obs: torch.Tensor,
+        *,
+        seq_lengths: np.ndarray,
+    ) -> torch.Tensor:
+        if not bool(getattr(self, "separate_value_backbone", False)):
+            return self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
+        with self._value_backbone_context():
+            return self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
 
     @staticmethod
     def _flat_to_time_major_sequence(tensor: torch.Tensor, *, n_seq: int) -> torch.Tensor:
@@ -3178,6 +5262,8 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
     def reset_rollout_cache(self, n_envs: int) -> None:
         self._rollout_kv_cache = None
         self._rollout_cache_batch_size = int(n_envs)
+        self._value_rollout_kv_cache = None
+        self._value_rollout_cache_batch_size = int(n_envs)
 
     def _reward_tokens_from_obs(self, obs: torch.Tensor) -> torch.Tensor:
         return obs[..., self.obs_slot_dim]
@@ -3783,25 +5869,72 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
                 reward_mask_t,
                 env_info,
             )
+            action_dims = env_info.get("action_dim_per_sample", None)
+            if action_dims is None:
+                action_dims = torch.full(
+                    (int(obs_full.shape[0]),),
+                    int(action_t.shape[-1]),
+                    device=obs_full.device,
+                    dtype=torch.long,
+                )
+            elif torch.is_tensor(action_dims):
+                action_dims = action_dims.to(device=obs_full.device, dtype=torch.long).reshape(-1)
+            else:
+                action_dims = torch.as_tensor(action_dims, device=obs_full.device, dtype=torch.long).reshape(-1)
+            batch_size = int(obs_full.shape[0])
             token_y = policy._reward_tokens_from_obs(obs_full).reshape(1, int(obs_full.shape[0]))
             token = policy.rlpfn_model._encode_train_token(obs_full.unsqueeze(0), token_y)
             token = policy.rlpfn_model._cast_token_for_rwkv_core(token)
-            if cache is None:
-                cache = policy.rlpfn_model.rwkv_core.init_state(
+            actor_cache = cache
+            value_cache = None
+            if bool(getattr(policy, "separate_value_backbone", False)) and isinstance(cache, dict):
+                actor_cache = cache.get("actor")
+                value_cache = cache.get("value")
+            if actor_cache is None:
+                actor_cache = policy.rlpfn_model.rwkv_core.init_state(
                     int(obs_full.shape[0]),
                     device=token.device,
                     dtype=token.dtype,
                 )
-            hidden, next_cache = policy.rlpfn_model.rwkv_core.forward_step(token[0], cache)
+                if bool(getattr(policy, "separate_value_backbone", False)):
+                    value_cache = None
+            hidden, next_actor_cache = policy.rlpfn_model.rwkv_core.forward_step(token[0], actor_cache)
             latent_pi = policy.mlp_extractor.forward_actor(hidden)
-            latent_vf = policy.mlp_extractor.forward_critic(hidden)
+            if bool(getattr(policy, "separate_value_backbone", False)):
+                with policy._value_backbone_context():
+                    if value_cache is None:
+                        value_cache = policy.rlpfn_model.rwkv_core.init_state(
+                            int(obs_full.shape[0]),
+                            device=token.device,
+                            dtype=token.dtype,
+                        )
+                    value_hidden, next_value_cache = policy.rlpfn_model.rwkv_core.forward_step(token[0], value_cache)
+                latent_vf = policy.mlp_extractor.forward_critic(value_hidden)
+                next_cache = {
+                    "actor": next_actor_cache,
+                    "value": next_value_cache,
+                }
+            else:
+                latent_vf = policy.mlp_extractor.forward_critic(hidden)
+                next_cache = next_actor_cache
             distribution = policy._get_action_dist_from_latent(latent_pi)
-            action_mean = distribution.distribution.mean
-            action_std = distribution.distribution.stddev
+            action_mean_full = distribution.distribution.mean
+            action_std_full = distribution.distribution.stddev
+            max_action_dim = int(action_dims.max().item()) if int(action_dims.numel()) > 0 else int(action_t.shape[-1])
+            max_action_dim = int(max(1, min(int(action_mean_full.shape[-1]), max_action_dim)))
+            action_mean = action_mean_full[:, :max_action_dim].clone()
+            action_std = action_std_full[:, :max_action_dim].clone()
+            for row_idx in range(batch_size):
+                action_dim = int(action_dims[row_idx].item())
+                if action_dim < max_action_dim:
+                    action_mean[row_idx, action_dim:] = 0.0
+                    action_std[row_idx, action_dim:] = 0.0
+            value_logits = policy._value_logits_from_latent(latent_vf)
             return {
                 "action_mean": action_mean,
                 "action_std": action_std,
-                "values": policy.value_net(latent_vf),
+                "values": policy._value_from_logits(value_logits),
+                "value_logits": value_logits,
             }, next_cache
 
         policy_step_fn._policy_actor_sample_fn = (
@@ -3813,6 +5946,9 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         self,
         obs_steps: torch.Tensor,
         episode_starts_steps: torch.Tensor,
+        *,
+        value_means: Optional[torch.Tensor | np.ndarray] = None,
+        value_stds: Optional[torch.Tensor | np.ndarray] = None,
     ) -> torch.Tensor:
         if obs_steps.ndim != 3:
             raise ValueError(f"obs_steps must have shape (T, B, F), got {tuple(obs_steps.shape)}")
@@ -3824,9 +5960,32 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         n_seq = int(obs_steps.shape[1])
         obs_flat = obs_steps.swapaxes(0, 1).reshape(-1, int(obs_steps.shape[-1]))
         starts_flat = episode_starts_steps.swapaxes(0, 1).reshape(-1)
-        hidden = self._official_sequence_hidden(obs_flat, starts_flat, n_seq=n_seq)
+        def _flatten_value_affine(value, *, name: str):
+            if value is None:
+                return None
+            if torch.is_tensor(value):
+                out = value.to(device=obs_steps.device, dtype=torch.float32)
+            else:
+                out = torch.as_tensor(value, device=obs_steps.device, dtype=torch.float32)
+            if out.ndim == 0:
+                return out
+            if tuple(out.shape) == tuple(obs_steps.shape[:2]):
+                return out.swapaxes(0, 1).reshape(-1)
+            if out.ndim == 2 and int(out.shape[0]) == 1 and int(out.shape[1]) == int(obs_steps.shape[1]):
+                return out.reshape(-1)
+            if out.ndim == 1 and int(out.shape[0]) == int(obs_flat.shape[0]):
+                return out
+            raise ValueError(
+                f"{name} must have shape (), (T, B), (1, B), or (T*B,), got {tuple(out.shape)}"
+            )
+        hidden = self._value_sequence_hidden(obs_flat, starts_flat, n_seq=n_seq)
         latent_vf = self.mlp_extractor.forward_critic(hidden)
-        values = self.value_net(latent_vf).reshape(n_seq, int(obs_steps.shape[0])).swapaxes(0, 1)
+        value_logits = self._value_logits_from_latent(latent_vf)
+        values = self._value_from_logits(
+            value_logits,
+            value_means=_flatten_value_affine(value_means, name="value_means"),
+            value_stds=_flatten_value_affine(value_stds, name="value_stds"),
+        ).reshape(n_seq, int(obs_steps.shape[0])).swapaxes(0, 1)
         return values
 
     def forward(
@@ -3842,8 +6001,10 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
             raise RuntimeError("PPO rollout forward must stay on the official no-grad eval path.")
         hidden = self._official_rollout_hidden(obs, episode_starts, mutate_cache=True)
         latent_pi = self.mlp_extractor.forward_actor(hidden)
-        latent_vf = self.mlp_extractor.forward_critic(hidden)
-        values = self.value_net(latent_vf)
+        value_hidden = self._value_rollout_hidden(obs, episode_starts, mutate_cache=True)
+        latent_vf = self.mlp_extractor.forward_critic(value_hidden)
+        value_logits = self._value_logits_from_latent(latent_vf)
+        values = self._value_from_logits(value_logits)
         distribution = self._get_action_dist_from_latent(latent_pi)
         action_mask_t = self._coerce_action_masks(action_masks, int(obs.shape[0]), device=obs.device)
         actions = distribution.get_actions(deterministic=deterministic)
@@ -3854,9 +6015,10 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
 
     def predict_values(self, obs: torch.Tensor, lstm_states, episode_starts: torch.Tensor) -> torch.Tensor:
         del lstm_states
-        hidden = self._official_rollout_hidden(obs, episode_starts, mutate_cache=False)
+        hidden = self._value_rollout_hidden(obs, episode_starts, mutate_cache=False)
         latent_vf = self.mlp_extractor.forward_critic(hidden)
-        return self.value_net(latent_vf)
+        value_logits = self._value_logits_from_latent(latent_vf)
+        return self._value_from_logits(value_logits)
 
     def evaluate_actions_with_hidden(
         self,
@@ -3868,15 +6030,18 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
     ):
         n_seq = int(lstm_states.pi[0].shape[1])
         hidden = self._official_sequence_hidden(obs, episode_starts, n_seq=n_seq)
+        value_hidden = self._value_sequence_hidden(obs, episode_starts, n_seq=n_seq)
         latent_pi = self.mlp_extractor.forward_actor(hidden)
-        latent_vf = self.mlp_extractor.forward_critic(hidden)
+        latent_vf = self.mlp_extractor.forward_critic(value_hidden)
         distribution = self._get_action_dist_from_latent(latent_pi)
         action_mask_t = self._coerce_action_masks(action_masks, int(obs.shape[0]), device=obs.device)
         actions = self._masked_action_tensor(actions, action_mask_t)
         log_prob, entropy = self._masked_diag_gaussian_stats(distribution, actions, action_mask_t)
-        values = self.value_net(latent_vf)
+        value_logits = self._value_logits_from_latent(latent_vf)
+        values = self._value_from_logits(value_logits)
         return {
             "values": values,
+            "value_logits": value_logits,
             "log_prob": log_prob,
             "entropy": entropy,
             "hidden": hidden,
@@ -3909,15 +6074,18 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         else:
             fused_outputs = None
             hidden = self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
+        value_hidden = self._value_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
         latent_pi = self.mlp_extractor.forward_actor(hidden)
-        latent_vf = self.mlp_extractor.forward_critic(hidden)
+        latent_vf = self.mlp_extractor.forward_critic(value_hidden)
         distribution = self._get_action_dist_from_latent(latent_pi)
         action_mask_t = self._coerce_action_masks(action_masks, int(obs.shape[0]), device=obs.device)
         actions = self._masked_action_tensor(actions, action_mask_t)
         log_prob, entropy = self._masked_diag_gaussian_stats(distribution, actions, action_mask_t)
-        values = self.value_net(latent_vf)
+        value_logits = self._value_logits_from_latent(latent_vf)
+        values = self._value_from_logits(value_logits)
         outputs = {
             "values": values,
+            "value_logits": value_logits,
             "log_prob": log_prob,
             "entropy": entropy,
             "hidden": hidden,
@@ -3969,11 +6137,64 @@ def build_recurrent_ppo(
     vf_coef: float,
     max_grad_norm: float,
     target_kl,
+    reset_env_state_at_sep: bool = False,
+    separate_value_backbone: bool = False,
+    strict_fixed_env_mode: bool = False,
+    env_rng_seeds: Optional[int | Sequence[int]] = None,
+    rollout_rng_seeds: Optional[int | Sequence[int]] = None,
+    deterministic_actor_sampling: bool = False,
+    deterministic_batch_plan: bool = False,
+    strict_native_rollout: bool = False,
+    restore_validation_policy_state: bool = False,
+    actor_gae_space: str = "normalized",
+    actor_baseline_mode: str = "learned",
+    actor_objective_mode: str = "tokenwise",
+    actor_objective_runtime_current_suite_name: Optional[str] = None,
+    runtime_normalized_q_value_weight_override=None,
+    runtime_next_state_flow_matching_weight_override=None,
     verbose: int = 0,
 ):
+    actor_gae_space = str(actor_gae_space).strip().lower()
+    if actor_gae_space not in {"normalized", "raw", "normalized_sep_synced"}:
+        raise ValueError(
+            f"Unsupported PPO actor GAE space: {actor_gae_space}. Expected 'normalized', 'normalized_sep_synced', or 'raw'."
+        )
+    actor_baseline_mode = str(actor_baseline_mode).strip().lower()
+    if actor_baseline_mode not in {"learned", "zero", "rollout_mean"}:
+        raise ValueError(
+            "Unsupported PPO actor baseline mode: "
+            f"{actor_baseline_mode}. Expected 'learned', 'zero', or 'rollout_mean'."
+        )
+    actor_objective_mode = str(actor_objective_mode).strip().lower()
+    if not _is_supported_actor_objective_mode(actor_objective_mode):
+        raise ValueError(
+            "Unsupported PPO actor objective mode: "
+            f"{actor_objective_mode}. Expected 'tokenwise', 'trajectory_suffix_return', "
+            "'tokenwise_suffix_return_correction', 'tokenwise_drop_q1_early', "
+            "'tokenwise_post_first_terminal_only', "
+            "'tokenwise_scale_env12_mid_episode_extension_block', "
+            "'tokenwise_shift_q1_contract', or a boundary-local mode such as "
+            "'tokenwise_drop_first_4_suffix_steps' / 'tokenwise_linear_ramp_first_8_suffix_steps'."
+        )
+    if clip_range_vf is not None:
+        raise ValueError("PPO bar-distribution value head requires ppo_clip_range_vf=None.")
+    effective_env_prior = env_prior
+    if (
+        runtime_normalized_q_value_weight_override is not None
+        or runtime_next_state_flow_matching_weight_override is not None
+    ):
+        effective_env_prior = copy.deepcopy(env_prior)
+        if runtime_normalized_q_value_weight_override is not None:
+            effective_env_prior.config["normalized_q_value_weight"] = float(
+                runtime_normalized_q_value_weight_override
+            )
+        if runtime_next_state_flow_matching_weight_override is not None:
+            effective_env_prior.config["next_state_flow_matching_weight"] = float(
+                runtime_next_state_flow_matching_weight_override
+            )
     boundary = _validate_official_rwkv_ppo_boundary(
         model=model,
-        env_prior=env_prior,
+        env_prior=effective_env_prior,
         device=device,
         num_features=num_features,
     )
@@ -3988,7 +6209,7 @@ def build_recurrent_ppo(
     )
 
     vec_env = EnvironmentPriorPPOBatchVecEnv(
-        env_prior=env_prior,
+        env_prior=effective_env_prior,
         device=device,
         num_features=num_features,
         n_steps=int(n_steps),
@@ -4020,13 +6241,79 @@ def build_recurrent_ppo(
             "rlpfn_model": target_model,
             "num_features": int(num_features),
             "obs_slot_dim": int(obs_slot_dim),
+            "separate_value_backbone": bool(separate_value_backbone),
             "net_arch": [],
         },
     )
+    if bool(restore_validation_policy_state):
+        saved_policy_state = getattr(model, "_validation_ppo_policy_state", None)
+        if not isinstance(saved_policy_state, dict):
+            raise ValueError(
+                "restore_validation_policy_state=True requires model._validation_ppo_policy_state to be present."
+            )
+        _restore_saved_recurrent_ppo_policy_state(algo.policy, saved_policy_state)
+
+    def _set_force_native_eval_forward_step(model_ref, enabled: bool) -> None:
+        core = getattr(model_ref, "rwkv_core", None)
+        if core is None:
+            return
+        setattr(core, "force_native_eval_forward_step", bool(enabled))
+        if bool(enabled):
+            setattr(core, "_official_eval_core", None)
+            setattr(core, "_official_eval_core_device", None)
+
+    _set_force_native_eval_forward_step(algo.policy.rlpfn_model, bool(strict_native_rollout))
+    if getattr(algo.policy, "value_rlpfn_model", None) is not None:
+        _set_force_native_eval_forward_step(algo.policy.value_rlpfn_model, bool(strict_native_rollout))
+
     callback = _NullCallback()
-    algo._rwkv_env_prior = env_prior
+    setattr(effective_env_prior, "_rwkv_reset_env_state_at_sep_keep_actor_history", bool(reset_env_state_at_sep))
+    algo._rwkv_env_prior = effective_env_prior
     algo._rwkv_aux_q_weight = float(boundary["q_weight"])
     algo._rwkv_aux_flow_weight = float(boundary["fm_weight"])
+    algo._rwkv_reset_env_state_at_sep = bool(reset_env_state_at_sep)
+    algo._rwkv_strict_fixed_env_mode = bool(
+        strict_fixed_env_mode or env_rng_seeds is not None or rollout_rng_seeds is not None
+    )
+    algo._rwkv_env_rng_seeds = _normalize_optional_seed_spec(
+        env_rng_seeds,
+        n_envs=int(n_envs),
+        name="env_rng_seeds",
+    )
+    algo._rwkv_rollout_rng_seeds = _normalize_optional_seed_spec(
+        rollout_rng_seeds,
+        n_envs=int(n_envs),
+        name="rollout_rng_seeds",
+    )
+    algo._rwkv_last_collect_rollout_env_rng_seeds = None
+    algo._rwkv_last_collect_rollout_rollout_rng_seeds = None
+    algo._rwkv_deterministic_actor_sampling = bool(deterministic_actor_sampling)
+    algo._rwkv_deterministic_batch_plan = bool(deterministic_batch_plan)
+    algo._rwkv_strict_native_rollout = bool(strict_native_rollout)
+    algo._rwkv_train_outer_batch_snapshot_path = None
+    algo._rwkv_train_outer_batch_snapshot_written = False
+    algo._rwkv_last_train_outer_batch_snapshot_path = None
+    algo._rwkv_train_outer_batch_selector_trace_path = None
+    algo._rwkv_train_outer_batch_selector_trace_rows = []
+    algo._rwkv_train_outer_batch_selector_trace_completed = False
+    algo._rwkv_last_train_outer_batch_selector_trace_path = None
+    algo._rwkv_train_outer_batch_snapshot_target_outer_batch_idx = None
+    algo._rwkv_train_outer_batch_snapshot_target_env_index = None
+    algo._rwkv_train_outer_batch_snapshot_target_objective_episode_index = None
+    algo._rwkv_train_outer_batch_snapshot_target_objective_position_start = None
+    algo._rwkv_train_outer_batch_snapshot_target_objective_position_end = None
     if isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer):
         algo.rollout_buffer._enable_q_target_cache = float(boundary["q_weight"]) > 0.0
+        algo.rollout_buffer._actor_gae_space = actor_gae_space
+        algo.rollout_buffer._actor_baseline_mode = actor_baseline_mode
+        algo.rollout_buffer._actor_objective_mode = actor_objective_mode
+        algo.rollout_buffer._actor_objective_runtime_current_suite_name = (
+            None
+            if actor_objective_runtime_current_suite_name is None
+            else str(actor_objective_runtime_current_suite_name).strip().lower()
+        )
+        algo.rollout_buffer.set_deterministic_batch_plan(bool(deterministic_batch_plan))
+    algo._rwkv_actor_gae_space = actor_gae_space
+    algo._rwkv_actor_objective_mode = actor_objective_mode
+    algo._rwkv_separate_value_backbone = bool(separate_value_backbone)
     return algo, callback, vec_env
