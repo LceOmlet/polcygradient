@@ -1,4 +1,5 @@
 import os
+import json
 import random
 import math
 import numpy as np
@@ -101,6 +102,15 @@ def test_environment_prior_shapes_and_finite():
     assert torch.isfinite(x).all()
     assert torch.isfinite(y).all()
     assert torch.isfinite(y_).all()
+
+
+def test_environment_prior_default_activation_choices_match_exact_scm_mainline():
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    activation_cfg = env_cfg["prior_mlp_activations"]
+    assert activation_cfg["distribution"] == "meta_choice"
+    choice_values = activation_cfg["choice_values"]
+    assert choice_values == ["sin", torch.nn.Tanh, torch.nn.ReLU]
 
 
 def test_environment_prior_clear_rollout_artifacts_resets_all_cached_slots():
@@ -2852,6 +2862,62 @@ def test_environment_prior_action_clip_preserves_in_range_magnitude():
     assert torch.allclose(transformed, expected)
 
 
+def test_environment_prior_action_clip_supports_batchwise_clip_bounds():
+    action_raw = torch.tensor(
+        [
+            [-9.0, -4.0, 2.5],
+            [1.0, 7.5, -12.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    transformed = EnvironmentPrior._transform_reinforce_action(
+        action_raw,
+        mode="clip",
+        clip_bound=torch.tensor([2.0, 5.0], dtype=torch.float32),
+    )
+
+    expected = torch.tensor(
+        [
+            [-2.0, -2.0, 2.0],
+            [1.0, 5.0, -5.0],
+        ],
+        dtype=torch.float32,
+    )
+    assert torch.allclose(transformed, expected)
+
+
+def test_environment_prior_sample_environment_batch_uses_sampled_reinforce_transforms():
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    prior = EnvironmentPrior(env_cfg)
+    sampled_h = _manual_sampled_h(
+        family="gp",
+        state_dim=7,
+        obs_dim=5,
+        action_dim=2,
+        noise_dim=3,
+        zero_pad_dim=1,
+        gp_rff_features=32,
+    )
+    sampled_h["reinforce_action_transform"] = "none"
+    sampled_h["reinforce_reward_transform"] = "none"
+
+    env_serial = prior._sample_environment(sampled_h, device="cpu", rng_seed=37)
+    env_batch = prior._sample_environment_batch([sampled_h], device="cpu", rng_seeds=[37])
+
+    assert env_serial["reinforce_action_transform"] == "none"
+    assert env_batch["reinforce_action_transform"] == "none"
+    assert env_serial["reinforce_reward_transform"] == "none"
+    assert env_batch["reinforce_reward_transform"] == "none"
+    assert torch.allclose(
+        env_serial["initial_state"],
+        env_batch["initial_state"][0],
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
 def test_environment_prior_state_grad_clip_norm_clips_per_row_global_norm():
     state_next = torch.tensor(
         [
@@ -3938,8 +4004,8 @@ def test_environment_prior_strict_joint_transition_builds_single_generator(famil
     env = prior._sample_environment(h, device="cpu", rng_seed=123)
 
     assert callable(env["transition_generator"])
-    assert env["x_generator"] is None
-    assert env["y_generator"] is None
+    assert "x_generator" not in env
+    assert "y_generator" not in env
     assert callable(env["policy_generator"])
 
     in_dim = int(env["env_input_dim"])
@@ -3980,10 +4046,8 @@ def test_environment_prior_legacy_scm_transition_supports_sin_activation():
 
     in_dim = int(env_sin["env_input_dim"])
     env_in = torch.linspace(-4.0, 4.0, steps=2 * in_dim, dtype=torch.float32).reshape(2, in_dim)
-    state_sin = env_sin["x_generator"](env_in)
-    reward_sin = env_sin["y_generator"](env_in)
-    state_tanh = env_tanh["x_generator"](env_in)
-    reward_tanh = env_tanh["y_generator"](env_in)
+    state_sin, reward_sin = env_sin["transition_generator"](env_in)
+    state_tanh, reward_tanh = env_tanh["transition_generator"](env_in)
 
     assert torch.isfinite(state_sin).all()
     assert torch.isfinite(reward_sin).all()
@@ -4884,8 +4948,6 @@ def test_environment_prior_strict_reference_scm_family_coarse_batch_matches_refe
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     assert bool(getattr(env_batch["transition_generator"], "_reference_scm_vectorized", False))
@@ -4960,8 +5022,6 @@ def test_environment_prior_strict_reference_scm_family_coarse_batch_matches_refe
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     assert bool(getattr(env_batch["transition_generator"], "_reference_scm_vectorized", False))
@@ -5023,8 +5083,6 @@ def test_environment_prior_strict_reference_scm_family_coarse_batch_packed_input
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     transition = env_batch["transition_generator"]
@@ -5099,16 +5157,12 @@ def test_environment_prior_strict_reference_scm_layer_compile_matches_eager_and_
         h_list=h_list,
         device="cuda",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     env_compiled = prior_compiled._sample_environment_family_coarse_batch(
         h_list=h_list,
         device="cuda",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     in_dim = int(env_eager["env_input_dim"])
@@ -5166,8 +5220,6 @@ def test_environment_prior_strict_reference_scm_layer_compile_matches_eager_and_
         h_list=h_list_2,
         device="cuda",
         rng_seeds=[777, 888, 999],
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     env_in_2 = torch.linspace(
@@ -5249,8 +5301,6 @@ def test_environment_prior_strict_reference_gp_family_coarse_batch_matches_refer
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     assert bool(getattr(env_batch["transition_generator"], "_reference_gp_vectorized", False))
@@ -5306,8 +5356,6 @@ def test_environment_prior_strict_reference_gp_family_coarse_batch_repeats_ident
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     env_in = torch.linspace(
@@ -5351,8 +5399,6 @@ def test_environment_prior_strict_reference_gp_family_coarse_batch_multistep_mat
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     fast_fn = env_batch["transition_generator"]
@@ -5486,8 +5532,6 @@ def test_environment_prior_reference_gp_fixed_cost_family_coarse_batch_matches_s
         h_list=h_list,
         device="cpu",
         rng_seeds=seeds,
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
     )
     assert bool(getattr(env_batch["transition_generator"], "_reference_gp_fixed_cost", False))
@@ -5643,6 +5687,248 @@ def test_environment_prior_strict_reference_semantics_override_env_fields_and_se
     assert float(info["reward_drop_frac_realized"]) == 0.0
 
 
+def test_environment_prior_reference_state_inertia_preserves_alpha_and_rollout_mixing(monkeypatch):
+    _seed_everything(20260422)
+    prior = EnvironmentPrior({})
+    fixed_state = torch.tensor([0.1, -0.2, 0.3], dtype=torch.float32)
+    captured_env_inputs = []
+
+    def _constant_policy_builder(in_dim, out_dim, h, device, generator=None, apply_output_tanh=True):
+        del in_dim, h, generator
+
+        def _fn(x, generator=None):
+            del x, generator
+            return torch.zeros((1, out_dim), device=device, dtype=torch.float32)
+
+        _fn._applies_output_tanh = bool(apply_output_tanh)
+        return _fn
+
+    def _constant_transition_builder(in_dim, state_dim, h, device, generator=None):
+        del in_dim, h, generator
+
+        def _fn(x, generator=None):
+            del generator
+            captured_env_inputs.append(x.detach().clone())
+            state = torch.full((1, state_dim), 2.0, device=device, dtype=torch.float32)
+            reward = torch.full((1, 1), 3.0, device=device, dtype=torch.float32)
+            return state, reward
+
+        _fn._applies_output_tanh = False
+        return _fn
+
+    monkeypatch.setattr(prior, "_build_scm_fn", _constant_policy_builder)
+    monkeypatch.setattr(prior, "_build_scm_joint_transition_fn", _constant_transition_builder)
+    monkeypatch.setattr(prior, "_build_reference_scm_joint_transition_fn", _constant_transition_builder)
+    monkeypatch.setattr(
+        prior,
+        "_sample_random_initial_state",
+        lambda state_dim, **kwargs: fixed_state[:state_dim].to(
+            device=kwargs["device"],
+            dtype=kwargs.get("dtype", torch.float32),
+        ),
+    )
+
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=3,
+        obs_dim=2,
+        action_dim=1,
+        noise_dim=1,
+        zero_pad_dim=1,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["reference_state_inertia_enabled"] = True
+    h["alpha"] = 0.2
+    h["init_state_std"] = 0.1
+    h["state_noise_std"] = 1.0
+
+    env_serial = prior._sample_environment(h, device="cpu", rng_seed=123)
+    env_batch = prior._sample_environment_batch([h, h], device="cpu", rng_seeds=[11, 23])
+
+    assert bool(env_serial["reference_semantics_enabled"]) is True
+    assert bool(env_serial["reference_state_inertia_enabled"]) is True
+    assert float(env_serial["alpha"]) == pytest.approx(0.2)
+    assert torch.equal(
+        env_batch["reference_state_inertia_enabled"],
+        torch.tensor([True, True], dtype=torch.bool),
+    )
+    assert torch.allclose(env_batch["alpha"], torch.full((2,), 0.2, dtype=torch.float32))
+
+    x, y, _ = prior._rollout_single(
+        env=env_serial,
+        n_samples=2,
+        num_features=8,
+        single_eval_pos=1,
+        device="cpu",
+        collect_x=True,
+        collect_runtime_info=False,
+        rng_seed=456,
+    )
+
+    expected_carry_next = ((1.0 - 0.2) * fixed_state) + (0.2 * torch.full_like(fixed_state, 2.0))
+    assert len(captured_env_inputs) == 2
+    assert torch.allclose(x[1, :2], torch.full((2,), 2.0), atol=1e-6, rtol=1e-6)
+    assert torch.allclose(captured_env_inputs[1][0, :3], expected_carry_next, atol=1e-6, rtol=1e-6)
+    assert torch.allclose(y, torch.full_like(y, 3.0))
+
+
+def test_environment_prior_reward_state_input_gain_fraction_rejection_sampling_accepts_threshold():
+    _seed_everything(20260424)
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=320,
+        obs_dim=160,
+        action_dim=6,
+        noise_dim=8,
+        zero_pad_dim=66,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["reward_state_input_gain_fraction_rejection_min"] = 0.58
+    h["reward_state_input_gain_fraction_rejection_max_tries"] = 64
+
+    env = prior._sample_environment(h, device="cpu", rng_seed=123)
+
+    assert float(env["reward_state_input_gain_fraction"]) >= 0.58
+    assert bool(env["reward_state_input_gain_fraction_rejection_accepted"]) is True
+    assert 1 <= int(env["reward_state_input_gain_fraction_rejection_attempt"]) <= 64
+
+
+def test_environment_prior_reward_state_input_gain_fraction_rejection_sampling_accepts_vectorized_batch():
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=32,
+        obs_dim=16,
+        action_dim=4,
+        noise_dim=6,
+        zero_pad_dim=10,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["reward_state_input_gain_fraction_rejection_min"] = 0.01
+    h["reward_state_input_gain_fraction_rejection_max_tries"] = 8
+
+    env = prior._sample_environment_batch([dict(h), dict(h)], device="cpu", rng_seeds=[1, 2])
+    env_repeat = prior._sample_environment_batch([dict(h), dict(h)], device="cpu", rng_seeds=[1, 2])
+
+    transition = env["transition_generator"]
+    assert bool(getattr(transition, "_reference_scm_vectorized", False)) is True
+    assert torch.is_tensor(env["reward_state_input_gain_fraction"])
+    assert tuple(env["reward_state_input_gain_fraction"].shape) == (2,)
+    assert torch.all(env["reward_state_input_gain_fraction"] >= 0.01)
+    assert torch.all(env["reward_state_input_gain_fraction_rejection_accepted"])
+    assert torch.all(env["reward_state_input_gain_fraction_rejection_attempt"] >= 1)
+    assert tuple(env["reward_state_input_gain_fraction_rejection_env_rng_seed"].shape) == (2,)
+    assert torch.equal(
+        env["reward_state_input_gain_fraction_rejection_env_rng_seed"],
+        env_repeat["reward_state_input_gain_fraction_rejection_env_rng_seed"],
+    )
+    assert torch.equal(
+        env["reward_state_input_gain_fraction_rejection_attempt"],
+        env_repeat["reward_state_input_gain_fraction_rejection_attempt"],
+    )
+    assert torch.allclose(
+        env["reward_state_input_gain_fraction"],
+        env_repeat["reward_state_input_gain_fraction"],
+    )
+
+
+def test_environment_prior_reward_state_input_gain_fraction_rejection_sampling_accepts_family_vectorized_batch():
+    prior = EnvironmentPrior({})
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=40,
+        obs_dim=20,
+        action_dim=4,
+        noise_dim=2,
+        zero_pad_dim=8,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["reward_state_input_gain_fraction_rejection_min"] = 0.01
+    h["reward_state_input_gain_fraction_rejection_max_tries"] = 8
+
+    env = prior._sample_environment_family_coarse_batch(
+        [dict(h), dict(h)],
+        device="cpu",
+        rng_seeds=[11, 22],
+        build_policy_generator=False,
+    )
+
+    transition = env["transition_generator"]
+    assert bool(getattr(transition, "_reference_scm_vectorized", False)) is True
+    assert torch.is_tensor(env["reward_state_input_gain_fraction"])
+    assert tuple(env["reward_state_input_gain_fraction"].shape) == (2,)
+    assert torch.all(env["reward_state_input_gain_fraction"] >= 0.01)
+    assert torch.all(env["reward_state_input_gain_fraction_rejection_accepted"])
+
+
+def test_environment_prior_reward_state_input_gain_fraction_conditioned_training_sampler_fills_batch():
+    _seed_everything(20260425)
+    prior = EnvironmentPrior(
+        {
+            "family": "scm",
+            "state_dim": 40,
+            "obs_dim": 20,
+            "action_dim": 4,
+            "noise_dim": 2,
+            "zero_pad_dim": 8,
+            "num_layers": 3,
+            "strict_joint_transition_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_sampling_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_min": 0.01,
+        }
+    )
+
+    h_list, env, accepted_seeds = prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+        2,
+        device="cpu",
+        rng_seeds=[101, 202],
+        build_policy_generator=False,
+    )
+
+    transition = env["transition_generator"]
+    assert len(h_list) == 2
+    assert len(accepted_seeds) == 2
+    assert bool(getattr(transition, "_reference_scm_vectorized", False)) is True
+    assert torch.all(env["reward_state_input_gain_fraction"] >= 0.01)
+    assert torch.all(env["reward_state_input_gain_fraction_conditioned_sampling_enabled"])
+    assert torch.all(env["reward_state_input_gain_fraction_conditioned_min"] == 0.01)
+    assert torch.all(env["reward_state_input_gain_fraction_conditioned_attempt"] >= 1)
+    for sampled_h in h_list:
+        assert float(sampled_h["reward_state_input_gain_fraction_rejection_min"]) == 0.0
+
+
+def test_environment_prior_fixed_frozen_h_json_clones_hyper_sample_source(tmp_path):
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=24,
+        obs_dim=12,
+        action_dim=3,
+        noise_dim=2,
+        zero_pad_dim=5,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["reward_state_input_gain_fraction_rejection_min"] = 0.7
+    path = tmp_path / "full_frozen_h.json"
+    path.write_text(json.dumps({"frozen_h": h}), encoding="utf-8")
+
+    prior = EnvironmentPrior({"fixed_frozen_h_json": str(path)})
+    h_list = prior._sample_batch_hypers(3)
+
+    assert len(h_list) == 3
+    assert h_list[0] is not h_list[1]
+    for sampled_h in h_list:
+        assert sampled_h["state_dim"] == 24
+        assert sampled_h["action_dim"] == 3
+        assert sampled_h["strict_joint_transition_enabled"] is True
+        assert sampled_h["reward_state_input_gain_fraction_rejection_min"] == 0.0
+        assert sampled_h["fixed_frozen_h_json"] == str(path.resolve())
+
 def test_environment_prior_strict_reference_semantics_shared_vectorized_rollout(monkeypatch):
     _seed_everything(20260309)
     prior = EnvironmentPrior({})
@@ -5721,6 +6007,73 @@ def test_environment_prior_strict_reference_semantics_shared_vectorized_rollout(
     assert torch.allclose(captured["shared_env_in"][:, :3], torch.full((2, 3), 0.5))
     assert len(info) == 2
     assert all(float(row["reward_drop_frac_realized"]) == 0.0 for row in info)
+
+
+def test_environment_prior_rollout_single_reuses_sampled_initial_state_for_start_and_reset(monkeypatch):
+    _seed_everything(20260422)
+    prior = EnvironmentPrior({})
+    helper_calls = []
+
+    def _wrapped_sample_random_initial_state(*args, **kwargs):
+        helper_calls.append(("single", int(args[0])))
+        return EnvironmentPrior._sample_random_initial_state(prior, *args, **kwargs)
+
+    def _wrapped_sample_random_initial_state_batch(*args, **kwargs):
+        helper_calls.append(("batch", tuple(kwargs["shape"])))
+        return EnvironmentPrior._sample_random_initial_state_batch(prior, *args, **kwargs)
+
+    monkeypatch.setattr(prior, "_sample_random_initial_state", _wrapped_sample_random_initial_state)
+    monkeypatch.setattr(prior, "_sample_random_initial_state_batch", _wrapped_sample_random_initial_state_batch)
+    _install_constant_terminal_builders(prior, monkeypatch)
+
+    h = _manual_sampled_h(
+        family="scm",
+        state_dim=4,
+        obs_dim=3,
+        action_dim=2,
+        noise_dim=2,
+        zero_pad_dim=1,
+        num_layers=3,
+    )
+    h["strict_joint_transition_enabled"] = True
+    h["terminal_reset_enabled"] = True
+    h["terminal_reset_count_target"] = 4.0
+    h["init_state_std"] = 0.5
+    h["init_action_std"] = 0.0
+    h["alpha"] = 1.0
+    h["reward_scale"] = 1.0
+    h["state_noise_std"] = 0.0
+    h["action_noise_train_std"] = 0.0
+    h["action_noise_eval_std"] = 0.0
+    h["terminal_bonus_scale_min"] = 1.0
+    h["terminal_bonus_scale_max"] = 1.0
+
+    env = prior._sample_environment(h, device="cpu", rng_seed=12)
+    assert helper_calls[0] == ("single", 4)
+    fixed_initial_state = torch.tensor([0.75, -0.5, 0.25, 1.25], dtype=torch.float32)
+    env["initial_state"] = fixed_initial_state.clone()
+    helper_calls.clear()
+    x, y, info = prior._rollout_single(
+        env=env,
+        n_samples=4,
+        num_features=10,
+        single_eval_pos=2,
+        device="cpu",
+        collect_x=True,
+        collect_runtime_info=True,
+        rng_seed=34,
+    )
+
+    assert helper_calls == []
+    assert x.shape == (4, 10)
+    assert y.shape == (4,)
+    assert int(info["state_dim"]) == 4
+    assert torch.allclose(
+        x[:, :3],
+        fixed_initial_state[:3].expand(4, 3),
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_environment_prior_torch_vectorized_preserves_heterogeneous_structure_semantics():
@@ -7050,7 +7403,7 @@ def test_environment_prior_balanced_transition_bucket_groups_split_family_into_f
     assert min(group_sizes) >= 1
 
 
-def test_environment_prior_family_coarse_batch_transition_only_build_falls_back_without_fused_transition():
+def test_environment_prior_family_coarse_batch_joint_only_build_uses_transition_generator_on_cpu():
     _seed_everything(20260307)
     cfg = dict(get_prior_config()["prior"]["environment"])
     sampled = [
@@ -7077,16 +7430,15 @@ def test_environment_prior_family_coarse_batch_transition_only_build_falls_back_
     env_batch = prior._sample_environment_family_coarse_batch(
         h_list=sampled,
         device="cpu",
-        prefer_transition_only=True,
         build_policy_generator=False,
     )
-    assert callable(env_batch["x_generator"])
-    assert callable(env_batch["y_generator"])
+    assert "x_generator" not in env_batch
+    assert "y_generator" not in env_batch
     assert env_batch["policy_generator"] is None
-    assert env_batch["transition_generator"] is None
+    assert callable(env_batch["transition_generator"])
     build_profile = env_batch["_build_profile"]
     assert int(build_profile["transition_only_build_enabled"]) == 0
-    assert int(build_profile["non_transition_generator_build_count"]) == 2
+    assert int(build_profile["non_transition_generator_build_count"]) == 0
     assert int(build_profile["non_transition_generator_skip_count"]) == 1
 
 
@@ -7128,27 +7480,26 @@ def test_environment_prior_family_coarse_batch_skipped_generators_preserve_cpu_r
     env_skip = prior._sample_environment_family_coarse_batch(
         h_list=[sampled[0]],
         device="cpu",
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
         preserve_skipped_generator_rng=True,
     )
     cpu_rng_after_skip = torch.random.get_rng_state()
 
-    assert callable(env_full["x_generator"])
-    assert callable(env_full["y_generator"])
+    assert callable(env_full["transition_generator"])
     assert callable(env_full["policy_generator"])
-    assert env_skip["x_generator"] is None
-    assert env_skip["y_generator"] is None
+    assert "x_generator" not in env_full
+    assert "y_generator" not in env_full
+    assert callable(env_skip["transition_generator"])
+    assert "x_generator" not in env_skip
+    assert "y_generator" not in env_skip
     assert env_skip["policy_generator"] is None
-    assert env_skip["transition_generator"] is None
     assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
     build_profile = env_skip["_build_profile"]
     assert int(build_profile["transition_only_build_enabled"]) == 0
-    assert int(build_profile["skipped_non_transition_generator_count"]) == 3
-    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 3
+    assert int(build_profile["skipped_non_transition_generator_count"]) == 1
+    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 1
     assert int(build_profile["non_transition_generator_build_count"]) == 0
-    assert int(build_profile["non_transition_generator_skip_count"]) == 3
+    assert int(build_profile["non_transition_generator_skip_count"]) == 1
 
     # Also probe the GP path because its init consumes mixed rand/randn draws.
     torch.manual_seed(20260308)
@@ -7164,8 +7515,6 @@ def test_environment_prior_family_coarse_batch_skipped_generators_preserve_cpu_r
     prior._sample_environment_family_coarse_batch(
         h_list=[sampled[1]],
         device="cpu",
-        build_x_generator=False,
-        build_y_generator=False,
         build_policy_generator=False,
         preserve_skipped_generator_rng=True,
     )
@@ -7173,8 +7522,8 @@ def test_environment_prior_family_coarse_batch_skipped_generators_preserve_cpu_r
     assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
 
 
-@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for transition-only env build")
-def test_environment_prior_family_coarse_batch_transition_only_build_skips_non_transition_generators_on_cuda():
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for joint transition env build")
+def test_environment_prior_family_coarse_batch_joint_transition_build_skips_policy_generator_on_cuda():
     _seed_everything(20260307)
     torch.cuda.empty_cache()
     cfg = dict(get_prior_config()["prior"]["environment"])
@@ -7203,19 +7552,18 @@ def test_environment_prior_family_coarse_batch_transition_only_build_skips_non_t
         env_batch = prior._sample_environment_family_coarse_batch(
             h_list=sampled,
             device="cuda",
-            prefer_transition_only=True,
             build_policy_generator=False,
         )
     except (torch.OutOfMemoryError, torch.AcceleratorError):
-        pytest.skip("CUDA OOM while probing transition-only env build")
-    assert env_batch["x_generator"] is None
-    assert env_batch["y_generator"] is None
+        pytest.skip("CUDA OOM while probing joint transition env build")
+    assert "x_generator" not in env_batch
+    assert "y_generator" not in env_batch
     assert env_batch["policy_generator"] is None
     assert callable(env_batch["transition_generator"])
     build_profile = env_batch["_build_profile"]
-    assert int(build_profile["transition_only_build_enabled"]) == 1
+    assert int(build_profile["transition_only_build_enabled"]) == 0
     assert int(build_profile["non_transition_generator_build_count"]) == 0
-    assert int(build_profile["non_transition_generator_skip_count"]) == 3
+    assert int(build_profile["non_transition_generator_skip_count"]) == 1
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required for fused-transition env build")
@@ -7268,8 +7616,6 @@ def test_environment_prior_family_coarse_batch_auto_elision_preserves_cuda_rng_s
         env_skip = prior._sample_environment_family_coarse_batch(
             h_list=sampled,
             device=device,
-            build_x_generator=False,
-            build_y_generator=False,
             build_policy_generator=False,
             preserve_skipped_generator_rng=True,
         )
@@ -7280,17 +7626,17 @@ def test_environment_prior_family_coarse_batch_auto_elision_preserves_cuda_rng_s
 
     assert callable(env_full["transition_generator"])
     assert callable(env_skip["transition_generator"])
-    assert env_skip["x_generator"] is None
-    assert env_skip["y_generator"] is None
+    assert "x_generator" not in env_skip
+    assert "y_generator" not in env_skip
     assert env_skip["policy_generator"] is None
     assert torch.equal(cpu_rng_after_full, cpu_rng_after_skip)
     assert torch.equal(cuda_rng_after_full, cuda_rng_after_skip)
     build_profile = env_skip["_build_profile"]
     assert int(build_profile["transition_only_build_enabled"]) == 0
-    assert int(build_profile["skipped_non_transition_generator_count"]) == 3
-    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 3
+    assert int(build_profile["skipped_non_transition_generator_count"]) == 1
+    assert int(build_profile["skipped_non_transition_rng_preserve_count"]) == 1
     assert int(build_profile["non_transition_generator_build_count"]) == 0
-    assert int(build_profile["non_transition_generator_skip_count"]) == 3
+    assert int(build_profile["non_transition_generator_skip_count"]) == 1
 
 def _install_constant_terminal_builders(prior, monkeypatch):
     def _constant_policy_builder(in_dim, out_dim, h, device, generator=None, apply_output_tanh=True):
