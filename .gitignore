@@ -184,10 +184,11 @@ tabpfn/mlruns/
 tabpfn/results
 mothernet/results_bak
 ticl/models_diff
+models_diff/
+*.cpkt
 
 mlruns
 **/wandb/
 
 # drafts
-
 

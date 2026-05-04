@@ -1454,6 +1454,10 @@ class EnvironmentPrior:
         cfg.setdefault("reward_state_input_gain_fraction_rejection_max_tries", 128)
         cfg.setdefault("reward_state_input_gain_fraction_conditioned_sampling_enabled", False)
         cfg.setdefault("reward_state_input_gain_fraction_conditioned_min", 0.0)
+        cfg.setdefault("reward_topology_conditioned_sampling_enabled", False)
+        cfg.setdefault("reward_action_input_gain_fraction_conditioned_min", 0.0)
+        cfg.setdefault("reward_state_to_action_gain_ratio_conditioned_max", 0.0)
+        cfg.setdefault("reward_topology_conditioned_sampling_max_attempts", 4096)
         cfg.setdefault("fixed_frozen_h_json", None)
         # Batch-level rollout parallelism for get_batch():
         # each batch column is independent and can be generated concurrently.
@@ -1465,6 +1469,14 @@ class EnvironmentPrior:
         # - "structure": strict homogeneous grouping (legacy semantics path)
         # - "family": coarser grouping by family to enlarge policy-step batch width
         cfg.setdefault("batch_vectorized_grouping", "structure")
+        # Transition-generator execution grouping. None preserves the historical
+        # environment-variable controlled behavior; explicit config values are
+        # preferred by fit_model so the memory contract is visible in saved args.
+        cfg.setdefault("transition_inner_grouping", None)
+        cfg.setdefault("transition_inner_min_bucket", None)
+        cfg.setdefault("reference_scm_partition_max_bytes", None)
+        cfg.setdefault("reference_scm_memory_guard_fraction", None)
+        cfg.setdefault("transition_generator_rebuild_each_step", False)
 
         # Dynamics / rollout knobs.
         cfg.setdefault("alpha", {"distribution": "uniform", "min": 0.05, "max": 0.35})
@@ -1478,6 +1490,7 @@ class EnvironmentPrior:
         cfg.setdefault("reward_scale", {"distribution": "uniform", "min": 0.1, "max": 10.0})
         cfg.setdefault("reward_clip", 10.0)
         cfg.setdefault("state_clip", 8.0)
+        cfg.setdefault("state_output_scale", 1.0)
         cfg.setdefault("state_input_scale_enabled", False)
         cfg.setdefault("state_input_scale", 1.0)
         cfg.setdefault("state_full_rms_enabled", False)
@@ -1730,12 +1743,20 @@ class EnvironmentPrior:
             "no",
             "off",
         }
-        self.reference_scm_memory_guard_fraction = float(
-            os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION", "0.25")
-        )
-        reference_scm_partition_max_bytes = str(
-            os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES", str(2 * 1024 * 1024 * 1024))
-        ).strip()
+        reference_scm_memory_guard_fraction = self.config.get("reference_scm_memory_guard_fraction", None)
+        if reference_scm_memory_guard_fraction is None:
+            reference_scm_memory_guard_fraction = os.environ.get(
+                "TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION",
+                "0.25",
+            )
+        self.reference_scm_memory_guard_fraction = float(reference_scm_memory_guard_fraction)
+        reference_scm_partition_max_bytes = self.config.get("reference_scm_partition_max_bytes", None)
+        if reference_scm_partition_max_bytes is None:
+            reference_scm_partition_max_bytes = os.environ.get(
+                "TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES",
+                str(2 * 1024 * 1024 * 1024),
+            )
+        reference_scm_partition_max_bytes = str(reference_scm_partition_max_bytes).strip()
         try:
             self.reference_scm_partition_max_bytes = int(reference_scm_partition_max_bytes)
         except Exception:
@@ -1824,9 +1845,10 @@ class EnvironmentPrior:
             "yes",
             "on",
         }
-        transition_inner_grouping = str(
-            os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING", "family")
-        ).strip().lower()
+        transition_inner_grouping = self.config.get("transition_inner_grouping", None)
+        if transition_inner_grouping is None:
+            transition_inner_grouping = os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING", "family")
+        transition_inner_grouping = str(transition_inner_grouping).strip().lower()
         if transition_inner_grouping in {"", "1", "true", "yes", "on"}:
             transition_inner_grouping = "structure"
         if transition_inner_grouping in {"0", "false", "no", "off"}:
@@ -1835,10 +1857,16 @@ class EnvironmentPrior:
             transition_inner_grouping = "family"
         self.transition_inner_grouping = transition_inner_grouping
         try:
-            transition_inner_min_bucket = int(os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET", "0"))
+            transition_inner_min_bucket = self.config.get("transition_inner_min_bucket", None)
+            if transition_inner_min_bucket is None:
+                transition_inner_min_bucket = os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET", "0")
+            transition_inner_min_bucket = int(transition_inner_min_bucket)
         except Exception:
             transition_inner_min_bucket = 0
         self.transition_inner_min_bucket = max(0, transition_inner_min_bucket)
+        self.transition_generator_rebuild_each_step = bool(
+            self.config.get("transition_generator_rebuild_each_step", False)
+        )
 
     @staticmethod
     def _load_fixed_frozen_h_json(path):
@@ -2642,12 +2670,19 @@ class EnvironmentPrior:
             return int(total), local_hidden_dims, local_num_hidden_blocks
 
         partition_budget = int(self.reference_scm_partition_max_bytes)
-        if partition_budget <= 0 and device.type == "cuda" and bool(self.reference_scm_memory_guard):
+        if device.type == "cuda" and bool(self.reference_scm_memory_guard):
             try:
                 free_bytes, _ = torch.cuda.mem_get_info(device=device)
-                partition_budget = int(float(self.reference_scm_memory_guard_fraction) * float(free_bytes))
+                live_budget = int(float(self.reference_scm_memory_guard_fraction) * float(free_bytes))
+                if live_budget > 0:
+                    partition_budget = (
+                        live_budget
+                        if partition_budget <= 0
+                        else min(int(partition_budget), int(live_budget))
+                    )
             except Exception:
-                partition_budget = 0
+                if partition_budget <= 0:
+                    partition_budget = 0
         estimated_builder_bytes, estimated_hidden_dims, estimated_num_hidden_blocks = _estimate_reference_scm_builder_bytes(
             in_dims,
             state_dims,
@@ -2736,6 +2771,11 @@ class EnvironmentPrior:
             transition_fn._prefers_packed_env_input = True
             transition_fn._packed_input_cap = int(packed_input_cap_partition)
             transition_fn._reference_scm_partitioned = True
+            transition_fn._reference_scm_partition_sub_index_lists = tuple(
+                tuple(int(i) for i in indices)
+                for indices in sub_index_lists
+            )
+            transition_fn._reference_scm_partition_sub_transition_fns = tuple(sub_transition_fns)
             return transition_fn
 
         if input_mask is not None:
@@ -3602,6 +3642,86 @@ class EnvironmentPrior:
         transition_fn = env.get("transition_generator", None)
         if transition_fn is None:
             return None
+        partition_sub_index_lists = getattr(
+            transition_fn,
+            "_reference_scm_partition_sub_index_lists",
+            None,
+        )
+        partition_sub_transition_fns = getattr(
+            transition_fn,
+            "_reference_scm_partition_sub_transition_fns",
+            None,
+        )
+        if partition_sub_index_lists is not None or partition_sub_transition_fns is not None:
+            if partition_sub_index_lists is None or partition_sub_transition_fns is None:
+                return None
+
+            batch_size = None
+            for key in (
+                "state_dim_per_sample",
+                "action_dim_per_sample",
+                "noise_dim_per_sample",
+                "zero_pad_dim_per_sample",
+            ):
+                value = env.get(key, None)
+                if torch.is_tensor(value) and value.ndim > 0:
+                    batch_size = int(value.shape[0])
+                    break
+                if isinstance(value, (list, tuple)):
+                    batch_size = int(len(value))
+                    break
+            if batch_size is None:
+                batch_size = int(sum(len(indices) for indices in partition_sub_index_lists))
+            if batch_size <= 0:
+                return None
+
+            def _select_partition_value(value, indices):
+                if torch.is_tensor(value):
+                    if value.ndim > 0 and int(value.shape[0]) == batch_size:
+                        idx = torch.as_tensor(indices, device=value.device, dtype=torch.long)
+                        return value.index_select(0, idx)
+                    return value
+                if isinstance(value, tuple) and len(value) == batch_size:
+                    return tuple(value[int(i)] for i in indices)
+                if isinstance(value, list) and len(value) == batch_size:
+                    return [value[int(i)] for i in indices]
+                return value
+
+            merged = None
+            for indices, sub_transition_fn in zip(
+                partition_sub_index_lists,
+                partition_sub_transition_fns,
+            ):
+                indices = [int(i) for i in indices]
+                if not indices:
+                    continue
+                sub_env = {
+                    key: _select_partition_value(value, indices)
+                    for key, value in env.items()
+                }
+                sub_env["transition_generator"] = sub_transition_fn
+                sub_summary = EnvironmentPrior._reference_exact_scm_reward_input_gain_summary_batch(sub_env)
+                if sub_summary is None:
+                    return None
+                if merged is None:
+                    merged = {
+                        key: torch.full(
+                            (batch_size,),
+                            float("nan"),
+                            device=value.device,
+                            dtype=value.dtype,
+                        )
+                        for key, value in sub_summary.items()
+                    }
+                for key, value in sub_summary.items():
+                    idx = torch.as_tensor(indices, device=merged[key].device, dtype=torch.long)
+                    merged[key].index_copy_(
+                        0,
+                        idx,
+                        value.to(device=merged[key].device, dtype=merged[key].dtype),
+                    )
+            return merged
+
         first_weight = getattr(transition_fn, "_reference_first_weight", None)
         hidden_weights = getattr(transition_fn, "_reference_hidden_weights", None)
         reward_index = getattr(transition_fn, "_reference_reward_index", None)
@@ -4181,6 +4301,8 @@ class EnvironmentPrior:
             "_reference_hidden_weights",
             "_reference_scm_vectorized",
             "_reference_scm_partitioned",
+            "_reference_scm_partition_sub_index_lists",
+            "_reference_scm_partition_sub_transition_fns",
             "_reference_gp_vectorized",
             "_envgen_checkpoint_enabled",
             "_consume_gp_projection_profile",
@@ -4531,6 +4653,64 @@ class EnvironmentPrior:
         if not math.isfinite(value):
             return 0.0
         return max(0.0, value)
+
+    def _resolve_reward_action_input_gain_fraction_conditioned_min(self):
+        value = float(
+            self._resolve_scalar(
+                self.config.get(
+                    "reward_action_input_gain_fraction_conditioned_min",
+                    0.0,
+                )
+            )
+        )
+        if not math.isfinite(value):
+            return 0.0
+        return max(0.0, value)
+
+    def _resolve_reward_state_to_action_gain_ratio_conditioned_max(self):
+        value = float(
+            self._resolve_scalar(
+                self.config.get(
+                    "reward_state_to_action_gain_ratio_conditioned_max",
+                    0.0,
+                )
+            )
+        )
+        if not math.isfinite(value) or value <= 0.0:
+            return 0.0
+        return float(value)
+
+    def _resolve_reward_topology_conditioned_sampling_max_attempts(self):
+        value = self._resolve_scalar(
+            self.config.get("reward_topology_conditioned_sampling_max_attempts", 4096)
+        )
+        if not math.isfinite(value):
+            return 4096
+        return max(1, int(round(value)))
+
+    def _resolve_reward_topology_conditioned_sampling_enabled(self):
+        explicit_enabled = bool(
+            self._resolve_scalar(
+                self.config.get("reward_topology_conditioned_sampling_enabled", False)
+            )
+        )
+        # Backward compatibility: the older state-gain conditioned sampler is a
+        # strict subset of topology conditioning, so old commands continue to
+        # take the same conditioned code path.
+        return bool(
+            explicit_enabled
+            or self._resolve_reward_state_input_gain_fraction_conditioned_sampling_enabled()
+        )
+
+    def _reward_topology_conditioning_thresholds(self):
+        return {
+            "state_min": float(self._resolve_reward_state_input_gain_fraction_conditioned_min()),
+            "action_min": float(self._resolve_reward_action_input_gain_fraction_conditioned_min()),
+            "state_to_action_max": float(
+                self._resolve_reward_state_to_action_gain_ratio_conditioned_max()
+            ),
+            "max_attempts": int(self._resolve_reward_topology_conditioned_sampling_max_attempts()),
+        }
 
     @staticmethod
     def _resolve_constrained_dim_sampling_enabled(h):
@@ -6178,10 +6358,18 @@ class EnvironmentPrior:
         return float(min(1.0, max(0.0, v)))
 
     @staticmethod
+    def _resolve_state_output_scale(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("state_output_scale", 1.0))
+        if not math.isfinite(v):
+            return 1.0
+        return float(max(1e-6, v))
+
+    @staticmethod
     def _apply_state_postprocess(
         state_next_raw,
         state_prev,
         state_clip,
+        state_output_scale=1.0,
         state_highway_enabled=False,
         state_highway_lambda=0.0,
     ):
@@ -6277,6 +6465,7 @@ class EnvironmentPrior:
         state_noise_std=0.0,
         reference_semantics_enabled=False,
         state_clip=float("inf"),
+        state_output_scale=1.0,
         state_highway_enabled=False,
         state_highway_lambda=0.0,
         state_full_rms_enabled=False,
@@ -6313,6 +6502,7 @@ class EnvironmentPrior:
                     state_next_raw=visible_state_next,
                     state_prev=visible_state_prev,
                     state_clip=state_clip,
+                    state_output_scale=state_output_scale,
                     state_highway_enabled=state_highway_enabled,
                     state_highway_lambda=state_highway_lambda,
                 )
@@ -6322,9 +6512,26 @@ class EnvironmentPrior:
                 state_next_raw=visible_state_next,
                 state_prev=visible_state_prev,
                 state_clip=state_clip,
+                state_output_scale=state_output_scale,
                 state_highway_enabled=state_highway_enabled,
                 state_highway_lambda=state_highway_lambda,
             )
+
+        output_scale = state_output_scale
+        if not torch.is_tensor(output_scale):
+            output_scale = torch.as_tensor(
+                output_scale,
+                device=visible_state_next.device,
+                dtype=visible_state_next.dtype,
+            )
+        else:
+            output_scale = output_scale.to(
+                device=visible_state_next.device,
+                dtype=visible_state_next.dtype,
+            )
+        if output_scale.ndim == visible_state_next.ndim - 1:
+            output_scale = output_scale.unsqueeze(-1)
+        visible_state_next = visible_state_next * output_scale.clamp_min(1e-6)
 
         visible_state_next = self._apply_state_full_rms(
             visible_state_next,
@@ -6388,6 +6595,7 @@ class EnvironmentPrior:
         reward_scale = float(h["reward_scale"])
         reward_clip = float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0))))
         state_clip = float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0))))
+        state_output_scale = float(self._resolve_state_output_scale(h))
         state_input_scale_enabled = bool(self._resolve_state_input_scale_enabled(h))
         state_input_scale = float(self._resolve_state_input_scale(h))
         state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
@@ -6487,6 +6695,7 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_output_scale": state_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
@@ -6643,11 +6852,21 @@ class EnvironmentPrior:
         h_list,
         accepted_seeds,
         accepted_attempts,
-        accepted_gains,
+        accepted_state_gains,
+        accepted_action_gains,
+        accepted_state_to_action_ratios,
         total_candidate_draws,
         device,
     ):
-        conditioned_min = float(self._resolve_reward_state_input_gain_fraction_conditioned_min())
+        thresholds = self._reward_topology_conditioning_thresholds()
+        state_min = float(thresholds["state_min"])
+        action_min = float(thresholds["action_min"])
+        ratio_max = float(thresholds["state_to_action_max"])
+        explicit_enabled = bool(
+            self._resolve_scalar(
+                self.config.get("reward_topology_conditioned_sampling_enabled", False)
+            )
+        )
         env["reward_state_input_gain_fraction_conditioned_sampling_enabled"] = torch.ones(
             (len(h_list),),
             device=device,
@@ -6655,7 +6874,25 @@ class EnvironmentPrior:
         )
         env["reward_state_input_gain_fraction_conditioned_min"] = torch.full(
             (len(h_list),),
-            float(conditioned_min),
+            float(state_min),
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_topology_conditioned_sampling_enabled"] = torch.full(
+            (len(h_list),),
+            bool(explicit_enabled),
+            device=device,
+            dtype=torch.bool,
+        )
+        env["reward_action_input_gain_fraction_conditioned_min"] = torch.full(
+            (len(h_list),),
+            float(action_min),
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_state_to_action_gain_ratio_conditioned_max"] = torch.full(
+            (len(h_list),),
+            float(ratio_max),
             device=device,
             dtype=torch.float32,
         )
@@ -6664,13 +6901,29 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.long,
         )
+        env["reward_topology_conditioned_attempt"] = env[
+            "reward_state_input_gain_fraction_conditioned_attempt"
+        ]
         env["reward_state_input_gain_fraction_conditioned_env_rng_seed"] = torch.as_tensor(
             accepted_seeds,
             device=device,
             dtype=torch.long,
         )
+        env["reward_topology_conditioned_env_rng_seed"] = env[
+            "reward_state_input_gain_fraction_conditioned_env_rng_seed"
+        ]
         env["reward_state_input_gain_fraction_conditioned_accepted_gain"] = torch.as_tensor(
-            accepted_gains,
+            accepted_state_gains,
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_action_input_gain_fraction_conditioned_accepted_gain"] = torch.as_tensor(
+            accepted_action_gains,
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_state_to_action_gain_ratio_conditioned_accepted_ratio"] = torch.as_tensor(
+            accepted_state_to_action_ratios,
             device=device,
             dtype=torch.float32,
         )
@@ -6680,6 +6933,9 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.long,
         )
+        env["reward_topology_conditioned_total_candidate_draws"] = env[
+            "reward_state_input_gain_fraction_conditioned_total_candidate_draws"
+        ]
         return env
 
     def _sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
@@ -6690,21 +6946,32 @@ class EnvironmentPrior:
         *,
         build_policy_generator=True,
         preserve_skipped_generator_rng=True,
+        return_final_env=True,
     ):
-        """Sample fresh (frozen_h, env_seed) candidates until a legal training batch is full."""
+        """Sample fresh (frozen_h, env_seed) candidates until a legal training batch is full.
+
+        The original legality criterion was a lower bound on the state input
+        reward-gain fraction.  Topology-conditioned sampling extends that
+        criterion with optional action-gain and state/action-ratio constraints
+        while preserving the old state-gain command semantics.
+        """
         batch_size = int(batch_size)
         if batch_size <= 0:
             raise ValueError("batch_size must be positive")
         if isinstance(getattr(self, "_fixed_frozen_h", None), dict):
             raise ValueError(
-                "conditioned reward_state_input_gain_fraction training sampling cannot be used "
+                "conditioned reward topology training sampling cannot be used "
                 "with fixed_frozen_h_json because the environment hyper-sample is intentionally fixed."
             )
-        conditioned_min = float(self._resolve_reward_state_input_gain_fraction_conditioned_min())
-        if conditioned_min <= 0.0:
+        thresholds = self._reward_topology_conditioning_thresholds()
+        state_min = float(thresholds["state_min"])
+        action_min = float(thresholds["action_min"])
+        ratio_max = float(thresholds["state_to_action_max"])
+        max_attempts = int(thresholds["max_attempts"])
+        if state_min <= 0.0 and action_min <= 0.0 and ratio_max <= 0.0:
             raise ValueError(
-                "reward_state_input_gain_fraction_conditioned_sampling_enabled requires "
-                "reward_state_input_gain_fraction_conditioned_min > 0"
+                "topology-conditioned sampling requires at least one active criterion: "
+                "state_gain_min > 0, action_gain_min > 0, or state_to_action_ratio_max > 0"
             )
         base_seeds = (
             [int(s) for s in rng_seeds]
@@ -6717,13 +6984,32 @@ class EnvironmentPrior:
         accepted_h_list = [None] * batch_size
         accepted_seeds = [None] * batch_size
         accepted_attempts = [0] * batch_size
-        accepted_gains = [float("nan")] * batch_size
-        best_gains = [-float("inf")] * batch_size
+        accepted_state_gains = [float("nan")] * batch_size
+        accepted_action_gains = [float("nan")] * batch_size
+        accepted_state_to_action_ratios = [float("nan")] * batch_size
+        best_state_gains = [-float("inf")] * batch_size
+        best_action_gains = [-float("inf")] * batch_size
+        best_state_to_action_ratios = [float("inf")] * batch_size
         pending = set(range(batch_size))
         attempt_idx = 0
         total_draws = 0
 
         while pending:
+            if attempt_idx >= max_attempts:
+                pending_str = ", ".join(
+                    (
+                        f"{idx}:best_state={float(best_state_gains[idx]):.6f},"
+                        f"best_action={float(best_action_gains[idx]):.6f},"
+                        f"best_ratio={float(best_state_to_action_ratios[idx]):.6f}"
+                    )
+                    for idx in sorted(pending)
+                )
+                raise RuntimeError(
+                    "failed to sample exact SCM environments satisfying topology-conditioned "
+                    f"criteria within {int(max_attempts)} candidate rounds; "
+                    f"state_min={state_min:.6f}, action_min={action_min:.6f}, "
+                    f"state_to_action_max={ratio_max:.6f}; {pending_str}"
+                )
             active = [i for i in range(batch_size) if i in pending]
             candidate_h_list = self._sample_batch_hypers(len(active))
             self._validate_vectorized_reward_state_gain_conditioned_h_list(candidate_h_list)
@@ -6737,31 +7023,68 @@ class EnvironmentPrior:
                 _disable_rejection=True,
             )
             total_draws += len(active)
-            gains = candidate_env.get("reward_state_input_gain_fraction", None)
-            if not torch.is_tensor(gains):
+            state_gains = candidate_env.get("reward_state_input_gain_fraction", None)
+            action_gains = candidate_env.get("reward_action_input_gain_fraction", None)
+            state_to_action_ratios = candidate_env.get("reward_state_to_action_gain_ratio", None)
+            if (
+                not torch.is_tensor(state_gains)
+                or not torch.is_tensor(action_gains)
+                or not torch.is_tensor(state_to_action_ratios)
+            ):
                 raise RuntimeError(
-                    "conditioned reward_state_input_gain_fraction training sampling requires "
+                    "conditioned reward topology training sampling requires "
                     "batched exact-SCM gain summaries; none were produced"
                 )
-            gains_cpu = gains.detach().cpu().reshape(-1).tolist()
-            if len(gains_cpu) != len(active):
+            state_gains_cpu = state_gains.detach().cpu().reshape(-1).tolist()
+            action_gains_cpu = action_gains.detach().cpu().reshape(-1).tolist()
+            ratios_cpu = state_to_action_ratios.detach().cpu().reshape(-1).tolist()
+            if (
+                len(state_gains_cpu) != len(active)
+                or len(action_gains_cpu) != len(active)
+                or len(ratios_cpu) != len(active)
+            ):
                 raise RuntimeError("batched gain summary length does not match conditioned candidates")
             for local_idx, global_idx in enumerate(active):
-                gain = float(gains_cpu[local_idx])
-                if math.isfinite(gain):
-                    best_gains[global_idx] = max(best_gains[global_idx], gain)
-                if math.isfinite(gain) and gain >= conditioned_min:
+                state_gain = float(state_gains_cpu[local_idx])
+                action_gain = float(action_gains_cpu[local_idx])
+                ratio = float(ratios_cpu[local_idx])
+                if math.isfinite(state_gain):
+                    best_state_gains[global_idx] = max(best_state_gains[global_idx], state_gain)
+                if math.isfinite(action_gain):
+                    best_action_gains[global_idx] = max(best_action_gains[global_idx], action_gain)
+                if math.isfinite(ratio):
+                    best_state_to_action_ratios[global_idx] = min(
+                        best_state_to_action_ratios[global_idx],
+                        ratio,
+                    )
+                accepted = (
+                    (state_min <= 0.0 or (math.isfinite(state_gain) and state_gain >= state_min))
+                    and (action_min <= 0.0 or (math.isfinite(action_gain) and action_gain >= action_min))
+                    and (ratio_max <= 0.0 or (math.isfinite(ratio) and ratio <= ratio_max))
+                )
+                if accepted:
                     accepted_h = copy.deepcopy(candidate_h_list[local_idx])
                     accepted_h["reward_state_input_gain_fraction_rejection_min"] = 0.0
                     accepted_h_list[global_idx] = accepted_h
                     accepted_seeds[global_idx] = int(candidate_seeds[local_idx])
                     accepted_attempts[global_idx] = int(attempt_idx + 1)
-                    accepted_gains[global_idx] = float(gain)
+                    accepted_state_gains[global_idx] = float(state_gain)
+                    accepted_action_gains[global_idx] = float(action_gain)
+                    accepted_state_to_action_ratios[global_idx] = float(ratio)
                     pending.discard(global_idx)
+            # Candidate envs are only used for their gain summaries here. Drop
+            # heavy transition closures before the next candidate build so the
+            # sampler does not transiently retain multiple full exact-SCM
+            # batches on GPU.
+            candidate_env["transition_generator"] = None
+            candidate_env["policy_generator"] = None
+            candidate_env = None
             attempt_idx += 1
 
         final_h_list = [copy.deepcopy(h) for h in accepted_h_list]
         final_seeds = [int(s) for s in accepted_seeds]
+        if not bool(return_final_env):
+            return final_h_list, None, final_seeds
         final_env = self._sample_environment_family_coarse_batch(
             h_list=final_h_list,
             device=device,
@@ -6775,7 +7098,9 @@ class EnvironmentPrior:
             h_list=final_h_list,
             accepted_seeds=final_seeds,
             accepted_attempts=accepted_attempts,
-            accepted_gains=accepted_gains,
+            accepted_state_gains=accepted_state_gains,
+            accepted_action_gains=accepted_action_gains,
+            accepted_state_to_action_ratios=accepted_state_to_action_ratios,
             total_candidate_draws=total_draws,
             device=device,
         )
@@ -9804,6 +10129,16 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        state_output_scale = torch.tensor(
+            [float(self._resolve_state_output_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_output_scale = torch.tensor(
+            [float(self._resolve_state_output_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_input_scale_enabled = torch.tensor(
             [bool(self._resolve_state_input_scale_enabled(h)) for h in h_list],
             device=device,
@@ -10034,6 +10369,7 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_output_scale": state_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "ctrl_reward_weight": ctrl_reward_weight,
@@ -10417,6 +10753,11 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        state_output_scale = torch.tensor(
+            [float(self._resolve_state_output_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
         state_input_scale_enabled = torch.tensor(
             [bool(self._resolve_state_input_scale_enabled(h)) for h in h_list],
             device=device,
@@ -10522,6 +10863,7 @@ class EnvironmentPrior:
             "reward_scale": reward_scale,
             "reward_clip": reward_clip,
             "state_clip": state_clip,
+            "state_output_scale": state_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
@@ -11508,6 +11850,7 @@ class EnvironmentPrior:
                     "action_noise_eval_std": float(action_noise_eval_std_cpu[b]),
                     "reward_dropout_ratio": float(reward_dropout_ratio_cpu[b]),
                     "reward_drop_frac_realized": float(reward_drop_frac_cpu[b]),
+                    "state_output_scale": float(_env_value_at("state_output_scale", b)),
                     "state_input_scale_enabled": bool(_env_value_at("state_input_scale_enabled", b)),
                     "state_input_scale": float(_env_value_at("state_input_scale", b)),
                     "state_full_rms_enabled": bool(_env_value_at("state_full_rms_enabled", b)),
@@ -11803,6 +12146,7 @@ class EnvironmentPrior:
                 state_noise_std=env["state_noise_std"],
                 reference_semantics_enabled=reference_semantics_enabled,
                 state_clip=env["state_clip"],
+                state_output_scale=env.get("state_output_scale", 1.0),
                 state_highway_enabled=env.get("state_highway_enabled", False),
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
@@ -13545,6 +13889,7 @@ class EnvironmentPrior:
                 state_noise_std=env["state_noise_std"],
                 reference_semantics_enabled=reference_semantics_enabled,
                 state_clip=env["state_clip"],
+                state_output_scale=env.get("state_output_scale", 1.0),
                 state_highway_enabled=env.get("state_highway_enabled", False),
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
@@ -13928,6 +14273,14 @@ class EnvironmentPrior:
         if transition_inner_grouping not in {"family", "structure", "pow2", "pow2_no_depth"}:
             transition_inner_grouping = "family"
         transition_inner_min_bucket = int(max(0, int(getattr(self, "transition_inner_min_bucket", 0) or 0)))
+        transition_rebuild_each_step = bool(
+            getattr(self, "transition_generator_rebuild_each_step", False)
+        )
+        if transition_rebuild_each_step and env_rng_seeds is None:
+            raise RuntimeError(
+                "transition_generator_rebuild_each_step requires explicit env_rng_seeds "
+                "so transition weights can be rebuilt without changing environment semantics"
+            )
         for bi, h in enumerate(h_list_effective):
             family = self._normalize_family(h.get("family", "scm"))
             sig = (family, bool(self._resolve_reference_semantics_enabled(h)))
@@ -13950,6 +14303,7 @@ class EnvironmentPrior:
             and device_obj.type == "cuda"
             and torch.cuda.is_available()
             and rollout_generators is None
+            and (not transition_rebuild_each_step)
         )
         try:
             transition_stream_fusion_max_groups = int(
@@ -14046,6 +14400,7 @@ class EnvironmentPrior:
         terminal_bonus_scale_max = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_output_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_input_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         ctrl_reward_weight = torch.empty((batch_size,), device=device, dtype=torch.float32)
@@ -14138,6 +14493,12 @@ class EnvironmentPrior:
                     transition_only_skipped_generator_count += int(
                         build_profile.get("non_transition_generator_skip_count", 0) or 0
                     )
+                effective_group_env_seeds = group_env_seeds
+                rejection_seed_value = env_batch.get("reward_state_input_gain_fraction_rejection_env_rng_seed", None)
+                if torch.is_tensor(rejection_seed_value):
+                    rejection_seed_flat = rejection_seed_value.detach().cpu().reshape(-1).tolist()
+                    if len(rejection_seed_flat) == len(group_indices):
+                        effective_group_env_seeds = [int(v) for v in rejection_seed_flat]
                 group_idx = torch.tensor(group_indices, device=device, dtype=torch.long)
                 group_bs = int(group_idx.numel())
                 transition_group_max_batch = max(transition_group_max_batch, group_bs)
@@ -14200,6 +14561,7 @@ class EnvironmentPrior:
                 terminal_bonus_scale_max[group_idx] = env_batch["terminal_bonus_scale_max"].to(dtype=torch.float32)
                 alpha[group_idx] = env_batch["alpha"]
                 state_clip[group_idx] = env_batch["state_clip"]
+                state_output_scale[group_idx] = env_batch["state_output_scale"]
                 state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
                 state_input_scale[group_idx] = env_batch["state_input_scale"]
                 ctrl_reward_weight[group_idx] = env_batch["ctrl_reward_weight"]
@@ -14295,10 +14657,27 @@ class EnvironmentPrior:
                 transition_checkpoint_enabled = int(
                     bool(getattr(transition_generator, "_envgen_checkpoint_enabled", False))
                 )
+                stored_transition_generator = transition_generator
+                if transition_rebuild_each_step:
+                    if effective_group_env_seeds is None:
+                        raise RuntimeError(
+                            "transition_generator_rebuild_each_step lost effective env seeds for a transition group"
+                        )
+                    # Keep all sampled environment metadata but drop the heavy
+                    # transition closure so subsequent groups do not accumulate
+                    # exact-SCM weights on GPU. The accepted env seeds below
+                    # rebuild the same transition generator when the group is
+                    # actually used.
+                    env_batch["transition_generator"] = None
+                    stored_transition_generator = None
+                    transition_generator = None
                 transition_groups.append(
                     {
                         "indices": group_idx,
                         "env": env_batch,
+                        "h_list": group_h_list,
+                        "env_rng_seeds": effective_group_env_seeds,
+                        "transition_generator_rebuild_each_step": bool(transition_rebuild_each_step),
                         "batch_size": group_bs,
                         "state_dim": state_dim_g,
                         "obs_dim": obs_dim_g,
@@ -14330,7 +14709,7 @@ class EnvironmentPrior:
                         "state_noise_active": bool(torch.any(env_batch["state_noise_std"] > 0).item()),
                         "family": str(env_batch["family"]),
                         "gp_projection_profile_capable": gp_projection_profile_capable,
-                        "transition_generator": transition_generator,
+                        "transition_generator": stored_transition_generator,
                         "use_fused_transition": use_fused_transition,
                         "transition_checkpoint_enabled": transition_checkpoint_enabled,
                         "stream_transition": None,
@@ -14378,6 +14757,7 @@ class EnvironmentPrior:
             terminal_bonus_scale_max = terminal_bonus_scale_max.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
+            state_output_scale = state_output_scale.index_select(0, perm)
             state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
             state_input_scale = state_input_scale.index_select(0, perm)
             state_highway_enabled = state_highway_enabled.index_select(0, perm)
@@ -14416,6 +14796,42 @@ class EnvironmentPrior:
                 else:
                     group["stream_y"] = torch.cuda.Stream(device=device_obj)
                     group["stream_x"] = torch.cuda.Stream(device=device_obj)
+
+        def _rebuild_transition_generator_for_group(group):
+            nonlocal transition_family_build_wall_s
+            nonlocal transition_generator_build_wall_s
+            nonlocal transition_gp_shared_build_wall_s
+            if not bool(group.get("transition_generator_rebuild_each_step", False)):
+                return group.get("transition_generator", None)
+            group_h_for_rebuild = group.get("h_list", None)
+            group_seed_for_rebuild = group.get("env_rng_seeds", None)
+            if group_h_for_rebuild is None or group_seed_for_rebuild is None:
+                raise RuntimeError(
+                    "transition_generator_rebuild_each_step requires stored h_list and accepted env seeds"
+                )
+            rebuild_env = self._sample_environment_family_coarse_batch(
+                h_list=group_h_for_rebuild,
+                device=device,
+                rng_seeds=group_seed_for_rebuild,
+                build_policy_generator=False,
+                preserve_skipped_generator_rng=True,
+                _disable_rejection=True,
+            )
+            rebuild_profile = rebuild_env.get("_build_profile", None)
+            if isinstance(rebuild_profile, dict):
+                transition_family_build_wall_s += float(
+                    rebuild_profile.get("family_build_wall_s", 0.0) or 0.0
+                )
+                transition_generator_build_wall_s += float(
+                    rebuild_profile.get("transition_generator_build_wall_s", 0.0) or 0.0
+                )
+                transition_gp_shared_build_wall_s += float(
+                    rebuild_profile.get("gp_shared_transition_build_wall_s", 0.0) or 0.0
+                )
+            transition_generator_rebuilt = rebuild_env.get("transition_generator", None)
+            if not callable(transition_generator_rebuilt):
+                raise RuntimeError("rebuilt transition generator was not callable")
+            return transition_generator_rebuilt
 
         max_state_dim = int(state_dims.max().item())
         max_obs_dim = int(obs_dims.max().item())
@@ -15308,7 +15724,7 @@ class EnvironmentPrior:
                             env_in[:, env_noise_start: env_noise_start + noise_dim_g] = noise_in
                             transition_input = env_in
 
-                        transition_generator_g = group.get("transition_generator", None)
+                        transition_generator_g = _rebuild_transition_generator_for_group(group)
                         terminal_signal_next_g = None
                         terminal_bonus_base_next_g = None
                         if not callable(transition_generator_g):
@@ -15374,6 +15790,10 @@ class EnvironmentPrior:
                                         dtype=terminal_bonus_base_next_g.dtype,
                                     )
                                 terminal_bonus_base_next_replay[group_slice] = terminal_bonus_base_next_g.reshape(-1)
+                        if transition_rebuild_each_step:
+                            transition_generator_g = None
+                            transition_input = None
+                            transition_out_g = None
 
                     reward_next_aux_replay = torch.zeros((batch_size,), device=device, dtype=torch.float32)
                     for group in transition_groups:
@@ -15432,6 +15852,7 @@ class EnvironmentPrior:
                         state_noise_std=state_noise_std,
                         reference_semantics_enabled=reference_semantics,
                         state_clip=state_clip,
+                        state_output_scale=state_output_scale,
                         state_highway_enabled=state_highway_enabled,
                         state_highway_lambda=state_highway_lambda,
                         state_full_rms_enabled=state_full_rms_enabled,
@@ -15588,6 +16009,7 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "state_input_scale_enabled": state_input_scale_enabled,
+            "state_output_scale": state_output_scale,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
@@ -16123,7 +16545,7 @@ class EnvironmentPrior:
 
                 reward_scale_g = group["reward_scale_view"]
                 alpha_g = group["alpha_view"]
-                transition_generator_g = group.get("transition_generator", None)
+                transition_generator_g = _rebuild_transition_generator_for_group(group)
                 ctrl_reward_next_g, survival_reward_next_g = self._exact_scm_aux_reward_components(
                     action_in,
                     action_mask=group.get("action_mask_view", None),
@@ -16335,6 +16757,10 @@ class EnvironmentPrior:
                                 terminal_bonus_base_next[group_slice] = terminal_bonus_base_next_g.reshape(-1)
                 else:
                     raise RuntimeError("Exact-SCM family rollout requires transition_generator.")
+                if transition_rebuild_each_step:
+                    transition_generator_g = None
+                    transition_input = None
+                    transition_out_g = None
                 if profile_rollout_timing and group_wall_t0 is not None:
                     transition_group_wall_s += (time.perf_counter() - group_wall_t0)
 
@@ -16426,6 +16852,7 @@ class EnvironmentPrior:
                 state_noise_std=state_noise_std,
                 reference_semantics_enabled=reference_semantics,
                 state_clip=state_clip,
+                state_output_scale=state_output_scale,
                 state_highway_enabled=state_highway_enabled,
                 state_highway_lambda=state_highway_lambda,
                 state_full_rms_enabled=state_full_rms_enabled,
@@ -17816,6 +18243,7 @@ class EnvironmentPrior:
                 state_noise_std=env["state_noise_std"],
                 reference_semantics_enabled=reference_semantics_enabled,
                 state_clip=env["state_clip"],
+                state_output_scale=env.get("state_output_scale", 1.0),
                 state_highway_enabled=env.get("state_highway_enabled", False),
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
@@ -18421,6 +18849,7 @@ class EnvironmentPrior:
                 state_noise_std=state_noise_std,
                 reference_semantics_enabled=reference_semantics_enabled,
                 state_clip=state_clip,
+                state_output_scale=env.get("state_output_scale", 1.0),
                 state_highway_enabled=env.get("state_highway_enabled", False),
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
@@ -18661,6 +19090,14 @@ class EnvironmentPrior:
                     self.last_runtime_info[b] = info
 
         return x, y, y
+
+    def rollout_policy_gradient_loss(self, *args, **kwargs):
+        del args, kwargs
+        raise RuntimeError(
+            "EnvironmentPrior.rollout_policy_gradient_loss is disabled in the maintained RLPFN path. "
+            "This legacy policy-gradient route is not numerically tied to the trusted pack PPO runner "
+            "or the healthy sampled-topology prior generator. Use the canonical pack PPO runner instead."
+        )
 
     def rollout_with_policy(
         self,

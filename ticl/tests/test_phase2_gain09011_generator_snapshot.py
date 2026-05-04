@@ -24,13 +24,23 @@ FROZEN_H_OVERRIDES = {
 }
 
 EXPECTED_LEGACY_PROJECTED_FINGERPRINT = (
-    "5206d9b9db9e9ef0a6599b1a9fe85ab11c44bc471b1d23a14364fe62aa878f55"
+    "8cc0c948beed221c0cfbbce47df6d402a3089a8fdd34445efb37435cb2dad60d"
 )
 EXPECTED_LEGACY_PROJECTED_KEY_COUNT = 99
 CURRENT_ONLY_INERT_KEYS = {
+    "batch_vectorized_grouping",
     "fixed_frozen_h_json",
+    "reference_scm_memory_guard_fraction",
+    "reference_scm_partition_max_bytes",
     "reward_state_input_gain_fraction_conditioned_sampling_enabled",
     "reward_state_input_gain_fraction_conditioned_min",
+    "reward_topology_conditioned_sampling_enabled",
+    "reward_action_input_gain_fraction_conditioned_min",
+    "reward_state_to_action_gain_ratio_conditioned_max",
+    "reward_topology_conditioned_sampling_max_attempts",
+    "transition_generator_rebuild_each_step",
+    "transition_inner_grouping",
+    "transition_inner_min_bucket",
 }
 
 EXPECTED_SAMPLED_ENV_SNAPSHOT = {

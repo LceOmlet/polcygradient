@@ -19,6 +19,9 @@ PAIR2_HELDOUT_SUITE_PATH = "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline
 PAIR2_ZERO_JSON = "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/zero_cross_env_control.json"
 PAIR2_PRE_JSON = "/home/chen/RLPFN/artifacts/phase3_cross_env_baseline_pair2/ppo_cross_env_baseline.json"
 PAIR2_PREFLIGHT_JSON = "/home/chen/RLPFN/artifacts/phase3_preflight_contract_check_pair2.json"
+PAIR2_GUARDED_SELECTOR_REIDENTIFIED_JSON = (
+    "/home/chen/RLPFN/artifacts/phase3_pair2_guarded_selector_reidentified.json"
+)
 
 PAIR2_BRANCH_SPECIFIC_MODE = "tokenwise_scale_env12_mid_episode_extension_block"
 PAIR2_TRAIN_UPDATE_EVAL_NSAMPLES = 256
@@ -36,10 +39,18 @@ PAIR2_BASELINE_POST_POLICY_BUNDLE_PATH = (
 PAIR2_OVERRIDE_POST_POLICY_BUNDLE_PATH = (
     "/home/chen/RLPFN/artifacts/phase3_pair2_train_update_ab_override_post_policy_bundle.pt"
 )
+PAIR2_SNAPSHOT_TARGET_OUTER_BATCH_IDX = 13
 PAIR2_SNAPSHOT_TARGET_ENV_INDEX = 12
-PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX = 0
-PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START = 18
-PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_END = 21
+PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX = 4
+PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START = 15
+PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_END = 18
+PAIR2_TRAIN_UPDATE_MATERIAL_EPS = 1e-4
+
+
+def _normalize_optional_str(value: Any) -> str:
+    if value is None:
+        return ""
+    return str(value)
 
 
 def _suite_context(report: dict[str, Any]) -> dict[str, Any]:
@@ -58,7 +69,9 @@ def _suite_context(report: dict[str, Any]) -> dict[str, Any]:
         "deterministic_actor_sampling": bool(config.get("deterministic_actor_sampling", False)),
         "deterministic_batch_plan": bool(config.get("deterministic_batch_plan", False)),
         "strict_native_rollout": bool(config.get("strict_native_rollout", False)),
-        "actor_objective_runtime_current_suite_name": str(config.get("actor_objective_runtime_current_suite_name", "")),
+        "actor_objective_runtime_current_suite_name": _normalize_optional_str(
+            config.get("actor_objective_runtime_current_suite_name", "")
+        ),
         "actor_objective_mode_override": config.get("actor_objective_mode_override", None),
         "ppo_actor_baseline_mode": str(config.get("ppo_actor_baseline_mode", "")),
         "ppo_actor_gae_space": str(config.get("ppo_actor_gae_space", "")),
@@ -66,6 +79,9 @@ def _suite_context(report: dict[str, Any]) -> dict[str, Any]:
         "ppo_vf_coef": float(config.get("ppo_vf_coef", float("nan"))),
         "ppo_reset_env_state_at_sep": bool(config.get("ppo_reset_env_state_at_sep", False)),
         "ppo_separate_value_backbone": bool(config.get("ppo_separate_value_backbone", False)),
+        "ppo_restore_validation_policy_head_state": bool(
+            config.get("ppo_restore_validation_policy_head_state", False)
+        ),
         "runtime_normalized_q_value_weight_override": config.get("runtime_normalized_q_value_weight_override", None),
         "runtime_next_state_flow_matching_weight_override": config.get("runtime_next_state_flow_matching_weight_override", None),
         "train_suite_fingerprint": str(report["train_suite_summary"]["fingerprint"]),
@@ -111,6 +127,65 @@ def _load_pair2_preflight() -> dict[str, Any]:
     return payload
 
 
+def _load_pair2_guarded_selector_reidentified() -> dict[str, int]:
+    path = Path(PAIR2_GUARDED_SELECTOR_REIDENTIFIED_JSON).expanduser().resolve()
+    payload = json.loads(path.read_text(encoding="utf-8"))
+    if str(payload.get("probe_entry", "")) != "phase3_pair2_guarded_selector_reidentified":
+        raise RuntimeError(f"Expected guarded selector reidentify artifact at {path}")
+    selector = dict(payload.get("reidentified_selector", {}))
+    return {
+        "target_outer_batch_idx": int(selector["outer_batch_idx"]),
+        "target_env_index": int(selector["target_env_index"]),
+        "target_objective_episode_index": int(selector["target_objective_episode_index"]),
+        "target_objective_position_start": int(selector["target_objective_position_start"]),
+        "target_objective_position_end": int(selector["target_objective_position_end"]),
+    }
+
+
+def _current_pair2_snapshot_selector() -> dict[str, int]:
+    return {
+        "target_outer_batch_idx": int(PAIR2_SNAPSHOT_TARGET_OUTER_BATCH_IDX),
+        "target_env_index": int(PAIR2_SNAPSHOT_TARGET_ENV_INDEX),
+        "target_objective_episode_index": int(PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX),
+        "target_objective_position_start": int(PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START),
+        "target_objective_position_end": int(PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_END),
+    }
+
+
+def _assert_pair2_snapshot_selector_matches_reidentified() -> dict[str, int]:
+    expected = _load_pair2_guarded_selector_reidentified()
+    current = _current_pair2_snapshot_selector()
+    if current != expected:
+        raise RuntimeError(
+            "Pair2 target-side selector constants drifted from the reidentified guarded-contract selector: "
+            f"current={current!r}, expected={expected!r}"
+        )
+    return expected
+
+
+def _require_target_snapshot_written(report: dict[str, Any], *, arm_name: str) -> dict[str, Any]:
+    snapshot = dict(report.get("train_outer_batch_snapshot", {}))
+    if not bool(snapshot.get("written", False)):
+        raise RuntimeError(
+            f"Pair2 {arm_name} train-side snapshot was not written. "
+            "Do not treat this target-side A/B as efficacy evidence when the requested selector is absent."
+        )
+    selector = dict(snapshot.get("selector", {}))
+    if selector != _current_pair2_snapshot_selector():
+        raise RuntimeError(
+            f"Pair2 {arm_name} snapshot selector drifted from the locked guarded selector: {selector!r}"
+        )
+    if snapshot.get("written_path", None) in {None, ""}:
+        raise RuntimeError(f"Pair2 {arm_name} snapshot reports written=True but has no written_path.")
+    target_match_count = int(snapshot.get("snapshot_target_match_count", 0))
+    if target_match_count <= 0:
+        raise RuntimeError(
+            f"Pair2 {arm_name} snapshot was written but the locked selector matched no objective tokens "
+            f"(snapshot_target_match_count={target_match_count})."
+        )
+    return snapshot
+
+
 def _build_reused_metrics_payload(
     *,
     report: dict[str, Any],
@@ -151,6 +226,10 @@ def _write_reused_metrics_json(path: Path, payload: dict[str, Any]) -> str:
 
 def _gap_delta(baseline: dict[str, float], override: dict[str, float]) -> dict[str, float]:
     return {str(k): float(override[str(k)] - baseline[str(k)]) for k in baseline}
+
+
+def _has_material_delta(values: dict[str, float], *, eps: float = PAIR2_TRAIN_UPDATE_MATERIAL_EPS) -> bool:
+    return any(abs(float(v)) > float(eps) for v in values.values())
 
 
 def _train_history_delta(baseline: list[dict[str, Any]], override: list[dict[str, Any]]) -> dict[str, Any]:
@@ -197,6 +276,7 @@ def _train_history_delta(baseline: list[dict[str, Any]], override: list[dict[str
 def _run_audit(
     *,
     actor_objective_mode_override: str | None,
+    restore_validation_policy_head_state: bool = False,
     reuse_zero_control_json: str | None = None,
     reuse_pre_policy_json: str | None = None,
     save_post_policy_bundle_path: str | None = None,
@@ -235,6 +315,7 @@ def _run_audit(
         deterministic_actor_sampling=True,
         deterministic_batch_plan=True,
         strict_native_rollout=True,
+        restore_validation_policy_head_state=bool(restore_validation_policy_head_state),
         actor_objective_mode_override=actor_objective_mode_override,
         actor_objective_runtime_current_suite_name=(
             "pair2" if actor_objective_mode_override is not None else None
@@ -254,12 +335,15 @@ def _run_audit(
 
 def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
     preflight = _load_pair2_preflight()
+    locked_selector = _assert_pair2_snapshot_selector_matches_reidentified()
     print("[pair2-train-update-ab] start baseline audit", flush=True)
     baseline = _run_audit(
         actor_objective_mode_override=None,
+        restore_validation_policy_head_state=True,
         save_post_policy_bundle_path=PAIR2_BASELINE_POST_POLICY_BUNDLE_PATH,
         eval_n_samples=PAIR2_TRAIN_UPDATE_EVAL_NSAMPLES,
         train_outer_batch_snapshot_json=PAIR2_BASELINE_TRAIN_OUTER_BATCH_SNAPSHOT_JSON,
+        train_outer_batch_snapshot_target_outer_batch_idx=PAIR2_SNAPSHOT_TARGET_OUTER_BATCH_IDX,
         train_outer_batch_snapshot_target_env_index=PAIR2_SNAPSHOT_TARGET_ENV_INDEX,
         train_outer_batch_snapshot_target_objective_episode_index=PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX,
         train_outer_batch_snapshot_target_objective_position_start=PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START,
@@ -283,11 +367,13 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
         reuse_pre_policy_json = _write_reused_metrics_json(tmpdir_path / "pre_policy.json", pre_payload)
         override = _run_audit(
             actor_objective_mode_override=PAIR2_BRANCH_SPECIFIC_MODE,
+            restore_validation_policy_head_state=True,
             reuse_zero_control_json=reuse_zero_control_json,
             reuse_pre_policy_json=reuse_pre_policy_json,
             save_post_policy_bundle_path=PAIR2_OVERRIDE_POST_POLICY_BUNDLE_PATH,
             eval_n_samples=PAIR2_TRAIN_UPDATE_EVAL_NSAMPLES,
             train_outer_batch_snapshot_json=PAIR2_OVERRIDE_TRAIN_OUTER_BATCH_SNAPSHOT_JSON,
+            train_outer_batch_snapshot_target_outer_batch_idx=PAIR2_SNAPSHOT_TARGET_OUTER_BATCH_IDX,
             train_outer_batch_snapshot_target_env_index=PAIR2_SNAPSHOT_TARGET_ENV_INDEX,
             train_outer_batch_snapshot_target_objective_episode_index=PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX,
             train_outer_batch_snapshot_target_objective_position_start=PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START,
@@ -320,6 +406,8 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
             "Override audit did not target pair2 runtime scope: "
             f"{override_ctx['actor_objective_runtime_current_suite_name']!r}"
         )
+    baseline_snapshot = _require_target_snapshot_written(baseline, arm_name="baseline")
+    override_snapshot = _require_target_snapshot_written(override, arm_name="override")
 
     baseline_comparison = dict(baseline["comparison"])
     override_comparison = dict(override["comparison"])
@@ -355,6 +443,7 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
             "candidate_small_control_target": "env12_mid_episode_extension_block",
             "runtime_control_shape": "contiguous_four_token_branch_specific_gate",
             "branch_specific": True,
+            "locked_selector": locked_selector,
             "runtime_mode_activated": bool(
                 override_ctx["actor_objective_runtime_current_suite_name"] == "pair2"
                 and override_ctx["actor_objective_mode_override"] == PAIR2_BRANCH_SPECIFIC_MODE
@@ -385,15 +474,9 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
         "train_outer_batch_snapshots": {
             "baseline_requested_path": PAIR2_BASELINE_TRAIN_OUTER_BATCH_SNAPSHOT_JSON,
             "override_requested_path": PAIR2_OVERRIDE_TRAIN_OUTER_BATCH_SNAPSHOT_JSON,
-            "selector": {
-                "target_outer_batch_idx": None,
-                "target_env_index": PAIR2_SNAPSHOT_TARGET_ENV_INDEX,
-                "target_objective_episode_index": PAIR2_SNAPSHOT_TARGET_OBJECTIVE_EPISODE_INDEX,
-                "target_objective_position_start": PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_START,
-                "target_objective_position_end": PAIR2_SNAPSHOT_TARGET_OBJECTIVE_POSITION_END,
-            },
-            "baseline": dict(baseline.get("train_outer_batch_snapshot", {})),
-            "override": dict(override.get("train_outer_batch_snapshot", {})),
+            "selector": locked_selector,
+            "baseline": baseline_snapshot,
+            "override": override_snapshot,
         },
         "post_policy_bundles": {
             "baseline_requested_path": PAIR2_BASELINE_POST_POLICY_BUNDLE_PATH,
@@ -404,12 +487,37 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
         "conclusions": {
             "target_side_train_update_changes_trajectory": bool(
                 not train_history_delta["histories_identical"]
-                or any(abs(float(v)) > 1e-6 for v in train_gap_delta.values())
-                or any(abs(float(v)) > 1e-6 for v in post_train_gap_delta.values())
+                or _has_material_delta(train_gap_delta)
+                or _has_material_delta(post_train_gap_delta)
+                or abs(float(override_comparison["train_full_return_delta"] - baseline_comparison["train_full_return_delta"]))
+                > float(PAIR2_TRAIN_UPDATE_MATERIAL_EPS)
+                or abs(float(override_comparison["train_suffix_return_delta"] - baseline_comparison["train_suffix_return_delta"]))
+                > float(PAIR2_TRAIN_UPDATE_MATERIAL_EPS)
             ),
             "pre_metrics_unchanged": bool(
                 all(abs(float(v)) <= 1e-6 for v in train_gap_delta.values())
             ),
+            "target_side_effect_is_only_numeric_noise": bool(
+                train_history_delta["histories_identical"]
+                and not _has_material_delta(train_gap_delta)
+                and not _has_material_delta(post_train_gap_delta)
+                and abs(
+                    float(
+                        override_comparison["train_full_return_delta"]
+                        - baseline_comparison["train_full_return_delta"]
+                    )
+                )
+                <= float(PAIR2_TRAIN_UPDATE_MATERIAL_EPS)
+                and abs(
+                    float(
+                        override_comparison["train_suffix_return_delta"]
+                        - baseline_comparison["train_suffix_return_delta"]
+                    )
+                )
+                <= float(PAIR2_TRAIN_UPDATE_MATERIAL_EPS)
+            ),
+            "target_selector_present_in_both_arms": True,
+            "target_side_compare_is_efficacy_eligible": True,
             "runtime_mode_local_to_pair2": True,
             "shared_core_unchanged": True,
         },
@@ -418,8 +526,8 @@ def build_pair2_train_update_ab_compare_pack() -> dict[str, Any]:
             "branch_specific_scope_gate_needed": True,
             "shared_core_unchanged": True,
             "reason": (
-                "Compare pair2 baseline and branch-specific target-side train-update audits under the same strict "
-                "contract to see whether the runtime-feasible small control changes actual optimization trajectory."
+                "Keep the target-side pair2 A/B valid only when the locked guarded selector is present in both arms; "
+                "otherwise fail hard instead of interpreting a no-op as efficacy evidence."
             ),
         },
     }

@@ -235,6 +235,24 @@ _OFFICIAL_RWKV7_TIME_MIXING = _OFFICIAL_RWKV7_SCRIPT_API.time_mixing
 _OFFICIAL_RWKV7_CHANNEL_MIXING = _OFFICIAL_RWKV7_SCRIPT_API.channel_mixing
 
 
+@torch.jit.script
+def _official_eval_layer_norm_fp32(
+    x: torch.Tensor,
+    *,
+    normalized_shape: int,
+    weight: torch.Tensor,
+    bias: torch.Tensor,
+):
+    x_fp32 = x.to(dtype=torch.float32)
+    out = F.layer_norm(
+        x_fp32,
+        (int(normalized_shape),),
+        weight=weight.to(dtype=torch.float32),
+        bias=bias.to(dtype=torch.float32),
+    )
+    return out
+
+
 class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
     z: Dict[str, torch.Tensor]
     n_embd: int
@@ -267,9 +285,9 @@ class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
         with torch.no_grad():
             z = self.z
             if self.has_ln0:
-                x = F.layer_norm(
+                x = _official_eval_layer_norm_fp32(
                     x,
-                    (self.n_embd,),
+                    normalized_shape=self.n_embd,
                     weight=z["blocks.0.ln0.weight"],
                     bias=z["blocks.0.ln0.bias"],
                 )
@@ -280,9 +298,9 @@ class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
                 att = bbb + "att."
                 ffn = bbb + "ffn."
 
-                xx = F.layer_norm(
+                xx = _official_eval_layer_norm_fp32(
                     x,
-                    (self.n_embd,),
+                    normalized_shape=self.n_embd,
                     weight=z[bbb + "ln1.weight"],
                     bias=z[bbb + "ln1.bias"],
                 )
@@ -324,9 +342,9 @@ class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
                 )
                 x = x + xx
 
-                xx = F.layer_norm(
+                xx = _official_eval_layer_norm_fp32(
                     x,
-                    (self.n_embd,),
+                    normalized_shape=self.n_embd,
                     weight=z[bbb + "ln2.weight"],
                     bias=z[bbb + "ln2.bias"],
                 )
@@ -339,9 +357,9 @@ class OfficialRWKV7EvalCore(torch.jit.ScriptModule):
                 )
                 x = x + xx
 
-            x = F.layer_norm(
+            x = _official_eval_layer_norm_fp32(
                 x,
-                (self.n_embd,),
+                normalized_shape=self.n_embd,
                 weight=z["ln_out.weight"],
                 bias=z["ln_out.bias"],
             )
@@ -682,23 +700,18 @@ class RWKV7Core(nn.Module):
         return all(torch.is_tensor(t) for t in state)
 
     def _init_official_eval_state(self, *, device: torch.device, dtype: torch.dtype):
-        return self._flatten_official_eval_state(self.init_state(1, device=device, dtype=dtype))
+        del dtype
+        return self._flatten_official_eval_state(self.init_state(1, device=device, dtype=torch.float32))
 
     def _official_eval_state_tensor_dtype(self, index: int, *, token_dtype: torch.dtype) -> torch.dtype:
-        # Match the vendor RWKV-7 eval state contract:
-        # 0 = att_x_prev (token dtype), 1 = att_kv (float32), 2 = ffn_x_prev (token dtype).
-        if int(index) % 3 == 1:
-            return torch.float32
-        return token_dtype
+        del index
+        del token_dtype
+        return torch.float32
 
     def _build_official_eval_weights(self, *, device: torch.device):
         def _snapshot(name: str, tensor: torch.Tensor):
             tensor = tensor.detach().to(device=device)
-            if name.endswith("att.w0"):
-                tensor = tensor.to(dtype=torch.float32)
-            else:
-                tensor = tensor.to(dtype=torch.bfloat16)
-            return tensor.contiguous()
+            return tensor.to(dtype=torch.float32).contiguous()
 
         z: Dict[str, torch.Tensor] = {
             "ln_out.weight": _snapshot("ln_out.weight", self.ln_out.weight),
@@ -765,7 +778,6 @@ class RWKV7Core(nn.Module):
 
     def _forward_step_official_eval(self, token: torch.Tensor, state=None):
         output_dtype = token.dtype
-        token = token.to(dtype=torch.bfloat16)
         if state is None:
             flat_state = self._init_official_eval_state(device=token.device, dtype=token.dtype)
         elif self._is_official_eval_state(state):
@@ -788,7 +800,8 @@ class RWKV7Core(nn.Module):
         if compiler_mod is not None and hasattr(compiler_mod, "cudagraph_mark_step_begin"):
             compiler_mod.cudagraph_mark_step_begin()
         eval_core = self._get_official_eval_core(device=token.device)
-        hidden, flat_state = eval_core(token[0], flat_state)
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=bool(token.is_cuda)):
+            hidden, flat_state = eval_core(token[0], flat_state)
         return hidden.unsqueeze(0).to(dtype=output_dtype), flat_state
 
     def init_state(self, batch_size: int, *, device: torch.device, dtype: torch.dtype):

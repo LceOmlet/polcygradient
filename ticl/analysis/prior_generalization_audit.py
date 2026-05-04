@@ -964,6 +964,7 @@ def run_prior_generalization_audit(
     reference_semantics_enabled: bool = False,
     rollout_backend: str = "family_vectorized",
     include_action_reachability_probe: bool = True,
+    allow_noncanonical_rollout_backend: bool = False,
 ) -> dict[str, Any]:
     device_obj = torch.device(str(device or _default_device()))
     seedless_base_config = get_model_default_config("rlpfn")
@@ -1014,6 +1015,18 @@ def run_prior_generalization_audit(
     resolved_suite_regime = str(suite_regime).strip().lower()
     if resolved_suite_regime not in {"cross_env", "same_env"}:
         raise ValueError(f"Unknown suite_regime={suite_regime!r}")
+    resolved_backend = str(rollout_backend).strip().lower()
+    if (
+        resolved_suite_regime == "cross_env"
+        and resolved_backend != "serial"
+        and not bool(allow_noncanonical_rollout_backend)
+    ):
+        raise ValueError(
+            "cross_env prior_generalization_audit forward judgement is locked to rollout_backend='serial'. "
+            "Non-serial backends are exploratory only because the maintained family_vectorized cross-env path "
+            "has shown benchmark-contract drift against the serial baseline. "
+            "Pass allow_noncanonical_rollout_backend=True only for traceback or exploratory diagnostics."
+        )
 
     base_suite = None
     train_suite = _maybe_load_suite(train_suite_path)
@@ -1154,6 +1167,7 @@ def run_prior_generalization_audit(
             "reference_semantics_enabled": bool(reference_semantics_enabled),
             "rollout_backend": str(rollout_backend),
             "include_action_reachability_probe": bool(include_action_reachability_probe),
+            "allow_noncanonical_rollout_backend": bool(allow_noncanonical_rollout_backend),
         },
         "suite_paths": saved_suite_paths,
         "base_suite": (
@@ -1266,6 +1280,11 @@ def main(argv: Optional[list[str]] = None) -> int:
     parser.add_argument("--reference-semantics", action="store_true")
     parser.add_argument("--rollout-backend", type=str, default="family_vectorized", choices=["family_vectorized", "serial"])
     parser.add_argument("--no-action-reachability-probe", action="store_true")
+    parser.add_argument(
+        "--allow-noncanonical-rollout-backend",
+        action="store_true",
+        help="Allow exploratory non-serial backends for cross_env audits. Trusted forward judgement remains serial-only.",
+    )
     parser.add_argument("--output", type=str, default=None)
     parser.add_argument("--print-json", action="store_true")
     args = parser.parse_args(argv)
@@ -1296,6 +1315,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         reference_semantics_enabled=bool(args.reference_semantics),
         rollout_backend=args.rollout_backend,
         include_action_reachability_probe=not bool(args.no_action_reachability_probe),
+        allow_noncanonical_rollout_backend=bool(args.allow_noncanonical_rollout_backend),
     )
 
     output_path = str(Path(args.output).expanduser().resolve()) if args.output else _default_output_path(

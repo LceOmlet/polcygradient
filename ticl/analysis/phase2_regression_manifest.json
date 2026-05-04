@@ -21,20 +21,35 @@
   },
   "shared_milestone": {
     "abs_tol": 1e-06,
-    "zero_suffix_return_mean": -0.5634000301361084,
+    "required_report_fields": {
+      "frozen_h_seed_mode": "current",
+      "strict_native_rollout": false,
+      "restore_validation_policy_state": false,
+      "record_suite_critic_quality": true
+    },
+    "required_fixed_env_contract": {
+      "frozen_h_fingerprint": "7ef09e0736b8fd205af47d313b0b79723a6749bae126dff723cf8c08793ebee2",
+      "frozen_h_seed_mode": "current",
+      "zero_eval_prior_reuses_sampling_state": false
+    },
+    "zero_suffix_return_mean": -5.985112190246582,
     "learned": {
-      "pre_smp_gap": -0.028345704078674316,
-      "post_smp_gap": 0.6964260339736938,
-      "delta_smp_gap": 0.7247717380523682,
-      "pre_return": -0.5917457342147827,
-      "post_return": 0.13302600383758545
+      "delta_smp_gap": 5.074603736400604
     },
     "zero": {
-      "pre_smp_gap": 0.032540202140808105,
-      "post_smp_gap": 0.18433082103729248,
-      "delta_smp_gap": 0.15179061889648438,
-      "pre_return": -0.5308598279953003,
-      "post_return": -0.3790692090988159
+      "delta_smp_gap": 2.6649839878082275
+    },
+    "heldout_critic_quality": {
+      "learned": {
+        "objective_total": 1536,
+        "raw_corr_min": 0.9,
+        "explained_variance_raw_min": 0.8
+      },
+      "zero": {
+        "objective_total": 1536,
+        "raw_corr_min": 0.8,
+        "explained_variance_raw_min": 0.65
+      }
     }
   }
 }

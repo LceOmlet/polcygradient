@@ -17,9 +17,8 @@ DEFAULT_OUTPUT_JSON = (
 )
 
 TARGET_ENV_INDEX = 12
-TARGET_OBJECTIVE_EPISODE_INDEX = 0
-TARGET_OBJECTIVE_POSITION_START = 18
-TARGET_OBJECTIVE_POSITION_END = 21
+TARGET_OBJECTIVE_GLOBAL_POSITION_START = 18
+TARGET_OBJECTIVE_GLOBAL_POSITION_END = 21
 
 
 def _load_json(path: str) -> dict[str, Any]:
@@ -97,9 +96,8 @@ def _build_scope_masks(arrays: dict[str, np.ndarray]) -> dict[str, np.ndarray]:
     env12_mask = objective_mask & (np.asarray(arrays["env_indices"], dtype=np.int64) == int(TARGET_ENV_INDEX))
     block_mask = (
         env12_mask
-        & (np.asarray(arrays["objective_episode_indices"], dtype=np.int64) == int(TARGET_OBJECTIVE_EPISODE_INDEX))
-        & (np.asarray(arrays["objective_episode_positions"], dtype=np.int64) >= int(TARGET_OBJECTIVE_POSITION_START))
-        & (np.asarray(arrays["objective_episode_positions"], dtype=np.int64) <= int(TARGET_OBJECTIVE_POSITION_END))
+        & (np.asarray(arrays["objective_global_positions"], dtype=np.int64) >= int(TARGET_OBJECTIVE_GLOBAL_POSITION_START))
+        & (np.asarray(arrays["objective_global_positions"], dtype=np.int64) <= int(TARGET_OBJECTIVE_GLOBAL_POSITION_END))
     )
     return {
         "objective": objective_mask,
@@ -245,6 +243,12 @@ def build_pair2_exact_update_aggregation_audit(
     for key in ("outer_batch_idx", "epoch_idx", "batch_size_flat", "objective_total", "normalize_advantage"):
         if baseline_summary[key] != override_summary[key]:
             raise ValueError(f"snapshot contract mismatch on {key}: {baseline_summary[key]!r} vs {override_summary[key]!r}")
+    baseline_runtime_suite_name = str(
+        baseline_summary.get("actor_objective_runtime_current_suite_name", "")
+    )
+    override_runtime_suite_name = str(
+        override_summary.get("actor_objective_runtime_current_suite_name", "")
+    )
 
     baseline_arrays = _build_snapshot_arrays(baseline_snapshot)
     override_arrays = _build_snapshot_arrays(override_snapshot)
@@ -285,13 +289,14 @@ def build_pair2_exact_update_aggregation_audit(
             "normalize_advantage": bool(baseline_summary["normalize_advantage"]),
             "baseline_actor_objective_mode": str(baseline_summary["actor_objective_mode"]),
             "override_actor_objective_mode": str(override_summary["actor_objective_mode"]),
-            "runtime_suite_name": str(baseline_summary["actor_objective_runtime_current_suite_name"]),
+            "runtime_suite_name": override_runtime_suite_name,
+            "baseline_runtime_suite_name": baseline_runtime_suite_name,
+            "override_runtime_suite_name": override_runtime_suite_name,
         },
         "target_block": {
             "env_index": int(TARGET_ENV_INDEX),
-            "objective_episode_index": int(TARGET_OBJECTIVE_EPISODE_INDEX),
-            "objective_position_start": int(TARGET_OBJECTIVE_POSITION_START),
-            "objective_position_end": int(TARGET_OBJECTIVE_POSITION_END),
+            "objective_global_position_start": int(TARGET_OBJECTIVE_GLOBAL_POSITION_START),
+            "objective_global_position_end": int(TARGET_OBJECTIVE_GLOBAL_POSITION_END),
             "block_token_count": int(baseline_block_count),
             "env12_objective_token_count": int(baseline_masks["env12"].sum()),
             "batch_objective_token_count": int(baseline_masks["objective"].sum()),

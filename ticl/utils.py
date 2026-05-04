@@ -379,6 +379,13 @@ def _resolve_max_filename_component_bytes(default_value=255):
 
 def _truncate_component_with_hash(name, max_bytes):
     name = str(name)
+    # Model strings are used as a single filename component.  CLI values such
+    # as --fixed-frozen-h-json may contain absolute paths; keep that semantic
+    # content in the hash/truncated stem without accidentally creating nested
+    # log/checkpoint directories.
+    name = name.replace(os.sep, "_")
+    if os.altsep:
+        name = name.replace(os.altsep, "_")
     raw = name.encode("utf-8")
     if len(raw) <= int(max_bytes):
         return name
@@ -564,6 +571,67 @@ def _format_log_scalar(value):
     return str(value)
 
 
+def _format_compact_metric_value(value):
+    if isinstance(value, (bool, np.bool_)):
+        return str(int(bool(value)))
+    if isinstance(value, (int, np.integer)):
+        return str(int(value))
+    if isinstance(value, (float, np.floating)):
+        fv = float(value)
+        if np.isnan(fv):
+            return "nan"
+        if np.isposinf(fv):
+            return "inf"
+        if np.isneginf(fv):
+            return "-inf"
+        return f"{fv:.6g}"
+    return str(value)
+
+
+def _truncate_metric_label(label, max_width):
+    label = str(label)
+    if max_width <= 3 or len(label) <= max_width:
+        return label
+    return label[: max_width - 3] + "..."
+
+
+def _render_grouped_ppo_metric_table(ppo_logger_metrics):
+    if not isinstance(ppo_logger_metrics, dict) or len(ppo_logger_metrics) == 0:
+        return None
+    grouped = {}
+    for raw_key, raw_value in ppo_logger_metrics.items():
+        if raw_value is None:
+            continue
+        key = str(raw_key)
+        if "/" in key:
+            prefix, suffix = key.split("/", 1)
+            group_name = f"{prefix}/"
+        else:
+            group_name = "other/"
+            suffix = key
+        grouped.setdefault(group_name, []).append((str(suffix), raw_value))
+    if not grouped:
+        return None
+
+    preferred_group_order = ["rollout/", "time/", "train/"]
+    ordered_groups = [group for group in preferred_group_order if group in grouped]
+    ordered_groups.extend(sorted(group for group in grouped.keys() if group not in ordered_groups))
+
+    key_width = 56
+    value_width = 11
+    table_width = key_width + value_width + 7
+    border = "-" * table_width
+    lines = [border]
+    for group_name in ordered_groups:
+        lines.append(f"| {group_name:<{key_width}} | {'':>{value_width}} |")
+        for suffix, raw_value in sorted(grouped[group_name], key=lambda item: item[0]):
+            row_key = "   " + _truncate_metric_label(suffix, max(1, key_width - 3))
+            row_value = _format_compact_metric_value(raw_value)
+            lines.append(f"| {row_key:<{key_width}} | {row_value:>{value_width}} |")
+    lines.append(border)
+    return "\n".join(lines)
+
+
 def make_training_callback(
     save_every, 
     model_string, 
@@ -630,23 +698,10 @@ def make_training_callback(
                             f.write(f"Epoch {epoch} ppo_diag {' '.join(diag_fields)}\n")
                     ppo_logger_metrics = getattr(model, "last_ppo_logger_metrics", None)
                     if isinstance(ppo_logger_metrics, dict) and len(ppo_logger_metrics) > 0:
-                        def _ppo_metric_sort_key(key):
-                            key_str = str(key)
-                            if key_str.startswith("rollout/"):
-                                return (0, key_str)
-                            if key_str.startswith("time/"):
-                                return (1, key_str)
-                            if key_str.startswith("train/"):
-                                return (2, key_str)
-                            return (3, key_str)
-
-                        for key in sorted(ppo_logger_metrics.keys(), key=_ppo_metric_sort_key):
-                            value = ppo_logger_metrics.get(key, None)
-                            if value is None:
-                                continue
-                            f.write(
-                                f"Epoch {epoch} ppo_metric {key} {_format_log_scalar(value)}\n"
-                            )
+                        ppo_metric_table = _render_grouped_ppo_metric_table(ppo_logger_metrics)
+                        if ppo_metric_table:
+                            f.write(f"Epoch {epoch} ppo_metrics\n")
+                            f.write(ppo_metric_table + "\n")
                 else:
                     f.write(f'Epoch {epoch} loss {model.losses[-1]} learning_rate {model.learning_rates[-1]}\n')
         except Exception as e:
@@ -670,7 +725,11 @@ def make_training_callback(
                 else:
                     report(epoch=epoch, loss=model.losses[-1], wallclock_time=wallclock_ticker)  # every 5 minutes
 
-        if (epoch == "on_exit") or epoch % save_every == 0:
+        should_save_epoch = (
+            epoch == "on_exit"
+            or (int(save_every) > 0 and epoch % int(save_every) == 0)
+        )
+        if should_save_epoch:
             if checkpoint_dir is not None:
                 if epoch == "on_exit":
                     return

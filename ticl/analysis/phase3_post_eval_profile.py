@@ -10,7 +10,11 @@ import torch
 if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
-from ticl.analysis.phase2_guardrail import DEFAULT_PHASE2_SUMMARY, assert_phase2_green
+from ticl.analysis.phase2_guardrail import (
+    TRUSTED_PHASE2_LAUNCH_SUMMARY,
+    assert_phase2_launch_chain_green,
+    assert_phase2_green,
+)
 from ticl.analysis.phase3_multi_env_optimization_audit import (
     _default_device,
     _load_post_policy_bundle,
@@ -54,7 +58,7 @@ def main() -> int:
     parser.add_argument("--n-epochs", type=int, default=None)
     parser.add_argument("--learning-rate", type=float, default=None)
     parser.add_argument("--target-kl", type=float, default=None)
-    parser.add_argument("--phase2-summary-path", type=str, default=DEFAULT_PHASE2_SUMMARY)
+    parser.add_argument("--phase2-summary-path", type=str, default=TRUSTED_PHASE2_LAUNCH_SUMMARY)
     parser.add_argument("--max-envs", type=int, default=None)
     parser.add_argument("--output-json", type=str, required=True)
     parser.add_argument("--overwrite", action="store_true")
@@ -65,7 +69,11 @@ def main() -> int:
         print(output_path.read_text())
         return 0
 
-    phase2_summary = assert_phase2_green(args.phase2_summary_path)
+    resolved_train_profile = str(args.train_profile).strip().lower()
+    if resolved_train_profile == "trusted_sep_reset_mainline":
+        phase2_summary = assert_phase2_launch_chain_green(args.phase2_summary_path)
+    else:
+        phase2_summary = assert_phase2_green(args.phase2_summary_path)
     checkpoint_path = str(Path(args.checkpoint_path).expanduser().resolve())
     device_obj = torch.device(str(args.device or _default_device()))
 
@@ -84,11 +92,17 @@ def main() -> int:
     optimizer_cfg = dict(config.get("optimizer", {}))
     profile_cfg = _resolve_train_profile(
         optimizer_cfg=optimizer_cfg,
-        train_profile=str(args.train_profile),
+        train_profile=resolved_train_profile,
         batch_size=args.batch_size,
         n_epochs=args.n_epochs,
         learning_rate=args.learning_rate,
         target_kl=args.target_kl,
+    )
+    strict_native_rollout = bool(
+        optimizer_cfg.get(
+            "ppo_strict_native_rollout",
+            resolved_train_profile == "trusted_sep_reset_mainline",
+        )
     )
 
     algo, _callback, vec_env = build_recurrent_ppo(
@@ -111,6 +125,7 @@ def main() -> int:
         actor_objective_mode=str(profile_cfg["actor_objective_mode"]),
         reset_env_state_at_sep=bool(profile_cfg["reset_env_state_at_sep"]),
         separate_value_backbone=bool(profile_cfg["separate_value_backbone"]),
+        strict_native_rollout=bool(strict_native_rollout),
         restore_validation_policy_state=True,
         runtime_normalized_q_value_weight_override=profile_cfg["runtime_normalized_q_value_weight_override"],
         runtime_next_state_flow_matching_weight_override=profile_cfg["runtime_next_state_flow_matching_weight_override"],
@@ -135,6 +150,7 @@ def main() -> int:
         single_eval_pos=int(args.single_eval_pos),
         rollout_backend=str(args.rollout_backend),
         profile_cfg=profile_cfg,
+        strict_native_rollout=bool(strict_native_rollout),
     )
     algo.policy.load_state_dict(bundle["policy_state_dict"], strict=True)
 
@@ -178,6 +194,7 @@ def main() -> int:
             "single_eval_pos": int(args.single_eval_pos),
             "rollout_backend": str(args.rollout_backend),
             "train_profile": str(profile_cfg["train_profile"]),
+            "strict_native_rollout": bool(strict_native_rollout),
             "max_envs": None if args.max_envs is None else int(args.max_envs),
             "profile_build_n_envs": 1,
             "profile_build_n_steps": 1,

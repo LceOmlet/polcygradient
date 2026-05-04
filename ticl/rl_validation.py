@@ -336,6 +336,7 @@ def _resolve_validation_recurrent_ppo_policy(*, model, config, env_cfg, device, 
         device=device,
         num_features=int(num_features),
         policy_state_dict=policy_state_dict if isinstance(policy_state_dict, dict) else None,
+        strict_native_rollout=bool(config.get("optimizer", {}).get("ppo_strict_native_rollout", False)),
     )
     for target in (model, getattr(model, "module", None), getattr(model, "_orig_mod", None)):
         if target is None:

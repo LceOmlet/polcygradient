@@ -5,6 +5,7 @@ from types import SimpleNamespace
 import numpy as np
 import pytest
 import torch
+import torch.nn.functional as F
 from gymnasium import spaces
 
 import ticl.sb3_recurrent_ppo as sb3_recurrent_ppo_module
@@ -14,6 +15,8 @@ from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout
 from ticl.sb3_recurrent_ppo import (
     EnvironmentPriorPPOGymEnv,
+    CROSS_ROLLOUT_RUNNING_EMA_RMS_ALPHA,
+    CROSS_ROLLOUT_RUNNING_EMA_RMS_SPACE,
     MaskedRecurrentPPO,
     MaskedRecurrentFlatBatchSamples,
     MaskedRecurrentRolloutBuffer,
@@ -25,6 +28,7 @@ from ticl.sb3_recurrent_ppo import (
     _discounted_returns_from_rewards,
     _explained_variance_with_mask,
     _recover_raw_from_value_space,
+    _sampled_array_summary,
     _normalize_advantages_with_mask,
     _resolve_actor_advantages,
     _resolve_runtime_scoped_actor_objective_mode,
@@ -32,6 +36,7 @@ from ticl.sb3_recurrent_ppo import (
     _slice_flat_sequence_batch_to_padded,
     _slice_masked_rollout_sequence_batch,
     _slice_padded_sequence_tensor,
+    build_rlpfn_obs_token_batch_from_components,
     extract_validation_recurrent_ppo_policy_state,
     build_validation_recurrent_ppo_policy,
     build_recurrent_ppo,
@@ -45,6 +50,68 @@ def _cuda_or_skip():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required for strict official RWKV PPO tests.")
     return torch.device("cuda")
+
+
+def test_sampled_array_summary_does_not_alias_single_feature_column():
+    values = np.zeros((64, 64, 100), dtype=np.float32)
+    values[:, :, 1] = 1.0
+
+    summary = _sampled_array_summary(values, prefix="obs", sample_size=4096)
+
+    assert summary["obs_sample_absmax"] == pytest.approx(1.0)
+    assert summary["obs_sample_std"] > 0.0
+
+
+def test_rlpfn_obs_token_builder_uses_shared_rollout_schema():
+    obs_t = torch.tensor(
+        [
+            [1.0, 2.0, 3.0, 4.0],
+            [5.0, 6.0, 7.0, 8.0],
+        ],
+        dtype=torch.float32,
+    )
+    action_t = torch.tensor(
+        [
+            [0.1, 0.2, 0.3],
+            [-0.1, -0.2, -0.3],
+        ],
+        dtype=torch.float32,
+    )
+    reward_t = torch.tensor([9.0, -9.0], dtype=torch.float32)
+    reward_mask_t = torch.tensor([1.0, 0.0], dtype=torch.float32)
+    env_info = {
+        "obs_slot_dim": torch.tensor([4, 3], dtype=torch.long),
+        "action_slot_dim": torch.tensor([3, 2], dtype=torch.long),
+        "action_dim_per_sample": torch.tensor([2, 3], dtype=torch.long),
+        "terminal_reset_enabled": torch.tensor([False, True], dtype=torch.bool),
+        "obs_dim": torch.tensor([4, 2], dtype=torch.long),
+        "phase_t": torch.tensor([0.0, 1.0], dtype=torch.float32),
+        "terminal_t": torch.tensor([0.0, 1.0], dtype=torch.float32),
+    }
+
+    tokens = build_rlpfn_obs_token_batch_from_components(
+        obs_t=obs_t,
+        action_t=action_t,
+        reward_t=reward_t,
+        reward_mask_t=reward_mask_t,
+        env_info=env_info,
+        num_features=12,
+    )
+
+    assert tokens.shape == (2, 12)
+    assert torch.allclose(tokens[0, :4], torch.tensor([1.0, 2.0, 3.0, 4.0]))
+    assert tokens[0, 4].item() == pytest.approx(9.0)
+    assert tokens[0, 5].item() == pytest.approx(1.0)
+    assert tokens[0, 6].item() == pytest.approx(0.0)
+    assert torch.allclose(tokens[0, 7:9], torch.tensor([0.1, 0.2]))
+    assert tokens[0, 9].item() == pytest.approx(0.0)
+    assert torch.allclose(tokens[1, :3], torch.tensor([5.0, 6.0, 0.0]))
+    assert tokens[1, 3].item() == pytest.approx(-9.0)
+    assert tokens[1, 4].item() == pytest.approx(0.0)
+    assert tokens[1, 5].item() == pytest.approx(1.0)
+    assert tokens[1, 6].item() == pytest.approx(1.0)
+    assert torch.allclose(tokens[1, 7:9], torch.tensor([-0.1, -0.2]))
+    assert tokens[1, 9].item() == pytest.approx(0.0)
 
 
 class _FakeOfficialCore(torch.nn.Module):
@@ -739,6 +806,80 @@ def test_policy_rollout_forward_uses_single_batched_step_call():
     assert fake_model.rwkv_core.sequence_calls == 0
 
 
+def test_policy_evaluate_actions_with_hidden_uses_single_sequence_replay_for_shared_backbone():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        net_arch=[],
+    ).to(device)
+    policy.eval()
+    obs = torch.randn((6, num_features), device=device, dtype=torch.float32)
+    actions = torch.randn((6, action_dim), device=device, dtype=torch.float32)
+    episode_starts = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+    with torch.no_grad():
+        outputs = policy.evaluate_actions_with_hidden(
+            obs,
+            actions,
+            policy._dummy_states(2),
+            episode_starts,
+        )
+    assert outputs["values"].shape == (6, 1)
+    assert outputs["log_prob"].shape == (6,)
+    assert outputs["entropy"].shape == (6,)
+    assert fake_model.rwkv_core.sequence_calls == 1
+    assert fake_model.rwkv_core.step_calls == 0
+
+
+def test_policy_evaluate_actions_with_hidden_flat_uses_single_sequence_replay_for_shared_backbone():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        net_arch=[],
+    ).to(device)
+    policy.eval()
+    obs = torch.randn((6, num_features), device=device, dtype=torch.float32)
+    actions = torch.randn((6, action_dim), device=device, dtype=torch.float32)
+    with torch.no_grad():
+        outputs = policy.evaluate_actions_with_hidden_flat(
+            obs,
+            actions,
+            seq_lengths=np.array([3, 3], dtype=np.int64),
+        )
+    assert outputs["values"].shape == (6, 1)
+    assert outputs["log_prob"].shape == (6,)
+    assert outputs["entropy"].shape == (6,)
+    assert fake_model.rwkv_core.sequence_calls == 1
+    assert fake_model.rwkv_core.step_calls == 0
+
+
 def test_policy_vectorized_rollout_step_truncates_action_stats_to_batch_max_action_dim():
     num_features = 8
     obs_slot_dim = 4
@@ -784,7 +925,144 @@ def test_policy_vectorized_rollout_step_truncates_action_stats_to_batch_max_acti
     assert torch.allclose(action_std[2, 1:], torch.zeros((2,), dtype=action_std.dtype))
 
 
-def test_policy_evaluate_actions_uses_sequence_path_not_step_path():
+def test_policy_vectorized_rollout_step_resets_cache_rows_on_terminal():
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+    )
+
+    def _stateful_forward_step(token, state=None):
+        carry = state[0][0][:, :1].expand_as(token)
+        hidden = token + carry
+        next_state = []
+        for att_x_prev, att_kv, ffn_x_prev in state:
+            next_state.append(
+                (
+                    att_x_prev + 1.0,
+                    att_kv + 1.0,
+                    ffn_x_prev + 1.0,
+                )
+            )
+        return hidden, next_state
+
+    fake_model.rwkv_core.forward_step = _stateful_forward_step
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        net_arch=[],
+    )
+    policy.eval()
+    step_fn = policy.make_vectorized_rollout_step_fn()
+    batch_size = 2
+    obs_t = torch.randn((batch_size, obs_slot_dim), dtype=torch.float32)
+    action_t = torch.zeros((batch_size, action_dim), dtype=torch.float32)
+    reward_t = torch.zeros((batch_size, 1), dtype=torch.float32)
+    reward_mask_t = torch.ones((batch_size, 1), dtype=torch.float32)
+    env_info = {
+        "obs_dim": torch.full((batch_size,), obs_slot_dim, dtype=torch.long),
+        "obs_slot_dim": torch.full((batch_size,), obs_slot_dim, dtype=torch.long),
+        "action_slot_dim": torch.full((batch_size,), action_dim, dtype=torch.long),
+        "action_dim_per_sample": torch.full((batch_size,), action_dim, dtype=torch.long),
+        "terminal_reset_enabled": torch.ones((batch_size,), dtype=torch.bool),
+        "phase_t": torch.zeros((batch_size,), dtype=torch.float32),
+        "terminal_t": torch.zeros((batch_size, 1), dtype=torch.float32),
+    }
+
+    first_outputs, cache_after_first = step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 0, env_info)
+    continued_outputs, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, cache_after_first, 1, env_info)
+    reset_env_info = dict(env_info)
+    reset_env_info["terminal_t"] = torch.ones((batch_size, 1), dtype=torch.float32)
+    reset_outputs, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, cache_after_first, 1, reset_env_info)
+    fresh_reset_outputs, _ = step_fn(obs_t, action_t, reward_t, reward_mask_t, None, 1, reset_env_info)
+
+    assert not torch.allclose(first_outputs["value_logits"], continued_outputs["value_logits"])
+    assert torch.allclose(reset_outputs["value_logits"], fresh_reset_outputs["value_logits"])
+
+
+def test_official_rollout_hidden_from_cache_handles_batch1_flat_official_eval_state():
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+    )
+    state_inputs = []
+
+    def _flat_official_forward_step(token, state=None):
+        state_inputs.append(state)
+        hidden = token + 0.5
+        if state is None:
+            state = fake_model.rwkv_core.init_state(
+                int(token.shape[0]),
+                device=token.device,
+                dtype=token.dtype,
+            )
+        if isinstance(state, list) and state and isinstance(state[0], tuple):
+            flat = []
+            for att_x_prev, att_kv, ffn_x_prev in state:
+                flat.append(att_x_prev[0] + 1.0)
+                flat.append(att_kv[0] + 1.0)
+                flat.append(ffn_x_prev[0] + 1.0)
+            return hidden, flat
+        return hidden, [tensor + 1.0 for tensor in state]
+
+    fake_model.rwkv_core.forward_step = _flat_official_forward_step
+    fake_model.rwkv_core._is_official_eval_state = (
+        lambda state: isinstance(state, list) and len(state) == 3 and all(torch.is_tensor(t) for t in state)
+    )
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        net_arch=[],
+    )
+    policy.eval()
+    obs = torch.randn((1, num_features), dtype=torch.float32)
+
+    hidden_first, cache_first = policy._official_rollout_hidden_from_cache(
+        obs,
+        torch.zeros((1,), dtype=torch.float32),
+        cache=None,
+    )
+    hidden_second, cache_second = policy._official_rollout_hidden_from_cache(
+        obs,
+        torch.zeros((1,), dtype=torch.float32),
+        cache=cache_first,
+    )
+    hidden_reset, _ = policy._official_rollout_hidden_from_cache(
+        obs,
+        torch.ones((1,), dtype=torch.float32),
+        cache=cache_first,
+    )
+
+    assert tuple(hidden_first.shape) == (1, fake_model.emsize)
+    assert tuple(hidden_second.shape) == (1, fake_model.emsize)
+    assert tuple(hidden_reset.shape) == (1, fake_model.emsize)
+    assert isinstance(cache_first, list)
+    assert len(cache_first) == 3
+    assert isinstance(state_inputs[0], list)
+    assert isinstance(state_inputs[0][0], tuple)
+    assert state_inputs[1] is cache_first
+    assert isinstance(state_inputs[2], list)
+    assert isinstance(state_inputs[2][0], tuple)
+
+
+def test_policy_evaluate_actions_uses_official_separate_actor_critic_sequence_paths():
     device = _cuda_or_skip()
     num_features = 8
     obs_slot_dim = 4
@@ -819,10 +1097,10 @@ def test_policy_evaluate_actions_uses_sequence_path_not_step_path():
     assert log_prob.shape == (6,)
     assert entropy.shape == (6,)
     assert fake_model.rwkv_core.step_calls == 0
-    assert fake_model.rwkv_core.sequence_calls == 1
-    assert fake_model.replay_chunk_requests == [(3, 2)]
-    assert fake_model.encode_sequence_calls == 1
-    assert fake_model.encode_sequence_shapes == [(3, 2, num_features)]
+    assert fake_model.rwkv_core.sequence_calls == 2
+    assert fake_model.replay_chunk_requests == [(3, 2), (3, 2)]
+    assert fake_model.encode_sequence_calls == 2
+    assert fake_model.encode_sequence_shapes == [(3, 2, num_features), (3, 2, num_features)]
 
 
 def test_policy_value_head_returns_bar_mean_for_rollout_and_train_paths():
@@ -896,6 +1174,216 @@ def test_policy_value_head_returns_bar_mean_for_rollout_and_train_paths():
         rtol=1e-6,
     )
 
+
+def test_policy_can_use_scalar_linear_value_head():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+        normalized_q_head=True,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        value_head_impl="scalar_linear",
+        net_arch=[],
+    ).to(device)
+    obs = torch.randn((6, num_features), device=device, dtype=torch.float32)
+    episode_starts = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+    actions = torch.zeros((6, action_dim), device=device, dtype=torch.float32)
+
+    eval_outputs = policy.evaluate_actions_with_hidden(
+        obs,
+        actions,
+        policy._dummy_states(2),
+        episode_starts,
+    )
+    assert policy.has_value_bardist() is False
+    assert eval_outputs["value_logits"].shape == (6, 1)
+    assert eval_outputs["values"].shape == (6, 1)
+    assert torch.allclose(
+        eval_outputs["values"],
+        eval_outputs["value_logits"].to(dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+    offsets = torch.full((6,), 3.0, device=device, dtype=torch.float32)
+    scales = torch.full((6,), 2.5, device=device, dtype=torch.float32)
+    shifted_values = policy._value_from_logits(
+        eval_outputs["value_logits"],
+        value_means=offsets,
+        value_stds=scales,
+    )
+    assert torch.allclose(
+        shifted_values,
+        offsets.unsqueeze(-1) + scales.unsqueeze(-1) * eval_outputs["value_logits"].to(dtype=torch.float32),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_policy_can_use_batchnorm_value_path_adapter():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+        normalized_q_head=True,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        value_head_impl="legacy_bar",
+        value_path_adapter_impl="batchnorm",
+        net_arch=[],
+    ).to(device)
+    assert policy.value_path_adapter_impl == "batchnorm"
+    assert isinstance(policy.value_path_adapter, sb3_recurrent_ppo_module._ValuePathBatchNormAdapter)
+
+    latent = torch.randn((6, policy.mlp_extractor.latent_dim_vf), device=device, dtype=torch.float32)
+    adapted = policy._adapt_value_latent(latent)
+    assert adapted.shape == latent.shape
+    assert torch.isfinite(adapted).all()
+    assert not torch.allclose(adapted, latent)
+
+    single_latent = torch.randn((1, policy.mlp_extractor.latent_dim_vf), device=device, dtype=torch.float32)
+    single_adapted = policy._adapt_value_latent(single_latent)
+    assert single_adapted.shape == single_latent.shape
+    assert torch.isfinite(single_adapted).all()
+
+    obs = torch.randn((6, num_features), device=device, dtype=torch.float32)
+    episode_starts = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+    actions = torch.zeros((6, action_dim), device=device, dtype=torch.float32)
+    eval_outputs = policy.evaluate_actions_with_hidden(
+        obs,
+        actions,
+        policy._dummy_states(2),
+        episode_starts,
+    )
+    assert eval_outputs["value_logits"].shape == (6, int(policy.get_value_bardist().num_bars))
+    assert eval_outputs["values"].shape == (6, 1)
+
+
+def test_policy_can_use_batchnorm_batchstats_value_path_adapter():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+        normalized_q_head=True,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        value_head_impl="legacy_bar",
+        value_path_adapter_impl="batchnorm_batchstats",
+        net_arch=[],
+    ).to(device)
+    assert policy.value_path_adapter_impl == "batchnorm_batchstats"
+    assert isinstance(policy.value_path_adapter, sb3_recurrent_ppo_module._ValuePathBatchNormAdapter)
+    assert bool(policy.value_path_adapter.use_batch_stats_in_eval) is True
+
+    latent = torch.randn((6, policy.mlp_extractor.latent_dim_vf), device=device, dtype=torch.float32)
+    policy.eval()
+    adapted = policy._adapt_value_latent(latent)
+    expected = F.batch_norm(
+        latent,
+        policy.value_path_adapter.norm.running_mean.detach().clone(),
+        policy.value_path_adapter.norm.running_var.detach().clone(),
+        policy.value_path_adapter.norm.weight,
+        policy.value_path_adapter.norm.bias,
+        True,
+        policy.value_path_adapter.norm.momentum,
+        policy.value_path_adapter.norm.eps,
+    )
+    assert adapted.shape == latent.shape
+    assert torch.isfinite(adapted).all()
+    assert torch.allclose(adapted, expected, atol=1e-6, rtol=1e-6)
+
+
+def test_policy_can_use_vendor_official_value_head_and_frozen_zscore_adapter():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+        normalized_q_head=True,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        value_head_impl="vendor_official",
+        value_path_adapter_impl="frozen_zscore",
+        net_arch=[],
+    ).to(device)
+    assert policy.value_head_impl == "vendor_official"
+    assert policy.value_path_adapter_impl == "frozen_zscore"
+    assert isinstance(policy.value_path_adapter, sb3_recurrent_ppo_module._ValuePathFrozenZScoreAdapter)
+    assert policy.has_value_bardist() is True
+    assert policy.has_value_vendor_head() is True
+
+    obs = torch.randn((6, num_features), device=device, dtype=torch.float32)
+    episode_starts = torch.tensor([1.0, 0.0, 0.0, 1.0, 0.0, 0.0], device=device, dtype=torch.float32)
+    actions = torch.zeros((6, action_dim), device=device, dtype=torch.float32)
+    eval_outputs = policy.evaluate_actions_with_hidden(
+        obs,
+        actions,
+        policy._dummy_states(2),
+        episode_starts,
+    )
+    assert eval_outputs["value_logits"].shape == (6, int(policy.get_value_bardist().num_bars))
+    assert eval_outputs["values"].shape == (6, 1)
+
+    obs_steps = obs.reshape(3, 2, num_features)
+    episode_starts_steps = episode_starts.reshape(3, 2)
+    objective_masks_steps = torch.tensor(
+        [[0.0, 0.0], [1.0, 1.0], [1.0, 1.0]],
+        device=device,
+        dtype=torch.float32,
+    )
+    fitted = policy.fit_value_path_adapter_from_rollout_steps(
+        obs_steps,
+        episode_starts_steps,
+        objective_masks_steps,
+    )
+    assert fitted is True
+    assert bool(policy.value_path_adapter._is_fitted.item()) is True
+    assert torch.isfinite(eval_outputs["values"]).all()
+
     policy.eval()
     with torch.no_grad():
         rollout_values = policy.predict_values(obs[:3], policy._dummy_states(3), episode_starts[:3])
@@ -964,6 +1452,240 @@ def test_masked_rollout_buffer_identity_return_normalization_matches_official_ga
     assert np.allclose(buf.advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
     assert np.allclose(buf.actor_advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
     assert np.allclose(buf.returns[:, 0], expected_returns, atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_defaults_to_normalized_value_target_space():
+    gamma = 0.5
+    gae_lambda = 0.75
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=gae_lambda,
+        gamma=gamma,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    last_value = torch.tensor([3.0], dtype=torch.float32)
+    dones = np.asarray([False], dtype=bool)
+
+    buf.compute_returns_and_advantage(last_value, dones)
+
+    expected_adv = np.asarray([4.875, 9.0], dtype=np.float32)
+    expected_returns = np.asarray([5.875, 11.0], dtype=np.float32)
+
+    assert buf._value_target_space == "normalized"
+    assert np.allclose(buf.rollout_return_means[:, 0], np.asarray([5.25, 5.25], dtype=np.float32), atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.rollout_return_stds[:, 0], 0.25, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.actor_advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.returns[:, 0], expected_returns, atol=1e-6, rtol=1e-6)
+
+
+def test_raw_value_target_tensor_uses_gae_value_targets_not_discounted_returns():
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=0.5,
+        gamma=1.0,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf._value_target_space = "raw"
+    buf.values[:, 0] = np.asarray([0.0, 0.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([1.0, 1.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+
+    buf.compute_returns_and_advantage(torch.tensor([0.0], dtype=torch.float32), np.asarray([False], dtype=bool))
+
+    raw_value_targets = buf._get_flat_raw_value_targets_tensor(dtype=torch.float32).cpu().numpy()
+    raw_discounted_returns = buf._get_flat_raw_returns_tensor(dtype=torch.float32).cpu().numpy()
+    assert np.allclose(raw_value_targets, np.asarray([1.5, 1.0], dtype=np.float32), atol=1e-6, rtol=1e-6)
+    assert np.allclose(raw_discounted_returns, np.asarray([2.0, 1.0], dtype=np.float32), atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_cross_rollout_running_ema_rms_preserves_cross_rollout_scale():
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=1.0,
+        gamma=1.0,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf._value_target_space = CROSS_ROLLOUT_RUNNING_EMA_RMS_SPACE
+    buf._actor_gae_space = CROSS_ROLLOUT_RUNNING_EMA_RMS_SPACE
+    buf.reset()
+    buf.values[:, 0] = 0.0
+    buf.rewards[:, 0] = np.asarray([1.0, 1.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    buf.compute_returns_and_advantage(torch.tensor([0.0], dtype=torch.float32), np.asarray([False], dtype=bool))
+
+    first_scale = np.sqrt((2.0**2 + 1.0**2) / 2.0)
+    assert np.allclose(buf.rollout_return_means[:, 0], 0.0, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.rollout_return_stds[:, 0], first_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.returns[:, 0], np.asarray([2.0, 1.0]) / first_scale, atol=1e-6, rtol=1e-6)
+
+    buf.reset()
+    buf._value_target_space = CROSS_ROLLOUT_RUNNING_EMA_RMS_SPACE
+    buf._actor_gae_space = CROSS_ROLLOUT_RUNNING_EMA_RMS_SPACE
+    buf.values[:, 0] = 0.0
+    buf.rewards[:, 0] = np.asarray([10.0, 10.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    buf.compute_returns_and_advantage(torch.tensor([0.0], dtype=torch.float32), np.asarray([False], dtype=bool))
+
+    second_rollout_local_scale = np.sqrt((20.0**2 + 10.0**2) / 2.0)
+    second_running_scale = np.sqrt(
+        (1.0 - CROSS_ROLLOUT_RUNNING_EMA_RMS_ALPHA) * (first_scale**2)
+        + CROSS_ROLLOUT_RUNNING_EMA_RMS_ALPHA * (second_rollout_local_scale**2)
+    )
+    assert np.allclose(buf.rollout_return_stds[:, 0], second_running_scale, atol=1e-6, rtol=1e-6)
+    assert second_running_scale < second_rollout_local_scale
+    assert np.allclose(
+        buf.actor_advantages[:, 0],
+        np.asarray([20.0, 10.0], dtype=np.float32) / second_running_scale,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+
+
+def test_masked_rollout_buffer_reward_normalized_actor_gae_requires_reward_normalized_value_space():
+    gamma = 1.0
+    gae_lambda = 1.0
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=gae_lambda,
+        gamma=gamma,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf._value_target_space = "raw"
+    buf._actor_gae_space = "reward_normalized"
+    buf.values[:, 0] = np.asarray([0.0, 0.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([1.0, 5.0], dtype=np.float32)
+    buf.objective_masks[:, 0] = np.asarray([1.0, 1.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    last_value = torch.tensor([0.0], dtype=torch.float32)
+    dones = np.asarray([False], dtype=bool)
+
+    with pytest.raises(
+        ValueError,
+        match="actor_gae_space='reward_normalized' requires value_target_space='reward_normalized'",
+    ):
+        buf.compute_returns_and_advantage(last_value, dones)
+
+
+def test_masked_rollout_buffer_reward_normalized_value_space_supports_raw_actor_gae():
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=1.0,
+        gamma=1.0,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf._value_target_space = "reward_normalized"
+    buf._actor_gae_space = "raw"
+    buf.values[:, 0] = np.asarray([0.0, 0.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
+    buf.objective_masks[:, 0] = np.asarray([1.0, 1.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+
+    buf.compute_returns_and_advantage(torch.tensor([0.0], dtype=torch.float32), np.asarray([False], dtype=bool))
+
+    assert np.isfinite(buf.actor_advantages).all()
+    assert buf.actor_advantages.shape == (2, 1)
+
+
+def test_masked_rollout_buffer_cached_bucket_idx_clips_targets_outside_full_support():
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=3,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(3, 1, 1, 1),
+        device="cpu",
+        gae_lambda=1.0,
+        gamma=1.0,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    bardist = make_standardized_full_support_bar_distribution(num_buckets=5, value_range=5.0)
+    buf._value_target_bardist_borders = bardist.borders.detach().cpu().numpy()
+    buf.returns[:, 0] = np.asarray([-99.0, 0.0, 99.0], dtype=np.float32)
+
+    buf._cache_value_target_bucket_idx()
+
+    assert np.array_equal(buf.value_target_bucket_idx[:, 0], np.asarray([0, 2, 4], dtype=np.int64))
+
+
+def test_masked_rollout_buffer_reward_normalized_value_targets_use_whole_rollout_reward_stats():
+    gamma = 0.5
+    gae_lambda = 1.0
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=4,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(4, 1, 1, 1),
+        device="cpu",
+        gae_lambda=gae_lambda,
+        gamma=gamma,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf._value_target_space = "reward_normalized"
+    buf.values[:, 0] = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([100.0, 100.0, 1.0, 5.0], dtype=np.float32)
+    buf.objective_masks[:, 0] = np.asarray([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0, 0.0, 0.0], dtype=np.float32)
+    last_value = torch.tensor([0.0], dtype=torch.float32)
+    dones = np.asarray([False], dtype=bool)
+
+    buf.compute_returns_and_advantage(last_value, dones)
+
+    expected_reward_mean = np.asarray([51.5], dtype=np.float32)
+    expected_reward_std = np.asarray([48.520615], dtype=np.float32)
+    expected_return_means = np.asarray([65.28125, 65.28125, 65.28125, 65.28125], dtype=np.float32)
+    expected_return_stds = np.asarray([63.4567, 63.4567, 63.4567, 63.4567], dtype=np.float32)
+    expected_raw_returns = np.asarray([150.875, 101.75, 3.5, 5.0], dtype=np.float32)
+    expected_adv = np.asarray([1.1193696, 0.23958889, -1.5199726, -0.95835555], dtype=np.float32)
+
+    assert np.allclose(buf.rollout_return_means[:, 0], expected_return_means, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.rollout_return_stds[:, 0], expected_return_stds, atol=1e-5, rtol=1e-5)
+    assert np.allclose(buf.advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.actor_advantages[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
+    assert np.allclose(buf.returns[:, 0], expected_adv, atol=1e-6, rtol=1e-6)
+    assert np.allclose(expected_reward_mean, np.asarray([51.5], dtype=np.float32), atol=1e-6, rtol=1e-6)
+    assert np.allclose(expected_reward_std, np.asarray([48.520615], dtype=np.float32), atol=1e-5, rtol=1e-5)
+    assert np.allclose(
+        buf._get_flat_raw_returns_tensor(dtype=torch.float32).cpu().numpy(),
+        expected_raw_returns,
+        atol=1e-6,
+        rtol=1e-6,
+    )
 
 
 def test_masked_rollout_buffer_add_pads_action_masks_to_global_mask_dim():
@@ -1047,6 +1769,8 @@ def test_masked_rollout_buffer_rollout_return_stats_drive_normalized_gae():
         next_state_dim=1,
     )
     buf.reset()
+    buf._value_target_space = "normalized"
+    buf._actor_gae_space = "normalized"
     buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
     buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
     buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -1101,6 +1825,7 @@ def test_masked_rollout_buffer_raw_actor_gae_space_keeps_critic_normalized_but_a
     )
     buf.reset()
     buf._actor_gae_space = "raw"
+    buf._value_target_space = "normalized"
     buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
     buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
     buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -1162,6 +1887,8 @@ def test_masked_rollout_buffer_normalized_sep_synced_matches_normalized_when_obj
     )
     for buf in (base, synced):
         buf.reset()
+        buf._value_target_space = "normalized"
+        buf._actor_gae_space = "normalized"
         buf.values[:, 0] = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         buf.rewards[:, 0] = np.asarray([1.0, 2.0, 3.0, 4.0], dtype=np.float32)
         buf.objective_masks[:, 0] = np.asarray([1.0, 1.0, 1.0, 1.0], dtype=np.float32)
@@ -1204,6 +1931,8 @@ def test_masked_rollout_buffer_normalized_sep_synced_recomputes_actor_advantages
     )
     for buf in (base, synced):
         buf.reset()
+        buf._value_target_space = "normalized"
+        buf._actor_gae_space = "normalized"
         buf.values[:, 0] = np.asarray([0.0, 0.0, 0.0, 0.0], dtype=np.float32)
         buf.rewards[:, 0] = np.asarray([10.0, 10.0, 1.0, 1.0], dtype=np.float32)
         buf.objective_masks[:, 0] = np.asarray([0.0, 0.0, 1.0, 1.0], dtype=np.float32)
@@ -1217,7 +1946,54 @@ def test_masked_rollout_buffer_normalized_sep_synced_recomputes_actor_advantages
 
     assert np.allclose(synced.advantages[:, 0], base.advantages[:, 0], atol=1e-6, rtol=1e-6)
     assert np.allclose(synced.returns[:, 0], base.returns[:, 0], atol=1e-6, rtol=1e-6)
-    assert np.allclose(synced.actor_advantages[2:, 0], np.asarray([4.0, 2.0], dtype=np.float32), atol=1e-5, rtol=1e-5)
+    adjusted_episode_starts = np.asarray(synced.episode_starts, dtype=np.float32).copy()
+    objective_mask_bool = np.asarray(synced.objective_masks, dtype=np.float32) > 1e-8
+    for env_idx in range(int(adjusted_episode_starts.shape[1])):
+        valid_steps = np.flatnonzero(objective_mask_bool[:, env_idx])
+        if int(valid_steps.size) > 0:
+            adjusted_episode_starts[int(valid_steps[0]), env_idx] = 1.0
+    actor_rollout_raw_returns = _discounted_returns_from_rewards(
+        synced.rewards,
+        episode_starts=adjusted_episode_starts,
+        dones=dones,
+        gamma=gamma,
+    )
+    actor_return_means_np, actor_return_stds_np = _rollout_return_norm_stats_from_raw_returns(
+        actor_rollout_raw_returns,
+        eps=1e-6,
+    )
+    values_raw = (
+        np.asarray(synced.rollout_return_means, dtype=np.float32)
+        + np.asarray(synced.rollout_return_stds, dtype=np.float32) * np.asarray(synced.values, dtype=np.float32)
+    )
+    last_values_raw = (
+        np.asarray(synced.rollout_return_means, dtype=np.float32)[-1]
+        + np.asarray(synced.rollout_return_stds, dtype=np.float32)[-1] * np.asarray([0.0], dtype=np.float32)
+    )
+    actor_values = (
+        values_raw - actor_return_means_np.reshape((1, synced.n_envs))
+    ) / actor_return_stds_np.reshape((1, synced.n_envs))
+    actor_last_values = (last_values_raw - actor_return_means_np) / actor_return_stds_np
+    actor_return_mean_over_std = actor_return_means_np / actor_return_stds_np
+    expected_actor_adv = np.zeros_like(synced.actor_advantages, dtype=np.float32)
+    last_gae_lam = np.zeros((synced.n_envs,), dtype=np.float32)
+    for step in reversed(range(synced.buffer_size)):
+        if step == synced.buffer_size - 1:
+            next_non_terminal = 1.0 - dones.astype(np.float32, copy=False)
+            next_values = actor_last_values
+        else:
+            next_non_terminal = 1.0 - adjusted_episode_starts[step + 1].astype(np.float32, copy=False)
+            next_values = actor_values[step + 1]
+        curr_values = actor_values[step]
+        reward_norm = (
+            synced.rewards[step] / actor_return_stds_np
+            + ((synced.gamma * next_non_terminal) - 1.0) * actor_return_mean_over_std
+        )
+        gamma_eff = synced.gamma * next_non_terminal
+        delta = reward_norm + gamma_eff * next_values - curr_values
+        last_gae_lam = delta + gamma_eff * synced.gae_lambda * last_gae_lam
+        expected_actor_adv[step] = last_gae_lam
+    assert np.allclose(synced.actor_advantages[:, 0], expected_actor_adv[:, 0], atol=1e-5, rtol=1e-5)
     assert not np.allclose(synced.actor_advantages[2:, 0], base.actor_advantages[2:, 0], atol=1e-6, rtol=1e-6)
 
 
@@ -1237,6 +2013,7 @@ def test_masked_rollout_buffer_zero_actor_baseline_uses_raw_returns_for_actor_on
     )
     buf.reset()
     buf._actor_baseline_mode = "zero"
+    buf._value_target_space = "normalized"
     buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
     buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
     buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -1268,6 +2045,7 @@ def test_masked_rollout_buffer_rollout_mean_actor_baseline_centers_raw_returns_f
     )
     buf.reset()
     buf._actor_baseline_mode = "rollout_mean"
+    buf._value_target_space = "normalized"
     buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
     buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
     buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
@@ -1280,6 +2058,36 @@ def test_masked_rollout_buffer_rollout_mean_actor_baseline_centers_raw_returns_f
     expected_centered = expected_raw_returns - np.asarray([5.25, 5.25], dtype=np.float32)
     assert np.allclose(buf.actor_advantages[:, 0], expected_centered, atol=1e-6, rtol=1e-6)
     assert not np.allclose(buf.actor_advantages[:, 0], buf.advantages[:, 0], atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_rollout_mean_actor_baseline_centers_raw_returns_under_raw_value_targets():
+    gamma = 0.5
+    gae_lambda = 0.75
+    buf = MaskedRecurrentRolloutBuffer(
+        buffer_size=2,
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(2,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(1,), dtype=np.float32),
+        hidden_state_shape=(2, 1, 1, 1),
+        device="cpu",
+        gae_lambda=gae_lambda,
+        gamma=gamma,
+        n_envs=1,
+        next_state_dim=1,
+    )
+    buf.reset()
+    buf._actor_baseline_mode = "rollout_mean"
+    buf._value_target_space = "raw"
+    buf.values[:, 0] = np.asarray([1.0, 2.0], dtype=np.float32)
+    buf.rewards[:, 0] = np.asarray([3.0, 5.0], dtype=np.float32)
+    buf.episode_starts[:, 0] = np.asarray([1.0, 0.0], dtype=np.float32)
+    last_value = torch.tensor([3.0], dtype=torch.float32)
+    dones = np.asarray([False], dtype=bool)
+
+    buf.compute_returns_and_advantage(last_value, dones)
+
+    expected_raw_returns = np.asarray([5.5, 5.0], dtype=np.float32)
+    expected_centered = expected_raw_returns - np.asarray([5.25, 5.25], dtype=np.float32)
+    assert np.allclose(buf.actor_advantages[:, 0], expected_centered, atol=1e-6, rtol=1e-6)
 
 
 def test_masked_rollout_buffer_trajectory_suffix_return_actor_objective_repeats_suffix_score():
@@ -1499,14 +2307,17 @@ def test_masked_rollout_buffer_tokenwise_linear_ramp_first_k_suffix_steps_downwe
 
 
 def test_masked_rollout_buffer_tokenwise_scale_env12_mid_episode_extension_block_scales_only_branch_specific_window():
-    actor_advantages = np.zeros((101, 1), dtype=np.float32)
-    actor_advantages[18:22, 0] = np.asarray([-0.0901851886883378] * 4, dtype=np.float32)
-    actor_advantages[100, 0] = np.float32(-0.06972909942269324)
+    actor_advantages = np.zeros((40, 13), dtype=np.float32)
+    actor_advantages[27:31, 12] = np.asarray([-0.0901851886883378] * 4, dtype=np.float32)
+    actor_advantages[27:31, 11] = np.asarray([-0.0901851886883378] * 4, dtype=np.float32)
+    actor_advantages[35, 12] = np.float32(-0.06972909942269324)
     rewards = np.zeros_like(actor_advantages)
     objective_masks = np.ones_like(actor_advantages)
     episode_starts = np.zeros_like(actor_advantages)
-    episode_starts[0, 0] = 1.0
-    episode_starts[100, 0] = 1.0
+    episode_starts[0, :] = 1.0
+    for start in (3, 6, 9, 12):
+        episode_starts[start, 12] = 1.0
+        episode_starts[start, 11] = 1.0
 
     adjusted = _apply_actor_objective_postprocess(
         actor_advantages,
@@ -1518,18 +2329,134 @@ def test_masked_rollout_buffer_tokenwise_scale_env12_mid_episode_extension_block
 
     expected_scale = float(ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE)
     assert np.allclose(
-        adjusted[18:22, 0],
-        actor_advantages[18:22, 0] * expected_scale,
+        adjusted[27:31, 12],
+        actor_advantages[27:31, 12] * expected_scale,
         atol=1e-6,
         rtol=1e-6,
     )
-    assert np.allclose(adjusted[100, 0], actor_advantages[100, 0], atol=1e-6, rtol=1e-6)
-    assert np.allclose(adjusted[:18, 0], actor_advantages[:18, 0], atol=1e-6, rtol=1e-6)
-    assert np.allclose(adjusted[22:100, 0], actor_advantages[22:100, 0], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[27:31, 11], actor_advantages[27:31, 11], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[35, 12], actor_advantages[35, 12], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[:27, 12], actor_advantages[:27, 12], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[31:, 12], actor_advantages[31:, 12], atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_tokenwise_scale_env12_selector_matched_objective_episode_scales_only_target_episode():
+    actor_advantages = np.zeros((24, 13), dtype=np.float32)
+    actor_advantages[12:19, 12] = np.asarray([-0.2] * 7, dtype=np.float32)
+    actor_advantages[12:19, 11] = np.asarray([-0.2] * 7, dtype=np.float32)
+    actor_advantages[19:, 12] = np.asarray([-0.1] * 5, dtype=np.float32)
+    rewards = np.zeros_like(actor_advantages)
+    objective_masks = np.ones_like(actor_advantages)
+    episode_starts = np.zeros_like(actor_advantages)
+    episode_starts[0, :] = 1.0
+    for start in (3, 6, 9, 12, 19):
+        episode_starts[start, 12] = 1.0
+        episode_starts[start, 11] = 1.0
+
+    adjusted = _apply_actor_objective_postprocess(
+        actor_advantages,
+        rewards=rewards,
+        objective_masks=objective_masks,
+        episode_starts=episode_starts,
+        actor_objective_mode="tokenwise_scale_env12_selector_matched_objective_episode",
+    )
+
+    expected_scale = float(ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE)
+    assert np.allclose(
+        adjusted[12:19, 12],
+        actor_advantages[12:19, 12] * expected_scale,
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    assert np.allclose(adjusted[12:19, 11], actor_advantages[12:19, 11], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[:12, 12], actor_advantages[:12, 12], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[19:, 12], actor_advantages[19:, 12], atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_tokenwise_scale_env12_high_mass_objective_episode_family_scales_only_target_episodes():
+    actor_advantages = np.zeros((28, 13), dtype=np.float32)
+    actor_advantages[8:10, 12] = np.asarray([-0.2] * 2, dtype=np.float32)
+    actor_advantages[14:16, 12] = np.asarray([-0.3] * 2, dtype=np.float32)
+    actor_advantages[22:24, 12] = np.asarray([-0.4] * 2, dtype=np.float32)
+    actor_advantages[8:10, 11] = np.asarray([-0.2] * 2, dtype=np.float32)
+    actor_advantages[26:, 12] = np.asarray([-0.1] * 2, dtype=np.float32)
+    rewards = np.zeros_like(actor_advantages)
+    objective_masks = np.ones_like(actor_advantages)
+    episode_starts = np.zeros_like(actor_advantages)
+    episode_starts[0, :] = 1.0
+    for start in (2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26):
+        episode_starts[start, 12] = 1.0
+        episode_starts[start, 11] = 1.0
+
+    adjusted = _apply_actor_objective_postprocess(
+        actor_advantages,
+        rewards=rewards,
+        objective_masks=objective_masks,
+        episode_starts=episode_starts,
+        actor_objective_mode="tokenwise_scale_env12_high_mass_objective_episode_family",
+    )
+
+    expected_scale = float(ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE)
+    assert np.allclose(adjusted[8:10, 12], actor_advantages[8:10, 12] * expected_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[14:16, 12], actor_advantages[14:16, 12] * expected_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[22:24, 12], actor_advantages[22:24, 12] * expected_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[8:10, 11], actor_advantages[8:10, 11], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[:8, 12], actor_advantages[:8, 12], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[26:, 12], actor_advantages[26:, 12], atol=1e-6, rtol=1e-6)
+
+
+def test_masked_rollout_buffer_tokenwise_scale_pair2_recovered_anchor_first_objective_non_tail_family_scales_only_target_env_non_tail():
+    actor_advantages = np.zeros((60, 16), dtype=np.float32)
+    actor_advantages[:55, 0] = np.float32(-0.2)
+    actor_advantages[:40, 15] = np.float32(-0.3)
+    actor_advantages[:55, 1] = np.float32(-0.4)
+    rewards = np.zeros_like(actor_advantages)
+    objective_masks = np.ones_like(actor_advantages)
+    episode_starts = np.zeros_like(actor_advantages)
+    episode_starts[0, :] = 1.0
+    episode_starts[55, 0] = 1.0
+    episode_starts[40, 15] = 1.0
+    episode_starts[55, 1] = 1.0
+
+    adjusted = _apply_actor_objective_postprocess(
+        actor_advantages,
+        rewards=rewards,
+        objective_masks=objective_masks,
+        episode_starts=episode_starts,
+        actor_objective_mode="tokenwise_scale_pair2_recovered_anchor_first_objective_non_tail_family",
+    )
+
+    expected_scale = float(ENV12_MID_EPISODE_EXTENSION_BLOCK_SCALE)
+    assert np.allclose(adjusted[:47, 0], actor_advantages[:47, 0] * expected_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[47:55, 0], actor_advantages[47:55, 0], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[:32, 15], actor_advantages[:32, 15] * expected_scale, atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[32:40, 15], actor_advantages[32:40, 15], atol=1e-6, rtol=1e-6)
+    assert np.allclose(adjusted[:55, 1], actor_advantages[:55, 1], atol=1e-6, rtol=1e-6)
 
 
 def test_env12_mid_episode_extension_runtime_mode_is_scoped_to_pair2():
     mode = "tokenwise_scale_env12_mid_episode_extension_block"
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="pair2") == mode
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="seed_24680") == "tokenwise"
+    assert _resolve_runtime_scoped_actor_objective_mode("tokenwise", current_suite_name="seed_24680") == "tokenwise"
+
+
+def test_env12_selector_matched_objective_episode_runtime_mode_is_scoped_to_pair2():
+    mode = "tokenwise_scale_env12_selector_matched_objective_episode"
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="pair2") == mode
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="seed_24680") == "tokenwise"
+    assert _resolve_runtime_scoped_actor_objective_mode("tokenwise", current_suite_name="seed_24680") == "tokenwise"
+
+
+def test_env12_high_mass_objective_episode_family_runtime_mode_is_scoped_to_pair2():
+    mode = "tokenwise_scale_env12_high_mass_objective_episode_family"
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="pair2") == mode
+    assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="seed_24680") == "tokenwise"
+    assert _resolve_runtime_scoped_actor_objective_mode("tokenwise", current_suite_name="seed_24680") == "tokenwise"
+
+
+def test_pair2_recovered_anchor_first_objective_non_tail_family_runtime_mode_is_scoped_to_pair2():
+    mode = "tokenwise_scale_pair2_recovered_anchor_first_objective_non_tail_family"
     assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="pair2") == mode
     assert _resolve_runtime_scoped_actor_objective_mode(mode, current_suite_name="seed_24680") == "tokenwise"
     assert _resolve_runtime_scoped_actor_objective_mode("tokenwise", current_suite_name="seed_24680") == "tokenwise"
@@ -1547,7 +2474,46 @@ def test_resolve_actor_advantages_prefers_actor_specific_tensor():
     assert torch.equal(_resolve_actor_advantages(sample), advantages)
 
 
-def test_build_recurrent_ppo_propagates_actor_gae_space_to_rollout_buffer():
+def test_build_recurrent_ppo_rejects_mixed_space_contract_by_default():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    with pytest.raises(
+        ValueError,
+        match="Mixed PPO reward/value space contracts are disabled",
+    ):
+        build_recurrent_ppo(
+            model=fake_model,
+            env_prior=env_prior,
+            device=str(device),
+            num_features=cfg["prior"]["num_features"],
+            n_envs=cfg["optimizer"]["ppo_n_envs"],
+            n_steps=cfg["optimizer"]["ppo_n_steps"],
+            learning_rate=3e-4,
+            batch_size=4,
+            n_epochs=1,
+            gamma=1.0,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            clip_range_vf=None,
+            normalize_advantage=True,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            target_kl=None,
+            space_contract="normalized",
+            actor_gae_space="raw",
+            verbose=0,
+        )
+
+
+def test_build_recurrent_ppo_defaults_value_target_space_to_normalized():
     device = _cuda_or_skip()
     cfg, env_cfg = _build_small_ppo_config()
     env_cfg = _strict_env_cfg_for_ppo(env_cfg)
@@ -1576,14 +2542,20 @@ def test_build_recurrent_ppo_propagates_actor_gae_space_to_rollout_buffer():
         vf_coef=0.5,
         max_grad_norm=0.5,
         target_kl=None,
-        actor_gae_space="raw",
         verbose=0,
     )
     assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
-    assert algo.rollout_buffer._actor_gae_space == "raw"
+    assert algo.rollout_buffer._value_target_space == "normalized"
+    assert algo._rwkv_value_target_space == "normalized"
+    assert algo.rollout_buffer._actor_gae_space == "normalized"
+    assert algo._rwkv_actor_gae_space == "normalized"
+    assert algo._rwkv_space_contract["value_target_space_effective"] == "normalized"
+    assert algo._rwkv_space_contract["actor_gae_space_effective"] == "normalized"
+    assert algo._rwkv_space_contract["alignment"] == "aligned"
+    assert algo._rwkv_space_contract["space_contract"] == "normalized"
 
 
-def test_build_recurrent_ppo_accepts_normalized_sep_synced_actor_gae_space():
+def test_build_recurrent_ppo_accepts_reward_normalized_space_contract():
     device = _cuda_or_skip()
     cfg, env_cfg = _build_small_ppo_config()
     env_cfg = _strict_env_cfg_for_ppo(env_cfg)
@@ -1612,11 +2584,131 @@ def test_build_recurrent_ppo_accepts_normalized_sep_synced_actor_gae_space():
         vf_coef=0.5,
         max_grad_norm=0.5,
         target_kl=None,
+        space_contract="reward_normalized",
+        verbose=0,
+    )
+    assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
+    assert algo.rollout_buffer._value_target_space == "reward_normalized"
+    assert algo.rollout_buffer._actor_gae_space == "reward_normalized"
+
+
+def test_build_recurrent_ppo_accepts_scalar_mlp_value_head():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        value_head_impl="scalar_mlp",
+        value_head_mlp_hidden_dim=32,
+        space_contract="reward_normalized",
+        verbose=0,
+    )
+    assert algo.policy.value_head_impl == "scalar_mlp"
+    assert algo.policy.value_head_mlp_hidden_dim == 32
+    assert isinstance(algo.policy.value_net, torch.nn.Sequential)
+    assert algo._rwkv_value_target_space == "reward_normalized"
+
+
+def test_build_recurrent_ppo_accepts_legacy_mixed_space_only_with_explicit_override():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        space_contract="normalized",
         actor_gae_space="normalized_sep_synced",
+        allow_mixed_space_contract=True,
         verbose=0,
     )
     assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
     assert algo.rollout_buffer._actor_gae_space == "normalized_sep_synced"
+
+
+def test_build_recurrent_ppo_legacy_mixed_path_still_resolves_normalized_actor_gae_when_explicitly_enabled():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=False,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        space_contract="normalized",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        allow_mixed_space_contract=True,
+        verbose=0,
+    )
+    assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
+    assert algo._rwkv_requested_actor_gae_space == "normalized"
+    assert algo._rwkv_actor_gae_space == "raw"
+    assert algo.rollout_buffer._actor_gae_space == "raw"
 
 
 def test_build_recurrent_ppo_propagates_actor_baseline_mode_to_rollout_buffer():
@@ -1850,6 +2942,7 @@ def test_build_recurrent_ppo_propagates_env12_mid_episode_extension_runtime_mode
     device = _cuda_or_skip()
     cfg, env_cfg = _build_small_ppo_config()
     env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 13
     fake_model = _FakeRWKVModel(
         num_features=cfg["prior"]["num_features"],
         x_obs_dim=cfg["transformer"]["x_obs_dim"],
@@ -1875,6 +2968,7 @@ def test_build_recurrent_ppo_propagates_env12_mid_episode_extension_runtime_mode
         vf_coef=0.5,
         max_grad_norm=0.5,
         target_kl=None,
+        strict_fixed_env_mode=True,
         actor_gae_space="normalized",
         actor_baseline_mode="learned",
         actor_objective_mode="tokenwise_scale_env12_mid_episode_extension_block",
@@ -1884,6 +2978,222 @@ def test_build_recurrent_ppo_propagates_env12_mid_episode_extension_runtime_mode
     assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
     assert algo.rollout_buffer._actor_objective_mode == "tokenwise_scale_env12_mid_episode_extension_block"
     assert algo.rollout_buffer._actor_objective_runtime_current_suite_name == "pair2"
+
+
+def test_build_recurrent_ppo_accepts_env12_selector_matched_objective_episode_mode():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 13
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        strict_fixed_env_mode=True,
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise_scale_env12_selector_matched_objective_episode",
+        actor_objective_runtime_current_suite_name="pair2",
+        verbose=0,
+    )
+    assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
+    assert algo.rollout_buffer._actor_objective_mode == "tokenwise_scale_env12_selector_matched_objective_episode"
+    assert algo.rollout_buffer._actor_objective_runtime_current_suite_name == "pair2"
+
+
+def test_build_recurrent_ppo_accepts_env12_high_mass_objective_episode_family_mode():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 13
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        strict_fixed_env_mode=True,
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise_scale_env12_high_mass_objective_episode_family",
+        actor_objective_runtime_current_suite_name="pair2",
+        verbose=0,
+    )
+    assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
+    assert algo.rollout_buffer._actor_objective_mode == "tokenwise_scale_env12_high_mass_objective_episode_family"
+    assert algo.rollout_buffer._actor_objective_runtime_current_suite_name == "pair2"
+
+
+def test_build_recurrent_ppo_accepts_pair2_recovered_anchor_first_objective_non_tail_family_mode():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 16
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    algo, _, _ = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        strict_fixed_env_mode=True,
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise_scale_pair2_recovered_anchor_first_objective_non_tail_family",
+        actor_objective_runtime_current_suite_name="pair2",
+        verbose=0,
+    )
+    assert isinstance(algo.rollout_buffer, MaskedRecurrentRolloutBuffer)
+    assert (
+        algo.rollout_buffer._actor_objective_mode
+        == "tokenwise_scale_pair2_recovered_anchor_first_objective_non_tail_family"
+    )
+    assert algo.rollout_buffer._actor_objective_runtime_current_suite_name == "pair2"
+
+
+def test_build_recurrent_ppo_rejects_env12_mid_episode_extension_mode_without_strict_fixed_env():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 13
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    try:
+        build_recurrent_ppo(
+            model=fake_model,
+            env_prior=env_prior,
+            device=str(device),
+            num_features=cfg["prior"]["num_features"],
+            n_envs=cfg["optimizer"]["ppo_n_envs"],
+            n_steps=cfg["optimizer"]["ppo_n_steps"],
+            learning_rate=3e-4,
+            batch_size=4,
+            n_epochs=1,
+            gamma=1.0,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            clip_range_vf=None,
+            normalize_advantage=True,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            target_kl=None,
+            actor_gae_space="normalized",
+            actor_baseline_mode="learned",
+            actor_objective_mode="tokenwise_scale_env12_mid_episode_extension_block",
+            actor_objective_runtime_current_suite_name="pair2",
+            verbose=0,
+        )
+    except ValueError as exc:
+        assert "strict_fixed_env_mode=True" in str(exc)
+    else:
+        raise AssertionError("expected strict_fixed_env_mode guard to raise")
+
+
+def test_build_recurrent_ppo_rejects_env12_mid_episode_extension_mode_without_pair2_scope():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    cfg["optimizer"]["ppo_n_envs"] = 13
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    env_prior = EnvironmentPrior(env_cfg)
+    try:
+        build_recurrent_ppo(
+            model=fake_model,
+            env_prior=env_prior,
+            device=str(device),
+            num_features=cfg["prior"]["num_features"],
+            n_envs=cfg["optimizer"]["ppo_n_envs"],
+            n_steps=cfg["optimizer"]["ppo_n_steps"],
+            learning_rate=3e-4,
+            batch_size=4,
+            n_epochs=1,
+            gamma=1.0,
+            gae_lambda=0.95,
+            clip_range=0.2,
+            clip_range_vf=None,
+            normalize_advantage=True,
+            ent_coef=0.0,
+            vf_coef=0.5,
+            max_grad_norm=0.5,
+            target_kl=None,
+            strict_fixed_env_mode=True,
+            actor_gae_space="normalized",
+            actor_baseline_mode="learned",
+            actor_objective_mode="tokenwise_scale_env12_mid_episode_extension_block",
+            actor_objective_runtime_current_suite_name="seed_24680",
+            verbose=0,
+        )
+    except ValueError as exc:
+        assert "reserved for pair2 runtime scope" in str(exc)
+    else:
+        raise AssertionError("expected pair2 scope guard to raise")
 
 
 def test_build_recurrent_ppo_accepts_boundary_local_actor_objective_mode():
@@ -2023,6 +3333,245 @@ def test_build_recurrent_ppo_can_enable_separate_value_backbone():
         vec_env.close()
 
 
+def test_build_recurrent_ppo_accepts_scalar_linear_value_head():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    env_prior = EnvironmentPrior(deepcopy(env_cfg))
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+        emsize=12,
+    ).to(device)
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        value_head_impl="scalar_linear",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise",
+        verbose=0,
+    )
+    del callback
+    try:
+        assert algo.policy.value_head_impl == "scalar_linear"
+        assert algo.policy.has_value_bardist() is False
+        assert int(algo.policy.value_net.out_features) == 1
+    finally:
+        vec_env.close()
+
+
+def test_build_recurrent_ppo_accepts_batchnorm_value_path_adapter():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    env_prior = EnvironmentPrior(deepcopy(env_cfg))
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+        emsize=12,
+    ).to(device)
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        value_path_adapter_impl="batchnorm",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise",
+        verbose=0,
+    )
+    del callback
+    try:
+        assert algo.policy.value_path_adapter_impl == "batchnorm"
+        assert isinstance(algo.policy.value_path_adapter, sb3_recurrent_ppo_module._ValuePathBatchNormAdapter)
+    finally:
+        vec_env.close()
+
+
+def test_build_recurrent_ppo_accepts_vendor_official_and_frozen_zscore():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    env_prior = EnvironmentPrior(deepcopy(env_cfg))
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+        emsize=12,
+    ).to(device)
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=3e-4,
+        batch_size=4,
+        n_epochs=1,
+        gamma=1.0,
+        gae_lambda=0.95,
+        clip_range=0.2,
+        clip_range_vf=None,
+        normalize_advantage=True,
+        ent_coef=0.0,
+        vf_coef=0.5,
+        max_grad_norm=0.5,
+        target_kl=None,
+        value_head_impl="vendor_official",
+        value_path_adapter_impl="frozen_zscore",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise",
+        verbose=0,
+    )
+    del callback
+    try:
+        assert algo.policy.value_head_impl == "vendor_official"
+        assert algo.policy.value_path_adapter_impl == "frozen_zscore"
+        assert algo.policy.has_value_vendor_head() is True
+        assert isinstance(algo.policy.value_path_adapter, sb3_recurrent_ppo_module._ValuePathFrozenZScoreAdapter)
+    finally:
+        vec_env.close()
+
+
+def test_train_refits_frozen_zscore_adapter_each_epoch(monkeypatch):
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    env_prior = EnvironmentPrior(deepcopy(env_cfg))
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+        emsize=12,
+    ).to(device)
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=env_prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=cfg["optimizer"]["learning_rate"],
+        batch_size=cfg["optimizer"]["ppo_batch_size"],
+        n_epochs=2,
+        gamma=cfg["optimizer"]["ppo_gamma"],
+        gae_lambda=cfg["optimizer"]["ppo_gae_lambda"],
+        clip_range=cfg["optimizer"]["ppo_clip_range"],
+        clip_range_vf=cfg["optimizer"]["ppo_clip_range_vf"],
+        normalize_advantage=cfg["optimizer"]["ppo_normalize_advantage"],
+        ent_coef=cfg["optimizer"]["ppo_ent_coef"],
+        vf_coef=cfg["optimizer"]["ppo_vf_coef"],
+        max_grad_norm=cfg["optimizer"]["ppo_max_grad_norm"],
+        target_kl=cfg["optimizer"]["ppo_target_kl"],
+        value_head_impl="vendor_official",
+        value_path_adapter_impl="frozen_zscore",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise",
+        verbose=0,
+    )
+    try:
+        algo.ep_info_buffer = []
+        algo.ep_success_buffer = []
+        algo._last_obs = vec_env.reset()
+        algo._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+        algo._last_lstm_states = algo.policy._dummy_states(vec_env.num_envs)
+        callback.init_callback(algo)
+        assert algo.collect_rollouts(vec_env, callback, algo.rollout_buffer, n_rollout_steps=algo.n_steps)
+
+        calls = 0
+        original = algo.policy.fit_value_path_adapter_from_rollout_steps
+
+        def _wrapped(*args, **kwargs):
+            nonlocal calls
+            calls += 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(algo.policy, "fit_value_path_adapter_from_rollout_steps", _wrapped)
+        algo._logger = SimpleNamespace(record=lambda *args, **kwargs: None)
+        algo.train()
+        assert calls == int(algo.n_epochs)
+    finally:
+        vec_env.close()
+
+
+def test_vendor_official_value_loss_ignores_non_objective_without_nan_gradients():
+    device = _cuda_or_skip()
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+    ).to(device)
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        value_head_impl="vendor_official",
+        net_arch=[],
+    ).to(device)
+
+    value_logits = torch.randn(
+        (6, int(policy.get_value_bardist().num_bars)),
+        device=device,
+        dtype=torch.float32,
+        requires_grad=True,
+    )
+    targets = torch.tensor([0.0, 0.2, -0.4, 0.8, -1.2, 0.3], device=device, dtype=torch.float32)
+    objective_mask = torch.tensor([0, 0, 1, 1, 1, 1], device=device, dtype=torch.bool)
+    loss = policy.compute_value_loss_from_logits(
+        value_logits=value_logits,
+        targets=targets,
+        objective_mask=objective_mask,
+        value_target_bucket_idx=None,
+    )
+    grad = torch.autograd.grad(loss, value_logits)[0]
+    assert torch.isfinite(loss)
+    assert torch.isfinite(grad).all()
+
+
 def test_build_validation_recurrent_ppo_policy_restores_separate_value_backbone_state():
     device = _cuda_or_skip()
     cfg, env_cfg = _build_small_ppo_config()
@@ -2063,6 +3612,27 @@ def test_build_validation_recurrent_ppo_policy_restores_separate_value_backbone_
     )
     assert restored.separate_value_backbone is True
     assert restored.value_rlpfn_model is not None
+
+
+def test_build_validation_recurrent_ppo_policy_can_force_native_eval_forward_step():
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+        emsize=12,
+    ).to(device)
+    restored = build_validation_recurrent_ppo_policy(
+        model=fake_model,
+        env_cfg=env_cfg,
+        device=device,
+        num_features=cfg["prior"]["num_features"],
+        strict_native_rollout=True,
+    )
+
+    assert getattr(restored.rlpfn_model.rwkv_core, "force_native_eval_forward_step", False) is True
 
 
 def test_build_recurrent_ppo_can_restore_saved_validation_policy_state():
@@ -2328,7 +3898,7 @@ def test_build_recurrent_ppo_disables_q_aux_by_default():
     env_cfg["reward_clip"] = 10.0
     env_cfg["reinforce_action_transform"] = "none"
     assert env_cfg["normalized_q_value_weight"] == 0.0
-    assert env_cfg["next_state_flow_matching_weight"] == 0.2
+    assert env_cfg["next_state_flow_matching_weight"] == 0.0
     prior = EnvironmentPrior(env_cfg)
     fake_model = _FakeRWKVModel(
         num_features=cfg["prior"]["num_features"],
@@ -2358,7 +3928,7 @@ def test_build_recurrent_ppo_disables_q_aux_by_default():
         target_kl=cfg["optimizer"]["ppo_target_kl"],
     )
     assert float(algo._rwkv_aux_q_weight) == 0.0
-    assert float(algo._rwkv_aux_flow_weight) == 0.2
+    assert float(algo._rwkv_aux_flow_weight) == 0.0
     vec_env.close()
 
 
@@ -2704,6 +4274,64 @@ def test_masked_recurrent_ppo_collect_rollouts_streams_into_buffer_and_uses_only
     assert prior.last_rollout_ppo_trace["values"] is None
     assert prior.last_rollout_reinforce is None
     vec_env.close()
+
+
+def test_collect_rollouts_recomputes_full_rollout_values_for_batchnorm_batchstats(monkeypatch):
+    device = _cuda_or_skip()
+    cfg, env_cfg = _build_small_ppo_config()
+    env_cfg = _strict_env_cfg_for_ppo(env_cfg, aux=False)
+    prior = EnvironmentPrior(env_cfg)
+    fake_model = _FakeRWKVModel(
+        num_features=cfg["prior"]["num_features"],
+        x_obs_dim=cfg["transformer"]["x_obs_dim"],
+        action_dim=cfg["transformer"]["x_action_dim"],
+    ).to(device)
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=fake_model,
+        env_prior=prior,
+        device=str(device),
+        num_features=cfg["prior"]["num_features"],
+        n_envs=cfg["optimizer"]["ppo_n_envs"],
+        n_steps=cfg["optimizer"]["ppo_n_steps"],
+        learning_rate=cfg["optimizer"]["learning_rate"],
+        batch_size=cfg["optimizer"]["ppo_batch_size"],
+        n_epochs=1,
+        gamma=cfg["optimizer"]["ppo_gamma"],
+        gae_lambda=cfg["optimizer"]["ppo_gae_lambda"],
+        clip_range=cfg["optimizer"]["ppo_clip_range"],
+        clip_range_vf=cfg["optimizer"]["ppo_clip_range_vf"],
+        normalize_advantage=cfg["optimizer"]["ppo_normalize_advantage"],
+        ent_coef=cfg["optimizer"]["ppo_ent_coef"],
+        vf_coef=cfg["optimizer"]["ppo_vf_coef"],
+        max_grad_norm=cfg["optimizer"]["ppo_max_grad_norm"],
+        target_kl=cfg["optimizer"]["ppo_target_kl"],
+        value_head_impl="vendor_official",
+        value_path_adapter_impl="batchnorm_batchstats",
+        actor_gae_space="normalized",
+        actor_baseline_mode="learned",
+        actor_objective_mode="tokenwise",
+        verbose=0,
+    )
+    try:
+        algo.ep_info_buffer = []
+        algo.ep_success_buffer = []
+        algo._last_obs = vec_env.reset()
+        algo._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+        algo._last_lstm_states = algo.policy._dummy_states(vec_env.num_envs)
+        callback.init_callback(algo)
+
+        original_eval = algo.policy.evaluate_rollout_values
+        call_shapes = []
+
+        def _wrapped_eval(obs_steps, episode_starts_steps, **kwargs):
+            call_shapes.append(tuple(obs_steps.shape))
+            return original_eval(obs_steps, episode_starts_steps, **kwargs)
+
+        monkeypatch.setattr(algo.policy, "evaluate_rollout_values", _wrapped_eval)
+        assert algo.collect_rollouts(vec_env, callback, algo.rollout_buffer, n_rollout_steps=algo.n_steps)
+        assert (algo.n_steps, vec_env.num_envs, cfg["prior"]["num_features"]) in call_shapes
+    finally:
+        vec_env.close()
 
 
 def test_masked_recurrent_ppo_collect_rollouts_records_suffix_objective_masks_and_fixed_rollout_value_stats(monkeypatch):
@@ -4894,12 +6522,17 @@ def test_make_training_callback_writes_ppo_diag_line(tmp_path):
     assert "reward_env_mean=0.4" in log_text
     assert "reward_ctrl_mean=-0.05" in log_text
     assert "value_loss_weight=0.5" in log_text
-    assert "Epoch 1 ppo_metric rollout/ep_len_mean 165" in log_text
-    assert "Epoch 1 ppo_metric time/fps 1507" in log_text
-    assert "Epoch 1 ppo_metric train/update_wall_time_sec 2520" in log_text
+    assert "Epoch 1 ppo_metrics" in log_text
+    assert "| rollout/" in log_text
+    assert "ep_len_mean" in log_text
+    assert "ep_rew_mean" in log_text
+    assert "| time/" in log_text
+    assert "fps" in log_text
+    assert "| train/" in log_text
+    assert "update_wall_time_sec" in log_text
 
 
-def test_ppo_progress_logs_print_only_and_do_not_append_log_file(tmp_path, monkeypatch):
+def test_ppo_progress_logs_print_without_appending_log_file(tmp_path, monkeypatch):
     class _FakeProgressAlgo:
         def _progress_logging_enabled(self):
             return True

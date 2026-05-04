@@ -1,24 +1,34 @@
 import argparse
 import copy
 import json
+import random
 from pathlib import Path
 
 import numpy as np
 import torch
 
 from ticl.analysis.critic_free_single_env_audit import _build_audit_env_cfg, _make_deterministic_batch_plan
+from ticl.analysis.fixed_env_h import build_fixed_env_h
 from ticl.model_builder import load_model
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.sb3_recurrent_ppo import (
     _explained_variance_with_mask,
+    _ppo_autocast_context,
     _recover_raw_from_value_space,
     build_recurrent_ppo,
 )
-from ticl.train import _freeze_env_h_list_for_replay
 
 
 def _default_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
+
+
+def _seed_all(seed: int) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
 
 
 def _clone_h_repeated(h, count: int):
@@ -26,15 +36,7 @@ def _clone_h_repeated(h, count: int):
 
 
 def _build_fixed_env_h(*, prior_cfg: dict, frozen_h_seed: int):
-    prior_for_h = EnvironmentPrior(copy.deepcopy(prior_cfg))
-    rng_state = np.random.get_state()
-    np.random.seed(int(frozen_h_seed))
-    frozen_h = _freeze_env_h_list_for_replay(
-        prior_for_h,
-        list(prior_for_h._sample_batch_hypers(1)),
-    )[0]
-    np.random.set_state(rng_state)
-    return frozen_h
+    return build_fixed_env_h(prior_cfg=prior_cfg, frozen_h_seed=int(frozen_h_seed))
 
 
 def _build_algo(
@@ -127,6 +129,14 @@ def _measure_critic(algo, rollout_data) -> dict:
     )
     values = eval_outputs["values"].flatten()
     objective_mask = rollout_data.objective_masks > 1e-8
+    normalized_value_std = (
+        float(values[objective_mask].float().std().item()) if int(objective_mask.sum().item()) > 1 else 0.0
+    )
+    normalized_return_std = (
+        float(rollout_data.returns[objective_mask].float().std().item())
+        if int(objective_mask.sum().item()) > 1
+        else 0.0
+    )
     raw_pred = _recover_raw_from_value_space(
         values.detach(),
         value_means=rollout_data.rollout_return_means.detach(),
@@ -141,6 +151,15 @@ def _measure_critic(algo, rollout_data) -> dict:
     return_std = float(raw_returns[objective_mask].float().std().item()) if int(objective_mask.sum().item()) > 1 else 0.0
     return {
         "objective_total": int(objective_mask.sum().item()),
+        "normalized_value_std": normalized_value_std,
+        "normalized_return_std": normalized_return_std,
+        "explained_variance_normalized": float(
+            _explained_variance_with_mask(
+                values.detach().cpu().numpy(),
+                rollout_data.returns.detach().cpu().numpy(),
+                mask=objective_mask.detach().cpu().numpy(),
+            )
+        ),
         "raw_value_std": value_std,
         "raw_return_std": return_std,
         "raw_corr": _masked_corrcoef(raw_pred, raw_returns, objective_mask),
@@ -155,25 +174,39 @@ def _measure_critic(algo, rollout_data) -> dict:
 
 
 def _critic_only_step(algo, rollout_data) -> float:
+    algo.policy.train()
     objective_mask = rollout_data.objective_masks > 1e-8
     valid_total = objective_mask.to(device=rollout_data.returns.device, dtype=rollout_data.returns.dtype).sum().clamp_min(1.0)
-    eval_outputs = algo.policy.evaluate_actions_with_hidden_flat(
-        rollout_data.observations,
-        rollout_data.actions,
-        seq_lengths=rollout_data.seq_lengths,
-        action_masks=rollout_data.action_masks,
-    )
-    value_logits = eval_outputs["value_logits"]
-    value_bardist = algo.policy.get_value_bardist()
-    value_errors = value_bardist(
-        value_logits.to(dtype=torch.float32),
-        rollout_data.returns.to(device=value_logits.device, dtype=torch.float32),
-    )
+    autocast_dtype = getattr(algo, "_rwkv_autocast_dtype", None)
+    with _ppo_autocast_context(
+        autocast_dtype=autocast_dtype,
+        device=getattr(algo, "device", rollout_data.observations.device),
+    ):
+        eval_outputs = algo.policy.evaluate_actions_with_hidden_flat(
+            rollout_data.observations,
+            rollout_data.actions,
+            seq_lengths=rollout_data.seq_lengths,
+            action_masks=rollout_data.action_masks,
+        )
+        value_logits = eval_outputs["value_logits"]
+        value_bardist = algo.policy.get_value_bardist()
+        value_target_bucket_idx = getattr(rollout_data, "value_target_bucket_idx", None)
+        if value_target_bucket_idx is not None:
+            value_errors = value_bardist.nll_from_bucket_idx(
+                value_logits.to(dtype=torch.float32),
+                value_target_bucket_idx,
+            )
+        else:
+            value_errors = value_bardist(
+                value_logits.to(dtype=torch.float32),
+                rollout_data.returns.to(device=value_logits.device, dtype=torch.float32),
+            )
     objective_f = objective_mask.to(device=value_errors.device, dtype=value_errors.dtype)
     value_num = (value_errors * objective_f).sum()
     value_loss = value_num / valid_total.to(device=value_num.device, dtype=value_num.dtype)
     algo.policy.optimizer.zero_grad(set_to_none=True)
     value_loss.backward()
+    torch.nn.utils.clip_grad_norm_(algo.policy.parameters(), float(getattr(algo, "max_grad_norm", 0.5)))
     algo.policy.optimizer.step()
     return float(value_loss.detach().cpu().item())
 
@@ -193,9 +226,12 @@ def run_critic_value_fit_probe(
     ppo_reset_env_state_at_sep: bool = True,
     ppo_separate_value_backbone: bool = False,
     fit_steps: list[int] | None = None,
+    build_seed: int | None = None,
 ):
     fit_steps = sorted(set(int(v) for v in (fit_steps or [0, 10, 50, 200, 1000])))
     device_obj = torch.device(str(device or _default_device()))
+    resolved_build_seed = int(build_seed) if build_seed is not None else int(train_env_seed)
+    _seed_all(int(resolved_build_seed))
     load_model.cache_clear()
     _, config = load_model(checkpoint_path, device=device_obj, verbose=False)
     env_cfg = _build_audit_env_cfg(config["prior"]["environment"])
@@ -231,6 +267,9 @@ def run_critic_value_fit_probe(
             "target_kl": float(target_kl),
             "ppo_reset_env_state_at_sep": bool(ppo_reset_env_state_at_sep),
             "ppo_separate_value_backbone": bool(ppo_separate_value_backbone),
+            "build_seed": int(resolved_build_seed),
+            "critic_only_training_mode": True,
+            "critic_only_max_grad_norm": float(getattr(algo, "max_grad_norm", 0.5)),
             "fit_steps": fit_steps,
             "measurements": {},
         }
@@ -262,6 +301,7 @@ def main():
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--ppo-reset-env-state-at-sep", action="store_true")
     parser.add_argument("--ppo-separate-value-backbone", action="store_true")
+    parser.add_argument("--build-seed", type=int, default=None)
     parser.add_argument("--fit-steps", type=int, nargs="*", default=[0, 10, 50, 200, 1000])
     parser.add_argument("--output-json", type=str, default="/home/chen/RLPFN/artifacts/critic_value_fit_probe.json")
     args = parser.parse_args()
@@ -280,6 +320,7 @@ def main():
         ppo_reset_env_state_at_sep=bool(args.ppo_reset_env_state_at_sep),
         ppo_separate_value_backbone=bool(args.ppo_separate_value_backbone),
         fit_steps=args.fit_steps,
+        build_seed=args.build_seed,
     )
     output_path = Path(args.output_json).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)

@@ -65,6 +65,7 @@ def get_optimizer_config():
         "ppo_strict_fixed_env_mode": False,
         "ppo_env_rng_seeds": None,
         "ppo_rollout_rng_seeds": None,
+        "ppo_single_eval_pos": None,
         "ppo_deterministic_actor_sampling": False,
         "ppo_deterministic_batch_plan": False,
         "ppo_strict_native_rollout": False,
@@ -74,6 +75,24 @@ def get_optimizer_config():
         "ppo_vf_coef": 0.5,
         "ppo_max_grad_norm": 0.5,
         "ppo_target_kl": None,
+        "ppo_trusted_pack_runner_required": False,
+        "ppo_pack_output_dir": None,
+        "ppo_pack_seed": 4040,
+        "ppo_pack_prior_mode": "sampled_topology",
+        "ppo_pack_fixed_env_group_across_updates": False,
+        "ppo_pack_sb3_reward_normalization_enabled": True,
+        "ppo_pack_sb3_observation_normalization_enabled": True,
+        "ppo_pack_sb3_observation_normalization_clip": 10.0,
+        "ppo_pack_sb3_observation_normalization_epsilon": 1e-8,
+        "ppo_pack_semantic_probes_enabled": False,
+        "ppo_pack_semantic_probe_sidecar_enabled": False,
+        "ppo_pack_semantic_probe_sidecar_every": 1,
+        "ppo_pack_checkpoint_every": 0,
+        "ppo_pack_checkpoint_include_optimizer": False,
+        "ppo_pack_topology_state_gain_min": 0.7,
+        "ppo_pack_topology_action_gain_min": 0.06,
+        "ppo_pack_topology_state_to_action_ratio_max": 10.0,
+        "ppo_pack_topology_max_attempts": 4096,
         "adamw_fused": True,
         "train_profiler_enabled": False,
         "train_profiler_output_path": None,
@@ -255,6 +274,12 @@ def get_prior_config(max_features=100, n_samples=2048):
         "fixed_frozen_h_json": None,
         "reward_state_input_gain_fraction_rejection_min": 0.0,
         "reward_state_input_gain_fraction_rejection_max_tries": 128,
+        "reward_state_input_gain_fraction_conditioned_sampling_enabled": False,
+        "reward_state_input_gain_fraction_conditioned_min": 0.0,
+        "reward_topology_conditioned_sampling_enabled": False,
+        "reward_action_input_gain_fraction_conditioned_min": 0.0,
+        "reward_state_to_action_gain_ratio_conditioned_max": 0.0,
+        "reward_topology_conditioned_sampling_max_attempts": 4096,
         # Parallel generation across independent batch columns in get_batch().
         "batch_parallel_workers": 4,
         # Backend for per-column batch generation:
@@ -271,6 +296,11 @@ def get_prior_config(max_features=100, n_samples=2048):
         # - "structure": strict homogeneous grouping (legacy behavior)
         # - "family": coarser grouping for larger batched policy steps
         "batch_vectorized_grouping": "structure",
+        "transition_inner_grouping": None,
+        "transition_inner_min_bucket": None,
+        "reference_scm_partition_max_bytes": None,
+        "reference_scm_memory_guard_fraction": None,
+        "transition_generator_rebuild_each_step": False,
         # Rollout/randomization knobs.
         "alpha": {"distribution": "uniform", "min": 0.05, "max": 0.35},
         "init_state_std": {"distribution": "log_uniform", "min": 1e-3, "max": 1.0},
@@ -549,9 +579,8 @@ def get_rlpfn_default_config():
     # (TBPTT/chunk degradation) polluting per-batch wall-time measurements.
     config['optimizer']['pg_oom_debug_raise'] = False
     config['optimizer']['pg_oom_fail_fast'] = True
-    # Keep the maintained RWKV reinforce mainline on the existing optimizer
-    # scale until dedicated skyline tuning lands.
-    config['optimizer']['learning_rate'] = 4e-4
+    # Keep the maintained PPO mainline on the Phase-2 legacy optimizer scale.
+    config['optimizer']['learning_rate'] = 2e-4
     # Current maintained memory-efficiency mainline should benchmark from
     # physical batch 1024.
     config['dataloader']['batch_size'] = 64 * 16 * 2

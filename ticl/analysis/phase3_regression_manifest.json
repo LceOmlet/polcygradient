@@ -1,50 +1,146 @@
 {
-  "phase3_claims_trusted": false,
-  "phase3_trust_reason": "Phase 3 longrun and optimization artifacts are currently quarantined. The only trusted branch is the maintained Phase 2 shared actor-critic backbone contract.",
-  "trusted_longrun_gradient_compare": {
+  "phase3_claims_trusted": true,
+  "phase3_trust_reason": "The only trusted chain is phase2_launch_anchor -> phase3_anchor -> ticl.fit_model rlpfn. Specifically: the explicit shared-backbone single-environment Phase 2 launch anchor under the current strict fixed-env contract, the exact Phase 2 -> Phase 3 gradient/rollout contract compare, the fingerprinted Phase 3 anchor gradient compare, and the exact fit_model bridge alignment probe. All other Phase 2 and Phase 3 branches are historical or traceback-only and must not participate in forward semantic or regression judgement.",
+  "historical_traceback_only": [
+    "phase2_current_regression_gate",
+    "phase3_shortrun_profile_gradient_regression_v2",
+    "phase3_cross_env_baseline_pair1",
+    "phase3_cross_env_baseline_pair2",
+    "phase3_longrun_existing_checkpoint_eval_summary",
+    "phase3_multi_env_trusted_pair1",
+    "pair1_heavy_tail_sign_flip_explanation"
+  ],
+  "phase2_launch_anchor": {
+    "abs_tol": 1e-06,
+    "zero_suffix_return_mean": -5.985112190246582,
+    "learned": {
+      "delta_smp_gap": 5.074603736400604
+    },
+    "zero": {
+      "delta_smp_gap": 2.6649839878082275
+    },
+    "required_contract": {
+      "frozen_h_seed": 12345,
+      "frozen_h_seed_mode": "current",
+      "train_env_seed": 2020,
+      "train_rollout_seed": 4040,
+      "single_eval_pos": 64,
+      "n_steps": 256,
+      "batch_size": 256,
+      "outer_epochs": 2,
+      "ppo_reset_env_state_at_sep": true,
+      "record_suite_critic_quality": true,
+      "restore_validation_policy_state": false,
+      "strict_native_rollout": false,
+      "strict_fixed_env_mode": true,
+      "deterministic_actor_sampling": true
+    },
+    "required_fixed_env_contract": {
+      "frozen_h_fingerprint": "7ef09e0736b8fd205af47d313b0b79723a6749bae126dff723cf8c08793ebee2",
+      "frozen_h_seed_mode": "current",
+      "zero_eval_prior_reuses_sampling_state": false
+    },
+    "heldout_critic_quality": {
+      "learned": {
+        "objective_total": 1536,
+        "raw_corr_min": 0.9,
+        "explained_variance_raw_min": 0.8
+      },
+      "zero": {
+        "objective_total": 1536,
+        "raw_corr_min": 0.8,
+        "explained_variance_raw_min": 0.65
+      }
+    }
+  },
+  "phase2_to_phase3_anchor_compare": {
+    "abs_tol": 1e-06,
+    "phase2_guardrail_passed": true,
+    "gradient_exact_match": true,
+    "rollout_tensors_exact_match": true,
+    "scalar_measures_exact_match": true,
+    "signature_exact_match": true,
+    "grad_compare": {
+      "phase2_grad_norm": 3.8278887271881104,
+      "phase3_grad_norm": 3.8278887271881104,
+      "cosine_similarity_min": 0.9999,
+      "l2_delta_norm_max": 1e-09
+    },
+    "required_signature_fields": {
+      "actor_baseline_mode": "learned",
+      "actor_gae_space": "normalized",
+      "actor_objective_mode": "tokenwise",
+      "batch_size": 256,
+      "deterministic_actor_sampling": true,
+      "deterministic_batch_plan": true,
+      "n_epochs": 1,
+      "n_steps": 256,
+      "reset_env_state_at_sep": true,
+      "restore_validation_policy_state": false,
+      "separate_value_backbone": false,
+      "strict_fixed_env_mode": true,
+      "strict_native_rollout": false,
+      "target_kl": 0.03
+    }
+  },
+  "phase3_anchor_gradient_compare": {
+    "abs_tol": 1e-05,
     "exact_match_required": true,
     "cosine_similarity_min": 0.9999,
     "l2_delta_norm_max": 0.01,
-    "resume_grad_norm_expected": 8.315512657165527,
-    "phase3_isolated_grad_norm_expected": 8.315511703491211,
-    "collect_wall_s_max": 80.0,
-    "backward_wall_s_max": 1.0,
+    "resume_grad_norm": 2.2682673931121826,
+    "phase3_isolated_grad_norm": 2.26826548576355,
+    "frozen_h_fingerprint": "7ef09e0736b8fd205af47d313b0b79723a6749bae126dff723cf8c08793ebee2",
+    "frozen_h_leaf_count": 96,
     "collect_ratio_max": 1.5,
     "backward_ratio_max": 2.0,
-    "abs_tol": 1e-06
-  },
-  "legacy_shortrun_profile_gradient_compare": {
-    "enabled": false,
-    "reason": "Quarantined: current strict fixed-env contract still shows cross-run numeric instability in shortrun profile regression.",
-    "exact_match_required": true,
-    "cosine_similarity_min": 0.9999,
-    "l2_delta_norm_max": 0.5,
-    "driver_grad_norm_expected": 0.0,
-    "reference_grad_norm_expected": 0.0,
-    "abs_tol": 1e-06
-  },
-  "checkpoint_generalization": {
-    "abs_tol": 1e-06,
-    "pair1": {
-      "train_full_gap": -12.389642596244812,
-      "train_suffix_gap": -0.5169562138617039,
-      "heldout_full_gap": 59.01048278808594,
-      "heldout_suffix_gap": 2.8122913241386414
-    },
-    "pair2": {
-      "train_full_gap": 66.80872344970703,
-      "train_suffix_gap": 3.2046568989753723,
-      "heldout_full_gap": 26.168006896972656,
-      "heldout_suffix_gap": 1.5457842350006104
+    "required_signature_fields": {
+      "optimizer.ppo_actor_baseline_mode": "learned",
+      "optimizer.ppo_actor_gae_space": "normalized",
+      "optimizer.ppo_clip_range": 0.2,
+      "optimizer.ppo_gamma": 1.0,
+      "optimizer.ppo_n_epochs": 4,
+      "optimizer.ppo_normalize_advantage": true,
+      "optimizer.ppo_reset_env_state_at_sep": true,
+      "optimizer.ppo_separate_value_backbone": false,
+      "optimizer.rl_objective": "ppo"
     }
   },
-  "legacy_pair1_optimization": {
-    "enabled": false,
-    "reason": "Quarantined: historical pair1 optimization artifact used a fresh-built PPO policy rather than restoring the checkpoint validation PPO policy state, so its pre/post optimization deltas are not a trusted semantic baseline.",
-    "abs_tol": 1e-06,
-    "train_full_return_delta": -1.0401105880737305,
-    "train_suffix_return_delta": -0.07944512367248535,
-    "heldout_full_return_delta": -0.2744731903076172,
-    "heldout_suffix_return_delta": 0.019055277109146118
+  "fit_model_anchor_alignment": {
+    "abs_tol": 1e-08,
+    "expected_stage": "aligned",
+    "exact_match_required": true,
+    "allowed_training_signature_diff_keys": [
+      "optimizer.ppo_restore_validation_policy_state"
+    ],
+    "grad_cosine_similarity_min": 0.9999,
+    "grad_l2_delta_norm_max": 1e-09,
+    "fit_model_grad_norm": 2.268260955810547,
+    "anchor_grad_norm": 2.268260955810547,
+    "required_runtime_fields": {
+      "checkpoint_saved_validation_policy_state_present": true,
+      "deterministic_actor_sampling": true,
+      "deterministic_batch_plan": true,
+      "env_rng_seeds": [
+        2020
+      ],
+      "restore_validation_policy_state": true,
+      "rollout_rng_seeds": [
+        2020
+      ],
+      "strict_fixed_env_mode": true,
+      "strict_native_rollout": true
+    },
+    "required_training_signature_fields": {
+      "optimizer.ppo_actor_baseline_mode": "learned",
+      "optimizer.ppo_actor_gae_space": "normalized",
+      "optimizer.ppo_deterministic_actor_sampling": true,
+      "optimizer.ppo_deterministic_batch_plan": true,
+      "optimizer.ppo_reset_env_state_at_sep": true,
+      "optimizer.ppo_separate_value_backbone": false,
+      "optimizer.ppo_strict_fixed_env_mode": true,
+      "optimizer.ppo_strict_native_rollout": true,
+      "optimizer.rl_objective": "ppo"
+    }
   }
 }

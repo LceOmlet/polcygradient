@@ -53,6 +53,37 @@ def test_run_policy_eval_forwards_rollout_backend(monkeypatch):
     assert captured["single_eval_pos"] == 16
 
 
+def test_phase3_audit_cli_defaults_to_trusted_launch_chain_summary(tmp_path, monkeypatch):
+    captured = {}
+
+    def _fake_run_phase3_multi_env_optimization_audit(**kwargs):
+        captured.update(kwargs)
+        return {"ok": True}
+
+    monkeypatch.setattr(audit_mod, "run_phase3_multi_env_optimization_audit", _fake_run_phase3_multi_env_optimization_audit)
+    output_json = tmp_path / "out.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "phase3_multi_env_optimization_audit.py",
+            str(tmp_path / "checkpoint.cpkt"),
+            "--train-suite-path",
+            str(tmp_path / "train_suite.pt"),
+            "--heldout-suite-path",
+            str(tmp_path / "heldout_suite.pt"),
+            "--output-json",
+            str(output_json),
+        ],
+    )
+
+    rc = audit_mod.main()
+
+    assert rc == 0
+    assert captured["phase2_summary_path"] == audit_mod.TRUSTED_PHASE2_LAUNCH_SUMMARY
+    assert output_json.exists() is True
+
+
 def test_resolve_train_profile_phase2_shared_backbone_contract_matches_phase2_milestone():
     profile = audit_mod._resolve_train_profile(
         optimizer_cfg={},
@@ -69,7 +100,7 @@ def test_resolve_train_profile_phase2_shared_backbone_contract_matches_phase2_mi
     assert profile["learning_rate"] == 2e-4
     assert profile["target_kl"] == 0.03
     assert profile["normalize_advantage"] is False
-    assert profile["actor_gae_space"] == "normalized"
+    assert profile["actor_gae_space"] == "raw"
     assert profile["actor_baseline_mode"] == "learned"
     assert profile["actor_objective_mode"] == "tokenwise"
     assert profile["reset_env_state_at_sep"] is True
@@ -77,7 +108,23 @@ def test_resolve_train_profile_phase2_shared_backbone_contract_matches_phase2_mi
     assert profile["runtime_normalized_q_value_weight_override"] is None
     assert profile["runtime_next_state_flow_matching_weight_override"] is None
     assert profile["vf_coef"] == 0.5
+    assert profile["strict_native_rollout"] is False
     assert profile["restore_validation_policy_state"] is False
+
+
+def test_resolve_train_profile_trusted_sep_reset_mainline_keeps_strict_native_rollout():
+    profile = audit_mod._resolve_train_profile(
+        optimizer_cfg={},
+        train_profile="trusted_sep_reset_mainline",
+        batch_size=None,
+        n_epochs=None,
+        learning_rate=None,
+        target_kl=None,
+    )
+
+    assert profile["train_profile"] == "trusted_sep_reset_mainline"
+    assert profile["strict_native_rollout"] is True
+    assert profile["restore_validation_policy_state"] is True
 
 
 def test_load_reused_zero_control_metrics_accepts_matching_contract(tmp_path):
@@ -212,7 +259,7 @@ def test_post_policy_bundle_roundtrip(tmp_path):
         "ppo_reset_env_state_at_sep": True,
         "ppo_separate_value_backbone": False,
         "ppo_restore_validation_policy_state": True,
-        "strict_native_rollout": False,
+        "strict_native_rollout": True,
     }
     bundle_path = tmp_path / "post_policy_bundle.pt"
     train_history = {"history": [1, 2, 3]}
@@ -247,7 +294,7 @@ def test_post_policy_bundle_roundtrip(tmp_path):
                 "separate_value_backbone": False,
                 "restore_validation_policy_state": True,
             },
-            strict_native_rollout=False,
+            strict_native_rollout=True,
         )
 
     assert loaded["source_path"] == str(bundle_path.resolve())
@@ -283,7 +330,7 @@ def test_run_phase3_audit_resumes_post_policy_bundle_without_train_loop(tmp_path
                 "ppo_reset_env_state_at_sep": True,
                 "ppo_separate_value_backbone": False,
                 "ppo_restore_validation_policy_state": True,
-                "strict_native_rollout": False,
+                "strict_native_rollout": True,
             },
             train_history={"resumed": True},
         )
@@ -297,7 +344,11 @@ def test_run_phase3_audit_resumes_post_policy_bundle_without_train_loop(tmp_path
             self.policy = torch.nn.Linear(2, 2, bias=False)
             self.rollout_buffer = object()
 
-    monkeypatch.setattr(audit_mod, "assert_phase2_green", lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}})
+    monkeypatch.setattr(
+        audit_mod,
+        "assert_phase2_launch_chain_green",
+        lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}, "source_of_truth": {}},
+    )
     monkeypatch.setattr(audit_mod, "_load_required_suite", lambda path: {"batch_size": 1, "h_list": [], "env_seeds": [1], "rollout_seeds": [2]})
     def _fake_load_model(checkpoint_path, device, verbose=False):
         return object(), {"prior": {"num_features": 8}, "optimizer": {}}
@@ -376,7 +427,11 @@ def test_run_phase3_audit_forwards_pair2_runtime_scope_and_strict_contract(tmp_p
     train_suite = {"batch_size": 1, "h_list": [], "env_seeds": [11], "rollout_seeds": [22]}
     heldout_suite = {"batch_size": 1, "h_list": [], "env_seeds": [33], "rollout_seeds": [44]}
 
-    monkeypatch.setattr(audit_mod, "assert_phase2_green", lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}})
+    monkeypatch.setattr(
+        audit_mod,
+        "assert_phase2_launch_chain_green",
+        lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}, "source_of_truth": {}},
+    )
     monkeypatch.setattr(
         audit_mod,
         "_load_required_suite",
@@ -443,14 +498,14 @@ def test_run_phase3_audit_forwards_pair2_runtime_scope_and_strict_contract(tmp_p
     assert captured["strict_fixed_env_mode"] is True
     assert captured["deterministic_actor_sampling"] is True
     assert captured["deterministic_batch_plan"] is True
-    assert captured["strict_native_rollout"] is False
+    assert captured["strict_native_rollout"] is True
     assert captured["actor_objective_runtime_current_suite_name"] == "pair2"
     assert captured["actor_objective_mode"] == "tokenwise_scale_env12_mid_episode_extension_block"
     assert captured["env_rng_seeds"] == [11]
     assert captured["rollout_rng_seeds"] == [22]
     assert report["config"]["actor_objective_runtime_current_suite_name"] == "pair2"
     assert report["config"]["actor_objective_mode_override"] == "tokenwise_scale_env12_mid_episode_extension_block"
-    assert report["config"]["strict_native_rollout"] is False
+    assert report["config"]["strict_native_rollout"] is True
     assert report["config"]["train_outer_batch_snapshot_json"] == str(
         (tmp_path / "outer_batch_snapshot.json").resolve()
     )
@@ -497,8 +552,13 @@ def test_run_phase3_audit_phase2_shared_backbone_contract_uses_phase2_env_cfg(tm
 
     monkeypatch.setattr(
         audit_mod,
-        "assert_phase2_green",
-        lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}, "trusted_contract": {}},
+        "assert_phase2_launch_chain_green",
+        lambda path: {
+            "validation": {"all_checks_pass": True},
+            "pass_flags": {},
+            "trusted_contract": {},
+            "source_of_truth": {"phase2_launch_anchor_artifact": "stub"},
+        },
     )
     monkeypatch.setattr(
         audit_mod,
@@ -575,6 +635,7 @@ def test_run_phase3_audit_phase2_shared_backbone_contract_uses_phase2_env_cfg(tm
 
     assert captured["build_audit_env_cfg_arg"] == {"family": "exact_scm"}
     assert captured["ppo_kwargs"]["normalize_advantage"] is False
+    assert captured["ppo_kwargs"]["actor_gae_space"] == "raw"
     assert captured["ppo_kwargs"]["actor_baseline_mode"] == "learned"
     assert captured["ppo_kwargs"]["actor_objective_mode"] == "tokenwise"
     assert captured["ppo_kwargs"]["reset_env_state_at_sep"] is True
@@ -589,6 +650,127 @@ def test_run_phase3_audit_phase2_shared_backbone_contract_uses_phase2_env_cfg(tm
     assert report["config"]["ppo_restore_validation_policy_state"] is False
     assert report["config"]["runtime_normalized_q_value_weight_override"] is None
     assert report["config"]["runtime_next_state_flow_matching_weight_override"] is None
+    assert report["phase2_preflight"]["launch_chain_locked"] is True
+
+
+def test_run_phase3_audit_reports_snapshot_target_match_count_from_written_snapshot(tmp_path, monkeypatch):
+    snapshot_path = tmp_path / "outer_batch_snapshot.json"
+    snapshot_path.write_text(
+        json.dumps(
+            {
+                "snapshot_entry": "phase3_train_outer_batch_snapshot",
+                "snapshot_target_match_count": 29,
+            }
+        ),
+        encoding="utf-8",
+    )
+
+    class _VecEnv:
+        def close(self):
+            return None
+
+    class _Algo:
+        def __init__(self):
+            self.policy = torch.nn.Linear(2, 2, bias=False)
+            self.rollout_buffer = type("_Buffer", (), {})()
+
+    train_suite = {"batch_size": 1, "h_list": [], "env_seeds": [11], "rollout_seeds": [22]}
+    heldout_suite = {"batch_size": 1, "h_list": [], "env_seeds": [33], "rollout_seeds": [44]}
+
+    monkeypatch.setattr(
+        audit_mod,
+        "assert_phase2_launch_chain_green",
+        lambda path: {
+            "validation": {"all_checks_pass": True},
+            "pass_flags": {},
+            "trusted_contract": {},
+            "source_of_truth": {"phase2_launch_anchor_artifact": "stub"},
+        },
+    )
+    monkeypatch.setattr(
+        audit_mod,
+        "_load_required_suite",
+        lambda path: train_suite if "train" in str(path) else heldout_suite,
+    )
+
+    def _fake_load_model(checkpoint_path, device, verbose=False):
+        return object(), {
+            "prior": {"num_features": 8, "environment": {"family": "exact_scm"}},
+            "optimizer": {},
+        }
+
+    _fake_load_model.cache_clear = lambda: None
+    monkeypatch.setattr(audit_mod, "load_model", _fake_load_model)
+    monkeypatch.setattr(audit_mod, "_build_audit_env_cfg", lambda environment_cfg: {"phase2_env_cfg": True})
+    monkeypatch.setattr(audit_mod, "_bind_vec_env_to_fixed_suite", lambda *args, **kwargs: _VecEnv())
+    monkeypatch.setattr(audit_mod, "_clone_suite_h_list", lambda h_list: [])
+    monkeypatch.setattr(
+        audit_mod,
+        "evaluate_prior_suite",
+        lambda *args, **kwargs: {"full_return_mean": 0.0, "suffix_return_mean": 0.0},
+    )
+    monkeypatch.setattr(audit_mod, "_run_policy_eval", lambda **kwargs: {"full_return_mean": 1.0, "suffix_return_mean": 2.0})
+
+    def _fake_audit_train_loop(algo, callback, vec_env, outer_epochs):
+        algo._rwkv_last_train_outer_batch_snapshot_path = str(snapshot_path.resolve())
+        algo._rwkv_train_outer_batch_snapshot_written = True
+        return [{"outer_epoch": 1}]
+
+    monkeypatch.setattr(audit_mod, "_audit_train_loop", _fake_audit_train_loop)
+
+    def _fake_build_recurrent_ppo(**kwargs):
+        return _Algo(), object(), _VecEnv()
+
+    monkeypatch.setattr(audit_mod, "build_recurrent_ppo", _fake_build_recurrent_ppo)
+
+    report = audit_mod.run_phase3_multi_env_optimization_audit(
+        checkpoint_path=str((tmp_path / "checkpoint.cpkt").resolve()),
+        train_suite_path=str(tmp_path / "train_suite.pt"),
+        heldout_suite_path=str(tmp_path / "heldout_suite.pt"),
+        device="cpu",
+        n_samples=256,
+        single_eval_pos=64,
+        outer_epochs=1,
+        rollout_backend="serial",
+        train_profile="phase2_shared_backbone_contract",
+        phase2_summary_path=str(tmp_path / "phase2.json"),
+        strict_fixed_env_mode=True,
+        deterministic_actor_sampling=True,
+        deterministic_batch_plan=True,
+        train_outer_batch_snapshot_json=str(snapshot_path),
+        train_outer_batch_snapshot_target_outer_batch_idx=13,
+        train_outer_batch_snapshot_target_env_index=12,
+        train_outer_batch_snapshot_target_objective_episode_index=4,
+        train_outer_batch_snapshot_target_objective_position_start=0,
+        train_outer_batch_snapshot_target_objective_position_end=28,
+        skip_heldout_eval=True,
+    )
+
+    assert report["train_outer_batch_snapshot"]["written"] is True
+    assert report["train_outer_batch_snapshot"]["written_path"] == str(snapshot_path.resolve())
+    assert report["train_outer_batch_snapshot"]["snapshot_target_match_count"] == 29
+
+
+def test_run_phase3_audit_trusted_profiles_require_launch_chain_summary(tmp_path, monkeypatch):
+    monkeypatch.setattr(
+        audit_mod,
+        "assert_phase2_launch_chain_green",
+        lambda path: (_ for _ in ()).throw(RuntimeError("launch-chain guard hit")),
+    )
+
+    try:
+        audit_mod.run_phase3_multi_env_optimization_audit(
+            checkpoint_path=str((tmp_path / "checkpoint.cpkt").resolve()),
+            train_suite_path=str(tmp_path / "train_suite.pt"),
+            heldout_suite_path=str(tmp_path / "heldout_suite.pt"),
+            device="cpu",
+            train_profile="phase2_shared_backbone_contract",
+            phase2_summary_path=str(tmp_path / "phase2.json"),
+        )
+    except RuntimeError as exc:
+        assert "launch-chain guard hit" in str(exc)
+    else:
+        raise AssertionError("trusted pre/post audit should require launch-chain summary")
 
 
 def test_collect_suite_rewards_serial_profiled_reports_per_env_timings():
@@ -677,6 +859,101 @@ def test_phase3_post_eval_profile_reuses_existing_output(tmp_path, monkeypatch, 
     assert post_profile_mod.main() == 0
     captured = capsys.readouterr()
     assert json.loads(captured.out) == payload
+
+
+def test_phase3_post_eval_profile_cli_defaults_to_trusted_launch_chain_summary(tmp_path, monkeypatch):
+    captured = {}
+
+    def _fake_main_guard(**kwargs):
+        captured["phase2_summary_path"] = kwargs.get("phase2_summary_path")
+        return {"ok": True}
+
+    monkeypatch.setattr(
+        post_profile_mod,
+        "assert_phase2_launch_chain_green",
+        lambda path: {"validation": {"all_checks_pass": True}, "pass_flags": {}},
+    )
+    monkeypatch.setattr(post_profile_mod, "_load_required_suite", lambda path: {"batch_size": 1, "h_list": [{}], "env_seeds": [1], "rollout_seeds": [2]})
+    def _fake_load_model(*args, **kwargs):
+        return object(), {"prior": {"num_features": 1}, "optimizer": {"ppo_strict_native_rollout": True}}
+
+    _fake_load_model.cache_clear = lambda: None  # type: ignore[attr-defined]
+    monkeypatch.setattr(post_profile_mod, "load_model", _fake_load_model)
+    monkeypatch.setattr(post_profile_mod, "_resolve_audit_env_config", lambda *args, **kwargs: {})
+    monkeypatch.setattr(
+        post_profile_mod,
+        "_resolve_train_profile",
+        lambda **kwargs: {
+            "train_profile": "trusted_sep_reset_mainline",
+            "learning_rate": 1e-4,
+            "n_epochs": 1,
+            "normalize_advantage": True,
+            "actor_gae_space": "normalized",
+            "actor_baseline_mode": "learned",
+            "actor_objective_mode": "tokenwise",
+            "reset_env_state_at_sep": True,
+            "separate_value_backbone": False,
+            "runtime_normalized_q_value_weight_override": None,
+            "runtime_next_state_flow_matching_weight_override": None,
+            "vf_coef": 0.5,
+            "target_kl": None,
+        },
+    )
+
+    class _DummyAlgo:
+        def __init__(self):
+            self.policy = type("P", (), {"load_state_dict": lambda self, *args, **kwargs: None})()
+            self.rollout_buffer = object()
+
+    class _DummyVecEnv:
+        def close(self):
+            return None
+
+    monkeypatch.setattr(post_profile_mod, "build_recurrent_ppo", lambda **kwargs: (_DummyAlgo(), None, _DummyVecEnv()))
+    monkeypatch.setattr(post_profile_mod, "_make_deterministic_batch_plan", lambda *args, **kwargs: None)
+    monkeypatch.setattr(post_profile_mod, "_summarize_suite", lambda *args, **kwargs: {"fingerprint": "fp"})
+    monkeypatch.setattr(
+        post_profile_mod,
+        "_load_post_policy_bundle",
+        lambda **kwargs: (
+            captured.update(
+                {
+                    "phase2_summary_path": post_profile_mod.TRUSTED_PHASE2_LAUNCH_SUMMARY,
+                    "strict_native_rollout": kwargs["strict_native_rollout"],
+                }
+            )
+            or {"contract": {}, "policy_state_dict": {"w": torch.tensor(1.0)}, "train_history": {}}
+        ),
+    )
+    monkeypatch.setattr(post_profile_mod, "_build_audit_ppo_policy_step_fn", lambda *args, **kwargs: object())
+    monkeypatch.setattr(
+        post_profile_mod,
+        "collect_suite_rewards_serial_profiled",
+        lambda *args, **kwargs: {"aggregate": {"full_return_mean": 0.0, "suffix_return_mean": 0.0}},
+    )
+    output_path = tmp_path / "post_eval_cli.json"
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "phase3_post_eval_profile.py",
+            str(tmp_path / "checkpoint.cpkt"),
+            "--train-suite-path",
+            str(tmp_path / "train_suite.pt"),
+            "--heldout-suite-path",
+            str(tmp_path / "heldout_suite.pt"),
+            "--post-policy-bundle-path",
+            str(tmp_path / "bundle.pt"),
+            "--suite-target",
+            "train",
+            "--output-json",
+            str(output_path),
+        ],
+    )
+
+    assert post_profile_mod.main() == 0
+    assert captured["phase2_summary_path"] == post_profile_mod.TRUSTED_PHASE2_LAUNCH_SUMMARY
+    assert captured["strict_native_rollout"] is True
 
 
 def test_phase3_post_eval_hotspot_profile_reuses_existing_output(tmp_path, monkeypatch, capsys):
@@ -835,7 +1112,46 @@ def test_phase3_train_rollout_quality_probe_collect_contract_uses_suite_seeds_an
         "rollout_rng_seeds": [44, 55, 66],
         "deterministic_actor_sampling": True,
         "deterministic_batch_plan": True,
+        "strict_native_rollout": True,
     }
+
+
+def test_phase3_train_rollout_quality_probe_accepts_phase2_shared_backbone_contract_profile(
+    tmp_path, monkeypatch, capsys
+):
+    output_path = tmp_path / "train_quality_phase2_profile.json"
+    payload = {"ok": True, "kind": "train_rollout_quality_phase2_profile"}
+    output_path.write_text(json.dumps(payload))
+
+    monkeypatch.setattr(
+        train_quality_probe_mod,
+        "assert_phase2_green",
+        lambda *args, **kwargs: (_ for _ in ()).throw(AssertionError("should not preflight when reusing output")),
+    )
+    monkeypatch.setattr(
+        sys,
+        "argv",
+        [
+            "phase3_train_rollout_quality_probe.py",
+            "/tmp/checkpoint.cpkt",
+            "--train-suite-path",
+            "/tmp/train.pt",
+            "--heldout-suite-path",
+            "/tmp/heldout.pt",
+            "--reuse-zero-control-json",
+            "/tmp/zero.json",
+            "--reuse-pre-policy-json",
+            "/tmp/pre.json",
+            "--train-profile",
+            "phase2_shared_backbone_contract",
+            "--output-json",
+            str(output_path),
+        ],
+    )
+
+    assert train_quality_probe_mod.main() == 0
+    captured = capsys.readouterr()
+    assert json.loads(captured.out) == payload
 
 
 def test_phase3_train_env_quality_contrast_probe_reuses_existing_output(tmp_path, capsys, monkeypatch):

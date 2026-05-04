@@ -2,6 +2,7 @@ import argparse
 import copy
 import json
 import random
+import types
 from pathlib import Path
 from typing import Any
 
@@ -14,7 +15,11 @@ from ticl.analysis.critic_free_single_env_audit import (
     _build_audit_env_cfg,
     _make_deterministic_batch_plan,
 )
-from ticl.analysis.phase2_guardrail import DEFAULT_PHASE2_SUMMARY, assert_phase2_green
+from ticl.analysis.fixed_env_h import build_fixed_env_h
+from ticl.analysis.phase2_guardrail import (
+    TRUSTED_PHASE2_LAUNCH_SUMMARY,
+    assert_phase2_launch_chain_green,
+)
 from ticl.analysis.phase3_multi_env_optimization_audit import (
     _bind_vec_env_to_fixed_suite,
     _clone_suite_h_list,
@@ -23,7 +28,6 @@ from ticl.analysis.phase3_multi_env_optimization_audit import (
 from ticl.model_builder import load_model
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.sb3_recurrent_ppo import _resolve_actor_advantages, build_recurrent_ppo
-from ticl.train import _freeze_env_h_list_for_replay
 
 
 DEFAULT_OUTPUT_JSON = (
@@ -49,15 +53,7 @@ def _seed_all(seed: int) -> None:
 
 
 def _build_fixed_env_h(*, prior_cfg: dict[str, Any], frozen_h_seed: int):
-    prior = EnvironmentPrior(copy.deepcopy(prior_cfg))
-    rng_state = np.random.get_state()
-    np.random.seed(int(frozen_h_seed))
-    frozen_h = _freeze_env_h_list_for_replay(
-        prior,
-        list(prior._sample_batch_hypers(1)),
-    )[0]
-    np.random.set_state(rng_state)
-    return frozen_h
+    return build_fixed_env_h(prior_cfg=prior_cfg, frozen_h_seed=int(frozen_h_seed))
 
 
 def _sync_last_obs(algo, callback, vec_env, *, train_env_seed: int) -> None:
@@ -125,6 +121,58 @@ def _signature_diff(a: dict[str, Any], b: dict[str, Any]) -> dict[str, dict[str,
                 "phase3": b.get(key, None),
             }
     return diff
+
+
+def _install_batch1_non_native_compare_shim(algo) -> dict[str, Any]:
+    """Normalize batch=1 official-eval rollout jitter inside this compare harness only.
+
+    Under the current trusted Phase 2 contract we intentionally keep
+    `strict_native_rollout=false`. In that mode, batch-1 no-grad rollout steps route
+    through the vendor official-eval ScriptModule path. We observed a reproducible
+    cross-build drift there even when:
+    - checkpoint weights are exact,
+    - env/token inputs are exact,
+    - fixed-env contract is exact.
+
+    The compare harness cares about semantic parity between the Phase 2-side and
+    Phase 3-side contracts, not about instance-local vendor kernel jitter. For this
+    one narrow case we therefore replace the batch=1 official-eval branch with the
+    same deterministic native-step fallback on both sides. This does not touch the
+    training/runtime codepath outside this audit script.
+    """
+
+    policy = algo.policy
+    core = policy.rlpfn_model.rwkv_core
+    original_forward_step = core.forward_step
+
+    def _wrapped_forward_step(self, token: torch.Tensor, state=None):
+        if (
+            token.ndim == 2
+            and int(token.shape[0]) == 1
+            and token.is_cuda
+            and (not self.training)
+            and (not torch.is_grad_enabled())
+            and (not bool(getattr(self, "force_native_eval_forward_step", False)))
+        ):
+            prev = bool(getattr(self, "force_native_eval_forward_step", False))
+            self.force_native_eval_forward_step = True
+            try:
+                return original_forward_step(token, state)
+            finally:
+                self.force_native_eval_forward_step = prev
+        return original_forward_step(token, state)
+
+    core.forward_step = types.MethodType(_wrapped_forward_step, core)
+    return {
+        "batch1_non_native_compare_shim_applied": True,
+        "shim_scope": "phase3_phase2_exact_compare_only",
+        "shim_reason": (
+            "Current trusted Phase 2 contract keeps strict_native_rollout=false, but "
+            "vendor batch=1 official-eval ScriptModule shows cross-build jitter. "
+            "Compare harness replaces only that branch with a deterministic shared "
+            "native-step fallback on both sides."
+        ),
+    }
 
 
 def _collect_and_measure_main_loss(algo, callback, vec_env, *, train_env_seed: int) -> dict[str, Any]:
@@ -446,10 +494,10 @@ def run_phase3_phase2_milestone_contract_gradient_compare(
     n_epochs: int = 1,
     learning_rate: float = 2e-4,
     target_kl: float = 0.03,
-    strict_native_rollout: bool = True,
-    phase2_summary_path: str = DEFAULT_PHASE2_SUMMARY,
+    strict_native_rollout: bool = False,
+    phase2_summary_path: str = TRUSTED_PHASE2_LAUNCH_SUMMARY,
 ) -> dict[str, Any]:
-    phase2_summary = assert_phase2_green(phase2_summary_path)
+    phase2_summary = assert_phase2_launch_chain_green(phase2_summary_path)
     checkpoint_path = str(Path(checkpoint_path).expanduser().resolve())
     device_obj = torch.device(str(device or _default_device()))
     args = {
@@ -483,6 +531,12 @@ def run_phase3_phase2_milestone_contract_gradient_compare(
         frozen_h=frozen_h,
         args=args,
     )
+    compare_runtime_shims: dict[str, Any] = {
+        "batch1_non_native_compare_shim_applied": False,
+    }
+    if not bool(strict_native_rollout):
+        compare_runtime_shims = _install_batch1_non_native_compare_shim(phase2_bundle["algo"])
+        _install_batch1_non_native_compare_shim(phase3_bundle["algo"])
 
     try:
         initial_param_diff = _param_diff_summary(
@@ -545,6 +599,7 @@ def run_phase3_phase2_milestone_contract_gradient_compare(
         "contract_args": dict(args),
         "phase2_signature": phase2_bundle["signature"],
         "phase3_signature": phase3_bundle["signature"],
+        "compare_runtime_shims": compare_runtime_shims,
         "signature_diff": signature_diff,
         "initial_param_diff": initial_param_diff,
         "phase2_measure": phase2_measure,
@@ -588,13 +643,13 @@ def main() -> int:
     parser.add_argument(
         "--strict-native-rollout",
         action=argparse.BooleanOptionalAction,
-        default=True,
+        default=False,
         help=(
-            "Bypass the batch=1 no-grad official eval shortcut in the trusted milestone compare. "
-            "Enabled by default for strict regression numeric parity."
+            "Toggle strict-native rollout in the trusted milestone compare. "
+            "The current trusted Phase 2 launch anchor keeps this disabled."
         ),
     )
-    parser.add_argument("--phase2-summary-path", type=str, default=DEFAULT_PHASE2_SUMMARY)
+    parser.add_argument("--phase2-summary-path", type=str, default=TRUSTED_PHASE2_LAUNCH_SUMMARY)
     parser.add_argument("--output-json", type=str, default=DEFAULT_OUTPUT_JSON)
     args = parser.parse_args()
 

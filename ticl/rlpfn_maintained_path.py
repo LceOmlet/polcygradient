@@ -17,11 +17,11 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "ctrl_reward_enable_prob": 0.7,
     "survival_reward_weight": 0.0,
     "survival_reward_enable_prob": 0.0,
-    "reinforce_reward_transform": "tanh",
+    "reinforce_reward_transform": "none",
     "reinforce_reward_rms_eps": 1e-6,
     "reinforce_reward_tanh_c": 10.0,
     "reinforce_reward_tanh_bound": {"distribution": "uniform", "min": 0.0, "max": 2.0},
-    "reinforce_action_transform": "clip",
+    "reinforce_action_transform": "none",
     "reinforce_action_rms_eps": 1e-6,
     "reinforce_action_clip_bound": 5.0,
     "reinforce_normalize_advantages": True,
@@ -29,10 +29,10 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reinforce_advantage_norm_eps": 1e-6,
     "reinforce_advantage_norm_clip": 10.0,
     "policy_gradient_weight": 0.4,
-    "reinforce_aux_enabled": True,
+    "reinforce_aux_enabled": False,
     "reinforce_aux_backbone_query_pass_enabled": False,
     "normalized_q_value_weight": 0.0,
-    "next_state_flow_matching_weight": 0.2,
+    "next_state_flow_matching_weight": 0.0,
     "next_state_flow_head_type": "rwkv_two_layer",
     "reinforce_sequence_replay_enabled": True,
     "reinforce_sequence_replay_share_context_forward": False,
@@ -62,6 +62,11 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "batch_parallel_backend": "torch_vectorized",
     "batch_shared_environment": False,
     "batch_vectorized_grouping": "family",
+    "reward_topology_conditioned_sampling_enabled": True,
+    "reward_state_input_gain_fraction_conditioned_min": 0.7,
+    "reward_action_input_gain_fraction_conditioned_min": 0.06,
+    "reward_state_to_action_gain_ratio_conditioned_max": 10.0,
+    "reward_topology_conditioned_sampling_max_attempts": 4096,
 }
 
 
@@ -89,6 +94,12 @@ def resolve_rlpfn_token_layout(env_cfg, *, num_features=None):
 def apply_rlpfn_maintained_path_defaults(config):
     env_cfg = config["prior"]["environment"]
     env_cfg.update(deepcopy(RLPFN_MAINTAINED_ENV_DEFAULTS))
+    # The pack-aligned PPO contract trains only actor/critic PPO objectives.
+    # Keep aux disabled in the environment contract and again at the runtime
+    # bridge so there is no hidden loss-path fork.
+    env_cfg["reinforce_aux_enabled"] = False
+    env_cfg["normalized_q_value_weight"] = 0.0
+    env_cfg["next_state_flow_matching_weight"] = 0.0
     layout = resolve_rlpfn_token_layout(env_cfg)
 
     config["prior"]["classification"]["num_features_sampler"] = "fixed"
@@ -100,12 +111,61 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["x_obs_dim"] = int(layout["x_obs_dim"])
     config["transformer"]["x_action_dim"] = int(layout["x_action_dim"])
     config["prior"]["num_features"] = int(layout["default_num_features"])
+    config["prior"]["n_samples"] = 2048
+    config["dataloader"]["batch_size"] = 2048
     config["transformer"]["single_eval_causal"] = True
     config["transformer"]["backbone"] = "rwkv7"
     config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
     config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = 64
     config["transformer"]["rwkv_sequence_replay_token_budget"] = 262144
     config["optimizer"]["rl_objective"] = "ppo"
+    # Keep fit_model rlpfn on the pack-trainer PPO contract by default.
+    # These values are intentionally set here rather than requiring every
+    # training command to repeat the same semantic alignment flags.
+    config["optimizer"]["learning_rate"] = 2e-4
+    # Let the official PPO bridge choose the largest RWKV-safe sequence batch
+    # from n_steps * replay_chunk_capacity.  A fixed 256-transition batch makes
+    # the default 2048x2048 rollout split into 16384 tiny outer batches.
+    config["optimizer"]["ppo_batch_size"] = None
+    config["optimizer"]["ppo_n_epochs"] = 4
+    config["optimizer"]["ppo_gamma"] = 0.98
+    config["optimizer"]["ppo_gae_lambda"] = 0.90
+    config["optimizer"]["ppo_clip_range"] = 0.2
+    config["optimizer"]["ppo_clip_range_vf"] = None
+    config["optimizer"]["ppo_normalize_advantage"] = True
+    config["optimizer"]["ppo_space_contract"] = "raw"
+    config["optimizer"]["ppo_target_kl"] = None
+    config["optimizer"]["ppo_deterministic_batch_plan"] = True
+    config["optimizer"]["ppo_strict_native_rollout"] = False
+    config["optimizer"]["ppo_reset_env_state_at_sep"] = True
+    config["optimizer"]["ppo_value_head_impl"] = "vendor_official"
+    config["optimizer"]["ppo_value_path_adapter_impl"] = "none"
+    config["optimizer"]["ppo_value_head_mlp_hidden_dim"] = 256
+    config["optimizer"]["ppo_actor_baseline_mode"] = "learned"
+    config["optimizer"]["ppo_vf_coef"] = 0.1
+    config["optimizer"]["ppo_trusted_pack_runner_required"] = True
+    config["optimizer"]["ppo_pack_prior_mode"] = "sampled_topology"
+    config["optimizer"]["ppo_pack_fixed_env_group_across_updates"] = False
+    config["optimizer"]["ppo_pack_sb3_reward_normalization_enabled"] = True
+    config["optimizer"]["ppo_pack_sb3_observation_normalization_enabled"] = True
+    config["optimizer"]["ppo_pack_sb3_observation_normalization_clip"] = 10.0
+    config["optimizer"]["ppo_pack_sb3_observation_normalization_epsilon"] = 1e-8
+    # The semantic health probe is an explicit diagnostic/sidecar tool.  Keeping
+    # it off in default large-scale pretraining avoids materializing extra
+    # rollout-wide statistics on top of the canonical PPO pack.
+    config["optimizer"]["ppo_pack_semantic_probes_enabled"] = False
+    config["optimizer"]["ppo_pack_semantic_probe_sidecar_enabled"] = False
+    config["optimizer"]["ppo_pack_semantic_probe_sidecar_every"] = 1
+    config["optimizer"]["ppo_pack_checkpoint_every"] = 0
+    config["optimizer"]["ppo_pack_checkpoint_include_optimizer"] = False
+    config["optimizer"]["ppo_pack_topology_state_gain_min"] = 0.7
+    config["optimizer"]["ppo_pack_topology_action_gain_min"] = 0.06
+    config["optimizer"]["ppo_pack_topology_state_to_action_ratio_max"] = 10.0
+    config["optimizer"]["ppo_pack_topology_max_attempts"] = 4096
+    # Pack PPO trains only the actor/critic objective.  The fit_model PPO
+    # bridge must not silently add an auxiliary loss.
+    config["optimizer"]["ppo_runtime_normalized_q_value_weight_override"] = 0.0
+    config["optimizer"]["ppo_runtime_next_state_flow_matching_weight_override"] = 0.0
     return layout
 
 
@@ -132,4 +192,21 @@ def validate_rlpfn_maintained_path_config(config):
         raise ValueError("Maintained RLPFN path requires exact-SCM strict_joint_transition_enabled=True.")
     if not bool(env_cfg.get("reinforce_sequence_replay_enabled", False)):
         raise ValueError("Maintained RLPFN path requires reinforce_sequence_replay_enabled=True.")
+    optimizer_cfg = config["optimizer"]
+    if not bool(optimizer_cfg.get("ppo_trusted_pack_runner_required", False)):
+        raise ValueError("Maintained RLPFN path requires ppo_trusted_pack_runner_required=True.")
+    if str(optimizer_cfg.get("ppo_space_contract", "")).strip().lower() != "raw":
+        raise ValueError("Maintained RLPFN path requires ppo_space_contract='raw'.")
+    if str(optimizer_cfg.get("ppo_value_head_impl", "")).strip().lower() != "vendor_official":
+        raise ValueError("Maintained RLPFN path requires ppo_value_head_impl='vendor_official'.")
+    if str(optimizer_cfg.get("ppo_value_path_adapter_impl", "")).strip().lower() != "none":
+        raise ValueError("Maintained RLPFN path requires ppo_value_path_adapter_impl='none'.")
+    if not bool(optimizer_cfg.get("ppo_deterministic_batch_plan", False)):
+        raise ValueError("Maintained RLPFN path requires ppo_deterministic_batch_plan=True.")
+    if str(optimizer_cfg.get("ppo_pack_prior_mode", "")).strip().lower() != "sampled_topology":
+        raise ValueError("Maintained RLPFN path requires ppo_pack_prior_mode='sampled_topology'.")
+    if bool(optimizer_cfg.get("ppo_pack_fixed_env_group_across_updates", True)):
+        raise ValueError("Maintained RLPFN path requires a fresh sampled topology batch each PPO update.")
+    if abs(float(optimizer_cfg.get("ppo_vf_coef", 0.0)) - 0.1) > 1e-12:
+        raise ValueError("Maintained RLPFN path requires ppo_vf_coef=0.1.")
     return layout

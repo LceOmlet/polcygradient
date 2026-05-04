@@ -330,10 +330,44 @@ def _run_rwkv7_exact_scm_reinforce_rollout(
     }
 
 
-class _FakeBox:
+class _FakeSpace:
+    pass
+
+
+class _FakeBox(_FakeSpace):
     def __init__(self, low, high):
         self.low = np.asarray(low, dtype=np.float32)
         self.high = np.asarray(high, dtype=np.float32)
+
+
+class _FakeDiscrete(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeMultiDiscrete(_FakeSpace):
+    def __init__(self, nvec):
+        self.nvec = np.asarray(nvec)
+
+
+class _FakeMultiBinary(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeDict(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = dict(spaces)
+
+
+class _FakeTuple(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = tuple(spaces)
+
+
+class _FakeWrapper:
+    def __init__(self, env=None):
+        self.env = env
 
 
 class _ScriptedEnv:
@@ -374,7 +408,18 @@ class _ScriptedEnv:
 def _install_fake_gym(monkeypatch, env_factory):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
+    spaces_mod.Space = _FakeSpace
     spaces_mod.Box = _FakeBox
+    spaces_mod.Discrete = _FakeDiscrete
+    spaces_mod.MultiDiscrete = _FakeMultiDiscrete
+    spaces_mod.MultiBinary = _FakeMultiBinary
+    spaces_mod.Dict = _FakeDict
+    spaces_mod.Tuple = _FakeTuple
+    gym_mod.Space = _FakeSpace
+    gym_mod.Wrapper = _FakeWrapper
+    gym_mod.ObservationWrapper = _FakeWrapper
+    gym_mod.RewardWrapper = _FakeWrapper
+    gym_mod.ActionWrapper = _FakeWrapper
     gym_mod.spaces = spaces_mod
     gym_mod.make = lambda env_name: env_factory(env_name)
     monkeypatch.setitem(sys.modules, "gymnasium", gym_mod)
@@ -848,18 +893,55 @@ def test_rwkv7_core_cuda_batch1_official_eval_fastpath_matches_raw_step():
 
     assert isinstance(state_fast, list)
     assert len(state_fast) == int(cfg["transformer"]["nlayers"]) * 3
-    assert torch.allclose(out_fast, x_ref, atol=1e-2, rtol=1e-2)
+    assert torch.equal(out_fast, x_ref)
     for fast_tensor, ref_tensor in zip(state_fast, flat_state_ref):
-        assert torch.allclose(fast_tensor.to(dtype=ref_tensor.dtype), ref_tensor, atol=1e-2, rtol=1e-2)
-    for idx, state_tensor in enumerate(state_fast):
-        expected_dtype = torch.float32 if idx % 3 == 1 else torch.bfloat16
-        assert state_tensor.dtype == expected_dtype
-    assert torch.allclose(out_fast_2, x_ref_2, atol=1e-2, rtol=1e-2)
+        assert torch.allclose(fast_tensor, ref_tensor, atol=1.5e-4, rtol=0.0)
+    for state_tensor in state_fast:
+        assert state_tensor.dtype == torch.float32
+    assert torch.equal(out_fast_2, x_ref_2)
     for fast_tensor, ref_tensor in zip(state_fast_2, flat_state_ref_2):
-        assert torch.allclose(fast_tensor.to(dtype=ref_tensor.dtype), ref_tensor, atol=1e-2, rtol=1e-2)
-    for idx, state_tensor in enumerate(state_fast_2):
-        expected_dtype = torch.float32 if idx % 3 == 1 else torch.bfloat16
-        assert state_tensor.dtype == expected_dtype
+        assert torch.allclose(fast_tensor, ref_tensor, atol=1.5e-4, rtol=0.0)
+    for state_tensor in state_fast_2:
+        assert state_tensor.dtype == torch.float32
+
+
+def test_rwkv7_core_cuda_batch1_official_eval_fastpath_matches_native_sequence_path_exactly():
+    if not torch.cuda.is_available():
+        return
+
+    _ensure_torch_extensions_dir()
+    _seed_everything(123)
+    cfg = _build_rwkv7_rlpfn_config()
+    cfg["transformer"]["emsize"] = 64
+    cfg["transformer"]["nlayers"] = 2
+    cfg["transformer"]["rwkv_head_size"] = 64
+    _, model, *_ = get_model(cfg, device="cuda", should_train=False, verbose=False)
+    model = model.cuda().eval()
+    core = model.rwkv_core
+
+    seq_len = 8
+    batch_size = 1
+    num_features = int(cfg["prior"]["num_features"])
+    x = torch.randn(seq_len, batch_size, num_features, device="cuda")
+    y = torch.randn(seq_len, batch_size, device="cuda")
+    tokens = model._cast_token_for_rwkv_core(model._encode_train_token(x, y))
+
+    with torch.no_grad():
+        state = None
+        hidden_steps = []
+        for t in range(seq_len):
+            hidden_t, state = core.forward_step(tokens[t], state)
+            hidden_steps.append(hidden_t.unsqueeze(0))
+        hidden_fast = torch.cat(hidden_steps, dim=0)
+
+        prev = bool(getattr(core, "force_native_eval_forward_step", False))
+        core.force_native_eval_forward_step = True
+        try:
+            hidden_native = core.forward_tokens_sequence_only(tokens)
+        finally:
+            core.force_native_eval_forward_step = prev
+
+    assert torch.equal(hidden_fast, hidden_native)
 
 
 def test_rwkv7_rlpfn_exact_scm_reinforce_rollout_backward_is_finite():

@@ -20,7 +20,7 @@ DEFAULT_LEGACY_GRAD_SNAPSHOT = (
 )
 DEFAULT_CANONICAL_MILESTONE = (
     "/home/chen/RLPFN/artifacts/"
-    "critic_help_vs_zero_state_reset_shared_seed12345_strict_fixed_env_deterministic_quick.json"
+    "phase2_launch_anchor_shared_seed12345_current_contract_quick.json"
 )
 DEFAULT_CANONICAL_OFFICIAL_MONKEY = (
     "/home/chen/RLPFN/artifacts/critic_official_vs_monkey_regression_seed12345.json"
@@ -29,6 +29,7 @@ DEFAULT_MANIFEST = (
     "/home/chen/RLPFN/reinforce-terminal-explore/ticl/analysis/phase2_regression_manifest.json"
 )
 PREFERRED_PYTHON = "/home/liangchen/miniconda3/envs/rlpfn/bin/python"
+PYTHON_OVERRIDE_ENV = "TICL_PHASE_REGRESSION_PYTHON"
 
 
 def _default_device() -> str:
@@ -36,10 +37,18 @@ def _default_device() -> str:
 
 
 def _python_executable() -> str:
+    override = os.environ.get(PYTHON_OVERRIDE_ENV, "").strip()
+    if override:
+        override_path = Path(override).expanduser().resolve()
+        if override_path.exists():
+            return str(override_path)
+    current = Path(sys.executable).resolve()
+    if current.exists():
+        return str(current)
     preferred = Path(PREFERRED_PYTHON)
     if preferred.exists():
         return str(preferred)
-    return str(Path(sys.executable).resolve())
+    return str(current)
 
 
 def _subprocess_env() -> dict[str, str]:
@@ -85,6 +94,11 @@ def _milestone_summary(report: dict) -> dict:
     zero["pre_return"] = float(zero_suffix + float(zero["pre_smp_gap"]))
     return {
         "zero_suffix_return_mean": zero_suffix,
+        "frozen_h_seed_mode": report.get("frozen_h_seed_mode"),
+        "strict_native_rollout": report.get("strict_native_rollout"),
+        "restore_validation_policy_state": report.get("restore_validation_policy_state"),
+        "record_suite_critic_quality": report.get("record_suite_critic_quality"),
+        "fixed_env_contract": dict(report.get("fixed_env_contract", {})),
         "learned": learned,
         "zero": zero,
     }
@@ -169,6 +183,13 @@ def _validate_against_manifest(*, regression: dict, milestone: dict, manifest: d
 
     milestone_spec = manifest["shared_milestone"]
     tol = float(milestone_spec["abs_tol"])
+    for key, expected in milestone_spec.get("required_report_fields", {}).items():
+        if milestone.get(key) != expected:
+            failures.append(f"shared_milestone.{key} drift")
+    fixed_env_contract = dict(milestone.get("fixed_env_contract", {}))
+    for key, expected in milestone_spec.get("required_fixed_env_contract", {}).items():
+        if fixed_env_contract.get(key) != expected:
+            failures.append(f"shared_milestone.fixed_env_contract.{key} drift")
     if not _check_close(
         actual=float(milestone["zero_suffix_return_mean"]),
         expected=float(milestone_spec["zero_suffix_return_mean"]),
@@ -182,8 +203,24 @@ def _validate_against_manifest(*, regression: dict, milestone: dict, manifest: d
                 failures.append(f"shared_milestone.{mode_name}.{key} drift")
     if not (float(milestone["learned"]["delta_smp_gap"]) > float(milestone["zero"]["delta_smp_gap"])):
         failures.append("shared_milestone.learned no longer beats zero")
-    if not (float(milestone["learned"]["post_return"]) > 0.0):
-        failures.append("shared_milestone.learned post_return not positive")
+    if not (float(milestone["learned"]["delta_smp_gap"]) > 0.0):
+        failures.append("shared_milestone.learned delta not positive")
+    heldout_quality_spec = dict(milestone_spec.get("heldout_critic_quality", {}))
+    for mode_name, quality_spec in heldout_quality_spec.items():
+        quality = milestone.get(mode_name, {}).get("eval_suite_critic_quality_after_train")
+        if not isinstance(quality, dict):
+            failures.append(f"shared_milestone.{mode_name}.eval_suite_critic_quality_after_train missing")
+            continue
+        if int(quality.get("objective_total", -1)) != int(quality_spec["objective_total"]):
+            failures.append(f"shared_milestone.{mode_name}.eval_suite_critic_quality_after_train.objective_total drift")
+        if float(quality.get("raw_corr", float("-inf"))) < float(quality_spec["raw_corr_min"]):
+            failures.append(f"shared_milestone.{mode_name}.eval_suite_critic_quality_after_train.raw_corr too low")
+        if float(quality.get("explained_variance_raw", float("-inf"))) < float(
+            quality_spec["explained_variance_raw_min"]
+        ):
+            failures.append(
+                f"shared_milestone.{mode_name}.eval_suite_critic_quality_after_train.explained_variance_raw too low"
+            )
 
     return {
         "manifest_path": str(Path(manifest_path).expanduser().resolve()),
@@ -204,6 +241,10 @@ def _pass_flags(*, regression: dict, milestone: dict) -> dict:
     learned = milestone["learned"]
     zero = milestone["zero"]
     regression_core = regression.get("regression_compare_after_sync", regression)
+    heldout_quality_recorded = bool(
+        isinstance(learned.get("eval_suite_critic_quality_after_train"), dict)
+        and isinstance(zero.get("eval_suite_critic_quality_after_train"), dict)
+    )
     return {
         "official_vs_monkey_numeric_match": bool(
             float(regression_core["policy_loss_abs_diff"]) == 0.0
@@ -217,7 +258,8 @@ def _pass_flags(*, regression: dict, milestone: dict) -> dict:
         "shared_learned_beats_zero": bool(
             float(learned["delta_smp_gap"]) > float(zero["delta_smp_gap"])
         ),
-        "shared_learned_post_return_positive": bool(float(learned["post_return"]) > 0.0),
+        "shared_learned_delta_positive": bool(float(learned["delta_smp_gap"]) > 0.0),
+        "shared_heldout_critic_quality_recorded": heldout_quality_recorded,
     }
 
 
@@ -238,6 +280,17 @@ def _summary_matches_invocation(*, summary: dict, args) -> bool:
             int(contract.get("outer_epochs", -1)) == int(args.outer_epochs),
             float(contract.get("learning_rate", float("nan"))) == float(args.learning_rate),
             float(contract.get("target_kl", float("nan"))) == float(args.target_kl),
+            int(contract.get("build_seed", -1)) == int(args.build_seed),
+            bool(contract.get("ppo_reset_env_state_at_sep", False)) is True,
+            bool(contract.get("strict_fixed_env_mode", False)) is True,
+            bool(contract.get("deterministic_actor_sampling", False)) is True,
+            bool(contract.get("deterministic_batch_plan", False)) is True,
+            bool(contract.get("strict_native_rollout", True)) is False,
+            bool(contract.get("restore_validation_policy_state", True)) is False,
+            bool(contract.get("shared_actor_critic_backbone", False)) is True,
+            bool(contract.get("record_suite_critic_quality", False)) is True,
+            str(contract.get("frozen_h_seed_mode", "")) == "current",
+            bool(contract.get("zero_eval_prior_reuses_sampling_state", True)) is False,
             str(summary.get("manifest_path", "")) == str(Path(args.manifest_path).expanduser().resolve()),
             bool(assembly.get("reuse_canonical_official_monkey", False))
             == bool(args.reuse_canonical_official_monkey),
@@ -279,9 +332,18 @@ def build_arg_parser() -> argparse.ArgumentParser:
     parser.add_argument("--outer-epochs", type=int, default=2)
     parser.add_argument("--learning-rate", type=float, default=2e-4)
     parser.add_argument("--target-kl", type=float, default=0.03)
+    parser.add_argument("--build-seed", type=int, default=4040)
     parser.add_argument("--timing-repeats", type=int, default=3)
-    parser.add_argument("--reuse-canonical-official-monkey", action="store_true")
-    parser.add_argument("--reuse-canonical-shared-milestone", action="store_true")
+    parser.add_argument(
+        "--reuse-canonical-official-monkey",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+    )
+    parser.add_argument(
+        "--reuse-canonical-shared-milestone",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+    )
     parser.add_argument("--manifest-path", type=str, default=DEFAULT_MANIFEST)
     parser.add_argument("--force-rerun", action="store_true")
     parser.add_argument("--allow-validation-failure", action="store_true")
@@ -387,11 +449,17 @@ def main(argv: list[str] | None = None) -> int:
                     str(args.n_epochs),
                     "--target-kl",
                     str(args.target_kl),
+                    "--build-seed",
+                    str(args.build_seed),
                     "--strict-fixed-env-mode",
                     "--train-rollout-seed",
                     str(args.train_rollout_seed),
+                    "--frozen-h-seed-mode",
+                    "current",
                     "--deterministic-actor-sampling",
                     "--ppo-reset-env-state-at-sep",
+                    "--no-restore-validation-policy-state",
+                    "--record-suite-critic-quality",
                     "--modes",
                     "learned",
                     "zero",
@@ -428,10 +496,16 @@ def main(argv: list[str] | None = None) -> int:
             "outer_epochs": int(args.outer_epochs),
             "learning_rate": float(args.learning_rate),
             "target_kl": float(args.target_kl),
+            "build_seed": int(args.build_seed),
             "ppo_reset_env_state_at_sep": True,
             "strict_fixed_env_mode": True,
             "deterministic_actor_sampling": True,
             "deterministic_batch_plan": True,
+            "strict_native_rollout": False,
+            "restore_validation_policy_state": False,
+            "record_suite_critic_quality": True,
+            "frozen_h_seed_mode": "current",
+            "zero_eval_prior_reuses_sampling_state": False,
             "shared_actor_critic_backbone": True,
         },
         "legacy_artifacts": {

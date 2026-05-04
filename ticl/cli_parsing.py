@@ -125,6 +125,109 @@ def argparser_from_config(parser, description="Train Mothernet"):
                            help='Number of head-only support adaptation steps for ANIL.')
     optimizer.add_argument('--anil-inner-learning-rate', type=float,
                            help='Inner-loop learning rate for ANIL head adaptation.')
+    optimizer.add_argument('--ppo-n-envs', type=int,
+                           help='PPO rollout environment count. For exact legacy compare this should match dataloader batch size.')
+    optimizer.add_argument('--ppo-n-steps', type=int,
+                           help='PPO rollout steps per environment. For exact legacy compare this should match dataloader num_steps.')
+    optimizer.add_argument('--ppo-batch-size', type=int,
+                           help='PPO update minibatch size, distinct from dataloader -b/--batch-size which controls PPO n_envs.')
+    optimizer.add_argument('--ppo-n-epochs', type=int,
+                           help='Number of PPO optimization epochs per collected rollout.')
+    optimizer.add_argument('--ppo-gamma', type=float,
+                           help='PPO discount factor.')
+    optimizer.add_argument('--ppo-gae-lambda', type=float,
+                           help='PPO GAE lambda.')
+    optimizer.add_argument('--ppo-clip-range', type=float,
+                           help='PPO policy ratio clip range.')
+    optimizer.add_argument('--ppo-clip-range-vf', type=float,
+                           help='PPO value-function clip range. None disables value clipping.')
+    optimizer.add_argument('--ppo-normalize-advantage', type=str2bool,
+                           help='Whether PPO whitens actor advantages before the policy loss.')
+    optimizer.add_argument('--ppo-space-contract', type=str, choices=['raw', 'normalized', 'reward_normalized'],
+                           help='PPO return/value/actor-GAE space contract.')
+    optimizer.add_argument('--ppo-value-target-space', type=str, choices=['raw', 'normalized', 'reward_normalized'],
+                           help='Optional explicit PPO critic target space override.')
+    optimizer.add_argument('--ppo-actor-gae-space', type=str, choices=['raw', 'normalized', 'reward_normalized'],
+                           help='Optional explicit PPO actor advantage/GAE space override.')
+    optimizer.add_argument('--ppo-allow-mixed-space-contract', type=str2bool,
+                           help='Allow PPO critic target and actor GAE spaces to intentionally differ.')
+    optimizer.add_argument('--ppo-actor-baseline-mode', type=str, choices=['learned', 'zero', 'rollout_mean'],
+                           help='Baseline used to construct PPO actor advantages.')
+    optimizer.add_argument('--ppo-separate-value-backbone', type=str2bool,
+                           help='Use a separate value backbone in the PPO policy wrapper.')
+    optimizer.add_argument('--ppo-reset-env-state-at-sep', type=str2bool,
+                           help='Reset environment state at the single-eval boundary while preserving actor history.')
+    optimizer.add_argument('--ppo-value-head-impl', type=str, choices=['legacy_bar', 'scalar_linear', 'scalar_mlp', 'vendor_official'],
+                           help='PPO critic/value head implementation.')
+    optimizer.add_argument('--ppo-value-path-adapter-impl', type=str, choices=['none', 'batchnorm', 'batchnorm_batchstats', 'frozen_zscore'],
+                           help='PPO value-path adapter implementation.')
+    optimizer.add_argument('--ppo-value-head-mlp-hidden-dim', type=int,
+                           help='Hidden dimension for PPO scalar_mlp value head.')
+    optimizer.add_argument('--ppo-restore-validation-policy-state', type=str2bool,
+                           help='For PPO continue-run checkpoints, restore the saved validation PPO policy state onto the training bridge when available. Omit to use the maintained auto-restore behavior.')
+    optimizer.add_argument('--ppo-strict-fixed-env-mode', type=str2bool,
+                           help='Enable strict fixed-env PPO seed plumbing for trusted compare/debug runs.')
+    optimizer.add_argument('--ppo-env-rng-seeds', type=str,
+                           help='Optional fixed env RNG seed spec for PPO strict compare mode. Accepts a single int, comma list, or JSON list.')
+    optimizer.add_argument('--ppo-rollout-rng-seeds', type=str,
+                           help='Optional fixed rollout RNG seed spec for PPO strict compare mode. Accepts a single int, comma list, or JSON list.')
+    optimizer.add_argument('--ppo-single-eval-pos', type=int,
+                           help='Optional fixed single_eval_pos for PPO strict compare mode. Default samples eval boundary normally.')
+    optimizer.add_argument('--ppo-deterministic-actor-sampling', type=str2bool,
+                           help='Use deterministic actor sampling in PPO strict compare mode.')
+    optimizer.add_argument('--ppo-deterministic-batch-plan', type=str2bool,
+                           help='Use deterministic minibatch ordering in PPO strict compare mode.')
+    optimizer.add_argument('--ppo-strict-native-rollout', type=str2bool,
+                           help='Force the PPO bridge and validation policy to use the native RWKV eval-forward path.')
+    optimizer.add_argument('--ppo-runtime-normalized-q-value-weight-override', type=float,
+                           help='Runtime PPO override for normalized Q-value auxiliary loss weight.')
+    optimizer.add_argument('--ppo-runtime-next-state-flow-matching-weight-override', type=float,
+                           help='Runtime PPO override for next-state flow matching auxiliary loss weight.')
+    optimizer.add_argument('--ppo-ent-coef', type=float,
+                           help='PPO entropy coefficient.')
+    optimizer.add_argument('--ppo-vf-coef', type=float,
+                           help='PPO critic/value loss coefficient.')
+    optimizer.add_argument('--ppo-max-grad-norm', type=float,
+                           help='PPO global gradient norm clip.')
+    optimizer.add_argument('--ppo-target-kl', type=float,
+                           help='PPO target KL for early stopping. None disables target-KL stopping.')
+    optimizer.add_argument('--ppo-trusted-pack-runner-required', type=str2bool,
+                           help='Require the canonical pack trainer collect/update path for PPO instead of direct collect_rollouts.')
+    optimizer.add_argument('--ppo-pack-output-dir', type=str,
+                           help='Output directory for canonical PPO pack progress, sidecars, and runner checkpoints.')
+    optimizer.add_argument('--ppo-pack-seed', type=int,
+                           help='Base seed for canonical PPO pack runner environment batches.')
+    optimizer.add_argument('--ppo-pack-prior-mode', type=str,
+                           choices=['fixed_frozen', 'fixed_frozen_list', 'sampled_gain', 'sampled_topology'],
+                           help='Prior environment mode used by the canonical PPO pack runner.')
+    optimizer.add_argument('--ppo-pack-fixed-env-group-across-updates', type=str2bool,
+                           help='Reuse the same prior environment batch across PPO updates in the canonical pack runner.')
+    optimizer.add_argument('--ppo-pack-sb3-reward-normalization-enabled', type=str2bool,
+                           help='Enable SB3 VecNormalize-style reward normalization in the canonical PPO pack runner.')
+    optimizer.add_argument('--ppo-pack-sb3-observation-normalization-enabled', type=str2bool,
+                           help='Enable pack-runner observation normalization before policy/value calls.')
+    optimizer.add_argument('--ppo-pack-sb3-observation-normalization-clip', type=float,
+                           help='Observation normalization clip bound for the canonical PPO pack runner.')
+    optimizer.add_argument('--ppo-pack-sb3-observation-normalization-epsilon', type=float,
+                           help='Observation normalization epsilon for the canonical PPO pack runner.')
+    optimizer.add_argument('--ppo-pack-semantic-probes-enabled', type=str2bool,
+                           help='Compute pack semantic probe summaries during trusted PPO training.')
+    optimizer.add_argument('--ppo-pack-semantic-probe-sidecar-enabled', type=str2bool,
+                           help='Write per-env semantic sidecar JSONL files from the trusted PPO pack runner.')
+    optimizer.add_argument('--ppo-pack-semantic-probe-sidecar-every', type=int,
+                           help='Trusted PPO pack sidecar write interval in updates.')
+    optimizer.add_argument('--ppo-pack-checkpoint-every', type=int,
+                           help='Trusted PPO pack runner checkpoint interval in updates; 0 disables runner checkpoints.')
+    optimizer.add_argument('--ppo-pack-checkpoint-include-optimizer', type=str2bool,
+                           help='Include SB3 policy optimizer state in trusted PPO pack runner checkpoints.')
+    optimizer.add_argument('--ppo-pack-topology-state-gain-min', type=float,
+                           help='Sampled-topology prior minimum state reward-input gain fraction.')
+    optimizer.add_argument('--ppo-pack-topology-action-gain-min', type=float,
+                           help='Sampled-topology prior minimum action reward-input gain fraction.')
+    optimizer.add_argument('--ppo-pack-topology-state-to-action-ratio-max', type=float,
+                           help='Sampled-topology prior maximum state/action reward-input gain ratio.')
+    optimizer.add_argument('--ppo-pack-topology-max-attempts', type=int,
+                           help='Maximum attempts for sampled-topology prior acceptance.')
     optimizer.add_argument('--policy-rollout-chunk-size', type=int,
                            help='Policy-gradient rollout chunk size over batch columns. None uses auto(batch_size); <=0 forces full batch.')
     optimizer.add_argument('--policy-rollout-chunk-autotune', type=str2bool,
@@ -446,7 +549,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='Compatibility knob for grafted TBPTT replay depth. The safe high-throughput runner currently clamps this to 1 (one-hop only).')
     environment_prior.add_argument('--num-layers', type=int, help='Depth for scm generator network.')
     environment_prior.add_argument('--prior-mlp-hidden-dim', type=int, help='Hidden dim for scm generator network.')
-    environment_prior.add_argument('--prior-mlp-activations', type=str, choices=['tanh', 'relu', 'identity'],
+    environment_prior.add_argument('--prior-mlp-activations', type=str, choices=['sin', 'tanh', 'relu'],
                                    help='Activation for scm generator network.')
     environment_prior.add_argument('--init-std', type=float, help='Weight init std for scm generator network.')
     environment_prior.add_argument('--noise-std', type=float, help='Output noise std for scm generator network.')
@@ -460,6 +563,24 @@ def argparser_from_config(parser, description="Train Mothernet"):
     environment_prior.add_argument('--reward-dropout-ratio-min', type=float, help='Minimum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-ratio-max', type=float, help='Maximum reward dropout ratio when randomizing.')
     environment_prior.add_argument('--reward-dropout-impute-zero', type=str2bool, help='Use zero imputation for dropped rewards.')
+    environment_prior.add_argument('--fixed-frozen-h-json', type=str,
+                                   help='Optional full frozen_h JSON. When set, every sampled batch column clones this frozen environment hyperparameter sample.')
+    environment_prior.add_argument('--reward-state-input-gain-fraction-rejection-min', type=float,
+                                   help='Reject exact-SCM environment draws whose reward_state_input_gain_fraction is below this threshold.')
+    environment_prior.add_argument('--reward-state-input-gain-fraction-rejection-max-tries', type=int,
+                                   help='Maximum per-column attempts for reward_state_input_gain_fraction rejection sampling.')
+    environment_prior.add_argument('--reward-state-input-gain-fraction-conditioned-sampling-enabled', type=str2bool,
+                                   help='Training-only conditional sampler: resample fresh frozen_h + env_seed candidates until the PPO batch is filled with legal environments.')
+    environment_prior.add_argument('--reward-state-input-gain-fraction-conditioned-min', type=float,
+                                   help='Minimum reward_state_input_gain_fraction for training-only conditional environment sampling.')
+    environment_prior.add_argument('--reward-topology-conditioned-sampling-enabled', type=str2bool,
+                                   help='Training-only conditional sampler for reward topology; default off. Can require action gain and/or cap state/action gain ratio.')
+    environment_prior.add_argument('--reward-action-input-gain-fraction-conditioned-min', type=float,
+                                   help='Minimum reward_action_input_gain_fraction for reward-topology conditional environment sampling.')
+    environment_prior.add_argument('--reward-state-to-action-gain-ratio-conditioned-max', type=float,
+                                   help='Maximum reward_state_to_action_gain_ratio for reward-topology conditional environment sampling. Values <= 0 disable this criterion.')
+    environment_prior.add_argument('--reward-topology-conditioned-sampling-max-attempts', type=int,
+                                   help='Maximum candidate rounds for topology-conditioned sampling before failing loudly.')
     environment_prior.add_argument('--terminal-reset-enabled', type=str2bool,
                                    help='Enable terminal bonus/reset dynamics driven by the extra terminal signal state.')
     environment_prior.add_argument('--terminal-reset-count-target', type=float,
@@ -479,6 +600,17 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                    help='Match serial RNG stream exactly in torch_vectorized backend (slower; for A/B tests).')
     environment_prior.add_argument('--batch-vectorized-grouping', type=str, choices=['structure', 'family'],
                                    help='Grouping strategy for torch_vectorized backend.')
+    environment_prior.add_argument('--transition-inner-grouping', type=str,
+                                   choices=['family', 'structure', 'pow2', 'pow2_no_depth'],
+                                   help='Execution-only inner grouping for transition generator construction.')
+    environment_prior.add_argument('--transition-inner-min-bucket', type=int,
+                                   help='Minimum transition inner bucket size before merging back to a family bucket.')
+    environment_prior.add_argument('--reference-scm-partition-max-bytes', type=int,
+                                   help='Maximum estimated exact-SCM transition builder bytes before partitioning.')
+    environment_prior.add_argument('--reference-scm-memory-guard-fraction', type=float,
+                                   help='Fraction of currently free CUDA memory allowed for one exact-SCM transition builder partition.')
+    environment_prior.add_argument('--transition-generator-rebuild-each-step', type=str2bool,
+                                   help='Rebuild exact transition generators per rollout step/group to reduce cumulative GPU residency.')
     environment_prior.set_defaults(**config['prior']['environment'])
 
     boolean = parser.add_argument_group('prior.boolean')
@@ -493,6 +625,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
     orchestration.add_argument('--extra-fast-test', help="whether to use tiny data", action='store_true')
     orchestration.add_argument('--stop-after-epochs', help="for pausing rungs with synetune", type=int, default=None)
     orchestration.add_argument('--seed-everything', help="whether to seed everything for testing and benchmarking", default = False, type=str2bool)
+    orchestration.add_argument('--seed-everything-value', help="Optional integer seed for deterministic testing/benchmarking setup.", type=int, default=None)
     orchestration.add_argument('--experiment', help="Name of mlflow experiment", default='Default')
     orchestration.add_argument('-R', '--create-new-run', help="Create as new MLFLow run, even if continuing", action='store_true')
     orchestration.add_argument('-B', '--base-path', default='.')
@@ -517,6 +650,8 @@ def argparser_from_config(parser, description="Train Mothernet"):
                                help='Switch rlpfn validation from explore (E=0) to exploit (E=1) once context_len + mean_explore_rollout_len exceeds this bound.')
     orchestration.add_argument('--rl-validate-max-parallel-columns', type=int,
                                help='Upper bound on validation env columns batched together during PPO actor rollout; keeps GPU memory bounded while preserving batched validation.')
+    orchestration.add_argument('--rlpfn-anchor-compare-contract', type=str2bool,
+                               help='Apply the trusted unique-anchor PPO compare contract for rlpfn continue-run / warm-start regression checks.')
 
     if model_type == 'rlpfn':
         orchestration.set_defaults(
@@ -527,6 +662,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_seed=1,
             rl_validate_context_lower_bound=2048,
             rl_validate_max_parallel_columns=96,
+            rlpfn_anchor_compare_contract=False,
         )
     else:
         orchestration.set_defaults(
@@ -537,6 +673,7 @@ def argparser_from_config(parser, description="Train Mothernet"):
             rl_validate_seed=1,
             rl_validate_context_lower_bound=2048,
             rl_validate_max_parallel_columns=96,
+            rlpfn_anchor_compare_contract=False,
         )
 
     # orchestration options are not part of the default config

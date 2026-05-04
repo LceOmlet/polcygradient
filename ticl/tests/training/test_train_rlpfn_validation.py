@@ -4,6 +4,7 @@ import types
 
 import numpy as np
 import pytest
+import torch
 
 
 def _install_fake_tracking_modules(monkeypatch):
@@ -29,13 +30,47 @@ def _install_fake_tracking_modules(monkeypatch):
     monkeypatch.setitem(sys.modules, "wandb", wandb_mod)
 
 
-class _FakeBox:
+class _FakeSpace:
+    pass
+
+
+class _FakeBox(_FakeSpace):
     def __init__(self, low, high, shape=None, dtype=np.float32):
         del shape
         self.low = np.asarray(low, dtype=dtype)
         self.high = np.asarray(high, dtype=dtype)
         self.shape = self.low.shape
         self.dtype = dtype
+
+
+class _FakeDiscrete(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeMultiDiscrete(_FakeSpace):
+    def __init__(self, nvec):
+        self.nvec = np.asarray(nvec)
+
+
+class _FakeMultiBinary(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeDict(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = dict(spaces)
+
+
+class _FakeTuple(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = tuple(spaces)
+
+
+class _FakeWrapper:
+    def __init__(self, env=None):
+        self.env = env
 
 
 class _FastContinuousEnv:
@@ -67,14 +102,9 @@ class _FastContinuousEnv:
 
 
 def _install_fake_gym(monkeypatch):
-    gym_mod = types.ModuleType("gymnasium")
-    spaces_mod = types.ModuleType("gymnasium.spaces")
-    spaces_mod.Box = _FakeBox
-    gym_mod.Env = object
-    gym_mod.spaces = spaces_mod
-    gym_mod.make = lambda env_name: _FastContinuousEnv(env_name)
-    monkeypatch.setitem(sys.modules, "gymnasium", gym_mod)
-    monkeypatch.setitem(sys.modules, "gymnasium.spaces", spaces_mod)
+    import gymnasium as gym_mod
+
+    monkeypatch.setattr(gym_mod, "make", lambda env_name: _FastContinuousEnv(env_name))
 
 
 def _tiny_rlpfn_extra_config():
@@ -85,15 +115,14 @@ def _tiny_rlpfn_extra_config():
             "nhid_factor": 1,
             "nhead": 1,
             "recompute_attn": False,
-            "x_obs_dim": 8,
+            "x_obs_dim": 9,
             "x_action_dim": 1,
         },
         "prior": {
             "n_samples": 16,
             "eval_positions": [8],
-            "num_features": 9,
+            "num_features": 10,
             "environment": {
-                "family": "gp",
                 "action_dim": 1,
                 "state_dim": 4,
                 "obs_dim": 4,
@@ -134,6 +163,9 @@ def _tiny_rlpfn_extra_config():
 def test_short_rlpfn_training_runs_new_validation_path_across_all_default_envs(monkeypatch, tmp_path):
     import time
 
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for strict official RLPFN validation smoke.")
+
     _install_fake_tracking_modules(monkeypatch)
     _install_fake_gym(monkeypatch)
     monkeypatch.setenv("TICL_POLICY_ENVGEN_CHECKPOINT", "0")
@@ -166,7 +198,6 @@ def test_short_rlpfn_training_runs_new_validation_path_across_all_default_envs(m
 
     argv = [
         "rlpfn",
-        "-C",
         "--seed-everything",
         "False",
         "--validate",
@@ -174,6 +205,8 @@ def test_short_rlpfn_training_runs_new_validation_path_across_all_default_envs(m
         "--save-every",
         "1",
         "--extra-fast-test",
+        "--gpu-id",
+        "0",
         "--train-mixed-precision",
         "False",
         "--rl-validate-episodes",

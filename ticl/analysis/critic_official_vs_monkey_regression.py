@@ -9,10 +9,10 @@ import numpy as np
 import torch
 
 from ticl.analysis.critic_free_single_env_audit import _build_audit_env_cfg
+from ticl.analysis.fixed_env_h import build_fixed_env_h
 from ticl.model_builder import load_model
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.sb3_recurrent_ppo import _resolve_actor_advantages, build_recurrent_ppo
-from ticl.train import _freeze_env_h_list_for_replay
 
 
 def _default_device() -> str:
@@ -26,15 +26,7 @@ def _to_cpu_tensor(x):
 
 
 def _build_fixed_env_h(*, prior_cfg: dict, frozen_h_seed: int):
-    prior = EnvironmentPrior(copy.deepcopy(prior_cfg))
-    rng_state = np.random.get_state()
-    np.random.seed(int(frozen_h_seed))
-    frozen_h = _freeze_env_h_list_for_replay(
-        prior,
-        list(prior._sample_batch_hypers(1)),
-    )[0]
-    np.random.set_state(rng_state)
-    return frozen_h
+    return build_fixed_env_h(prior_cfg=prior_cfg, frozen_h_seed=int(frozen_h_seed))
 
 
 def _clone_h_repeated(h, count: int):

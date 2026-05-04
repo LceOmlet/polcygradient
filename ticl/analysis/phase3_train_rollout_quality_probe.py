@@ -203,6 +203,7 @@ def _train_rollout_quality_collect_contract_kwargs(train_suite: dict[str, Any]) 
         "rollout_rng_seeds": [int(v) for v in train_suite["rollout_seeds"]],
         "deterministic_actor_sampling": True,
         "deterministic_batch_plan": True,
+        "strict_native_rollout": True,
     }
 
 
@@ -224,7 +225,11 @@ def main() -> int:
         "--train-profile",
         type=str,
         default="trusted_sep_reset_mainline",
-        choices=["trusted_sep_reset_mainline", "legacy_actor_only_probe"],
+        choices=[
+            "phase2_shared_backbone_contract",
+            "trusted_sep_reset_mainline",
+            "legacy_actor_only_probe",
+        ],
     )
     parser.add_argument("--batch-size", type=int, default=None)
     parser.add_argument("--n-epochs", type=int, default=None)

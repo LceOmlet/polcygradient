@@ -112,10 +112,44 @@ def test_score_candidate_actions_raise_after_candidate_scoring_removal():
         )
 
 
-class _FakeBox:
+class _FakeSpace:
+    pass
+
+
+class _FakeBox(_FakeSpace):
     def __init__(self, low, high):
         self.low = np.asarray(low, dtype=np.float32)
         self.high = np.asarray(high, dtype=np.float32)
+
+
+class _FakeDiscrete(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeMultiDiscrete(_FakeSpace):
+    def __init__(self, nvec):
+        self.nvec = np.asarray(nvec)
+
+
+class _FakeMultiBinary(_FakeSpace):
+    def __init__(self, n):
+        self.n = int(n)
+
+
+class _FakeDict(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = dict(spaces)
+
+
+class _FakeTuple(_FakeSpace):
+    def __init__(self, spaces):
+        self.spaces = tuple(spaces)
+
+
+class _FakeWrapper:
+    def __init__(self, env=None):
+        self.env = env
 
 
 class _ShapeOnlyActionSpace:
@@ -479,8 +513,19 @@ class _FakeSyncVectorEnv:
 def _install_fake_gym(monkeypatch, env_factory, *, with_vector=False):
     gym_mod = types.ModuleType("gymnasium")
     spaces_mod = types.ModuleType("gymnasium.spaces")
+    spaces_mod.Space = _FakeSpace
     spaces_mod.Box = _FakeBox
+    spaces_mod.Discrete = _FakeDiscrete
+    spaces_mod.MultiDiscrete = _FakeMultiDiscrete
+    spaces_mod.MultiBinary = _FakeMultiBinary
+    spaces_mod.Dict = _FakeDict
+    spaces_mod.Tuple = _FakeTuple
+    gym_mod.Space = _FakeSpace
     gym_mod.Env = object
+    gym_mod.Wrapper = _FakeWrapper
+    gym_mod.ObservationWrapper = _FakeWrapper
+    gym_mod.RewardWrapper = _FakeWrapper
+    gym_mod.ActionWrapper = _FakeWrapper
     gym_mod.spaces = spaces_mod
     gym_mod.make = lambda env_name: env_factory(env_name)
     if bool(with_vector):
@@ -1172,10 +1217,11 @@ def test_evaluate_rlpfn_on_gym_envs_ppo_validation_rebuilds_saved_policy(monkeyp
     fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.25, action_std=0.1)
     builder_calls = {}
 
-    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict):
+    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict, strict_native_rollout):
         builder_calls["device"] = device
         builder_calls["num_features"] = int(num_features)
         builder_calls["policy_state_dict"] = policy_state_dict
+        builder_calls["strict_native_rollout"] = bool(strict_native_rollout)
         return fake_policy
 
     def _forbid_fastpath(*args, **kwargs):
@@ -1225,6 +1271,7 @@ def test_evaluate_rlpfn_on_gym_envs_ppo_validation_rebuilds_saved_policy(monkeyp
     assert builder_calls["device"] == "cpu"
     assert builder_calls["num_features"] == 9
     assert "dummy_weight" in builder_calls["policy_state_dict"]
+    assert builder_calls["strict_native_rollout"] is False
     assert action_log[-2:] == pytest.approx([0.25, 0.25], abs=1e-6)
 
 
@@ -1242,13 +1289,14 @@ def test_evaluate_rlpfn_on_gym_envs_ppo_validation_builds_and_caches_fresh_polic
     fake_policy = _FakePPOValidationPolicy(action_dim=1, action_mean=0.75, action_std=0.05)
     builder_calls = {"count": 0}
 
-    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict):
+    def _fake_builder(*, model, env_cfg, device, num_features, policy_state_dict, strict_native_rollout):
         del model
         del env_cfg
         builder_calls["count"] += 1
         builder_calls["device"] = device
         builder_calls["num_features"] = int(num_features)
         builder_calls["policy_state_dict"] = policy_state_dict
+        builder_calls["strict_native_rollout"] = bool(strict_native_rollout)
         return fake_policy
 
     def _forbid_fastpath(*args, **kwargs):
@@ -1302,6 +1350,7 @@ def test_evaluate_rlpfn_on_gym_envs_ppo_validation_builds_and_caches_fresh_polic
     assert builder_calls["device"] == "cpu"
     assert builder_calls["num_features"] == 9
     assert builder_calls["policy_state_dict"] is None
+    assert builder_calls["strict_native_rollout"] is False
     assert model.__dict__["_validation_sb3_policy_live"] is fake_policy
     assert len(action_log) == 8
     assert action_log[-2:] == pytest.approx([0.75, 0.75], abs=1e-6)

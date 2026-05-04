@@ -3,20 +3,31 @@ import copy
 import json
 import math
 import os
+import random
 import time
 from pathlib import Path
 
 import numpy as np
 import torch
 
+from ticl.analysis.fixed_env_h import (
+    build_fixed_env_h,
+    sample_fixed_env_h_from_prior,
+    summarize_fixed_env_h,
+)
 from ticl.analysis.prior_generalization_audit import (
     _build_zero_policy_step_fn,
     evaluate_prior_suite,
 )
 from ticl.model_builder import load_model
 from ticl.priors.environment_prior import EnvironmentPrior
-from ticl.sb3_recurrent_ppo import _explained_variance_with_mask, build_recurrent_ppo
-from ticl.train import _freeze_env_h_list_for_replay
+from ticl.sb3_recurrent_ppo import (
+    _explained_variance_with_mask,
+    _ppo_autocast_context,
+    _recover_raw_from_value_space,
+    _restore_saved_recurrent_ppo_policy_head_state,
+    build_recurrent_ppo,
+)
 from stable_baselines3.common.logger import configure as configure_logger
 
 
@@ -39,8 +50,43 @@ def _default_device() -> str:
     return "cuda:0" if torch.cuda.is_available() else "cpu"
 
 
+def _seed_all(seed: int) -> None:
+    random.seed(int(seed))
+    np.random.seed(int(seed))
+    torch.manual_seed(int(seed))
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(int(seed))
+
+
 def _clone_h_repeated(h, count: int):
     return [copy.deepcopy(h) for _ in range(int(count))]
+
+
+def _build_frozen_h_from_mode(
+    *,
+    prior_cfg: dict,
+    frozen_h_seed: int,
+    seed_mode: str,
+    prior: EnvironmentPrior | None = None,
+):
+    seed_mode_resolved = str(seed_mode).strip().lower()
+    if seed_mode_resolved in {"current", "legacy_numpy_only"}:
+        return build_fixed_env_h(
+            prior_cfg=prior_cfg,
+            frozen_h_seed=int(frozen_h_seed),
+            seed_mode=seed_mode_resolved,
+        )
+    if seed_mode_resolved == "legacy_same_prior_numpy_only":
+        if prior is None:
+            raise ValueError("legacy_same_prior_numpy_only requires the target prior instance.")
+        return sample_fixed_env_h_from_prior(
+            prior=prior,
+            frozen_h_seed=int(frozen_h_seed),
+            seed_mode="legacy_numpy_only",
+        )
+    if seed_mode_resolved != "legacy_numpy_only":
+        raise ValueError(f"Unsupported frozen_h seed mode: {seed_mode}")
+    raise ValueError(f"Unsupported frozen_h seed mode: {seed_mode}")
 
 
 def _make_suite(*, frozen_h, env_seeds: list[int], rollout_seeds: list[int]) -> dict:
@@ -74,7 +120,6 @@ def _run_extra_critic_updates_with_scope(algo, *, extra_updates: int, scope: str
         raise ValueError(f"Unsupported extra critic update scope: {scope}")
     rollout_buffer = algo.rollout_buffer
     _make_deterministic_batch_plan(rollout_buffer)
-    value_bardist = algo.policy.get_value_bardist()
     buffer_getter_flat = getattr(rollout_buffer, "get_gpu_flat", None)
     if not callable(buffer_getter_flat):
         raise RuntimeError("extra critic updates require rollout_buffer.get_gpu_flat().")
@@ -83,11 +128,13 @@ def _run_extra_critic_updates_with_scope(algo, *, extra_updates: int, scope: str
     if scope in {"head_only", "critic_path"}:
         original_requires_grad = {}
         if scope == "head_only":
-            enabled_params = list(algo.policy.value_net.parameters())
+            enabled_params = list(algo.policy.get_value_head_trainable_parameters())
         else:
             if not bool(getattr(algo.policy, "separate_value_backbone", False)):
                 raise RuntimeError("critic_path extra critic updates require separate value backbone.")
-            enabled_params = list(algo.policy.value_net.parameters()) + list(algo.policy.value_rlpfn_model.parameters())
+            enabled_params = list(algo.policy.get_value_head_trainable_parameters()) + list(
+                algo.policy.value_rlpfn_model.parameters()
+            )
         value_param_ids = {id(param) for param in enabled_params}
         grad_params = enabled_params
         for name, param in algo.policy.named_parameters():
@@ -102,20 +149,24 @@ def _run_extra_critic_updates_with_scope(algo, *, extra_updates: int, scope: str
                     dtype=rollout_data.returns.dtype,
                 ).sum().clamp_min(1.0)
                 algo.policy.optimizer.zero_grad(set_to_none=True)
-                eval_outputs = algo.policy.evaluate_actions_with_hidden_flat(
-                    rollout_data.observations,
-                    rollout_data.actions,
-                    seq_lengths=rollout_data.seq_lengths,
-                    action_masks=rollout_data.action_masks,
-                )
-                value_logits = eval_outputs["value_logits"]
-                value_errors = value_bardist(
-                    value_logits.to(dtype=torch.float32),
-                    rollout_data.returns.to(device=value_logits.device, dtype=torch.float32),
-                )
-                objective_f = objective_mask.to(device=value_errors.device, dtype=value_errors.dtype)
-                value_num = (value_errors * objective_f).sum()
-                value_loss = value_num / valid_total.to(device=value_num.device, dtype=value_num.dtype)
+                with _ppo_autocast_context(
+                    autocast_dtype=getattr(algo, "_rwkv_autocast_dtype", None),
+                    device=getattr(algo, "device", rollout_data.observations.device),
+                ):
+                    eval_outputs = algo.policy.evaluate_actions_with_hidden_flat(
+                        rollout_data.observations,
+                        rollout_data.actions,
+                        seq_lengths=rollout_data.seq_lengths,
+                        action_masks=rollout_data.action_masks,
+                    )
+                    value_logits = eval_outputs["value_logits"]
+                    value_target_bucket_idx = getattr(rollout_data, "value_target_bucket_idx", None)
+                    value_loss = algo.policy.compute_value_loss_from_logits(
+                        value_logits=value_logits,
+                        targets=rollout_data.returns.to(device=value_logits.device, dtype=torch.float32),
+                        objective_mask=objective_mask,
+                        value_target_bucket_idx=value_target_bucket_idx,
+                    )
                 value_loss.backward()
                 torch.nn.utils.clip_grad_norm_(grad_params, algo.max_grad_norm)
                 algo.policy.optimizer.step()
@@ -142,12 +193,39 @@ def _masked_corrcoef_np(x: np.ndarray, y: np.ndarray, mask: np.ndarray) -> float
 
 def _measure_rollout_critic_quality(algo) -> dict:
     rollout_buffer = algo.rollout_buffer
+    ensure_generator_ready = getattr(rollout_buffer, "_ensure_generator_ready", None)
+    if callable(ensure_generator_ready):
+        ensure_generator_ready()
     objective_mask = np.asarray(rollout_buffer.objective_masks, dtype=np.float32).reshape(-1) > 1e-8
+    normalized_values = np.asarray(rollout_buffer.values, dtype=np.float32).reshape(-1)
+    normalized_returns = np.asarray(rollout_buffer.returns, dtype=np.float32).reshape(-1)
     raw_values = rollout_buffer._get_flat_raw_values_tensor(dtype=torch.float32).cpu().numpy()
     raw_returns = rollout_buffer._get_flat_raw_returns_tensor(dtype=torch.float32).cpu().numpy()
+    objective_total = int(objective_mask.sum())
+    if objective_total > 1:
+        normalized_value_std = float(np.asarray(normalized_values[objective_mask], dtype=np.float32).std())
+        normalized_return_std = float(np.asarray(normalized_returns[objective_mask], dtype=np.float32).std())
+        raw_value_std = float(np.asarray(raw_values[objective_mask], dtype=np.float32).std())
+        raw_return_std = float(np.asarray(raw_returns[objective_mask], dtype=np.float32).std())
+    else:
+        normalized_value_std = 0.0
+        normalized_return_std = 0.0
+        raw_value_std = 0.0
+        raw_return_std = 0.0
     return {
-        "objective_total": int(objective_mask.sum()),
+        "objective_total": objective_total,
+        "normalized_value_std": normalized_value_std,
+        "normalized_return_std": normalized_return_std,
+        "raw_value_std": raw_value_std,
+        "raw_return_std": raw_return_std,
         "raw_corr": _masked_corrcoef_np(raw_values, raw_returns, objective_mask),
+        "explained_variance_normalized": float(
+            _explained_variance_with_mask(
+                normalized_values,
+                normalized_returns,
+                mask=objective_mask,
+            )
+        ),
         "explained_variance_raw": float(
             _explained_variance_with_mask(
                 raw_values,
@@ -155,6 +233,241 @@ def _measure_rollout_critic_quality(algo) -> dict:
                 mask=objective_mask,
             )
         ),
+    }
+
+
+@torch.no_grad()
+def _measure_current_policy_rollout_critic_quality(algo) -> dict:
+    rollout_buffer = algo.rollout_buffer
+    buffer_getter_flat = getattr(rollout_buffer, "get_gpu_flat", None)
+    if not callable(buffer_getter_flat):
+        return _measure_rollout_critic_quality(algo)
+
+    _make_deterministic_batch_plan(rollout_buffer)
+    pred_chunks: list[torch.Tensor] = []
+    return_chunks: list[torch.Tensor] = []
+    normalized_pred_chunks: list[torch.Tensor] = []
+    normalized_return_chunks: list[torch.Tensor] = []
+    mask_chunks: list[torch.Tensor] = []
+    for rollout_data in buffer_getter_flat(algo.batch_size):
+        eval_outputs = algo.policy.evaluate_actions_with_hidden_flat(
+            rollout_data.observations,
+            rollout_data.actions,
+            seq_lengths=rollout_data.seq_lengths,
+            action_masks=rollout_data.action_masks,
+        )
+        values = eval_outputs["values"].flatten()
+        normalized_pred_chunks.append(values.detach().cpu())
+        normalized_return_chunks.append(rollout_data.returns.flatten().detach().cpu())
+        raw_pred = _recover_raw_from_value_space(
+            values.detach(),
+            value_means=rollout_data.rollout_return_means.detach(),
+            value_stds=rollout_data.rollout_return_stds.detach(),
+        )
+        raw_returns = _recover_raw_from_value_space(
+            rollout_data.returns.flatten().detach(),
+            value_means=rollout_data.rollout_return_means.detach(),
+            value_stds=rollout_data.rollout_return_stds.detach(),
+        )
+        pred_chunks.append(raw_pred.detach().cpu())
+        return_chunks.append(raw_returns.detach().cpu())
+        mask_chunks.append((rollout_data.objective_masks.flatten() > 1e-8).detach().cpu())
+    _make_deterministic_batch_plan(rollout_buffer)
+
+    if not pred_chunks:
+        return {
+            "objective_total": 0,
+            "raw_corr": 0.0,
+            "explained_variance_normalized": float("nan"),
+            "explained_variance_raw": float("nan"),
+        }
+
+    normalized_values = torch.cat(normalized_pred_chunks, dim=0).numpy()
+    normalized_returns = torch.cat(normalized_return_chunks, dim=0).numpy()
+    raw_values = torch.cat(pred_chunks, dim=0).numpy()
+    raw_returns = torch.cat(return_chunks, dim=0).numpy()
+    objective_mask = torch.cat(mask_chunks, dim=0).numpy()
+    objective_total = int(objective_mask.sum())
+    if objective_total > 1:
+        normalized_value_std = float(np.asarray(normalized_values[objective_mask], dtype=np.float32).std())
+        normalized_return_std = float(np.asarray(normalized_returns[objective_mask], dtype=np.float32).std())
+        raw_value_std = float(np.asarray(raw_values[objective_mask], dtype=np.float32).std())
+        raw_return_std = float(np.asarray(raw_returns[objective_mask], dtype=np.float32).std())
+    else:
+        normalized_value_std = 0.0
+        normalized_return_std = 0.0
+        raw_value_std = 0.0
+        raw_return_std = 0.0
+    return {
+        "objective_total": objective_total,
+        "normalized_value_std": normalized_value_std,
+        "normalized_return_std": normalized_return_std,
+        "raw_value_std": raw_value_std,
+        "raw_return_std": raw_return_std,
+        "raw_corr": _masked_corrcoef_np(raw_values, raw_returns, objective_mask),
+        "explained_variance_normalized": float(
+            _explained_variance_with_mask(
+                normalized_values,
+                normalized_returns,
+                mask=objective_mask,
+            )
+        ),
+        "explained_variance_raw": float(
+            _explained_variance_with_mask(
+                raw_values,
+                raw_returns,
+                mask=objective_mask,
+            )
+        ),
+    }
+
+
+def _snapshot_policy_state_dict(policy) -> dict[str, torch.Tensor]:
+    state_dict = policy.state_dict()
+    return {str(name): tensor.detach().cpu().clone() for name, tensor in state_dict.items()}
+
+
+def _resolve_vf_coef(config: dict, vf_coef_override: float | None) -> float:
+    if vf_coef_override is not None:
+        return float(vf_coef_override)
+    return float(config["optimizer"].get("ppo_vf_coef", 0.5))
+
+
+def _resolve_policy_loss_coef(policy_loss_coef_override: float | None) -> float:
+    if policy_loss_coef_override is not None:
+        return float(policy_loss_coef_override)
+    return 1.0
+
+
+def _measure_suite_critic_quality_with_policy_state(
+    *,
+    checkpoint_path: str,
+    device_obj: torch.device,
+    env_cfg: dict,
+    num_features: int,
+    suite: dict,
+    single_eval_pos: int,
+    n_steps: int,
+    learning_rate: float,
+    batch_size: int,
+    n_epochs: int,
+    target_kl: float,
+    ppo_reset_env_state_at_sep: bool,
+    ppo_separate_value_backbone: bool,
+    deterministic_actor_sampling: bool,
+    deterministic_batch_plan: bool,
+    strict_native_rollout: bool,
+    actor_gae_space: str,
+    actor_baseline_mode: str,
+    actor_objective_mode: str,
+    boundary_contract_mode: str,
+    policy_state_dict: dict[str, torch.Tensor],
+    build_seed: int | None = None,
+    vf_coef_override: float | None = None,
+    policy_loss_coef_override: float | None = None,
+    value_head_impl: str = "legacy_bar",
+    value_path_adapter_impl: str = "none",
+) -> dict:
+    if build_seed is not None:
+        _seed_all(int(build_seed))
+    load_model.cache_clear()
+    model, config = load_model(checkpoint_path, device=device_obj, verbose=False)
+    prior = EnvironmentPrior(copy.deepcopy(env_cfg))
+    suite_h_list = [copy.deepcopy(h) for h in list(suite["h_list"])]
+    prior._sample_batch_hypers = lambda batch_n, _h_list=suite_h_list: [
+        copy.deepcopy(h) for h in _h_list[: int(batch_n)]
+    ]
+    prior._sample_single_eval_pos = lambda n_samples_arg, rng_seed=None: int(single_eval_pos)
+    _apply_boundary_contract_mode_flags(prior, boundary_contract_mode)
+    _apply_sep_state_reset_flag(prior, bool(ppo_reset_env_state_at_sep))
+
+    algo, callback, vec_env = build_recurrent_ppo(
+        model=model,
+        env_prior=prior,
+        device=str(device_obj),
+        num_features=int(num_features),
+        n_envs=int(suite["batch_size"]),
+        n_steps=int(n_steps),
+        learning_rate=float(learning_rate),
+        batch_size=int(batch_size),
+        n_epochs=int(n_epochs),
+        gamma=float(config["optimizer"].get("ppo_gamma", 0.98)),
+        gae_lambda=float(config["optimizer"].get("ppo_gae_lambda", 0.90)),
+        clip_range=config["optimizer"].get("ppo_clip_range", 0.2),
+        clip_range_vf=None,
+        normalize_advantage=False,
+        actor_gae_space=str(actor_gae_space),
+        actor_baseline_mode=str(actor_baseline_mode),
+        actor_objective_mode=str(actor_objective_mode),
+        reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+        separate_value_backbone=bool(ppo_separate_value_backbone),
+        ent_coef=float(config["optimizer"].get("ppo_ent_coef", 0.0)),
+        vf_coef=_resolve_vf_coef(config, vf_coef_override),
+        max_grad_norm=float(config["optimizer"].get("ppo_max_grad_norm", 0.5)),
+        target_kl=float(target_kl),
+        strict_fixed_env_mode=True,
+        env_rng_seeds=[int(v) for v in list(suite["env_seeds"])],
+        rollout_rng_seeds=[int(v) for v in list(suite["rollout_seeds"])],
+        deterministic_actor_sampling=bool(deterministic_actor_sampling),
+        deterministic_batch_plan=bool(deterministic_batch_plan),
+        strict_native_rollout=bool(strict_native_rollout),
+        restore_validation_policy_state=False,
+        value_head_impl=str(value_head_impl),
+        value_path_adapter_impl=str(value_path_adapter_impl),
+        verbose=0,
+    )
+    try:
+        algo._rwkv_policy_loss_coef = _resolve_policy_loss_coef(policy_loss_coef_override)
+        algo.policy.load_state_dict(policy_state_dict, strict=True)
+        vec_env._sample_seed_list = lambda _seeds=list(suite["env_seeds"]): [int(v) for v in list(_seeds)]
+        if bool(deterministic_batch_plan):
+            _make_deterministic_batch_plan(algo.rollout_buffer)
+        algo.ep_info_buffer = []
+        algo.ep_success_buffer = []
+        algo._last_obs = vec_env.reset()
+        algo._last_episode_starts = np.ones((vec_env.num_envs,), dtype=bool)
+        algo._last_lstm_states = algo.policy._dummy_states(vec_env.num_envs)
+        callback.init_callback(algo)
+        algo._update_current_progress_remaining(0, int(algo.n_steps))
+        assert algo.collect_rollouts(vec_env, callback, algo.rollout_buffer, n_rollout_steps=algo.n_steps)
+        return _measure_rollout_critic_quality(algo)
+    finally:
+        vec_env.close()
+        del algo, callback, vec_env, model, prior
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
+
+def _prepare_audit_fixed_env_contract(
+    *,
+    env_cfg: dict,
+    boundary_contract_mode: str,
+    ppo_reset_env_state_at_sep: bool,
+    frozen_h_seed: int,
+    frozen_h_seed_mode: str,
+):
+    prior_for_h = EnvironmentPrior(copy.deepcopy(env_cfg))
+    _apply_boundary_contract_mode_flags(prior_for_h, boundary_contract_mode)
+    _apply_sep_state_reset_flag(prior_for_h, bool(ppo_reset_env_state_at_sep))
+
+    seed_mode_resolved = str(frozen_h_seed_mode).strip().lower()
+    reuse_sampling_prior_state = seed_mode_resolved == "legacy_same_prior_numpy_only"
+    frozen_h = _build_frozen_h_from_mode(
+        prior_cfg=env_cfg,
+        frozen_h_seed=int(frozen_h_seed),
+        seed_mode=seed_mode_resolved,
+        prior=prior_for_h if reuse_sampling_prior_state else None,
+    )
+    fixed_env_contract = {
+        "frozen_h_seed": int(frozen_h_seed),
+        "frozen_h_seed_mode": str(seed_mode_resolved),
+        "zero_eval_prior_reuses_sampling_state": bool(reuse_sampling_prior_state),
+    }
+    fixed_env_contract.update(summarize_fixed_env_h(frozen_h))
+    return {
+        "prior_for_h": prior_for_h,
+        "frozen_h": frozen_h,
+        "fixed_env_contract": fixed_env_contract,
     }
 
 
@@ -167,6 +480,7 @@ def _audit_train_loop(
     extra_critic_updates_per_outer_epoch: int = 0,
     extra_critic_update_scope: str = "shared",
     critic_warmup: dict | None = None,
+    record_post_train_rollout_critic_quality: bool = False,
 ) -> list[dict]:
     total_timesteps = int(algo.n_steps) * int(outer_epochs)
     history: list[dict] = []
@@ -216,16 +530,42 @@ def _audit_train_loop(
             scope=str(extra_critic_update_scope),
         )
         _phase3_profile_timing(f"outer_epoch={outer_idx + 1} extra_critic_updates", t_extra)
-        history.append(
-            {
-                "outer_epoch": int(outer_idx + 1),
-                "actor_baseline_mode": str(baseline_mode_for_epoch),
-                "critic_raw_corr": float(critic_quality["raw_corr"]),
-                "critic_explained_variance_raw": float(critic_quality["explained_variance_raw"]),
-                "critic_objective_total": int(critic_quality["objective_total"]),
-                "switches_to_learned_next": bool(switched_on),
-            }
-        )
+        history_row = {
+            "outer_epoch": int(outer_idx + 1),
+            "actor_baseline_mode": str(baseline_mode_for_epoch),
+            "critic_raw_corr": float(critic_quality["raw_corr"]),
+            "critic_explained_variance_normalized": float(critic_quality["explained_variance_normalized"]),
+            "critic_explained_variance_raw": float(critic_quality["explained_variance_raw"]),
+            "critic_objective_total": int(critic_quality["objective_total"]),
+            "critic_normalized_value_std": float(critic_quality["normalized_value_std"]),
+            "critic_normalized_return_std": float(critic_quality["normalized_return_std"]),
+            "critic_raw_value_std": float(critic_quality["raw_value_std"]),
+            "critic_raw_return_std": float(critic_quality["raw_return_std"]),
+            "switches_to_learned_next": bool(switched_on),
+        }
+        if bool(record_post_train_rollout_critic_quality):
+            post_train_quality = _measure_current_policy_rollout_critic_quality(algo)
+            history_row["critic_raw_corr_post_train_rollout"] = float(post_train_quality["raw_corr"])
+            history_row["critic_explained_variance_normalized_post_train_rollout"] = float(
+                post_train_quality["explained_variance_normalized"]
+            )
+            history_row["critic_explained_variance_raw_post_train_rollout"] = float(
+                post_train_quality["explained_variance_raw"]
+            )
+            history_row["critic_objective_total_post_train_rollout"] = int(post_train_quality["objective_total"])
+            history_row["critic_normalized_value_std_post_train_rollout"] = float(
+                post_train_quality["normalized_value_std"]
+            )
+            history_row["critic_normalized_return_std_post_train_rollout"] = float(
+                post_train_quality["normalized_return_std"]
+            )
+            history_row["critic_raw_value_std_post_train_rollout"] = float(
+                post_train_quality["raw_value_std"]
+            )
+            history_row["critic_raw_return_std_post_train_rollout"] = float(
+                post_train_quality["raw_return_std"]
+            )
+        history.append(history_row)
     algo._update_current_progress_remaining(total_timesteps, total_timesteps)
     return history
 
@@ -430,6 +770,11 @@ def run_critic_free_single_env_audit(
     train_rollout_seed: int | None = None,
     deterministic_actor_sampling: bool = False,
     deterministic_batch_plan: bool = True,
+    strict_native_rollout: bool = False,
+    restore_validation_policy_state: bool = True,
+    restore_validation_policy_head_state: bool = False,
+    build_seed: int | None = None,
+    frozen_h_seed_mode: str = "current",
     ppo_reset_env_state_at_sep: bool = False,
     ppo_separate_value_backbone: bool = False,
     extra_critic_updates_per_outer_epoch: int = 0,
@@ -439,9 +784,20 @@ def run_critic_free_single_env_audit(
     boundary_contract_mode: str = "normal",
     critic_warmup_min_outer_epochs: int = 0,
     critic_warmup_raw_corr_threshold: float = 0.0,
+    record_suite_critic_quality: bool = False,
+    record_post_train_rollout_critic_quality: bool = False,
+    vf_coef_override: float | None = None,
+    policy_loss_coef_override: float | None = None,
+    value_head_impl: str = "legacy_bar",
+    value_path_adapter_impl: str = "none",
     modes: list[str] | None = None,
 ) -> dict:
     device_obj = torch.device(str(device or _default_device()))
+    resolved_build_seed = (
+        int(build_seed)
+        if build_seed is not None
+        else int(train_rollout_seed if train_rollout_seed is not None else train_env_seed)
+    )
     modes = list(modes or ["learned", "zero", "rollout_mean"])
     eval_env_seeds = list(range(int(eval_env_seed_start), int(eval_env_seed_start) + int(eval_env_count)))
     eval_rollout_seeds = list(
@@ -453,16 +809,15 @@ def run_critic_free_single_env_audit(
     num_features = int(config["prior"]["num_features"])
     env_cfg = _build_audit_env_cfg(config["prior"]["environment"])
 
-    prior_for_h = EnvironmentPrior(copy.deepcopy(env_cfg))
-    _apply_boundary_contract_mode_flags(prior_for_h, boundary_contract_mode)
-    _apply_sep_state_reset_flag(prior_for_h, bool(ppo_reset_env_state_at_sep))
-    rng_state = np.random.get_state()
-    np.random.seed(int(frozen_h_seed))
-    frozen_h = _freeze_env_h_list_for_replay(
-        prior_for_h,
-        list(prior_for_h._sample_batch_hypers(1)),
-    )[0]
-    np.random.set_state(rng_state)
+    fixed_env_bundle = _prepare_audit_fixed_env_contract(
+        env_cfg=env_cfg,
+        boundary_contract_mode=str(boundary_contract_mode),
+        ppo_reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+        frozen_h_seed=int(frozen_h_seed),
+        frozen_h_seed_mode=str(frozen_h_seed_mode),
+    )
+    prior_for_h = fixed_env_bundle["prior_for_h"]
+    frozen_h = fixed_env_bundle["frozen_h"]
 
     suite = _make_suite(
         frozen_h=frozen_h,
@@ -492,6 +847,7 @@ def run_critic_free_single_env_audit(
         "checkpoint_path": str(Path(checkpoint_path).expanduser().resolve()),
         "device": str(device_obj),
         "frozen_h_seed": int(frozen_h_seed),
+        "fixed_env_contract": dict(fixed_env_bundle["fixed_env_contract"]),
         "train_env_seed": int(train_env_seed),
         "eval_env_seeds": eval_env_seeds,
         "eval_rollout_seeds": eval_rollout_seeds,
@@ -508,6 +864,11 @@ def run_critic_free_single_env_audit(
         "train_rollout_seed": None if train_rollout_seed is None else int(train_rollout_seed),
         "deterministic_actor_sampling": bool(deterministic_actor_sampling),
         "deterministic_batch_plan": bool(deterministic_batch_plan),
+        "strict_native_rollout": bool(strict_native_rollout),
+        "restore_validation_policy_state": bool(restore_validation_policy_state),
+        "restore_validation_policy_head_state": bool(restore_validation_policy_head_state),
+        "build_seed": int(resolved_build_seed),
+        "frozen_h_seed_mode": str(frozen_h_seed_mode),
         "ppo_reset_env_state_at_sep": bool(ppo_reset_env_state_at_sep),
         "ppo_separate_value_backbone": bool(ppo_separate_value_backbone),
         "extra_critic_updates_per_outer_epoch": int(extra_critic_updates_per_outer_epoch),
@@ -517,11 +878,20 @@ def run_critic_free_single_env_audit(
         "boundary_contract_mode": str(boundary_contract_mode),
         "critic_warmup_min_outer_epochs": int(critic_warmup_min_outer_epochs),
         "critic_warmup_raw_corr_threshold": float(critic_warmup_raw_corr_threshold),
+        "record_suite_critic_quality": bool(record_suite_critic_quality),
+        "record_post_train_rollout_critic_quality": bool(record_post_train_rollout_critic_quality),
+        "vf_coef_override": None if vf_coef_override is None else float(vf_coef_override),
+        "policy_loss_coef_override": (
+            None if policy_loss_coef_override is None else float(policy_loss_coef_override)
+        ),
+        "value_head_impl": str(value_head_impl),
+        "value_path_adapter_impl": str(value_path_adapter_impl),
         "zero_suffix_return_mean": float(zero_suffix_mean),
         "modes": {},
     }
 
     for mode in modes:
+        _seed_all(int(resolved_build_seed))
         load_model.cache_clear()
         model, config = load_model(checkpoint_path, device=device_obj, verbose=False)
         prior = EnvironmentPrior(copy.deepcopy(env_cfg))
@@ -544,8 +914,8 @@ def run_critic_free_single_env_audit(
             learning_rate=float(learning_rate),
             batch_size=int(batch_size),
             n_epochs=int(n_epochs),
-            gamma=float(config["optimizer"].get("ppo_gamma", 1.0)),
-            gae_lambda=float(config["optimizer"].get("ppo_gae_lambda", 0.95)),
+            gamma=float(config["optimizer"].get("ppo_gamma", 0.98)),
+            gae_lambda=float(config["optimizer"].get("ppo_gae_lambda", 0.90)),
             clip_range=config["optimizer"].get("ppo_clip_range", 0.2),
             clip_range_vf=None,
             normalize_advantage=False,
@@ -555,7 +925,7 @@ def run_critic_free_single_env_audit(
             reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
             separate_value_backbone=bool(ppo_separate_value_backbone),
             ent_coef=float(config["optimizer"].get("ppo_ent_coef", 0.0)),
-            vf_coef=float(config["optimizer"].get("ppo_vf_coef", 0.5)),
+            vf_coef=_resolve_vf_coef(config, vf_coef_override),
             max_grad_norm=float(config["optimizer"].get("ppo_max_grad_norm", 0.5)),
             target_kl=float(target_kl),
             strict_fixed_env_mode=bool(strict_fixed_env_mode),
@@ -567,8 +937,20 @@ def run_critic_free_single_env_audit(
             ),
             deterministic_actor_sampling=bool(deterministic_actor_sampling),
             deterministic_batch_plan=bool(deterministic_batch_plan),
+            strict_native_rollout=bool(strict_native_rollout),
+            restore_validation_policy_state=bool(restore_validation_policy_state),
+            value_head_impl=str(value_head_impl),
+            value_path_adapter_impl=str(value_path_adapter_impl),
             verbose=0,
         )
+        algo._rwkv_policy_loss_coef = _resolve_policy_loss_coef(policy_loss_coef_override)
+        if bool(restore_validation_policy_head_state):
+            saved_policy_state = getattr(model, "_validation_ppo_policy_state", None)
+            if not isinstance(saved_policy_state, dict):
+                raise ValueError(
+                    "restore_validation_policy_head_state=True requires model._validation_ppo_policy_state to be present."
+                )
+            _restore_saved_recurrent_ppo_policy_head_state(algo.policy, saved_policy_state)
         vec_env._sample_seed_list = lambda: [int(train_env_seed)]
         if bool(deterministic_batch_plan):
             _make_deterministic_batch_plan(algo.rollout_buffer)
@@ -619,6 +1001,7 @@ def run_critic_free_single_env_audit(
                 if resolved_mode == "warmup"
                 else None
             ),
+            record_post_train_rollout_critic_quality=bool(record_post_train_rollout_critic_quality),
         )
         if bool(deterministic_batch_plan):
             _make_deterministic_batch_plan(algo.rollout_buffer)
@@ -655,15 +1038,83 @@ def run_critic_free_single_env_audit(
         )
 
         mode_report = {
+            "effective_actor_gae_space": str(getattr(algo, "_rwkv_actor_gae_space", actor_gae_space)),
+            "space_contract": getattr(algo, "_rwkv_space_contract", None),
             "pre_det_gap": float(det_pre["suffix_return_mean"] - zero_suffix_mean),
             "post_det_gap": float(det_post["suffix_return_mean"] - zero_suffix_mean),
             "delta_det_gap": float(det_post["suffix_return_mean"] - det_pre["suffix_return_mean"]),
             "pre_smp_gap": float(smp_pre["suffix_return_mean"] - zero_suffix_mean),
             "post_smp_gap": float(smp_post["suffix_return_mean"] - zero_suffix_mean),
             "delta_smp_gap": float(smp_post["suffix_return_mean"] - smp_pre["suffix_return_mean"]),
+            "critic_train_history": warmup_history,
         }
         if resolved_mode == "warmup":
             mode_report["critic_warmup_history"] = warmup_history
+        if bool(record_suite_critic_quality):
+            policy_state_dict = _snapshot_policy_state_dict(algo.policy)
+            train_quality_suite = _make_suite(
+                frozen_h=frozen_h,
+                env_seeds=[int(train_env_seed)],
+                rollout_seeds=[
+                    int(train_rollout_seed if train_rollout_seed is not None else train_env_seed)
+                ],
+            )
+            mode_report["train_suite_critic_quality_after_train"] = _measure_suite_critic_quality_with_policy_state(
+                checkpoint_path=checkpoint_path,
+                device_obj=device_obj,
+                env_cfg=env_cfg,
+                num_features=num_features,
+                suite=train_quality_suite,
+                single_eval_pos=eval_single_eval_pos,
+                n_steps=n_steps,
+                learning_rate=learning_rate,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                target_kl=target_kl,
+                ppo_reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+                ppo_separate_value_backbone=bool(ppo_separate_value_backbone),
+                deterministic_actor_sampling=bool(deterministic_actor_sampling),
+                deterministic_batch_plan=bool(deterministic_batch_plan),
+                strict_native_rollout=bool(strict_native_rollout),
+                actor_gae_space=str(actor_gae_space),
+                actor_baseline_mode=str(build_actor_baseline_mode),
+                actor_objective_mode=str(actor_objective_mode),
+                boundary_contract_mode=str(boundary_contract_mode),
+                policy_state_dict=policy_state_dict,
+                    build_seed=int(resolved_build_seed),
+                    vf_coef_override=vf_coef_override,
+                    policy_loss_coef_override=policy_loss_coef_override,
+                    value_head_impl=str(value_head_impl),
+                    value_path_adapter_impl=str(value_path_adapter_impl),
+                )
+            mode_report["eval_suite_critic_quality_after_train"] = _measure_suite_critic_quality_with_policy_state(
+                checkpoint_path=checkpoint_path,
+                device_obj=device_obj,
+                env_cfg=env_cfg,
+                num_features=num_features,
+                suite=suite,
+                single_eval_pos=eval_single_eval_pos,
+                n_steps=n_steps,
+                learning_rate=learning_rate,
+                batch_size=batch_size,
+                n_epochs=n_epochs,
+                target_kl=target_kl,
+                ppo_reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+                ppo_separate_value_backbone=bool(ppo_separate_value_backbone),
+                deterministic_actor_sampling=bool(deterministic_actor_sampling),
+                deterministic_batch_plan=bool(deterministic_batch_plan),
+                strict_native_rollout=bool(strict_native_rollout),
+                actor_gae_space=str(actor_gae_space),
+                actor_baseline_mode=str(build_actor_baseline_mode),
+                actor_objective_mode=str(actor_objective_mode),
+                boundary_contract_mode=str(boundary_contract_mode),
+                policy_state_dict=policy_state_dict,
+                build_seed=int(resolved_build_seed),
+                vf_coef_override=vf_coef_override,
+                policy_loss_coef_override=policy_loss_coef_override,
+                value_head_impl=str(value_head_impl),
+                value_path_adapter_impl=str(value_path_adapter_impl),
+            )
         report["modes"][str(mode)] = mode_report
 
         vec_env.close()
@@ -693,8 +1144,13 @@ def main():
     parser.add_argument("--target-kl", type=float, default=0.03)
     parser.add_argument("--strict-fixed-env-mode", action="store_true")
     parser.add_argument("--train-rollout-seed", type=int, default=None)
+    parser.add_argument("--frozen-h-seed-mode", default="current")
     parser.add_argument("--deterministic-actor-sampling", action="store_true")
     parser.add_argument("--no-deterministic-batch-plan", action="store_true")
+    parser.add_argument("--strict-native-rollout", action="store_true")
+    parser.add_argument("--no-restore-validation-policy-state", action="store_true")
+    parser.add_argument("--restore-validation-policy-head-state", action="store_true")
+    parser.add_argument("--build-seed", type=int, default=None)
     parser.add_argument("--ppo-reset-env-state-at-sep", action="store_true")
     parser.add_argument("--ppo-separate-value-backbone", action="store_true")
     parser.add_argument("--extra-critic-updates-per-outer-epoch", type=int, default=0)
@@ -704,6 +1160,12 @@ def main():
     parser.add_argument("--boundary-contract-mode", default="normal")
     parser.add_argument("--critic-warmup-min-outer-epochs", type=int, default=0)
     parser.add_argument("--critic-warmup-raw-corr-threshold", type=float, default=0.0)
+    parser.add_argument("--record-suite-critic-quality", action="store_true")
+    parser.add_argument("--record-post-train-rollout-critic-quality", action="store_true")
+    parser.add_argument("--vf-coef-override", type=float, default=None)
+    parser.add_argument("--policy-loss-coef-override", type=float, default=None)
+    parser.add_argument("--value-head-impl", default="legacy_bar")
+    parser.add_argument("--value-path-adapter-impl", default="none")
     parser.add_argument(
         "--modes",
         nargs="+",
@@ -730,8 +1192,13 @@ def main():
         target_kl=args.target_kl,
         strict_fixed_env_mode=bool(args.strict_fixed_env_mode),
         train_rollout_seed=args.train_rollout_seed,
+        frozen_h_seed_mode=str(args.frozen_h_seed_mode),
         deterministic_actor_sampling=bool(args.deterministic_actor_sampling),
         deterministic_batch_plan=not bool(args.no_deterministic_batch_plan),
+        strict_native_rollout=bool(args.strict_native_rollout),
+        restore_validation_policy_state=not bool(args.no_restore_validation_policy_state),
+        restore_validation_policy_head_state=bool(args.restore_validation_policy_head_state),
+        build_seed=args.build_seed,
         ppo_reset_env_state_at_sep=bool(args.ppo_reset_env_state_at_sep),
         ppo_separate_value_backbone=bool(args.ppo_separate_value_backbone),
         extra_critic_updates_per_outer_epoch=int(args.extra_critic_updates_per_outer_epoch),
@@ -741,6 +1208,12 @@ def main():
         boundary_contract_mode=args.boundary_contract_mode,
         critic_warmup_min_outer_epochs=int(args.critic_warmup_min_outer_epochs),
         critic_warmup_raw_corr_threshold=float(args.critic_warmup_raw_corr_threshold),
+        record_suite_critic_quality=bool(args.record_suite_critic_quality),
+        record_post_train_rollout_critic_quality=bool(args.record_post_train_rollout_critic_quality),
+        vf_coef_override=args.vf_coef_override,
+        policy_loss_coef_override=args.policy_loss_coef_override,
+        value_head_impl=str(args.value_head_impl),
+        value_path_adapter_impl=str(args.value_path_adapter_impl),
         modes=list(args.modes),
     )
     payload = json.dumps(report, sort_keys=True)

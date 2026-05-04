@@ -1,11 +1,13 @@
 import socket
 import sys
 import time
+import random
 
 import mlflow
 
 import torch
 import os
+import numpy as np
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
@@ -14,66 +16,10 @@ if hasattr(sys.stderr, "reconfigure"):
 
 from git import Repo
 
-def _argv_targets_rlpfn(argv):
-    return bool(argv) and str(argv[0]).strip().lower() == "rlpfn"
+from ticl.rlpfn_skyline_env import apply_rlpfn_skyline_env_defaults
 
 
-# Import-time env pinning is required here because several hot-path flags are
-# read while importing model/layer modules. Keep this scoped to the `rlpfn`
-# entrypoint so other model types do not inherit rollout-specific defaults.
-_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS = {
-    "TICL_POLICY_CAT_FUSION": "1",
-    "TICL_POLICY_SPLIT_ENCODE_FUSION": "1",
-    "TICL_POLICY_FINALIZE_2D_FASTPATH": "1",
-    "TICL_POLICY_STEP_PROJ_2D": "1",
-    "TICL_POLICY_STEP_LAYER_2D_LOOP": "1",
-    "TICL_POLICY_STEP_TOKEN_ALLOC_OPT": "1",
-    "TICL_POLICY_TOKEN_LAYOUT_PREPACK": "1",
-    "TICL_POLICY_TF32": "1",
-    "TICL_POLICY_CACHE_CONTAINER_REUSE": "1",
-    "TICL_POLICY_FUSED_TRANSITION_GENERATOR": "1",
-    "TICL_POLICY_FUSED_TRANSITION_SCM_HIDDEN_FUSED": "1",
-    "TICL_POLICY_TRANSITION_INNER_GROUPING": "balanced2",
-    "TICL_POLICY_TRANSITION_STREAM_FUSION": "1",
-    "TICL_POLICY_ROLLOUT_NOISE_STREAM": "1",
-    "TICL_POLICY_ENVGEN_BMM": "1",
-    "TICL_POLICY_ENVGEN_CHECKPOINT": "1",
-    "TICL_POLICY_TAIL_FREEZE": "1",
-    "TICL_POLICY_PREFIX_COMPACT_ON_TBPTT_DETACH": "1",
-    "TICL_POLICY_FLASH_PREFIX_ASYNC": "1",
-    "TICL_POLICY_FLASH_PREFIX_ZERO_FASTPATH": "1",
-    "TICL_POLICY_OOM_FAIL_FAST": "1",
-}
-
-# Pin probe-only or falsified paths back to the retained skyline settings so
-# `python -m ticl.fit_model rlpfn` is reproducible and does not silently drift
-# with stale shell env or earlier exploratory defaults.
-_RLPFN_SKYLINE_GUARD_ENV_DEFAULTS = {
-    "TICL_POLICY_PAGED_ATTN_TRAIN_MODE": "auto",
-    "TICL_POLICY_PAGED_ATTN_FLASHPREFIX_DENSE_MAX_TOKENS": "64",
-    "TICL_POLICY_FLASH_PREFIX_TAIL_DENSE_MAX_TOKENS": "0",
-    "TICL_POLICY_FINALIZE_2D_ZERO_DROPOUT_POSTNORM_GELU_FASTPATH": "0",
-    "TICL_POLICY_TRANSITION_STREAM_FUSION_MAX_GROUPS": "2",
-    "TICL_POLICY_ASYNC_GROUP_COMMIT_IN_STREAM": "auto",
-    "TICL_POLICY_TRANSITION_INNER_MIN_BUCKET": "0",
-    "TICL_POLICY_TBPTT_STREAM_MERGE_WINDOWS": "1",
-    "TICL_POLICY_TBPTT_STREAM_MERGE_AUTO": "0",
-    "TICL_POLICY_ENVGEN_CHECKPOINT_REENTRANT": "0",
-    "TICL_POLICY_ENVGEN_RAGGED_AFFINE": "0",
-    "TICL_POLICY_INPLACE_PAGED_KV": "0",
-}
-
-
-def _apply_rlpfn_skyline_env_defaults(argv=None):
-    argv = list(sys.argv[1:] if argv is None else argv)
-    if not _argv_targets_rlpfn(argv):
-        return
-    for env_map in (_RLPFN_SKYLINE_POSITIVE_ENV_DEFAULTS, _RLPFN_SKYLINE_GUARD_ENV_DEFAULTS):
-        for key, value in env_map.items():
-            os.environ.setdefault(key, value)
-
-
-_apply_rlpfn_skyline_env_defaults()
+apply_rlpfn_skyline_env_defaults()
 
 from ticl.model_builder import get_model
 from ticl.utils import (
@@ -87,7 +33,17 @@ from ticl.config_utils import compare_dicts, flatten_dict, update_config
 from ticl.cli_parsing import make_model_level_argparser
 from ticl.model_configs import get_model_default_config
 from ticl.host_memory_guard import install_host_rss_limit_guard
+from ticl.rlpfn_anchor_contract import apply_rlpfn_anchor_compare_contract
 from argparse import Namespace
+
+
+def _seed_python_numpy_torch(seed: int) -> None:
+    seed_int = int(seed)
+    random.seed(seed_int)
+    np.random.seed(seed_int)
+    torch.manual_seed(seed_int)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(seed_int)
 
 
 def _merge_missing_keys(dst, src):
@@ -196,6 +152,7 @@ _CONTINUE_RUN_EPHEMERAL_OPTIMIZER_FLAGS = (
     ("--train-kernel-profiler-output-dir", "train_kernel_profiler_output_dir"),
     ("--pg-compile-observe-output-path", "pg_compile_observe_output_path"),
     ("--pg-phase-log-file", "pg_phase_log_file"),
+    ("--ppo-pack-output-dir", "ppo_pack_output_dir"),
 )
 
 
@@ -226,6 +183,35 @@ def _clear_continue_run_stale_output_paths(config, argv):
         if _cli_flag_is_set(argv, flag):
             continue
         config["optimizer"][key] = None
+    return config
+
+
+def _apply_rlpfn_anchor_compare_contract_if_requested(config, args):
+    requested = bool(getattr(args.orchestration, "rlpfn_anchor_compare_contract", False))
+    if not requested:
+        return config
+    if str(getattr(args, "model_type", "")).strip().lower() != "rlpfn":
+        raise ValueError(
+            "rlpfn_anchor_compare_contract is only supported for model_type=rlpfn."
+        )
+    warm_start_from = getattr(args.orchestration, "warm_start_from", None)
+    if warm_start_from is None:
+        raise ValueError(
+            "rlpfn_anchor_compare_contract requires --warm-start-from or an equivalent continue-run checkpoint "
+            "because it forces restore_validation_policy_state=True for trusted anchor compare."
+        )
+    return apply_rlpfn_anchor_compare_contract(config)
+
+
+def _apply_extra_fast_rwkv_safe_overrides(config, attention_type):
+    if str(config[attention_type].get('backbone', 'transformer')).strip().lower() != 'rwkv7':
+        return config
+    rwkv_head_size = int(config[attention_type].get('rwkv_head_size', 64) or 64)
+    emsize = int(config[attention_type].get('emsize', rwkv_head_size) or rwkv_head_size)
+    if emsize < rwkv_head_size or (emsize % rwkv_head_size) != 0:
+        emsize = int(max(rwkv_head_size, ((emsize + rwkv_head_size - 1) // rwkv_head_size) * rwkv_head_size))
+    config[attention_type]['emsize'] = emsize
+    config[attention_type]['nhead'] = 1
     return config
 
 
@@ -338,7 +324,9 @@ def main(argv, extra_config=None):
             else:
                 config[group_name][k] = v
         config[group_name].update()
-    if args.orchestration.seed_everything:
+    if args.orchestration.seed_everything_value is not None:
+        _seed_python_numpy_torch(int(args.orchestration.seed_everything_value))
+    elif args.orchestration.seed_everything:
         import lightning as L
         L.seed_everything(42)
 
@@ -370,9 +358,12 @@ def main(argv, extra_config=None):
     if args.orchestration.extra_fast_test:
         config['prior']['n_samples'] = 2 * 16
         config[attention_type]['nhead'] = 1
+        _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
 
     if extra_config is not None:
         update_config(config, extra_config)
+        if args.orchestration.extra_fast_test:
+            _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
 
     host_rss_guard = None
     host_rss_guard_status = None
@@ -470,6 +461,10 @@ def main(argv, extra_config=None):
     # training as well.
     if extra_config is not None:
         update_config(config, extra_config)
+        if args.orchestration.extra_fast_test:
+            _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
+
+    config = _apply_rlpfn_anchor_compare_contract_if_requested(config, args)
 
     if config['orchestration']['detect_anomaly']:
         print("ENABLING GRADIENT DEBUGGING (detect-anomaly)! Don't use for training.")
@@ -480,8 +475,12 @@ def main(argv, extra_config=None):
     if "optimizer" not in config:
         config["optimizer"] = {}
     pg_phase_log_file_cfg = config["optimizer"].get("pg_phase_log_file", None)
-    if pg_phase_log_file_cfg is None or str(pg_phase_log_file_cfg).strip() == "":
-        config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_default
+    if pg_phase_log_file_cfg is None:
+        # PPO phase heartbeat is diagnostic progress output, not a training
+        # semantic artifact.  Keep it on stdout/tmux by default so it does not
+        # pollute the persistent metric log file.  Users can still opt in with
+        # --pg-phase-log-file when they explicitly want a heartbeat file.
+        config["optimizer"]["pg_phase_log_file"] = ""
     pg_phase_log_file_effective = config["optimizer"].get("pg_phase_log_file", None)
     if pg_phase_log_file_effective is not None and str(pg_phase_log_file_effective).strip() != "":
         pg_phase_log_file_safe = enforce_path_filename_limit(pg_phase_log_file_effective)
@@ -493,6 +492,23 @@ def main(argv, extra_config=None):
         config["optimizer"]["pg_phase_log_file"] = pg_phase_log_file_safe
     if config["optimizer"].get("pg_phase_log_every_batches", None) is None:
         config["optimizer"]["pg_phase_log_every_batches"] = 1
+    if (
+        str(config.get("model_type", "")).strip().lower() == "rlpfn"
+        and str(config["optimizer"].get("rl_objective", "")).strip().lower() == "ppo"
+        and bool(config["optimizer"].get("ppo_trusted_pack_runner_required", False))
+        and (
+            config["optimizer"].get("ppo_pack_output_dir", None) is None
+            or str(config["optimizer"].get("ppo_pack_output_dir", "")).strip() == ""
+        )
+    ):
+        pack_output_dir = os.path.join(base_path, "ppo_pack_runner", model_string)
+        pack_output_dir_safe = enforce_path_filename_limit(pack_output_dir)
+        if str(pack_output_dir_safe) != str(pack_output_dir):
+            print(
+                "[filename-limit] ppo_pack_output_dir basename was truncated to fit filesystem limits:"
+                f" {pack_output_dir_safe}"
+            )
+        config["optimizer"]["ppo_pack_output_dir"] = pack_output_dir_safe
     save_callback = make_training_callback(
         save_every, 
         model_string, 

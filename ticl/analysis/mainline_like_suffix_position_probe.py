@@ -14,6 +14,7 @@ from ticl.analysis.critic_free_single_env_audit import (
     _make_suite,
     _run_eval,
 )
+from ticl.analysis.prior_generalization_audit import _temporary_seed
 from ticl.model_builder import load_model
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.sb3_recurrent_ppo import build_recurrent_ppo
@@ -73,13 +74,11 @@ def run_mainline_like_suffix_position_probe(
         env_cfg = _build_audit_env_cfg(config["prior"]["environment"])
 
         prior_for_h = EnvironmentPrior(copy.deepcopy(env_cfg))
-        rng_state = np.random.get_state()
-        np.random.seed(int(frozen_h_seed))
-        frozen_h = _freeze_env_h_list_for_replay(
-            prior_for_h,
-            list(prior_for_h._sample_batch_hypers(1)),
-        )[0]
-        np.random.set_state(rng_state)
+        with _temporary_seed(int(frozen_h_seed)):
+            frozen_h = _freeze_env_h_list_for_replay(
+                prior_for_h,
+                list(prior_for_h._sample_batch_hypers(1)),
+            )[0]
 
         prior = EnvironmentPrior(copy.deepcopy(env_cfg))
         prior._sample_batch_hypers = lambda batch_n, _h=frozen_h: [copy.deepcopy(_h) for _ in range(int(batch_n))]

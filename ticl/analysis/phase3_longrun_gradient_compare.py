@@ -1,5 +1,6 @@
 import argparse
 import copy
+import hashlib
 import json
 import random
 import time
@@ -90,6 +91,51 @@ def _signature_diff(left: dict[str, Any], right: dict[str, Any]) -> dict[str, di
         if left.get(key) != right.get(key):
             out[key] = {"left": left.get(key), "right": right.get(key)}
     return out
+
+
+def _to_builtin(value: Any) -> Any:
+    if torch.is_tensor(value):
+        if value.ndim == 0:
+            return value.detach().cpu().item()
+        return value.detach().cpu().tolist()
+    if isinstance(value, np.ndarray):
+        return value.tolist()
+    if isinstance(value, (np.floating, np.integer)):
+        return value.item()
+    if isinstance(value, (list, tuple)):
+        return [_to_builtin(v) for v in value]
+    if isinstance(value, dict):
+        return {str(k): _to_builtin(v) for k, v in value.items()}
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return repr(value)
+
+
+def _leaf_count(value: Any) -> int:
+    if isinstance(value, dict):
+        if not value:
+            return 1
+        return int(sum(_leaf_count(v) for v in value.values()))
+    if isinstance(value, list):
+        if not value:
+            return 1
+        return int(sum(_leaf_count(v) for v in value))
+    return 1
+
+
+def _fixed_env_contract_summary(frozen_h: Any) -> dict[str, Any]:
+    frozen_h_builtin = _to_builtin(frozen_h)
+    payload = json.dumps(frozen_h_builtin, sort_keys=True, ensure_ascii=True)
+    top_level_keys = (
+        sorted(str(k) for k in frozen_h_builtin.keys()) if isinstance(frozen_h_builtin, dict) else []
+    )
+    return {
+        "frozen_h_fingerprint": hashlib.sha256(payload.encode("utf-8")).hexdigest(),
+        "frozen_h_leaf_count": int(_leaf_count(frozen_h_builtin)),
+        "top_level_key_count": int(len(top_level_keys)),
+        "top_level_keys_sample": top_level_keys[:16],
+        "latent_uniform_keys_sample": [k for k in top_level_keys if k.endswith("_u")][:16],
+    }
 
 
 def _build_algo_for_config(
@@ -373,6 +419,7 @@ def run_phase3_longrun_gradient_compare(
         "n_steps": int(n_steps),
         "batch_size": int(batch_size),
         "learning_rate": float(learning_rate),
+        "fixed_env_contract": _fixed_env_contract_summary(frozen_h),
         "training_signature": {
             "resume_checkpoint_semantics": resume_sig,
             "phase3_isolated_semantics": isolated_sig,

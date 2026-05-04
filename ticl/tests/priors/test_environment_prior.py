@@ -3030,6 +3030,61 @@ def test_environment_prior_reference_scm_partition_aligns_autocast_dtype_before_
     assert torch.isfinite(reward_out).all()
 
 
+def test_environment_prior_reference_scm_partition_respects_live_cuda_memory_guard(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required for reference SCM memory guard regression")
+
+    _seed_everything(20260426)
+    prior = EnvironmentPrior({})
+    prior.reference_scm_memory_guard = True
+    prior.reference_scm_memory_guard_fraction = 0.01
+    prior.reference_scm_partition_max_bytes = 2 * 1024 * 1024 * 1024
+    monkeypatch.setattr(torch.cuda, "mem_get_info", lambda device=None: (1024, 4096))
+
+    h_list = [
+        _manual_sampled_h(
+            family="scm",
+            state_dim=24,
+            obs_dim=12,
+            action_dim=3,
+            noise_dim=2,
+            zero_pad_dim=5,
+            num_layers=3,
+        ),
+        _manual_sampled_h(
+            family="scm",
+            state_dim=24,
+            obs_dim=12,
+            action_dim=3,
+            noise_dim=2,
+            zero_pad_dim=5,
+            num_layers=3,
+        ),
+    ]
+    for h in h_list:
+        h["strict_joint_transition_enabled"] = True
+
+    state_dims = torch.tensor([int(h["state_dim"]) for h in h_list], dtype=torch.long)
+    in_dims = torch.tensor(
+        [
+            int(h["state_dim"]) + int(h["action_dim"]) + int(h["noise_dim"]) + int(h["zero_pad_dim"])
+            for h in h_list
+        ],
+        dtype=torch.long,
+    )
+    transition_fn = prior._build_reference_scm_joint_transition_padded_batch_fn(
+        in_dims,
+        state_dims,
+        h_list,
+        device=torch.device("cuda"),
+        generators=None,
+        input_mask=None,
+        _allow_partition=True,
+    )
+
+    assert bool(getattr(transition_fn, "_reference_scm_partitioned", False)) is True
+
+
 def test_environment_prior_rollout_applies_action_rms_before_scm_input():
     _seed_everything(20260310)
     cfg = dict(get_prior_config()["prior"]["environment"])
@@ -5902,6 +5957,113 @@ def test_environment_prior_reward_state_input_gain_fraction_conditioned_training
         assert float(sampled_h["reward_state_input_gain_fraction_rejection_min"]) == 0.0
 
 
+def test_environment_prior_reward_topology_conditioned_training_sampler_accepts_action_gain_and_ratio():
+    _seed_everything(2026042901)
+    prior = EnvironmentPrior(
+        {
+            "family": "scm",
+            "state_dim": 40,
+            "obs_dim": 20,
+            "action_dim": 4,
+            "noise_dim": 2,
+            "zero_pad_dim": 8,
+            "num_layers": 3,
+            "strict_joint_transition_enabled": True,
+            "reward_topology_conditioned_sampling_enabled": True,
+            "reward_action_input_gain_fraction_conditioned_min": 0.02,
+            "reward_state_to_action_gain_ratio_conditioned_max": 100.0,
+            "reward_topology_conditioned_sampling_max_attempts": 64,
+        }
+    )
+
+    h_list, env, accepted_seeds = prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+        2,
+        device="cpu",
+        rng_seeds=[111, 222],
+        build_policy_generator=False,
+    )
+
+    assert len(h_list) == 2
+    assert len(accepted_seeds) == 2
+    assert torch.all(env["reward_topology_conditioned_sampling_enabled"])
+    assert torch.all(env["reward_action_input_gain_fraction"] >= 0.02)
+    assert torch.all(env["reward_state_to_action_gain_ratio"] <= 100.0)
+    assert torch.all(env["reward_action_input_gain_fraction_conditioned_accepted_gain"] >= 0.02)
+    assert torch.all(env["reward_state_to_action_gain_ratio_conditioned_accepted_ratio"] <= 100.0)
+    assert tuple(env["reward_topology_conditioned_env_rng_seed"].shape) == (2,)
+    assert torch.equal(
+        env["reward_topology_conditioned_env_rng_seed"],
+        env["reward_state_input_gain_fraction_conditioned_env_rng_seed"],
+    )
+
+
+def test_environment_prior_conditioned_sampler_can_return_seeds_without_final_env():
+    _seed_everything(2026042601)
+    prior = EnvironmentPrior(
+        {
+            "family": "scm",
+            "state_dim": 40,
+            "obs_dim": 20,
+            "action_dim": 4,
+            "noise_dim": 2,
+            "zero_pad_dim": 8,
+            "num_layers": 3,
+            "strict_joint_transition_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_sampling_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_min": 0.01,
+        }
+    )
+
+    h_list, env, accepted_seeds = prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+        2,
+        device="cpu",
+        rng_seeds=[101, 202],
+        build_policy_generator=False,
+        return_final_env=False,
+    )
+
+    assert env is None
+    assert len(h_list) == 2
+    assert len(accepted_seeds) == 2
+    for sampled_h in h_list:
+        assert float(sampled_h["reward_state_input_gain_fraction_rejection_min"]) == 0.0
+
+
+def test_environment_prior_reward_state_input_gain_fraction_conditioned_training_sampler_fills_partitioned_batch():
+    _seed_everything(20260426)
+    prior = EnvironmentPrior(
+        {
+            "family": "scm",
+            "state_dim": 40,
+            "obs_dim": 20,
+            "action_dim": 4,
+            "noise_dim": 2,
+            "zero_pad_dim": 8,
+            "num_layers": 3,
+            "strict_joint_transition_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_sampling_enabled": True,
+            "reward_state_input_gain_fraction_conditioned_min": 0.01,
+        }
+    )
+    prior.reference_scm_partition_max_bytes = 1
+
+    h_list, env, accepted_seeds = prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+        2,
+        device="cpu",
+        rng_seeds=[303, 404],
+        build_policy_generator=False,
+    )
+
+    transition = env["transition_generator"]
+    assert len(h_list) == 2
+    assert len(accepted_seeds) == 2
+    assert bool(getattr(transition, "_reference_scm_partitioned", False)) is True
+    assert torch.is_tensor(env["reward_state_input_gain_fraction"])
+    assert tuple(env["reward_state_input_gain_fraction"].shape) == (2,)
+    assert torch.all(env["reward_state_input_gain_fraction"] >= 0.01)
+    assert torch.all(env["reward_state_input_gain_fraction_conditioned_sampling_enabled"])
+
+
 def test_environment_prior_fixed_frozen_h_json_clones_hyper_sample_source(tmp_path):
     h = _manual_sampled_h(
         family="scm",
@@ -7165,6 +7327,38 @@ def test_environment_prior_transition_inner_grouping_defaults_to_family_with_min
         prior = EnvironmentPrior(get_prior_config()["prior"]["environment"])
         assert prior.transition_inner_grouping == "family"
         assert prior.transition_inner_min_bucket == 0
+    finally:
+        for key, value in env_backup.items():
+            if value is None:
+                os.environ.pop(key, None)
+            else:
+                os.environ[key] = value
+
+
+def test_environment_prior_transition_inner_grouping_config_overrides_env_var():
+    env_backup = {
+        "TICL_POLICY_TRANSITION_INNER_GROUPING": os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING"),
+        "TICL_POLICY_TRANSITION_INNER_MIN_BUCKET": os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET"),
+        "TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES": os.environ.get("TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES"),
+        "TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION": os.environ.get("TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION"),
+    }
+    try:
+        os.environ["TICL_POLICY_TRANSITION_INNER_GROUPING"] = "family"
+        os.environ["TICL_POLICY_TRANSITION_INNER_MIN_BUCKET"] = "9"
+        os.environ["TICL_POLICY_REFERENCE_SCM_PARTITION_MAX_BYTES"] = "999"
+        os.environ["TICL_POLICY_REFERENCE_SCM_MEMORY_GUARD_FRACTION"] = "0.9"
+        env_cfg = dict(get_prior_config()["prior"]["environment"])
+        env_cfg["transition_inner_grouping"] = "structure"
+        env_cfg["transition_inner_min_bucket"] = 0
+        env_cfg["reference_scm_partition_max_bytes"] = 134217728
+        env_cfg["reference_scm_memory_guard_fraction"] = 0.125
+        env_cfg["transition_generator_rebuild_each_step"] = True
+        prior = EnvironmentPrior(env_cfg)
+        assert prior.transition_inner_grouping == "structure"
+        assert prior.transition_inner_min_bucket == 0
+        assert prior.reference_scm_partition_max_bytes == 134217728
+        assert prior.reference_scm_memory_guard_fraction == 0.125
+        assert prior.transition_generator_rebuild_each_step is True
     finally:
         for key, value in env_backup.items():
             if value is None:

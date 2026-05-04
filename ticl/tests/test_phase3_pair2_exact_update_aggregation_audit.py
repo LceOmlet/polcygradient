@@ -68,6 +68,9 @@ def test_build_pair2_exact_update_aggregation_audit_tracks_three_stage_transfer(
         override_snapshot_json=override_snapshot,
     )
 
+    assert report["strict_contract"]["runtime_suite_name"] == "pair2"
+    assert report["strict_contract"]["baseline_runtime_suite_name"] == "pair2"
+    assert report["strict_contract"]["override_runtime_suite_name"] == "pair2"
     assert report["target_block"]["block_token_count"] == 4
     assert report["baseline"]["pre_normalization_actor_advantages"]["block"]["negative_mass"] == 8.0
     assert report["override"]["pre_normalization_actor_advantages"]["block"]["negative_mass"] == 6.0
@@ -199,6 +202,9 @@ def test_build_pair2_exact_update_aggregation_audit_reports_missing_target_block
         override_snapshot_json=override_snapshot,
     )
 
+    assert report["strict_contract"]["runtime_suite_name"] == "pair2"
+    assert report["strict_contract"]["baseline_runtime_suite_name"] == "pair2"
+    assert report["strict_contract"]["override_runtime_suite_name"] == "pair2"
     assert report["target_block"]["target_block_present_in_snapshot"] is False
     assert report["conclusions"]["requested_target_block_present_in_captured_outer_batch"] is False
     assert report["conclusions"]["current_single_snapshot_is_insufficient_for_env12_block_audit"] is True
@@ -211,3 +217,65 @@ def test_build_pair2_exact_update_aggregation_audit_reports_missing_target_block
             "objective_position_max": 3,
         }
     ]
+
+
+def test_build_pair2_exact_update_aggregation_audit_tracks_baseline_vs_override_runtime_scope(tmp_path):
+    baseline_snapshot = _write(
+        tmp_path,
+        "baseline.json",
+        {
+            "summary": {
+                "outer_batch_idx": 8,
+                "epoch_idx": 1,
+                "batch_size_flat": 4,
+                "objective_total": 4,
+                "normalize_advantage": False,
+                "actor_objective_mode": "tokenwise",
+                "actor_objective_runtime_current_suite_name": "None",
+            },
+            "objective_mask": [1, 1, 1, 1],
+            "flat_env_indices": [12, 12, 12, 12],
+            "flat_step_indices": [0, 1, 2, 3],
+            "flat_objective_episode_indices": [0, 0, 0, 0],
+            "flat_objective_episode_positions": [18, 19, 20, 21],
+            "flat_objective_global_positions": [18, 19, 20, 21],
+            "pre_normalization_actor_advantages": [-1, -1, -1, -1],
+            "post_normalization_advantages": [-1, -1, -1, -1],
+            "ratio": [1, 1, 1, 1],
+            "clipped_objective": [-1, -1, -1, -1],
+        },
+    )
+    override_snapshot = _write(
+        tmp_path,
+        "override.json",
+        {
+            "summary": {
+                "outer_batch_idx": 8,
+                "epoch_idx": 1,
+                "batch_size_flat": 4,
+                "objective_total": 4,
+                "normalize_advantage": False,
+                "actor_objective_mode": "tokenwise_scale_env12_mid_episode_extension_block",
+                "actor_objective_runtime_current_suite_name": "pair2",
+            },
+            "objective_mask": [1, 1, 1, 1],
+            "flat_env_indices": [12, 12, 12, 12],
+            "flat_step_indices": [0, 1, 2, 3],
+            "flat_objective_episode_indices": [0, 0, 0, 0],
+            "flat_objective_episode_positions": [18, 19, 20, 21],
+            "flat_objective_global_positions": [18, 19, 20, 21],
+            "pre_normalization_actor_advantages": [-0.9, -0.9, -0.9, -0.9],
+            "post_normalization_advantages": [-0.9, -0.9, -0.9, -0.9],
+            "ratio": [1, 1, 1, 1],
+            "clipped_objective": [-0.9, -0.9, -0.9, -0.9],
+        },
+    )
+
+    report = build_pair2_exact_update_aggregation_audit(
+        baseline_snapshot_json=baseline_snapshot,
+        override_snapshot_json=override_snapshot,
+    )
+
+    assert report["strict_contract"]["runtime_suite_name"] == "pair2"
+    assert report["strict_contract"]["baseline_runtime_suite_name"] == "None"
+    assert report["strict_contract"]["override_runtime_suite_name"] == "pair2"

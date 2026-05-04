@@ -27,6 +27,7 @@ from ticl.utils import ExponentialLR, ReduceLROnSpike, init_dist
 from ticl.profiling import TrainProfiler, TrainProfilerConfig
 from ticl.gpu_observer import GPUProcessObserver
 from ticl.kernel_profiling import TrainKernelProfiler, TrainKernelProfilerConfig
+from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.priors.maintained_policy_gradient_loss import attach_common_rollout_diagnostics
 
 def _has_nonfinite_gradients(model, device):
@@ -40,6 +41,14 @@ def _has_nonfinite_gradients(model, device):
 
 def _env_flag_enabled(name, default="0"):
     return str(os.environ.get(name, default)).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _looks_like_maintained_rlpfn_env_prior(env_prior) -> bool:
+    cfg = getattr(env_prior, "config", {}) or {}
+    return bool(
+        cfg.get("strict_joint_transition_enabled", False)
+        and cfg.get("reinforce_sequence_replay_enabled", False)
+    )
 
 
 def _get_host_memory_snapshot():
@@ -72,6 +81,208 @@ def _extract_optimizer_step(optimizer):
     except Exception:
         return None
     return None
+
+
+_PPO_TRAIN_DIAGNOSTIC_KEYS = {
+    "objective_total",
+    "explained_variance_value_target",
+    "explained_variance_value_target_objective",
+    "explained_variance_raw_value_target",
+    "explained_variance_raw_value_target_objective",
+    "explained_variance_raw_discounted_return",
+    "explained_variance_raw_discounted_return_objective",
+    "raw_value_target_corr",
+    "raw_discounted_return_corr",
+}
+_PPO_TRAIN_DIAGNOSTIC_PREFIXES = (
+    "value_space_",
+    "raw_value_",
+    "raw_value_target_",
+    "raw_discounted_return_",
+    "value_scale_",
+    "input_",
+)
+
+
+def _copy_ppo_train_diagnostic_logger_values(target: dict, logger_values: dict) -> None:
+    for key, value in logger_values.items():
+        key_str = str(key)
+        metric_name = None
+        if key_str.startswith("train/legacy_pre_rollout_"):
+            metric_name = key_str.removeprefix("train/legacy_pre_rollout_")
+        elif key_str.startswith("train/"):
+            candidate = key_str.removeprefix("train/")
+            if candidate in _PPO_TRAIN_DIAGNOSTIC_KEYS or candidate.startswith(_PPO_TRAIN_DIAGNOSTIC_PREFIXES):
+                metric_name = candidate
+        if metric_name is not None:
+            target[str(metric_name)] = value
+
+
+def _iter_validation_policy_state_carriers(model):
+    queue = [model]
+    seen = set()
+    while queue:
+        candidate = queue.pop(0)
+        if candidate is None:
+            continue
+        ident = id(candidate)
+        if ident in seen:
+            continue
+        seen.add(ident)
+        yield candidate
+        for nested_attr in ("module", "model", "_orig_mod"):
+            nested = getattr(candidate, nested_attr, None)
+            if nested is not None and id(nested) not in seen:
+                queue.append(nested)
+
+
+def _resolve_saved_validation_ppo_policy_state(model):
+    for candidate in _iter_validation_policy_state_carriers(model):
+        candidate_dict = getattr(candidate, "__dict__", {})
+        saved_state = candidate_dict.get("_validation_ppo_policy_state", None)
+        if isinstance(saved_state, dict):
+            return saved_state
+    return None
+
+
+def _parse_ppo_seed_spec(seed_spec, *, name):
+    if seed_spec is None:
+        return None
+    if torch.is_tensor(seed_spec):
+        seed_spec = seed_spec.detach().cpu().tolist()
+    if isinstance(seed_spec, np.ndarray):
+        seed_spec = seed_spec.tolist()
+    if isinstance(seed_spec, (list, tuple)):
+        return [int(v) for v in seed_spec]
+    if isinstance(seed_spec, (int, np.integer)):
+        return int(seed_spec)
+    seed_text = str(seed_spec).strip()
+    if seed_text == "":
+        return None
+    try:
+        parsed = json.loads(seed_text)
+    except Exception:
+        parsed = seed_text
+    if parsed is None:
+        return None
+    if isinstance(parsed, (list, tuple)):
+        return [int(v) for v in parsed]
+    if isinstance(parsed, (int, np.integer)):
+        return int(parsed)
+    if isinstance(parsed, str):
+        parsed_text = parsed.strip()
+        if parsed_text == "":
+            return None
+        if "," in parsed_text:
+            return [int(part.strip()) for part in parsed_text.split(",") if part.strip() != ""]
+        return int(parsed_text)
+    raise ValueError(f"Unsupported {name} seed spec: {seed_spec!r}")
+
+
+def _resolve_recurrent_ppo_training_bridge_kwargs(
+    *,
+    model,
+    env_prior,
+    device,
+    num_features,
+    n_envs,
+    n_steps,
+    learning_rate,
+    batch_size,
+    n_epochs,
+    gamma,
+    gae_lambda,
+    clip_range,
+    clip_range_vf,
+    normalize_advantage,
+    space_contract="normalized",
+    value_target_space=None,
+    actor_gae_space=None,
+    allow_mixed_space_contract=False,
+    actor_baseline_mode,
+    separate_value_backbone,
+    reset_env_state_at_sep,
+    value_head_impl="legacy_bar",
+    value_path_adapter_impl="none",
+    value_head_mlp_hidden_dim=256,
+    runtime_normalized_q_value_weight_override,
+    runtime_next_state_flow_matching_weight_override,
+    ent_coef,
+    vf_coef,
+    max_grad_norm,
+    target_kl,
+    verbose,
+    ppo_restore_validation_policy_state,
+    ppo_strict_fixed_env_mode,
+    ppo_env_rng_seeds,
+    ppo_rollout_rng_seeds,
+    ppo_deterministic_actor_sampling,
+    ppo_deterministic_batch_plan,
+    ppo_strict_native_rollout,
+):
+    saved_validation_policy_state = _resolve_saved_validation_ppo_policy_state(model)
+    has_saved_validation_policy_state = isinstance(saved_validation_policy_state, dict)
+    restore_validation_policy_state = (
+        bool(has_saved_validation_policy_state)
+        if ppo_restore_validation_policy_state is None
+        else bool(ppo_restore_validation_policy_state)
+    )
+    env_rng_seeds = _parse_ppo_seed_spec(ppo_env_rng_seeds, name="ppo_env_rng_seeds")
+    rollout_rng_seeds = _parse_ppo_seed_spec(ppo_rollout_rng_seeds, name="ppo_rollout_rng_seeds")
+    build_kwargs = {
+        "model": model,
+        "env_prior": env_prior,
+        "device": device,
+        "num_features": num_features,
+        "n_envs": int(n_envs),
+        "n_steps": int(n_steps),
+        "learning_rate": learning_rate,
+        "batch_size": int(batch_size),
+        "n_epochs": int(n_epochs),
+        "gamma": float(gamma),
+        "gae_lambda": float(gae_lambda),
+        "clip_range": clip_range,
+        "clip_range_vf": clip_range_vf,
+        "normalize_advantage": bool(normalize_advantage),
+        "space_contract": str(space_contract),
+        "value_target_space": value_target_space,
+        "actor_gae_space": actor_gae_space,
+        "allow_mixed_space_contract": bool(allow_mixed_space_contract),
+        "actor_baseline_mode": str(actor_baseline_mode),
+        "separate_value_backbone": bool(separate_value_backbone),
+        "reset_env_state_at_sep": bool(reset_env_state_at_sep),
+        "value_head_impl": str(value_head_impl),
+        "value_path_adapter_impl": str(value_path_adapter_impl),
+        "value_head_mlp_hidden_dim": int(value_head_mlp_hidden_dim),
+        "strict_fixed_env_mode": bool(ppo_strict_fixed_env_mode),
+        "env_rng_seeds": env_rng_seeds,
+        "rollout_rng_seeds": rollout_rng_seeds,
+        "deterministic_actor_sampling": bool(ppo_deterministic_actor_sampling),
+        "deterministic_batch_plan": bool(ppo_deterministic_batch_plan),
+        "strict_native_rollout": bool(ppo_strict_native_rollout),
+        "restore_validation_policy_state": bool(restore_validation_policy_state),
+        "runtime_normalized_q_value_weight_override": runtime_normalized_q_value_weight_override,
+        "runtime_next_state_flow_matching_weight_override": runtime_next_state_flow_matching_weight_override,
+        "ent_coef": float(ent_coef),
+        "vf_coef": float(vf_coef),
+        "max_grad_norm": float(max_grad_norm),
+        "target_kl": target_kl,
+        "verbose": int(verbose),
+    }
+    runtime_summary = {
+        "checkpoint_saved_validation_policy_state_present": bool(has_saved_validation_policy_state),
+        "restore_validation_policy_state": bool(restore_validation_policy_state),
+        "strict_fixed_env_mode": bool(build_kwargs["strict_fixed_env_mode"]),
+        "env_rng_seeds": env_rng_seeds,
+        "rollout_rng_seeds": rollout_rng_seeds,
+        "deterministic_actor_sampling": bool(build_kwargs["deterministic_actor_sampling"]),
+        "deterministic_batch_plan": bool(build_kwargs["deterministic_batch_plan"]),
+        "strict_native_rollout": bool(build_kwargs["strict_native_rollout"]),
+        "value_head_impl": str(build_kwargs["value_head_impl"]),
+        "value_path_adapter_impl": str(build_kwargs["value_path_adapter_impl"]),
+        "value_head_mlp_hidden_dim": int(build_kwargs["value_head_mlp_hidden_dim"]),
+    }
+    return build_kwargs, runtime_summary
 
 
 def _clear_policy_rollout_artifacts(env_prior=None, policy_step_fn=None):
@@ -257,7 +468,7 @@ def _resolve_environment_prior(prior):
     cur = prior
     while cur is not None and id(cur) not in seen:
         seen.add(id(cur))
-        if hasattr(cur, "rollout_policy_gradient_loss"):
+        if isinstance(cur, EnvironmentPrior) or hasattr(cur, "rollout_policy_gradient_loss"):
             return cur
         cur = getattr(cur, "base_prior", None)
     return None
@@ -772,6 +983,13 @@ def _build_policy_step_fn(
     require_policy_action_head = getattr(model_ref, "require_policy_action_head", None)
     if callable(require_policy_action_head):
         require_policy_action_head()
+    policy_action_head_required_fn = getattr(model_ref, "policy_action_head_required", None)
+    has_policy_action_head_fn = getattr(model_ref, "has_policy_action_head", None)
+    attach_policy_action_head_helpers = True
+    if callable(policy_action_head_required_fn):
+        attach_policy_action_head_helpers = bool(policy_action_head_required_fn())
+    elif callable(has_policy_action_head_fn):
+        attach_policy_action_head_helpers = bool(has_policy_action_head_fn())
 
     num_features = int(num_features)
     model_encoder = getattr(model_ref, "encoder", None)
@@ -1123,10 +1341,18 @@ def _build_policy_step_fn(
     log_prob_action_fn = getattr(model_ref, "log_prob_policy_action_from_outputs", None)
     score_action_fn = getattr(model_ref, "log_prob_score_wrt_mean_from_outputs", None)
     decomp_action_fn = getattr(model_ref, "policy_log_prob_decomposition_stats_from_outputs", None)
-    policy_step_fn._policy_actor_sample_fn = sample_action_fn if callable(sample_action_fn) else None
-    policy_step_fn._policy_actor_log_prob_fn = log_prob_action_fn if callable(log_prob_action_fn) else None
-    policy_step_fn._policy_actor_score_fn = score_action_fn if callable(score_action_fn) else None
-    policy_step_fn._policy_actor_decomp_stats_fn = decomp_action_fn if callable(decomp_action_fn) else None
+    policy_step_fn._policy_actor_sample_fn = (
+        sample_action_fn if attach_policy_action_head_helpers and callable(sample_action_fn) else None
+    )
+    policy_step_fn._policy_actor_log_prob_fn = (
+        log_prob_action_fn if attach_policy_action_head_helpers and callable(log_prob_action_fn) else None
+    )
+    policy_step_fn._policy_actor_score_fn = (
+        score_action_fn if attach_policy_action_head_helpers and callable(score_action_fn) else None
+    )
+    policy_step_fn._policy_actor_decomp_stats_fn = (
+        decomp_action_fn if attach_policy_action_head_helpers and callable(decomp_action_fn) else None
+    )
     return policy_step_fn
 
 
@@ -6894,6 +7120,7 @@ def train_epoch_official_recurrent_ppo(
         "approx_kl_mean": logger_values.get("train/approx_kl", None),
         "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
         "explained_variance": logger_values.get("train/explained_variance", None),
+        "explained_variance_normalized": logger_values.get("train/explained_variance_normalized", None),
         "clip_range": logger_values.get("train/clip_range", None),
         "clip_range_vf": logger_values.get("train/clip_range_vf", None),
         "policy_loss_weight": 1.0,
@@ -6912,9 +7139,191 @@ def train_epoch_official_recurrent_ppo(
         "logged_update_wall_time_sec": logger_values.get("train/update_wall_time_sec", None),
         "outer_batches": logger_values.get("train/outer_batches", None),
         "subbatches": logger_values.get("train/subbatches", None),
+        "sep_state_reset_enabled": logger_values.get("train/sep_state_reset_enabled", None),
+        "sep_state_reset_count": logger_values.get("train/sep_state_reset_count", None),
     }
+    for key, value in logger_values.items():
+        if str(key).startswith("train/legacy_pre_rollout_"):
+            target_model.last_ppo_epoch_metrics[str(key).removeprefix("train/")] = value
+    _copy_ppo_train_diagnostic_logger_values(target_model.last_ppo_epoch_metrics, logger_values)
     for key, value in reward_component_stats.items():
         target_model.last_ppo_epoch_metrics[key] = value
+    for reward_key in (
+        "reward_mean",
+        "reward_std",
+        "reward_return_mean",
+        "reward_return_std",
+        "reward_env_mean",
+        "reward_env_std",
+        "reward_env_return_mean",
+        "reward_env_return_std",
+        "reward_ctrl_mean",
+        "reward_ctrl_std",
+        "reward_ctrl_return_mean",
+        "reward_ctrl_return_std",
+        "reward_survival_mean",
+        "reward_survival_std",
+        "reward_survival_return_mean",
+        "reward_survival_return_std",
+        "reward_terminal_bonus_mean",
+        "reward_terminal_bonus_std",
+        "reward_terminal_bonus_return_mean",
+        "reward_terminal_bonus_return_std",
+    ):
+        target_model.last_ppo_epoch_metrics.setdefault(reward_key, None)
+    mean_loss = logger_values.get("train/loss", 0.0)
+    return float(mean_loss), 0.0, 0.0
+
+
+def train_epoch_trusted_pack_recurrent_ppo(
+    *,
+    model,
+    ppo_algo,
+    ppo_vec_env,
+    ppo_pack_runner_state: dict,
+    epoch_idx: int,
+    total_epochs: int,
+    seed: int,
+    fixed_env_group_across_updates: bool,
+    semantic_probes_enabled: bool,
+    semantic_probe_sidecar_enabled: bool,
+    semantic_probe_sidecar_every: int,
+    checkpoint_every: int,
+    checkpoint_include_optimizer: bool,
+):
+    from ticl.analysis.phase2_gym_prior_pack_training_runner import _run_pack_update_once
+
+    update_idx = int(epoch_idx) - 1
+    env_seed = int(seed) if bool(fixed_env_group_across_updates) else int(seed) + 1000 * int(update_idx)
+    wall_t0 = time.perf_counter()
+    row, _digest = _run_pack_update_once(
+        arm="prior",
+        algo=ppo_algo,
+        vec_env=ppo_vec_env,
+        gym_env_ids_arg="",
+        output_dir=ppo_pack_runner_state["output_dir"],
+        update_idx=int(update_idx),
+        env_seed=int(env_seed),
+        fixed_env_group_across_updates=bool(fixed_env_group_across_updates),
+        fixed_group_dump=ppo_pack_runner_state.get("fixed_group_dump"),
+        device_obj=torch.device(str(ppo_algo.device)),
+        num_features=int(ppo_pack_runner_state["num_features"]),
+        obs_slot_dim=int(ppo_pack_runner_state["obs_slot_dim"]),
+        action_slot_dim=int(ppo_pack_runner_state["action_slot_dim"]),
+        next_state_target_dim=int(ppo_pack_runner_state["next_state_target_dim"]),
+        n_envs=int(ppo_pack_runner_state["n_envs"]),
+        n_steps=int(ppo_pack_runner_state["n_steps"]),
+        single_eval_pos=ppo_pack_runner_state.get("single_eval_pos", None),
+        terminal_token_enabled=bool(ppo_pack_runner_state["terminal_token_enabled"]),
+        semantic_probes_enabled=bool(semantic_probes_enabled),
+        semantic_probe_sidecar_enabled=bool(semantic_probe_sidecar_enabled),
+        semantic_probe_sidecar_every=int(semantic_probe_sidecar_every),
+        checkpoint_every=int(checkpoint_every),
+        checkpoint_include_optimizer=bool(checkpoint_include_optimizer),
+        force_checkpoint=(int(epoch_idx) == int(total_epochs)),
+        progress_path=ppo_pack_runner_state["progress_path"],
+    )
+    wall_s = float(time.perf_counter() - wall_t0)
+    update = dict(row.get("update", {}) or {})
+    if update.get("exception") is not None:
+        raise RuntimeError(f"Trusted PPO pack update failed: {update.get('exception')}")
+    ppo_algo.num_timesteps = int(getattr(ppo_algo, "num_timesteps", 0)) + (
+        int(ppo_pack_runner_state["n_envs"]) * int(ppo_pack_runner_state["n_steps"])
+    )
+    logger_values = dict(update.get("logger", {}) or {})
+    target_model = model.module if hasattr(model, "module") else model
+    target_model.last_pg_epoch_metrics = None
+    ppo_logger_metrics = dict(logger_values)
+    ppo_logger_metrics.setdefault("time/total_timesteps", int(getattr(ppo_algo, "num_timesteps", 0)))
+    reward_component_stats = dict(row.get("reward_component_summary", {}) or {})
+    for key, value in reward_component_stats.items():
+        if value is not None:
+            try:
+                value_f = float(value)
+            except (TypeError, ValueError):
+                continue
+            if math.isfinite(value_f):
+                ppo_logger_metrics.setdefault(f"rollout/{key}", value_f)
+    target_model.last_ppo_logger_metrics = ppo_logger_metrics
+    pack_summary = dict(row.get("pack_summary", {}) or {})
+    pack_stats = dict(pack_summary.get("stats", {}) or {})
+    bridge = dict(row.get("bridge", {}) or {})
+    reward_norm = dict(bridge.get("reward_norm", {}) or {})
+    raw_reward_norm_stats = dict(reward_norm.get("raw_reward", {}) or {})
+    buffer_reward_norm_stats = dict(reward_norm.get("buffer_reward", {}) or {})
+    logged_update_wall_time_sec = logger_values.get("train/update_wall_time_sec", None)
+    try:
+        logged_update_wall_s = float(logged_update_wall_time_sec)
+    except (TypeError, ValueError):
+        logged_update_wall_s = float("nan")
+    rollout_wall_s = None
+    if math.isfinite(logged_update_wall_s):
+        rollout_wall_s = max(0.0, float(wall_s) - logged_update_wall_s)
+    update_wall_s = logged_update_wall_s if math.isfinite(logged_update_wall_s) else float(wall_s)
+    target_model.last_ppo_epoch_metrics = {
+        "policy_total_loss_mean": logger_values.get("train/loss", None),
+        "policy_gradient_loss_mean": logger_values.get("train/policy_gradient_loss", None),
+        "value_loss_mean": logger_values.get("train/value_loss", None),
+        "entropy_loss_mean": logger_values.get("train/entropy_loss", None),
+        "normalized_q_value_loss_mean": logger_values.get("train/normalized_q_value_loss", None),
+        "next_state_flow_matching_loss_mean": logger_values.get("train/next_state_flow_matching_loss", None),
+        "approx_kl_mean": logger_values.get("train/approx_kl", None),
+        "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
+        "explained_variance": logger_values.get("train/explained_variance", None),
+        "explained_variance_normalized": logger_values.get("train/explained_variance_normalized", None),
+        "clip_range": logger_values.get("train/clip_range", None),
+        "clip_range_vf": logger_values.get("train/clip_range_vf", None),
+        "policy_loss_weight": 1.0,
+        "entropy_loss_weight": float(getattr(ppo_algo, "ent_coef", 0.0)),
+        "value_loss_weight": float(getattr(ppo_algo, "vf_coef", 0.0)),
+        "normalized_q_value_weight": float(getattr(ppo_algo, "_rwkv_aux_q_weight", 0.0)),
+        "next_state_flow_matching_weight": float(getattr(ppo_algo, "_rwkv_aux_flow_weight", 0.0)),
+        "n_updates": logger_values.get("train/n_updates", update.get("n_updates", None)),
+        "num_timesteps": int(getattr(ppo_algo, "num_timesteps", 0)),
+        "rollout_wall_time_sec": rollout_wall_s,
+        "update_wall_time_sec": update_wall_s,
+        "logged_update_wall_time_sec": logged_update_wall_time_sec,
+        "pack_wall_time_sec": wall_s,
+        "outer_batches": logger_values.get("train/outer_batches", None),
+        "subbatches": logger_values.get("train/subbatches", None),
+        "pack_raw_reward_mean": raw_reward_norm_stats.get(
+            "mean",
+            reward_component_stats.get("reward_mean", pack_stats.get("raw_reward_mean")),
+        ),
+        "pack_buffer_reward_mean": buffer_reward_norm_stats.get("mean", pack_stats.get("reward_mean")),
+        "pack_single_eval_pos": row.get("single_eval_pos"),
+        "pack_progress_path": str(ppo_pack_runner_state["progress_path"]),
+        "reward_norm_enabled": reward_norm.get("enabled", False),
+        "episode_reward_mean": reward_component_stats.get("ep_rew_mean", None),
+        "episode_length_mean": reward_component_stats.get("ep_len_mean", None),
+        "full_episode_reward_mean": reward_component_stats.get("full_ep_rew_mean", None),
+        "full_episode_length_mean": reward_component_stats.get("full_ep_len_mean", None),
+        "sep_state_reset_enabled": logger_values.get("train/sep_state_reset_enabled", None),
+        "sep_state_reset_count": logger_values.get("train/sep_state_reset_count", None),
+    }
+    for key, value in logger_values.items():
+        if str(key).startswith("train/legacy_pre_rollout_"):
+            target_model.last_ppo_epoch_metrics[str(key).removeprefix("train/")] = value
+    _copy_ppo_train_diagnostic_logger_values(target_model.last_ppo_epoch_metrics, logger_values)
+    for key, value in reward_component_stats.items():
+        if value is not None:
+            target_model.last_ppo_epoch_metrics[key] = value
+    target_model.last_ppo_epoch_metrics.setdefault(
+        "reward_mean",
+        raw_reward_norm_stats.get("mean", pack_stats.get("raw_reward_mean")),
+    )
+    target_model.last_ppo_epoch_metrics.setdefault(
+        "reward_std",
+        raw_reward_norm_stats.get("std", pack_stats.get("raw_reward_std")),
+    )
+    target_model.last_ppo_epoch_metrics.setdefault(
+        "reward_return_mean",
+        pack_stats.get("raw_reward_return_mean", pack_stats.get("reward_return_mean")),
+    )
+    target_model.last_ppo_epoch_metrics.setdefault(
+        "reward_return_std",
+        pack_stats.get("raw_reward_return_std", pack_stats.get("reward_return_std")),
+    )
     for reward_key in (
         "reward_mean",
         "reward_std",
@@ -7036,27 +7445,68 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ppo_n_steps=None,
           ppo_batch_size=None,
           ppo_n_epochs=4,
-          ppo_gamma=1.0,
-          ppo_gae_lambda=0.95,
+          ppo_gamma=0.98,
+          ppo_gae_lambda=0.90,
           ppo_clip_range=0.2,
           ppo_clip_range_vf=None,
           ppo_normalize_advantage=True,
-          ppo_actor_gae_space="normalized",
+          ppo_space_contract="raw",
+          ppo_value_target_space=None,
+          ppo_actor_gae_space=None,
+          ppo_allow_mixed_space_contract=False,
           ppo_actor_baseline_mode="learned",
           ppo_separate_value_backbone=False,
           ppo_reset_env_state_at_sep=True,
+          ppo_value_head_impl="vendor_official",
+          ppo_value_path_adapter_impl="none",
+          ppo_value_head_mlp_hidden_dim=256,
+          ppo_restore_validation_policy_state=None,
+          ppo_strict_fixed_env_mode=False,
+          ppo_env_rng_seeds=None,
+          ppo_rollout_rng_seeds=None,
+          ppo_single_eval_pos=None,
+          ppo_deterministic_actor_sampling=False,
+          ppo_deterministic_batch_plan=True,
+          ppo_strict_native_rollout=False,
           ppo_runtime_normalized_q_value_weight_override=None,
           ppo_runtime_next_state_flow_matching_weight_override=None,
           ppo_ent_coef=0.0,
-          ppo_vf_coef=0.5,
+          ppo_vf_coef=0.1,
           ppo_max_grad_norm=0.5,
           ppo_target_kl=None,
+          ppo_trusted_pack_runner_required=False,
+          ppo_pack_output_dir=None,
+          ppo_pack_seed=4040,
+          ppo_pack_prior_mode="sampled_topology",
+          ppo_pack_fixed_env_group_across_updates=False,
+          ppo_pack_sb3_reward_normalization_enabled=True,
+          ppo_pack_sb3_observation_normalization_enabled=True,
+          ppo_pack_sb3_observation_normalization_clip=10.0,
+          ppo_pack_sb3_observation_normalization_epsilon=1e-8,
+          ppo_pack_semantic_probes_enabled=True,
+          ppo_pack_semantic_probe_sidecar_enabled=False,
+          ppo_pack_semantic_probe_sidecar_every=1,
+          ppo_pack_checkpoint_every=0,
+          ppo_pack_checkpoint_include_optimizer=False,
+          ppo_pack_topology_state_gain_min=0.7,
+          ppo_pack_topology_action_gain_min=0.06,
+          ppo_pack_topology_state_to_action_ratio_max=10.0,
+          ppo_pack_topology_max_attempts=4096,
           ):
     del train_host_rss_limit_gib, train_host_rss_limit_poll_interval_sec, train_host_rss_limit_try_rlimit_as
     using_dist, rank, device = init_dist(device)
     rl_objective = str(rl_objective).strip().lower()
     if rl_objective not in {'supervised', 'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil', 'ppo'}:
         raise ValueError(f"Unknown rl_objective: {rl_objective}")
+    if (
+        rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}
+        and _looks_like_maintained_rlpfn_env_prior(env_prior)
+    ):
+        raise RuntimeError(
+            "Maintained RLPFN policy-gradient/ANIL paths are disabled because they are not "
+            "numerically tied to the trusted pack PPO runner and healthy sampled-topology prior. "
+            "Use rl_objective='ppo' with ppo_trusted_pack_runner_required=True."
+        )
     if rank == 0 and verbose:
         print(f'Using {device} device')
 
@@ -7497,21 +7947,26 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 "Policy GP projection timing profile:",
                 bool(profile_gp_projection_timing_env in {"1", "true", "yes", "on"}),
             )
-            transition_inner_grouping_env = str(
-                os.environ.get("TICL_POLICY_TRANSITION_INNER_GROUPING", "family")
-            ).strip().lower()
-            if transition_inner_grouping_env in {"", "1", "true", "yes", "on"}:
-                transition_inner_grouping_env = "structure"
-            elif transition_inner_grouping_env in {"0", "false", "no", "off"}:
-                transition_inner_grouping_env = "family"
-            print("Policy transition inner grouping:", transition_inner_grouping_env)
-            try:
-                transition_inner_min_bucket = int(
-                    max(0, int(os.environ.get("TICL_POLICY_TRANSITION_INNER_MIN_BUCKET", "0")))
-                )
-            except Exception:
-                transition_inner_min_bucket = 0
-            print("Policy transition inner min bucket:", transition_inner_min_bucket)
+            print(
+                "Policy transition inner grouping:",
+                str(getattr(env_prior, "transition_inner_grouping", "family")),
+            )
+            print(
+                "Policy transition inner min bucket:",
+                int(getattr(env_prior, "transition_inner_min_bucket", 0) or 0),
+            )
+            print(
+                "Policy reference SCM partition max bytes:",
+                int(getattr(env_prior, "reference_scm_partition_max_bytes", 0) or 0),
+            )
+            print(
+                "Policy reference SCM memory guard fraction:",
+                float(getattr(env_prior, "reference_scm_memory_guard_fraction", 0.0) or 0.0),
+            )
+            print(
+                "Policy transition generator rebuild each step:",
+                bool(getattr(env_prior, "transition_generator_rebuild_each_step", False)),
+            )
             try:
                 pg_phase_log_every_print = int(max(1, int(pg_phase_log_every_batches)))
             except Exception:
@@ -7658,7 +8113,10 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             env_backend = str(getattr(env_prior, "config", {}).get("batch_parallel_backend", "python_thread"))
             reward_transform_mode = str(getattr(env_prior, "config", {}).get("reinforce_reward_transform", "none")).strip().lower()
             action_transform_mode = str(getattr(env_prior, "config", {}).get("reinforce_action_transform", "none")).strip().lower()
-            print("Using strict official RecurrentPPO path with RWKV official rollout/train plumbing.")
+            if bool(ppo_trusted_pack_runner_required):
+                print("Using trusted canonical PPO pack runner with RWKV official train plumbing.")
+            else:
+                print("Using direct strict official RecurrentPPO path with RWKV official rollout/train plumbing.")
             print(
                 "PPO environment backend:",
                 env_backend,
@@ -7695,6 +8153,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     ppo_vec_env = None
     ppo_callback_started = False
     ppo_total_timesteps_target = None
+    ppo_pack_runner_active = False
+    ppo_pack_runner_state = None
     if rl_objective == "ppo":
         from ticl.sb3_recurrent_ppo import (
             build_recurrent_ppo,
@@ -7710,6 +8170,20 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         ppo_batch_envs = int(dl.batch_size)
         ppo_rollout_steps = int(dl.n_samples)
         ppo_num_features = int(dl.num_features)
+        if ppo_single_eval_pos is not None:
+            fixed_ppo_single_eval_pos = int(max(1, min(int(ppo_rollout_steps) - 1, int(ppo_single_eval_pos))))
+            original_sample_single_eval_pos = env_prior._sample_single_eval_pos
+
+            def _sample_fixed_ppo_single_eval_pos(n_samples_arg, single_eval_pos_arg=None):
+                del single_eval_pos_arg
+                return original_sample_single_eval_pos(int(n_samples_arg), fixed_ppo_single_eval_pos)
+
+            env_prior._sample_single_eval_pos = _sample_fixed_ppo_single_eval_pos
+            if rank == 0 and verbose:
+                print(
+                    "PPO strict compare fixed single_eval_pos:",
+                    int(fixed_ppo_single_eval_pos),
+                )
         ppo_n_envs, ppo_n_steps = _resolve_official_ppo_rollout_shape(
             batch_size=ppo_batch_envs,
             n_samples=ppo_rollout_steps,
@@ -7722,10 +8196,15 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             n_steps=ppo_n_steps,
             configured_batch_size=ppo_batch_size,
         )
+        ppo_pack_runner_active = bool(ppo_trusted_pack_runner_required)
         if rank == 0 and verbose:
             print(
-                "Using strict official RecurrentPPO with official RWKV rollout/train paths "
-                f"(n_envs={int(ppo_n_envs)}, n_steps={int(ppo_n_steps)}, "
+                (
+                    "Using trusted canonical PPO pack runner with official RWKV train path "
+                    if bool(ppo_pack_runner_active)
+                    else "Using strict official RecurrentPPO with official RWKV rollout/train paths "
+                )
+                + f"(n_envs={int(ppo_n_envs)}, n_steps={int(ppo_n_steps)}, "
                 f"batch_size={int(ppo_batch_size)})."
             )
             try:
@@ -7740,50 +8219,214 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 f"min_interval_sec={float(max(0.0, ppo_progress_min_interval_print)):.1f}",
                 f"log_file={pg_phase_log_file if (pg_phase_log_file is not None and str(pg_phase_log_file).strip() != '') else 'disabled'}",
             )
-        ppo_algo, ppo_callback, ppo_vec_env = build_recurrent_ppo(
-            model=model,
-            env_prior=env_prior,
-            device=device,
-            num_features=ppo_num_features,
-            n_envs=int(ppo_n_envs),
-            n_steps=int(ppo_n_steps),
-            learning_rate=learning_rate,
-            batch_size=int(ppo_batch_size),
-            n_epochs=int(ppo_n_epochs),
-            gamma=float(ppo_gamma),
-            gae_lambda=float(ppo_gae_lambda),
-            clip_range=ppo_clip_range,
-            clip_range_vf=ppo_clip_range_vf,
-            normalize_advantage=bool(ppo_normalize_advantage),
-            actor_gae_space=str(ppo_actor_gae_space),
-            actor_baseline_mode=str(ppo_actor_baseline_mode),
-            separate_value_backbone=bool(ppo_separate_value_backbone),
-            reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
-            runtime_normalized_q_value_weight_override=ppo_runtime_normalized_q_value_weight_override,
-            runtime_next_state_flow_matching_weight_override=ppo_runtime_next_state_flow_matching_weight_override,
-            ent_coef=float(ppo_ent_coef),
-            vf_coef=float(ppo_vf_coef),
-            max_grad_norm=float(ppo_max_grad_norm),
-            target_kl=ppo_target_kl,
-            verbose=int(verbose),
-        )
+        if bool(ppo_pack_runner_active):
+            if ppo_pack_output_dir is None or str(ppo_pack_output_dir).strip() == "":
+                raise RuntimeError(
+                    "Trusted RLPFN PPO requires ppo_pack_output_dir so pack progress, sidecars, and "
+                    "checkpoints cannot silently disappear. fit_model fills this automatically."
+                )
+            if str(ppo_space_contract).strip().lower() != "raw":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires ppo_space_contract='raw'.")
+            if ppo_clip_range_vf is not None:
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires ppo_clip_range_vf=None.")
+            if ppo_value_target_space is not None and str(ppo_value_target_space).strip().lower() != "raw":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires value_target_space None/raw.")
+            if ppo_actor_gae_space is not None and str(ppo_actor_gae_space).strip().lower() != "raw":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires actor_gae_space None/raw.")
+            if str(ppo_actor_baseline_mode).strip().lower() != "learned":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires actor_baseline_mode='learned'.")
+            if bool(ppo_allow_mixed_space_contract):
+                raise RuntimeError("Trusted RLPFN PPO pack runner forbids mixed PPO space contracts.")
+            if str(ppo_value_head_impl).strip().lower() != "vendor_official":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires vendor_official value head.")
+            if str(ppo_value_path_adapter_impl).strip().lower() != "none":
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires value_path_adapter_impl='none'.")
+            if bool(ppo_separate_value_backbone):
+                raise RuntimeError("Trusted RLPFN PPO pack runner forbids separate_value_backbone.")
+            if not bool(ppo_reset_env_state_at_sep):
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires reset_env_state_at_sep=True.")
+            if bool(ppo_strict_native_rollout):
+                raise RuntimeError("Trusted RLPFN PPO pack runner forbids the direct strict_native_rollout path.")
+            if bool(ppo_deterministic_actor_sampling):
+                raise RuntimeError("Trusted RLPFN PPO pack runner trains with stochastic actor sampling.")
+            if not bool(ppo_deterministic_batch_plan):
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires deterministic PPO minibatch ordering.")
+            if (
+                ppo_runtime_normalized_q_value_weight_override not in (None, 0, 0.0)
+                or ppo_runtime_next_state_flow_matching_weight_override not in (None, 0, 0.0)
+            ):
+                raise RuntimeError("Trusted RLPFN PPO pack runner forbids auxiliary PPO losses.")
+            if learning_rate is None:
+                raise RuntimeError("Trusted RLPFN PPO pack runner requires an explicit learning_rate.")
+            if ppo_env_rng_seeds is not None or ppo_rollout_rng_seeds is not None:
+                raise RuntimeError("Trusted RLPFN PPO pack runner uses pack env_seed plumbing, not direct PPO seed specs.")
+            import copy
+            from pathlib import Path
 
-        def _attach_validation_ppo_policy_handles(target, *, live_policy, saved_policy_state):
-            if target is None:
-                return
-            target.__dict__["_validation_sb3_policy_live"] = live_policy
-            target.__dict__["_validation_ppo_policy_state"] = saved_policy_state
-
-        validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
-        _attach_validation_ppo_policy_handles(model, live_policy=ppo_algo.policy, saved_policy_state=validation_ppo_policy_state)
-        module_target = getattr(model, "module", None)
-        if module_target is not None:
-            _attach_validation_ppo_policy_handles(
-                module_target,
-                live_policy=ppo_algo.policy,
-                saved_policy_state=validation_ppo_policy_state,
+            from ticl.analysis.phase2_gym_prior_pack_training_runner import (
+                _build_algo as _build_trusted_pack_algo,
+                _dump_fixed_prior_group_if_available,
             )
-        start_epoch = 1
+            from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout
+
+            env_cfg_for_pack = copy.deepcopy(getattr(env_prior, "config", {}) or {})
+            layout = resolve_rlpfn_token_layout(env_cfg_for_pack, num_features=int(ppo_num_features))
+            dim_probe_prior = EnvironmentPrior(copy.deepcopy(env_cfg_for_pack))
+            next_state_target_dim = int(
+                max(
+                    int(dim_probe_prior._resolve_dim_upper_bound(env_cfg_for_pack.get("state_dim", None), default=0)),
+                    1,
+                )
+            )
+            pack_cfg = {
+                "optimizer": {
+                    "ppo_gamma": float(ppo_gamma),
+                    "ppo_gae_lambda": float(ppo_gae_lambda),
+                    "ppo_clip_range": ppo_clip_range,
+                    "ppo_ent_coef": float(ppo_ent_coef),
+                    "ppo_max_grad_norm": float(ppo_max_grad_norm),
+                }
+            }
+            ppo_algo, ppo_vec_env = _build_trusted_pack_algo(
+                cfg=pack_cfg,
+                env_cfg=env_cfg_for_pack,
+                model_override=model,
+                frozen_h=None,
+                frozen_h_list=None,
+                frozen_h_list_env_seeds=None,
+                prior_mode=str(ppo_pack_prior_mode),
+                device_obj=torch.device(str(device)),
+                num_features=int(ppo_num_features),
+                n_envs=int(ppo_n_envs),
+                n_steps=int(ppo_n_steps),
+                build_seed=int(ppo_pack_seed),
+                fixed_single_eval_pos=None,
+                sb3_reward_normalization_enabled=bool(ppo_pack_sb3_reward_normalization_enabled),
+                sb3_observation_normalization_enabled=bool(ppo_pack_sb3_observation_normalization_enabled),
+                sb3_observation_normalization_clip=float(ppo_pack_sb3_observation_normalization_clip),
+                sb3_observation_normalization_epsilon=float(ppo_pack_sb3_observation_normalization_epsilon),
+                gain_min=float(ppo_pack_topology_state_gain_min),
+                topology_state_gain_min=float(ppo_pack_topology_state_gain_min),
+                topology_action_gain_min=float(ppo_pack_topology_action_gain_min),
+                topology_state_to_action_ratio_max=float(ppo_pack_topology_state_to_action_ratio_max),
+                topology_max_attempts=int(ppo_pack_topology_max_attempts),
+                fixed_env_group_across_updates=bool(ppo_pack_fixed_env_group_across_updates),
+                ppo_learning_rate=float(learning_rate),
+                ppo_batch_size=int(ppo_batch_size),
+                ppo_n_epochs=int(ppo_n_epochs),
+                ppo_vf_coef=float(ppo_vf_coef),
+                ppo_normalize_advantage=bool(ppo_normalize_advantage),
+                ppo_target_kl=ppo_target_kl,
+            )
+            pack_output_dir = Path(str(ppo_pack_output_dir)).expanduser().resolve()
+            pack_output_dir.mkdir(parents=True, exist_ok=True)
+            ppo_pack_runner_state = {
+                "output_dir": pack_output_dir,
+                "progress_path": pack_output_dir / "prior_progress.jsonl",
+                "fixed_group_dump": _dump_fixed_prior_group_if_available(
+                    vec_env=ppo_vec_env,
+                    output_dir=pack_output_dir,
+                    arm="prior",
+                ),
+                "num_features": int(ppo_num_features),
+                "obs_slot_dim": int(layout["obs_slot_dim"]),
+                "action_slot_dim": int(layout["action_slot_dim"]),
+                "next_state_target_dim": int(next_state_target_dim),
+                "n_envs": int(ppo_n_envs),
+                "n_steps": int(ppo_n_steps),
+                "single_eval_pos": None if ppo_single_eval_pos is None else int(ppo_single_eval_pos),
+                "terminal_token_enabled": bool(layout["terminal_token_enabled"]),
+            }
+            validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
+            model.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
+            model.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
+            module_target = getattr(model, "module", None)
+            if module_target is not None:
+                module_target.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
+                module_target.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
+            start_epoch = 1
+        else:
+            if bool(ppo_trusted_pack_runner_required):
+                raise RuntimeError("Internal error: trusted PPO pack runner was required but not activated.")
+            looks_like_maintained_rlpfn = _looks_like_maintained_rlpfn_env_prior(env_prior)
+            if bool(looks_like_maintained_rlpfn):
+                raise RuntimeError(
+                    "Direct RLPFN PPO collect_rollouts is forbidden by default because it bypasses the "
+                    "pack trainer obs/reward VecNorm, sidecar, and checkpoint semantics. Use "
+                    "ppo_trusted_pack_runner_required=True."
+                )
+            if rank == 0 and verbose:
+                print(
+                    "[ppo-direct-warning] direct RecurrentPPO collect_rollouts is not the maintained RLPFN pack path. "
+                    "Keep ppo_trusted_pack_runner_required=True for trusted RLPFN training."
+                )
+            ppo_build_kwargs, ppo_runtime_summary = _resolve_recurrent_ppo_training_bridge_kwargs(
+                model=model,
+                env_prior=env_prior,
+                device=device,
+                num_features=ppo_num_features,
+                n_envs=int(ppo_n_envs),
+                n_steps=int(ppo_n_steps),
+                learning_rate=learning_rate,
+                batch_size=int(ppo_batch_size),
+                n_epochs=int(ppo_n_epochs),
+                gamma=float(ppo_gamma),
+                gae_lambda=float(ppo_gae_lambda),
+                clip_range=ppo_clip_range,
+                clip_range_vf=ppo_clip_range_vf,
+                normalize_advantage=bool(ppo_normalize_advantage),
+                space_contract=str(ppo_space_contract),
+                value_target_space=ppo_value_target_space,
+                actor_gae_space=ppo_actor_gae_space,
+                allow_mixed_space_contract=bool(ppo_allow_mixed_space_contract),
+                actor_baseline_mode=str(ppo_actor_baseline_mode),
+                separate_value_backbone=bool(ppo_separate_value_backbone),
+                reset_env_state_at_sep=bool(ppo_reset_env_state_at_sep),
+                value_head_impl=str(ppo_value_head_impl),
+                value_path_adapter_impl=str(ppo_value_path_adapter_impl),
+                value_head_mlp_hidden_dim=int(ppo_value_head_mlp_hidden_dim),
+                runtime_normalized_q_value_weight_override=ppo_runtime_normalized_q_value_weight_override,
+                runtime_next_state_flow_matching_weight_override=ppo_runtime_next_state_flow_matching_weight_override,
+                ent_coef=float(ppo_ent_coef),
+                vf_coef=float(ppo_vf_coef),
+                max_grad_norm=float(ppo_max_grad_norm),
+                target_kl=ppo_target_kl,
+                verbose=int(verbose),
+                ppo_restore_validation_policy_state=ppo_restore_validation_policy_state,
+                ppo_strict_fixed_env_mode=ppo_strict_fixed_env_mode,
+                ppo_env_rng_seeds=ppo_env_rng_seeds,
+                ppo_rollout_rng_seeds=ppo_rollout_rng_seeds,
+                ppo_deterministic_actor_sampling=ppo_deterministic_actor_sampling,
+                ppo_deterministic_batch_plan=ppo_deterministic_batch_plan,
+                ppo_strict_native_rollout=ppo_strict_native_rollout,
+            )
+            if rank == 0 and verbose:
+                print(
+                    "PPO runtime bridge:",
+                    f"restore_validation_policy_state={bool(ppo_runtime_summary['restore_validation_policy_state'])}",
+                    f"strict_native_rollout={bool(ppo_runtime_summary['strict_native_rollout'])}",
+                    f"strict_fixed_env_mode={bool(ppo_runtime_summary['strict_fixed_env_mode'])}",
+                    f"deterministic_actor_sampling={bool(ppo_runtime_summary['deterministic_actor_sampling'])}",
+                    f"deterministic_batch_plan={bool(ppo_runtime_summary['deterministic_batch_plan'])}",
+                )
+            ppo_algo, ppo_callback, ppo_vec_env = build_recurrent_ppo(**ppo_build_kwargs)
+
+            def _attach_validation_ppo_policy_handles(target, *, live_policy, saved_policy_state):
+                if target is None:
+                    return
+                target.__dict__["_validation_sb3_policy_live"] = live_policy
+                target.__dict__["_validation_ppo_policy_state"] = saved_policy_state
+
+            validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
+            _attach_validation_ppo_policy_handles(model, live_policy=ppo_algo.policy, saved_policy_state=validation_ppo_policy_state)
+            module_target = getattr(model, "module", None)
+            if module_target is not None:
+                _attach_validation_ppo_policy_handles(
+                    module_target,
+                    live_policy=ppo_algo.policy,
+                    saved_policy_state=validation_ppo_policy_state,
+                )
+            start_epoch = 1
     else:
         adamw_kwargs = dict(lr=learning_rate, weight_decay=weight_decay, betas=(adam_beta1, 0.999))
         if bool(adamw_fused) and ("cuda" in str(device)):
@@ -7861,15 +8504,30 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
         setattr(ppo_algo, "_rwkv_progress_log_file", pg_phase_log_file_rank0)
     if stop_after_epochs is not None:
         epochs = min(epochs, stop_after_epochs)
-    if rl_objective == "ppo" and ppo_algo is not None:
+    if rl_objective == "ppo" and ppo_algo is not None and not bool(ppo_pack_runner_active):
         ppo_total_timesteps_target = int(max(1, epochs)) * int(ppo_algo.n_envs) * int(ppo_algo.n_steps)
-        ppo_total_timesteps_target, ppo_callback = ppo_algo._setup_learn(
-            int(ppo_total_timesteps_target),
-            callback=ppo_callback,
-            reset_num_timesteps=True,
-            tb_log_name="ppo",
-            progress_bar=False,
-        )
+        ppo_vec_env = getattr(ppo_algo, "env", None)
+        ppo_setup_reset_stub_enabled = False
+        if hasattr(ppo_vec_env, "enable_direct_collect_reset_stub"):
+            # The RWKV PPO collect path below bypasses VecEnv.step_wait and
+            # samples the real exact-SCM rollout batch itself. SB3 still
+            # performs a mandatory reset inside _setup_learn(); building the
+            # full transition generator there is dead work and can consume
+            # tens of GiB at 2048x2048. Limit the stub to this reset only so
+            # normal VecEnv reset/action-mask semantics stay intact elsewhere.
+            ppo_vec_env.enable_direct_collect_reset_stub(True)
+            ppo_setup_reset_stub_enabled = True
+        try:
+            ppo_total_timesteps_target, ppo_callback = ppo_algo._setup_learn(
+                int(ppo_total_timesteps_target),
+                callback=ppo_callback,
+                reset_num_timesteps=True,
+                tb_log_name="ppo",
+                progress_bar=False,
+            )
+        finally:
+            if ppo_setup_reset_stub_enabled:
+                ppo_vec_env.enable_direct_collect_reset_stub(False)
         ppo_callback.on_training_start(locals(), globals())
         ppo_callback_started = True
     if "cuda" in device:
@@ -7892,13 +8550,32 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 gpu_start_time.record()
             
             if rl_objective == 'ppo':
-                new_loss, nan_share, ignore_share = train_epoch_official_recurrent_ppo(
-                    model=model,
-                    ppo_algo=ppo_algo,
-                    ppo_callback=ppo_callback,
-                    ppo_total_timesteps_target=int(ppo_total_timesteps_target),
-                    epoch_idx=epoch,
-                )
+                if bool(ppo_pack_runner_active):
+                    if ppo_pack_runner_state is None:
+                        raise RuntimeError("Trusted PPO pack runner is active but its runner state was not initialized.")
+                    new_loss, nan_share, ignore_share = train_epoch_trusted_pack_recurrent_ppo(
+                        model=model,
+                        ppo_algo=ppo_algo,
+                        ppo_vec_env=ppo_vec_env,
+                        ppo_pack_runner_state=ppo_pack_runner_state,
+                        epoch_idx=int(epoch),
+                        total_epochs=int(epochs),
+                        seed=int(ppo_pack_seed),
+                        fixed_env_group_across_updates=bool(ppo_pack_fixed_env_group_across_updates),
+                        semantic_probes_enabled=bool(ppo_pack_semantic_probes_enabled),
+                        semantic_probe_sidecar_enabled=bool(ppo_pack_semantic_probe_sidecar_enabled),
+                        semantic_probe_sidecar_every=int(ppo_pack_semantic_probe_sidecar_every),
+                        checkpoint_every=int(ppo_pack_checkpoint_every),
+                        checkpoint_include_optimizer=bool(ppo_pack_checkpoint_include_optimizer),
+                    )
+                else:
+                    new_loss, nan_share, ignore_share = train_epoch_official_recurrent_ppo(
+                        model=model,
+                        ppo_algo=ppo_algo,
+                        ppo_callback=ppo_callback,
+                        ppo_total_timesteps_target=int(ppo_total_timesteps_target),
+                        epoch_idx=epoch,
+                    )
             elif rl_objective in {'policy_gradient', 'first_policy_gradient', 'reinforce', 'alpha_grad', 'anil'}:
                 new_loss, nan_share, ignore_share = train_epoch_policy_gradient(
                     model=model,

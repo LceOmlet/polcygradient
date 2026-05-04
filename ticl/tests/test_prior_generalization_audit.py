@@ -171,6 +171,7 @@ def test_run_prior_generalization_audit_zero_policy_core_a_smoke():
         heldout_suite_seed=202,
         core_a=True,
         reference_semantics_enabled=False,
+        rollout_backend="serial",
     )
 
     assert report["audit_entry"] == "prior_generalization_audit"
@@ -178,6 +179,29 @@ def test_run_prior_generalization_audit_zero_policy_core_a_smoke():
     assert report["train_suite"]["metrics"]["batch_size"] == 3
     assert report["heldout_suite"]["metrics"]["batch_size"] == 3
     assert math.isfinite(report["comparison"]["heldout_minus_train_suffix_return_mean"])
+
+
+def test_run_prior_generalization_audit_cross_env_family_requires_opt_in():
+    try:
+        run_prior_generalization_audit(
+            checkpoint_path=None,
+            policy_mode="zero",
+            device="cpu",
+            n_samples=24,
+            num_features=434,
+            single_eval_pos=12,
+            train_suite_batch_size=3,
+            heldout_suite_batch_size=3,
+            train_suite_seed=101,
+            heldout_suite_seed=202,
+            core_a=True,
+            reference_semantics_enabled=False,
+            rollout_backend="family_vectorized",
+        )
+    except ValueError as exc:
+        assert "rollout_backend='serial'" in str(exc)
+    else:
+        raise AssertionError("expected cross_env family_vectorized to require explicit opt-in")
 
 
 def test_run_prior_generalization_audit_zero_policy_same_env_smoke():

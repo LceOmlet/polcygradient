@@ -22,12 +22,16 @@ def resolve_scalar(value):
 
 
 def resolve_strict_joint_transition_enabled(h):
-    enabled = h.get("strict_joint_transition_enabled", False)
-    return bool(coerce_bool(enabled))
+    del h
+    return True
 
 
 def resolve_reference_semantics_enabled(h):
     return resolve_strict_joint_transition_enabled(h)
+
+
+def resolve_reference_state_inertia_enabled(h):
+    return bool(coerce_bool(h.get("reference_state_inertia_enabled", False)))
 
 
 def env_uses_reference_semantics(env):
@@ -40,6 +44,8 @@ def env_uses_reference_semantics(env):
 
 def transition_reference_mode(family, reference_semantics_enabled, gp_forward_mode=None):
     family_str = str(family)
+    if family_str == "scm":
+        return "scm_exact"
     if family_str == "gp" and bool(reference_semantics_enabled):
         mode = str(gp_forward_mode or "exact").strip().lower()
         if mode == "fixed_cost":
@@ -270,8 +276,6 @@ def finalize_env_semantics_summary(acc):
         modes.append("gp_exact")
     if int(summary.get("fixed_gp_count", 0) or 0) > 0:
         modes.append("gp_fixed_cost")
-    if int(summary.get("legacy_scm_count", 0) or 0) > 0:
-        modes.append("scm_legacy")
     if int(summary.get("legacy_gp_count", 0) or 0) > 0:
         modes.append("gp_legacy")
     if len(modes) == 1:
@@ -325,10 +329,7 @@ def summarize_env_semantics(env, batch_size):
     for family, reference_enabled, gp_mode in zip(families, references, gp_modes):
         family_str = str(family)
         if family_str == "scm":
-            if reference_enabled:
-                exact_scm_count += 1
-            else:
-                legacy_scm_count += 1
+            exact_scm_count += 1
         elif family_str == "gp":
             if reference_enabled:
                 if str(gp_mode).strip().lower() == "fixed_cost":

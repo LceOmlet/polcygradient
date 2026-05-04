@@ -105,15 +105,177 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.orchestration.rl_validate_max_parallel_columns == 96
 
 
-def test_rlpfn_parser_defaults_match_current_perf_defaults():
+def test_rlpfn_parser_accepts_legacy_ppo_compare_knobs():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rl-objective", "ppo",
+            "-b", "1",
+            "-n", "256",
+            "--ppo-batch-size", "256",
+            "--ppo-n-epochs", "1",
+            "--ppo-gamma", "0.98",
+            "--ppo-gae-lambda", "0.90",
+            "--ppo-clip-range", "0.2",
+            "--ppo-normalize-advantage", "false",
+            "--ppo-space-contract", "normalized",
+            "--ppo-value-head-impl", "vendor_official",
+            "--ppo-value-path-adapter-impl", "none",
+            "--ppo-value-head-mlp-hidden-dim", "256",
+            "--ppo-vf-coef", "0.1",
+            "--ppo-target-kl", "0.03",
+            "--ppo-single-eval-pos", "64",
+            "--seed-everything-value", "4040",
+            "--fixed-frozen-h-json", "/tmp/full_frozen_h.json",
+            "--reward-state-input-gain-fraction-rejection-min", "0.7",
+            "--reward-state-input-gain-fraction-rejection-max-tries", "256",
+            "--reward-state-input-gain-fraction-conditioned-sampling-enabled", "true",
+            "--reward-state-input-gain-fraction-conditioned-min", "0.7",
+            "--reward-topology-conditioned-sampling-enabled", "true",
+            "--reward-action-input-gain-fraction-conditioned-min", "0.06",
+            "--reward-state-to-action-gain-ratio-conditioned-max", "15",
+            "--reward-topology-conditioned-sampling-max-attempts", "512",
+            "--transition-inner-grouping", "structure",
+            "--transition-inner-min-bucket", "0",
+            "--reference-scm-partition-max-bytes", "134217728",
+            "--reference-scm-memory-guard-fraction", "0.125",
+            "--transition-generator-rebuild-each-step", "true",
+            "--prior-mlp-activations", "sin",
+        ]
+    )
+
+    assert args.dataloader.batch_size == 1
+    assert args.dataloader.num_steps == 256
+    assert args.optimizer.rl_objective == "ppo"
+    assert args.optimizer.ppo_batch_size == 256
+    assert args.optimizer.ppo_n_epochs == 1
+    assert args.optimizer.ppo_gamma == 0.98
+    assert args.optimizer.ppo_gae_lambda == 0.90
+    assert args.optimizer.ppo_clip_range == 0.2
+    assert args.optimizer.ppo_normalize_advantage is False
+    assert args.optimizer.ppo_space_contract == "normalized"
+    assert args.optimizer.ppo_value_head_impl == "vendor_official"
+    assert args.optimizer.ppo_value_path_adapter_impl == "none"
+    assert args.optimizer.ppo_value_head_mlp_hidden_dim == 256
+    assert args.optimizer.ppo_vf_coef == 0.1
+    assert args.optimizer.ppo_target_kl == 0.03
+    assert args.optimizer.ppo_single_eval_pos == 64
+    assert args.orchestration.seed_everything_value == 4040
+    assert args.prior.environment.fixed_frozen_h_json == "/tmp/full_frozen_h.json"
+    assert args.prior.environment.reward_state_input_gain_fraction_rejection_min == 0.7
+    assert args.prior.environment.reward_state_input_gain_fraction_rejection_max_tries == 256
+    assert args.prior.environment.reward_state_input_gain_fraction_conditioned_sampling_enabled is True
+    assert args.prior.environment.reward_state_input_gain_fraction_conditioned_min == 0.7
+    assert args.prior.environment.reward_topology_conditioned_sampling_enabled is True
+    assert args.prior.environment.reward_action_input_gain_fraction_conditioned_min == 0.06
+    assert args.prior.environment.reward_state_to_action_gain_ratio_conditioned_max == 15
+    assert args.prior.environment.reward_topology_conditioned_sampling_max_attempts == 512
+    assert args.prior.environment.transition_inner_grouping == "structure"
+    assert args.prior.environment.transition_inner_min_bucket == 0
+    assert args.prior.environment.reference_scm_partition_max_bytes == 134217728
+    assert args.prior.environment.reference_scm_memory_guard_fraction == 0.125
+    assert args.prior.environment.transition_generator_rebuild_each_step is True
+    assert args.prior.environment.prior_mlp_activations == "sin"
+
+
+def test_rlpfn_parser_defaults_match_legacy_ppo_mainline_defaults():
     parser = make_model_level_argparser()
     args = parser.parse_args(["rlpfn"])
     cfg = get_model_default_config("rlpfn")
 
     assert args.prior.n_samples == 2048
+    assert args.dataloader.batch_size == 2048
     assert args.dataloader.num_steps == 4
     assert args.orchestration.save_every == 1
+    assert args.orchestration.seed_everything_value is None
+    assert args.orchestration.rlpfn_anchor_compare_contract is False
+    assert args.optimizer.learning_rate == pytest.approx(2e-4)
+    assert args.optimizer.ppo_batch_size == 256
+    assert args.optimizer.ppo_n_epochs == 4
+    assert args.optimizer.ppo_normalize_advantage is True
+    assert args.optimizer.ppo_space_contract == "raw"
+    assert args.optimizer.ppo_target_kl is None
+    assert args.optimizer.ppo_deterministic_batch_plan is True
+    assert args.optimizer.ppo_strict_native_rollout is False
+    assert args.optimizer.ppo_reset_env_state_at_sep is True
+    assert args.optimizer.ppo_value_head_impl == "vendor_official"
+    assert args.optimizer.ppo_value_path_adapter_impl == "none"
+    assert args.optimizer.ppo_value_head_mlp_hidden_dim == 256
+    assert args.optimizer.ppo_actor_baseline_mode == "learned"
+    assert args.optimizer.ppo_vf_coef == pytest.approx(0.1)
+    assert args.optimizer.ppo_trusted_pack_runner_required is True
+    assert args.optimizer.ppo_pack_prior_mode == "sampled_topology"
+    assert args.optimizer.ppo_pack_fixed_env_group_across_updates is False
+    assert args.optimizer.ppo_pack_sb3_reward_normalization_enabled is True
+    assert args.optimizer.ppo_pack_sb3_observation_normalization_enabled is True
+    assert args.optimizer.ppo_pack_semantic_probe_sidecar_enabled is False
+    assert args.optimizer.ppo_pack_checkpoint_every == 0
+    assert cfg["optimizer"]["learning_rate"] == pytest.approx(2e-4)
+    assert cfg["optimizer"]["ppo_batch_size"] == 256
     assert cfg["optimizer"]["ppo_n_epochs"] == 4
+    assert cfg["optimizer"]["ppo_gamma"] == pytest.approx(0.98)
+    assert cfg["optimizer"]["ppo_gae_lambda"] == pytest.approx(0.90)
+    assert cfg["optimizer"]["ppo_clip_range"] == pytest.approx(0.2)
+    assert cfg["optimizer"]["ppo_clip_range_vf"] is None
+    assert cfg["optimizer"]["ppo_normalize_advantage"] is True
+    assert cfg["optimizer"]["ppo_space_contract"] == "raw"
+    assert cfg["optimizer"]["ppo_target_kl"] is None
+    assert cfg["optimizer"]["ppo_deterministic_batch_plan"] is True
+    assert cfg["optimizer"]["ppo_strict_native_rollout"] is False
+    assert cfg["optimizer"]["ppo_reset_env_state_at_sep"] is True
+    assert cfg["optimizer"]["ppo_value_head_impl"] == "vendor_official"
+    assert cfg["optimizer"]["ppo_value_path_adapter_impl"] == "none"
+    assert cfg["optimizer"]["ppo_value_head_mlp_hidden_dim"] == 256
+    assert cfg["optimizer"]["ppo_actor_baseline_mode"] == "learned"
+    assert cfg["optimizer"]["ppo_vf_coef"] == pytest.approx(0.1)
+    assert cfg["optimizer"]["ppo_runtime_normalized_q_value_weight_override"] == pytest.approx(0.0)
+    assert cfg["optimizer"]["ppo_runtime_next_state_flow_matching_weight_override"] == pytest.approx(0.0)
+    assert cfg["optimizer"]["ppo_trusted_pack_runner_required"] is True
+    assert cfg["optimizer"]["ppo_pack_prior_mode"] == "sampled_topology"
+    assert cfg["optimizer"]["ppo_pack_fixed_env_group_across_updates"] is False
+    assert cfg["optimizer"]["ppo_pack_topology_state_gain_min"] == pytest.approx(0.7)
+    assert cfg["optimizer"]["ppo_pack_topology_action_gain_min"] == pytest.approx(0.06)
+    assert cfg["optimizer"]["ppo_pack_topology_state_to_action_ratio_max"] == pytest.approx(10.0)
+    assert cfg["optimizer"]["ppo_pack_topology_max_attempts"] == 4096
+    assert cfg["optimizer"]["ppo_restore_validation_policy_state"] is None
+    assert cfg["optimizer"]["ppo_single_eval_pos"] is None
+
+
+def test_rlpfn_parser_accepts_ppo_anchor_bridge_flags():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--ppo-restore-validation-policy-state", "true",
+            "--ppo-strict-fixed-env-mode", "true",
+            "--ppo-env-rng-seeds", "101,202",
+            "--ppo-rollout-rng-seeds", "[303, 404]",
+            "--ppo-deterministic-actor-sampling", "true",
+            "--ppo-deterministic-batch-plan", "true",
+            "--ppo-strict-native-rollout", "true",
+        ]
+    )
+
+    assert args.optimizer.ppo_restore_validation_policy_state is True
+    assert args.optimizer.ppo_strict_fixed_env_mode is True
+    assert args.optimizer.ppo_env_rng_seeds == "101,202"
+    assert args.optimizer.ppo_rollout_rng_seeds == "[303, 404]"
+    assert args.optimizer.ppo_deterministic_actor_sampling is True
+    assert args.optimizer.ppo_deterministic_batch_plan is True
+    assert args.optimizer.ppo_strict_native_rollout is True
+
+
+def test_rlpfn_parser_accepts_anchor_compare_contract_flag():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--rlpfn-anchor-compare-contract", "true",
+        ]
+    )
+
+    assert args.orchestration.rlpfn_anchor_compare_contract is True
 
 def test_rlpfn_parser_refreshes_split_dims_when_terminal_flag_changes():
     parser = make_model_level_argparser()
@@ -356,12 +518,21 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
     assert cfg["optimizer"]["rl_objective"] == "ppo"
+    assert cfg["optimizer"]["ppo_batch_size"] == 256
     assert cfg["optimizer"]["ppo_n_epochs"] == 4
+    assert cfg["optimizer"]["ppo_normalize_advantage"] is True
+    assert cfg["optimizer"]["ppo_space_contract"] == "raw"
+    assert cfg["optimizer"]["ppo_target_kl"] is None
+    assert cfg["optimizer"]["ppo_value_head_impl"] == "vendor_official"
+    assert cfg["optimizer"]["ppo_vf_coef"] == pytest.approx(0.1)
+    assert cfg["optimizer"]["ppo_trusted_pack_runner_required"] is True
+    assert cfg["optimizer"]["ppo_pack_prior_mode"] == "sampled_topology"
     assert cfg["transformer"]["backbone"] == "rwkv7"
     assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
     assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
     assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["prior"]["n_samples"] == 2048
+    assert cfg["dataloader"]["batch_size"] == 2048
     assert cfg["dataloader"]["num_steps"] == 4
     assert cfg["prior"]["environment"]["family"] == {
         "distribution": "meta_choice",
@@ -374,10 +545,16 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["state_input_scale"] == 1.0
     assert cfg["prior"]["environment"]["scm_standard_linear_init_enabled"] is True
     assert cfg["prior"]["environment"]["state_full_rms_enabled"] is True
+    assert cfg["prior"]["environment"]["reward_topology_conditioned_sampling_enabled"] is True
+    assert cfg["prior"]["environment"]["reward_state_input_gain_fraction_conditioned_min"] == pytest.approx(0.7)
+    assert cfg["prior"]["environment"]["reward_action_input_gain_fraction_conditioned_min"] == pytest.approx(0.06)
+    assert cfg["prior"]["environment"]["reward_state_to_action_gain_ratio_conditioned_max"] == pytest.approx(10.0)
+    assert cfg["prior"]["environment"]["reward_topology_conditioned_sampling_max_attempts"] == 4096
     assert cfg["prior"]["environment"]["reinforce_scale_advantages_by_suffix_episode_count"] is True
     assert cfg["prior"]["environment"]["policy_gradient_weight"] == 0.4
+    assert cfg["prior"]["environment"]["reinforce_aux_enabled"] is False
     assert cfg["prior"]["environment"]["normalized_q_value_weight"] == 0.0
-    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 0.2
+    assert cfg["prior"]["environment"]["next_state_flow_matching_weight"] == 0.0
     assert cfg["prior"]["environment"]["next_state_flow_head_type"] == "rwkv_two_layer"
     assert cfg["prior"]["environment"]["state_full_rms_target"] == 1.0
     assert cfg["prior"]["environment"]["ctrl_reward_weight"] == {
@@ -388,7 +565,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
     assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
-    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_enabled"] is True
     assert cfg["prior"]["environment"]["pg_markov_adjacent_replay_sample_prob"] == 0.5
@@ -399,7 +576,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
         "min": 0.0,
         "max": 2.0,
     }
-    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "clip"
+    assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_action_clip_bound"] == 5.0
     assert cfg["prior"]["environment"]["reinforce_normalize_advantages"] is True
@@ -909,6 +1086,58 @@ def test_main_continue_run_applies_extra_config_after_resume_config(tmp_path, mo
     assert cfg["optimizer"]["ppo_reset_env_state_at_sep"] is True
 
 
+def test_main_extra_fast_test_preserves_rwkv_head_size_contract(monkeypatch):
+    captured = {}
+
+    def _fake_init_device(gpu_id, use_cpu):
+        del gpu_id, use_cpu
+        return "cpu", 0, 1
+
+    def _fake_guard(**kwargs):
+        del kwargs
+        return None, {"enabled": False}
+
+    def _fake_model_string(config, num_gpus, device, parser):
+        del config, num_gpus, device, parser
+        return "extra_fast_test_model"
+
+    def _fake_callback(*args, **kwargs):
+        del args, kwargs
+        return lambda *cb_args, **cb_kwargs: None
+
+    def _fake_get_model(config, device, should_train=True, **kwargs):
+        del device, should_train, kwargs
+        captured["config"] = config
+        return 0.0, object(), None, 0
+
+    monkeypatch.setattr(fit_model_mod, "init_device", _fake_init_device)
+    monkeypatch.setattr(fit_model_mod, "install_host_rss_limit_guard", _fake_guard)
+    monkeypatch.setattr(fit_model_mod, "get_model_string", _fake_model_string)
+    monkeypatch.setattr(fit_model_mod, "make_training_callback", _fake_callback)
+    monkeypatch.setattr(fit_model_mod, "get_model", _fake_get_model)
+
+    main(
+        [
+            "rlpfn",
+            "-C",
+            "--extra-fast-test",
+            "--validate", "false",
+            "--rl-validate-enabled", "false",
+        ],
+        extra_config={
+            "transformer": {
+                "emsize": 32,
+                "rwkv_head_size": 64,
+                "backbone": "rwkv7",
+            },
+        },
+    )
+
+    cfg = captured["config"]
+    assert cfg["transformer"]["emsize"] == 64
+    assert cfg["transformer"]["nhead"] == 1
+
+
 def test_main_continue_run_clears_stale_pg_phase_log_file_when_not_explicit(tmp_path, monkeypatch):
     ckpt_path = tmp_path / "resume_test.cpkt"
     parser = make_model_level_argparser()
@@ -959,7 +1188,7 @@ def test_main_continue_run_clears_stale_pg_phase_log_file_when_not_explicit(tmp_
     )
 
     cfg = captured["config"]
-    assert cfg["optimizer"]["pg_phase_log_file"] == "./log/resume_test_model.log"
+    assert cfg["optimizer"]["pg_phase_log_file"] == ""
 
 
 def test_continue_run_cli_override_applies_train_profiler_flags():

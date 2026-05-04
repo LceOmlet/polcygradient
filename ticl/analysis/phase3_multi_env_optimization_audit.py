@@ -15,7 +15,8 @@ if __package__ in (None, ""):
     sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from ticl.analysis.phase2_guardrail import (
-    DEFAULT_PHASE2_SUMMARY,
+    TRUSTED_PHASE2_LAUNCH_SUMMARY,
+    assert_phase2_launch_chain_green,
     assert_phase2_green,
 )
 from ticl.analysis.critic_free_single_env_audit import (
@@ -276,6 +277,7 @@ def _make_policy_bundle_contract(
     rollout_backend: str,
     profile_cfg: dict[str, Any],
     strict_native_rollout: bool,
+    restore_validation_policy_head_state: bool = False,
 ) -> dict[str, Any]:
     return {
         "checkpoint_path": str(Path(checkpoint_path).expanduser().resolve()),
@@ -297,6 +299,7 @@ def _make_policy_bundle_contract(
         "ppo_reset_env_state_at_sep": bool(profile_cfg["reset_env_state_at_sep"]),
         "ppo_separate_value_backbone": bool(profile_cfg["separate_value_backbone"]),
         "ppo_restore_validation_policy_state": bool(profile_cfg["restore_validation_policy_state"]),
+        "ppo_restore_validation_policy_head_state": bool(restore_validation_policy_head_state),
         "strict_native_rollout": bool(strict_native_rollout),
     }
 
@@ -338,6 +341,7 @@ def _load_post_policy_bundle(
     rollout_backend: str,
     profile_cfg: dict[str, Any],
     strict_native_rollout: bool,
+    restore_validation_policy_head_state: bool = False,
 ) -> dict[str, Any]:
     resolved = str(Path(bundle_path).expanduser().resolve())
     payload = torch.load(resolved, map_location="cpu", weights_only=False)
@@ -353,9 +357,13 @@ def _load_post_policy_bundle(
         rollout_backend=rollout_backend,
         profile_cfg=profile_cfg,
         strict_native_rollout=bool(strict_native_rollout),
+        restore_validation_policy_head_state=bool(restore_validation_policy_head_state),
     )
     for key, expected_value in expected_contract.items():
-        observed_value = observed_contract.get(key, None)
+        if key == "ppo_restore_validation_policy_head_state":
+            observed_value = observed_contract.get(key, False)
+        else:
+            observed_value = observed_contract.get(key, None)
         if observed_value != expected_value:
             raise ValueError(
                 f"Post-policy bundle mismatch for {key}: observed={observed_value!r}, expected={expected_value!r}"
@@ -392,7 +400,7 @@ def _resolve_train_profile(
             "learning_rate": float(learning_rate) if learning_rate is not None else 2e-4,
             "target_kl": float(target_kl) if target_kl is not None else 0.03,
             "normalize_advantage": False,
-            "actor_gae_space": "normalized",
+            "actor_gae_space": "raw",
             "actor_baseline_mode": "learned",
             "actor_objective_mode": "tokenwise",
             "reset_env_state_at_sep": True,
@@ -400,6 +408,7 @@ def _resolve_train_profile(
             "runtime_normalized_q_value_weight_override": None,
             "runtime_next_state_flow_matching_weight_override": None,
             "vf_coef": 0.5,
+            "strict_native_rollout": False,
             "restore_validation_policy_state": False,
         }
     if profile == "trusted_sep_reset_mainline":
@@ -418,6 +427,7 @@ def _resolve_train_profile(
             "runtime_normalized_q_value_weight_override": None,
             "runtime_next_state_flow_matching_weight_override": None,
             "vf_coef": 0.5,
+            "strict_native_rollout": True,
             "restore_validation_policy_state": True,
         }
     if profile == "legacy_actor_only_probe":
@@ -436,9 +446,22 @@ def _resolve_train_profile(
             "runtime_normalized_q_value_weight_override": 0.0,
             "runtime_next_state_flow_matching_weight_override": 0.0,
             "vf_coef": 0.0,
+            "strict_native_rollout": True,
             "restore_validation_policy_state": True,
         }
     raise ValueError(f"Unsupported train_profile={train_profile!r}")
+
+
+def _read_snapshot_target_match_count(snapshot_path: str | None) -> int | None:
+    if snapshot_path in {None, ""}:
+        return None
+    resolved = Path(str(snapshot_path)).expanduser().resolve()
+    if not resolved.exists():
+        return None
+    payload = json.loads(resolved.read_text(encoding="utf-8"))
+    if str(payload.get("snapshot_entry", "")) != "phase3_train_outer_batch_snapshot":
+        raise RuntimeError(f"Unexpected train outer-batch snapshot payload at {resolved}")
+    return int(payload.get("snapshot_target_match_count", 0))
 
 
 def run_phase3_multi_env_optimization_audit(
@@ -456,7 +479,7 @@ def run_phase3_multi_env_optimization_audit(
     target_kl: float | None = None,
     rollout_backend: str = "serial",
     train_profile: str = "phase2_shared_backbone_contract",
-    phase2_summary_path: str = DEFAULT_PHASE2_SUMMARY,
+    phase2_summary_path: str = TRUSTED_PHASE2_LAUNCH_SUMMARY,
     reuse_zero_control_json: str | None = None,
     reuse_pre_policy_json: str | None = None,
     save_post_policy_bundle_path: str | None = None,
@@ -465,6 +488,7 @@ def run_phase3_multi_env_optimization_audit(
     deterministic_actor_sampling: bool = False,
     deterministic_batch_plan: bool = False,
     strict_native_rollout: bool = False,
+    restore_validation_policy_head_state: bool = False,
     actor_objective_mode_override: str | None = None,
     actor_objective_runtime_current_suite_name: str | None = None,
     skip_heldout_eval: bool = False,
@@ -481,7 +505,14 @@ def run_phase3_multi_env_optimization_audit(
     train_suite_path = str(Path(train_suite_path).expanduser().resolve())
     heldout_suite_path = str(Path(heldout_suite_path).expanduser().resolve())
     device_obj = torch.device(str(device or _default_device()))
-    phase2_summary = assert_phase2_green(phase2_summary_path)
+    resolved_train_profile = str(train_profile).strip().lower()
+    if resolved_train_profile in {
+        "phase2_shared_backbone_contract",
+        "trusted_sep_reset_mainline",
+    }:
+        phase2_summary = assert_phase2_launch_chain_green(phase2_summary_path)
+    else:
+        phase2_summary = assert_phase2_green(phase2_summary_path)
 
     train_suite = _load_required_suite(train_suite_path)
     heldout_suite = _load_required_suite(heldout_suite_path)
@@ -493,7 +524,6 @@ def run_phase3_multi_env_optimization_audit(
 
     load_model.cache_clear()
     model, config = load_model(checkpoint_path, device=device_obj, verbose=False)
-    resolved_train_profile = str(train_profile).strip().lower()
     if resolved_train_profile == "phase2_shared_backbone_contract":
         env_cfg = _build_audit_env_cfg(config["prior"]["environment"])
     else:
@@ -531,6 +561,10 @@ def run_phase3_multi_env_optimization_audit(
             train_suite_path
         )
 
+    resolved_strict_native_rollout = bool(profile_cfg["strict_native_rollout"])
+    if bool(strict_native_rollout):
+        resolved_strict_native_rollout = True
+
     algo, callback, vec_env = build_recurrent_ppo(
         model=model,
         env_prior=prior,
@@ -554,11 +588,12 @@ def run_phase3_multi_env_optimization_audit(
         rollout_rng_seeds=[int(v) for v in train_suite["rollout_seeds"]] if bool(strict_fixed_env_mode) else None,
         deterministic_actor_sampling=bool(deterministic_actor_sampling),
         deterministic_batch_plan=bool(deterministic_batch_plan),
-        strict_native_rollout=bool(strict_native_rollout),
+        strict_native_rollout=bool(resolved_strict_native_rollout),
         actor_objective_runtime_current_suite_name=resolved_actor_objective_runtime_current_suite_name,
         reset_env_state_at_sep=bool(profile_cfg["reset_env_state_at_sep"]),
         separate_value_backbone=bool(profile_cfg["separate_value_backbone"]),
         restore_validation_policy_state=bool(profile_cfg["restore_validation_policy_state"]),
+        restore_validation_policy_head_state=bool(restore_validation_policy_head_state),
         runtime_normalized_q_value_weight_override=profile_cfg["runtime_normalized_q_value_weight_override"],
         runtime_next_state_flow_matching_weight_override=profile_cfg["runtime_next_state_flow_matching_weight_override"],
         ent_coef=float(optimizer_cfg.get("ppo_ent_coef", 0.0)),
@@ -707,7 +742,8 @@ def run_phase3_multi_env_optimization_audit(
         single_eval_pos=int(single_eval_pos),
         rollout_backend=str(rollout_backend),
         profile_cfg=profile_cfg,
-        strict_native_rollout=bool(strict_native_rollout),
+        strict_native_rollout=bool(resolved_strict_native_rollout),
+        restore_validation_policy_head_state=bool(restore_validation_policy_head_state),
     )
     resumed_post_policy = None
     if resume_post_policy_bundle_path is not None:
@@ -720,7 +756,8 @@ def run_phase3_multi_env_optimization_audit(
             single_eval_pos=int(single_eval_pos),
             rollout_backend=str(rollout_backend),
             profile_cfg=profile_cfg,
-            strict_native_rollout=bool(strict_native_rollout),
+            strict_native_rollout=bool(resolved_strict_native_rollout),
+            restore_validation_policy_head_state=bool(restore_validation_policy_head_state),
         )
         algo.policy.load_state_dict(resumed_post_policy["policy_state_dict"], strict=True)
         train_history = copy.deepcopy(resumed_post_policy["train_history"])
@@ -803,10 +840,11 @@ def run_phase3_multi_env_optimization_audit(
             "ppo_reset_env_state_at_sep": bool(profile_cfg["reset_env_state_at_sep"]),
             "ppo_separate_value_backbone": bool(profile_cfg["separate_value_backbone"]),
             "ppo_restore_validation_policy_state": bool(profile_cfg["restore_validation_policy_state"]),
+            "ppo_restore_validation_policy_head_state": bool(restore_validation_policy_head_state),
             "strict_fixed_env_mode": bool(strict_fixed_env_mode),
             "deterministic_actor_sampling": bool(deterministic_actor_sampling),
             "deterministic_batch_plan": bool(deterministic_batch_plan),
-            "strict_native_rollout": bool(strict_native_rollout),
+            "strict_native_rollout": bool(resolved_strict_native_rollout),
             "actor_objective_mode_override": None
             if actor_objective_mode_override is None
             else str(actor_objective_mode_override).strip().lower(),
@@ -852,6 +890,15 @@ def run_phase3_multi_env_optimization_audit(
             "summary_path": str(Path(phase2_summary_path).expanduser().resolve()),
             "phase2_all_checks_pass": bool(phase2_summary["validation"]["all_checks_pass"]),
             "phase2_pass_flags": dict(phase2_summary["pass_flags"]),
+            "launch_chain_locked": bool(
+                resolved_train_profile in {
+                    "phase2_shared_backbone_contract",
+                    "trusted_sep_reset_mainline",
+                }
+            ),
+            "launch_chain_source_of_truth": None
+            if not isinstance(phase2_summary.get("source_of_truth", None), dict)
+            else dict(phase2_summary["source_of_truth"]),
         },
         "train_suite_summary": train_suite_summary,
         "heldout_suite_summary": heldout_suite_summary,
@@ -900,6 +947,9 @@ def run_phase3_multi_env_optimization_audit(
             },
             "written_path": getattr(algo, "_rwkv_last_train_outer_batch_snapshot_path", None),
             "written": bool(getattr(algo, "_rwkv_train_outer_batch_snapshot_written", False)),
+            "snapshot_target_match_count": _read_snapshot_target_match_count(
+                getattr(algo, "_rwkv_last_train_outer_batch_snapshot_path", None)
+            ),
         },
         "train_outer_batch_selector_trace": {
             "requested_path": None
@@ -967,7 +1017,7 @@ def main() -> int:
         default="phase2_shared_backbone_contract",
         choices=["phase2_shared_backbone_contract", "trusted_sep_reset_mainline", "legacy_actor_only_probe"],
     )
-    parser.add_argument("--phase2-summary-path", type=str, default=DEFAULT_PHASE2_SUMMARY)
+    parser.add_argument("--phase2-summary-path", type=str, default=TRUSTED_PHASE2_LAUNCH_SUMMARY)
     parser.add_argument("--reuse-zero-control-json", type=str, default=None)
     parser.add_argument("--reuse-pre-policy-json", type=str, default=None)
     parser.add_argument("--save-post-policy-bundle-path", type=str, default=None)

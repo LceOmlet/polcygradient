@@ -99,10 +99,8 @@ def run_diagnosis(
 
     counters = {
         "env_group_sizes": [],
-        "x_calls": 0,
-        "y_calls": 0,
-        "x_wall_time": 0.0,
-        "y_wall_time": 0.0,
+        "transition_calls": 0,
+        "transition_wall_time": 0.0,
         "policy_calls": 0,
         "policy_wall_time": 0.0,
         "policy_bs_counter": Counter(),
@@ -111,25 +109,16 @@ def run_diagnosis(
 
     def _wrap_env_generators(env, group_size):
         counters["env_group_sizes"].append(int(group_size))
-        x_gen = env["x_generator"]
-        y_gen = env["y_generator"]
+        transition_gen = prior._require_transition_generator(env)
 
-        def _x_wrapped(x, generators_for_noise=None):
+        def _transition_wrapped(x, *args, **kwargs):
             t0 = time.perf_counter()
-            out = x_gen(x, generators_for_noise=generators_for_noise)
-            counters["x_wall_time"] += (time.perf_counter() - t0)
-            counters["x_calls"] += 1
+            out = transition_gen(x, *args, **kwargs)
+            counters["transition_wall_time"] += (time.perf_counter() - t0)
+            counters["transition_calls"] += 1
             return out
 
-        def _y_wrapped(x, generators_for_noise=None):
-            t0 = time.perf_counter()
-            out = y_gen(x, generators_for_noise=generators_for_noise)
-            counters["y_wall_time"] += (time.perf_counter() - t0)
-            counters["y_calls"] += 1
-            return out
-
-        env["x_generator"] = _x_wrapped
-        env["y_generator"] = _y_wrapped
+        env["transition_generator"] = _transition_wrapped
         return env
 
     orig_sample_env_batch = prior._sample_environment_batch
@@ -217,14 +206,12 @@ def run_diagnosis(
 
     env_group_sizes = counters["env_group_sizes"]
     rollout_wall_times = counters["rollout_wall_times"]
-    x_calls = int(counters["x_calls"])
-    y_calls = int(counters["y_calls"])
+    transition_calls = int(counters["transition_calls"])
     policy_calls = int(counters["policy_calls"])
-    x_wall = float(counters["x_wall_time"])
-    y_wall = float(counters["y_wall_time"])
+    transition_wall = float(counters["transition_wall_time"])
     policy_wall = float(counters["policy_wall_time"])
     total_rollout_wall = float(sum(rollout_wall_times))
-    approx_env_wall = x_wall + y_wall
+    approx_env_wall = transition_wall
     approx_other_wall = max(0.0, total_rollout_wall - approx_env_wall - policy_wall)
 
     summary = {
@@ -257,8 +244,7 @@ def run_diagnosis(
             "batch_size_hist": dict(sorted(counters["policy_bs_counter"].items())),
             "wall_sec": float(policy_wall),
         },
-        "x_generator": {"calls": int(x_calls), "wall_sec": float(x_wall)},
-        "y_generator": {"calls": int(y_calls), "wall_sec": float(y_wall)},
+        "transition_generator": {"calls": int(transition_calls), "wall_sec": float(transition_wall)},
         "approx_wall_breakdown": {
             "env_sec": float(approx_env_wall),
             "policy_sec": float(policy_wall),
@@ -297,10 +283,16 @@ def run_diagnosis(
         f"batch_size_hist={summary['policy_calls']['batch_size_hist']}",
         f"wall_sec={summary['policy_calls']['wall_sec']:.4f}",
     )
-    print("x_generator:", f"calls={summary['x_generator']['calls']}", f"wall_sec={summary['x_generator']['wall_sec']:.4f}")
-    print("y_generator:", f"calls={summary['y_generator']['calls']}", f"wall_sec={summary['y_generator']['wall_sec']:.4f}")
+    print(
+        "transition_generator:",
+        f"calls={summary['transition_generator']['calls']}",
+        f"wall_sec={summary['transition_generator']['wall_sec']:.4f}",
+    )
     print("approx_wall_breakdown:")
-    print(f"  env(x+y)={summary['approx_wall_breakdown']['env_sec']:.4f}s ({summary['approx_wall_breakdown']['env_pct']:.1f}%)")
+    print(
+        f"  env(transition)={summary['approx_wall_breakdown']['env_sec']:.4f}s "
+        f"({summary['approx_wall_breakdown']['env_pct']:.1f}%)"
+    )
     print(f"  policy={summary['approx_wall_breakdown']['policy_sec']:.4f}s ({summary['approx_wall_breakdown']['policy_pct']:.1f}%)")
     print(f"  other={summary['approx_wall_breakdown']['other_sec']:.4f}s ({summary['approx_wall_breakdown']['other_pct']:.1f}%)")
 
