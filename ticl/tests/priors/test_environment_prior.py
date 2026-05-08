@@ -7892,6 +7892,51 @@ def _zero_policy_step(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx,
     return torch.zeros_like(action_t)
 
 
+def test_environment_prior_terminal_tail_event_uses_current_rank_without_history():
+    prior = EnvironmentPrior({})
+    signal = torch.zeros(4, dtype=torch.float32)
+    enabled = torch.ones(4, dtype=torch.bool)
+    reset_prob = torch.full((4,), 0.25, dtype=torch.float32)
+    draw = torch.tensor([0.0, 0.249, 0.25, 0.9], dtype=torch.float32)
+
+    out = prior._terminal_tail_event_from_signal(
+        signal,
+        enabled=enabled,
+        reset_prob=reset_prob,
+        terminal_draw=draw,
+        signal_history=None,
+        history_length=0,
+    )
+
+    assert torch.equal(out, torch.tensor([True, True, False, False]))
+
+
+@pytest.mark.parametrize("history_len", [0, 1, 2, 4, 8, 16, 64])
+def test_environment_prior_terminal_tail_event_calibrates_short_history(history_len):
+    _seed_everything(20260507 + int(history_len))
+    prior = EnvironmentPrior({})
+    batch_size = 8192
+    target_prob = 0.125
+    signal = torch.randn(batch_size, dtype=torch.float32)
+    history = (
+        torch.randn(history_len, batch_size, dtype=torch.float32)
+        if int(history_len) > 0
+        else None
+    )
+    draw = torch.rand(batch_size, dtype=torch.float32)
+
+    out = prior._terminal_tail_event_from_signal(
+        signal,
+        enabled=torch.ones(batch_size, dtype=torch.bool),
+        reset_prob=torch.full((batch_size,), target_prob, dtype=torch.float32),
+        terminal_draw=draw,
+        signal_history=history,
+        history_length=history_len,
+    )
+
+    assert float(out.to(dtype=torch.float32).mean()) == pytest.approx(target_prob, abs=0.025)
+
+
 def _make_terminal_sampled_h_list():
     specs = [
         dict(state_dim=3, obs_dim=2, action_dim=2, noise_dim=1, zero_pad_dim=0, num_layers=2),

@@ -43,7 +43,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
     assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
-    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "tanh"
+    assert cfg["prior"]["environment"]["reinforce_reward_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_reward_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["reinforce_reward_tanh_bound"] == {
@@ -71,7 +71,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["prior"]["environment"]["terminal_reset_count_target"] == {
         "distribution": "uniform",
         "min": 0.0,
-        "max": 20.0,
+        "max": 80.0,
     }
     assert cfg["prior"]["environment"]["terminal_bonus_tanh_c"] == 10.0
     assert cfg["prior"]["environment"]["terminal_bonus_scale_min"] == 1.0
@@ -85,7 +85,7 @@ def test_rlpfn_default_config_uses_split_encoder():
     assert cfg["optimizer"]["policy_rollout_chunk_autotune"] is False
     assert cfg["optimizer"]["policy_rollout_chunk_grow_every"] == 8
     assert cfg["optimizer"]["policy_rollout_chunk_grow_factor"] == 2.0
-    assert cfg["optimizer"]["learning_rate"] == 4e-4
+    assert cfg["optimizer"]["learning_rate"] == 2e-4
     assert cfg["dataloader"]["batch_size"] == 2048
     assert cfg["optimizer"]["pg_torch_compile"] is False
     assert cfg["optimizer"]["adamw_fused"] is True

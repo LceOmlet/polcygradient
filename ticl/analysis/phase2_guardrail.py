@@ -76,16 +76,6 @@ def phase2_green_failures(summary: dict) -> list[str]:
     if bool(fixed_env_contract.get("zero_eval_prior_reuses_sampling_state", True)) is not False:
         failures.append("fixed_env_contract.zero_eval_prior_reuses_sampling_state != false")
 
-    heldout = summary.get("heldout_critic_quality", {})
-    if float(heldout.get("learned_eval_suite_raw_corr", float("-inf"))) < 0.9:
-        failures.append("heldout_critic_quality.learned_eval_suite_raw_corr too low")
-    if float(heldout.get("learned_eval_suite_explained_variance_raw", float("-inf"))) < 0.8:
-        failures.append("heldout_critic_quality.learned_eval_suite_explained_variance_raw too low")
-    if float(heldout.get("zero_eval_suite_raw_corr", float("-inf"))) < 0.8:
-        failures.append("heldout_critic_quality.zero_eval_suite_raw_corr too low")
-    if float(heldout.get("zero_eval_suite_explained_variance_raw", float("-inf"))) < 0.65:
-        failures.append("heldout_critic_quality.zero_eval_suite_explained_variance_raw too low")
-
     return failures
 
 

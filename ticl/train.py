@@ -85,20 +85,9 @@ def _extract_optimizer_step(optimizer):
 
 _PPO_TRAIN_DIAGNOSTIC_KEYS = {
     "objective_total",
-    "explained_variance_value_target",
-    "explained_variance_value_target_objective",
-    "explained_variance_raw_value_target",
-    "explained_variance_raw_value_target_objective",
-    "explained_variance_raw_discounted_return",
-    "explained_variance_raw_discounted_return_objective",
-    "raw_value_target_corr",
-    "raw_discounted_return_corr",
 }
 _PPO_TRAIN_DIAGNOSTIC_PREFIXES = (
     "value_space_",
-    "raw_value_",
-    "raw_value_target_",
-    "raw_discounted_return_",
     "value_scale_",
     "input_",
 )
@@ -7120,7 +7109,6 @@ def train_epoch_official_recurrent_ppo(
         "approx_kl_mean": logger_values.get("train/approx_kl", None),
         "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
         "explained_variance": logger_values.get("train/explained_variance", None),
-        "explained_variance_normalized": logger_values.get("train/explained_variance_normalized", None),
         "clip_range": logger_values.get("train/clip_range", None),
         "clip_range_vf": logger_values.get("train/clip_range_vf", None),
         "policy_loss_weight": 1.0,
@@ -7270,7 +7258,6 @@ def train_epoch_trusted_pack_recurrent_ppo(
         "approx_kl_mean": logger_values.get("train/approx_kl", None),
         "clip_fraction_mean": logger_values.get("train/clip_fraction", None),
         "explained_variance": logger_values.get("train/explained_variance", None),
-        "explained_variance_normalized": logger_values.get("train/explained_variance_normalized", None),
         "clip_range": logger_values.get("train/clip_range", None),
         "clip_range_vf": logger_values.get("train/clip_range_vf", None),
         "policy_loss_weight": 1.0,
@@ -7477,6 +7464,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ppo_trusted_pack_runner_required=False,
           ppo_pack_output_dir=None,
           ppo_pack_seed=4040,
+          ppo_pack_prior_milestone="sampled_topology",
           ppo_pack_prior_mode="sampled_topology",
           ppo_pack_fixed_env_group_across_updates=False,
           ppo_pack_sb3_reward_normalization_enabled=True,
@@ -8267,9 +8255,21 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 _build_algo as _build_trusted_pack_algo,
                 _dump_fixed_prior_group_if_available,
             )
+            from ticl.analysis.phase2_gated_reward_path_milestone import (
+                GATED_REWARD_PATH_MILESTONE,
+                GATED_REWARD_PATH_MILESTONES,
+                SAMPLED_TOPOLOGY_MILESTONE,
+                normalize_prior_milestone,
+            )
             from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout
 
             env_cfg_for_pack = copy.deepcopy(getattr(env_prior, "config", {}) or {})
+            prior_milestone_norm = normalize_prior_milestone(ppo_pack_prior_milestone)
+            trusted_pack_prior_mode = str(ppo_pack_prior_mode)
+            if prior_milestone_norm in GATED_REWARD_PATH_MILESTONES:
+                trusted_pack_prior_mode = prior_milestone_norm
+            elif prior_milestone_norm != SAMPLED_TOPOLOGY_MILESTONE:
+                raise RuntimeError(f"Unsupported trusted PPO prior milestone: {ppo_pack_prior_milestone!r}")
             layout = resolve_rlpfn_token_layout(env_cfg_for_pack, num_features=int(ppo_num_features))
             dim_probe_prior = EnvironmentPrior(copy.deepcopy(env_cfg_for_pack))
             next_state_target_dim = int(
@@ -8294,7 +8294,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 frozen_h=None,
                 frozen_h_list=None,
                 frozen_h_list_env_seeds=None,
-                prior_mode=str(ppo_pack_prior_mode),
+                prior_mode=str(trusted_pack_prior_mode),
                 device_obj=torch.device(str(device)),
                 num_features=int(ppo_num_features),
                 n_envs=int(ppo_n_envs),
@@ -8334,6 +8334,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 "next_state_target_dim": int(next_state_target_dim),
                 "n_envs": int(ppo_n_envs),
                 "n_steps": int(ppo_n_steps),
+                "prior_milestone": str(prior_milestone_norm),
+                "prior_mode": str(trusted_pack_prior_mode),
                 "single_eval_pos": None if ppo_single_eval_pos is None else int(ppo_single_eval_pos),
                 "terminal_token_enabled": bool(layout["terminal_token_enabled"]),
             }

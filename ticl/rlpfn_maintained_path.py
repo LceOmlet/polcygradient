@@ -55,7 +55,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reward_dropout_ratio_max": 1.0,
     "reward_dropout_impute_zero": True,
     "terminal_reset_enabled": True,
-    "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 20.0},
+    "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 80.0},
     "terminal_bonus_tanh_c": 10.0,
     "terminal_bonus_scale_min": 1.0,
     "terminal_bonus_scale_max": 2.0,
@@ -144,6 +144,7 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["optimizer"]["ppo_actor_baseline_mode"] = "learned"
     config["optimizer"]["ppo_vf_coef"] = 0.1
     config["optimizer"]["ppo_trusted_pack_runner_required"] = True
+    config["optimizer"]["ppo_pack_prior_milestone"] = "sampled_topology"
     config["optimizer"]["ppo_pack_prior_mode"] = "sampled_topology"
     config["optimizer"]["ppo_pack_fixed_env_group_across_updates"] = False
     config["optimizer"]["ppo_pack_sb3_reward_normalization_enabled"] = True
@@ -205,6 +206,28 @@ def validate_rlpfn_maintained_path_config(config):
         raise ValueError("Maintained RLPFN path requires ppo_deterministic_batch_plan=True.")
     if str(optimizer_cfg.get("ppo_pack_prior_mode", "")).strip().lower() != "sampled_topology":
         raise ValueError("Maintained RLPFN path requires ppo_pack_prior_mode='sampled_topology'.")
+    prior_milestone = str(optimizer_cfg.get("ppo_pack_prior_milestone", "sampled_topology")).strip().lower()
+    prior_milestone = {
+        "sampled": "sampled_topology",
+        "sampled_topology_conditioned": "sampled_topology",
+        "gated": "gated_reward_path_balance",
+        "gated_reward_path": "gated_reward_path_balance",
+        "gated_reward_path_balancing": "gated_reward_path_balance",
+        "gated_terminal": "gated_reward_path_balance_terminal_coverage",
+        "gated_reward_path_terminal": "gated_reward_path_balance_terminal_coverage",
+        "gated_reward_path_terminal_coverage": "gated_reward_path_balance_terminal_coverage",
+        "gated_reward_path_balance_terminal": "gated_reward_path_balance_terminal_coverage",
+    }.get(prior_milestone, prior_milestone)
+    if prior_milestone not in {
+        "sampled_topology",
+        "gated_reward_path_balance",
+        "gated_reward_path_balance_terminal_coverage",
+    }:
+        raise ValueError(
+            "Maintained RLPFN path requires ppo_pack_prior_milestone to be "
+            "'sampled_topology', 'gated_reward_path_balance', or "
+            "'gated_reward_path_balance_terminal_coverage'."
+        )
     if bool(optimizer_cfg.get("ppo_pack_fixed_env_group_across_updates", True)):
         raise ValueError("Maintained RLPFN path requires a fresh sampled topology batch each PPO update.")
     if abs(float(optimizer_cfg.get("ppo_vf_coef", 0.0)) - 0.1) > 1e-12:

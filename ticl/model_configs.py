@@ -78,6 +78,7 @@ def get_optimizer_config():
         "ppo_trusted_pack_runner_required": False,
         "ppo_pack_output_dir": None,
         "ppo_pack_seed": 4040,
+        "ppo_pack_prior_milestone": "sampled_topology",
         "ppo_pack_prior_mode": "sampled_topology",
         "ppo_pack_fixed_env_group_across_updates": False,
         "ppo_pack_sb3_reward_normalization_enabled": True,

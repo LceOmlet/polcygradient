@@ -41,14 +41,10 @@
     },
     "heldout_critic_quality": {
       "learned": {
-        "objective_total": 1536,
-        "raw_corr_min": 0.9,
-        "explained_variance_raw_min": 0.8
+        "objective_total": 1536
       },
       "zero": {
-        "objective_total": 1536,
-        "raw_corr_min": 0.8,
-        "explained_variance_raw_min": 0.65
+        "objective_total": 1536
       }
     }
   }

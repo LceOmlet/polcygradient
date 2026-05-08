@@ -50,6 +50,14 @@ from ticl.analysis.phase2_gym_prior_pack_training_runner import (  # noqa: E402
     _set_topology_conditioned_sampling,
     _build_algo as _build_pack_algo,
 )
+from ticl.analysis.phase2_gated_reward_path_milestone import (  # noqa: E402
+    GATED_REWARD_PATH_MILESTONE,
+    GATED_REWARD_PATH_MILESTONES,
+    GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+    SAMPLED_TOPOLOGY_MILESTONE,
+    install_gated_reward_path_balance_milestone,
+    normalize_prior_milestone,
+)
 from ticl.analysis.phase2_fit_model_migration_gradient_compare import (  # noqa: E402
     _gradient_diff_summary,
     _loss_diff_summary,
@@ -139,6 +147,7 @@ def _enforce_healthy_sampled_topology_contract(
     ppo_vf_coef: float,
     ppo_normalize_advantage: bool,
     ppo_target_kl: float | None,
+    ppo_pack_prior_milestone: str,
 ) -> dict[str, Any]:
     cfg = copy.deepcopy(cfg)
     env_cfg = cfg["prior"]["environment"]
@@ -165,6 +174,8 @@ def _enforce_healthy_sampled_topology_contract(
     opt["ppo_normalize_advantage"] = bool(ppo_normalize_advantage)
     opt["ppo_vf_coef"] = float(ppo_vf_coef)
     opt["ppo_target_kl"] = None if ppo_target_kl is None else float(ppo_target_kl)
+    opt["ppo_pack_prior_milestone"] = normalize_prior_milestone(ppo_pack_prior_milestone)
+    opt["ppo_pack_prior_mode"] = "sampled_topology"
     opt["ppo_single_eval_pos"] = None
     opt["ppo_space_contract"] = "raw"
     opt["ppo_value_head_impl"] = "vendor_official"
@@ -189,6 +200,7 @@ def _load_contract_config(args: argparse.Namespace) -> dict[str, Any]:
         ppo_vf_coef=float(args.ppo_vf_coef),
         ppo_normalize_advantage=bool(args.ppo_normalize_advantage),
         ppo_target_kl=args.ppo_target_kl,
+        ppo_pack_prior_milestone=str(args.ppo_pack_prior_milestone),
     )
 
 
@@ -203,6 +215,36 @@ def _make_fixed_single_eval_prior(
     _apply_boundary_contract_mode_flags(prior, "normal")
     _apply_sep_state_reset_flag(prior, bool(ppo_reset_env_state_at_sep))
     return prior
+
+
+def _prior_mode_for_milestone(ppo_pack_prior_milestone: str) -> str:
+    milestone = normalize_prior_milestone(ppo_pack_prior_milestone)
+    if milestone in GATED_REWARD_PATH_MILESTONES:
+        return milestone
+    if milestone == SAMPLED_TOPOLOGY_MILESTONE:
+        return "sampled_topology"
+    raise AssertionError(f"unreachable prior milestone: {milestone}")
+
+
+def _install_fit_prior_milestone_if_needed(
+    prior: EnvironmentPrior,
+    *,
+    env_cfg: dict[str, Any],
+    ppo_pack_prior_milestone: str,
+) -> None:
+    milestone = normalize_prior_milestone(ppo_pack_prior_milestone)
+    if milestone not in GATED_REWARD_PATH_MILESTONES:
+        return
+    install_gated_reward_path_balance_milestone(
+        prior,
+        state_gain_min=float(env_cfg["reward_state_input_gain_fraction_conditioned_min"]),
+        action_gain_min=float(env_cfg["reward_action_input_gain_fraction_conditioned_min"]),
+        state_to_action_ratio_max=float(env_cfg["reward_state_to_action_gain_ratio_conditioned_max"]),
+        max_attempts=int(env_cfg["reward_topology_conditioned_sampling_max_attempts"]),
+        terminal_count_coverage_enabled=(
+            milestone == GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE
+        ),
+    )
 
 
 def _build_model_from_scratch(*, cfg: dict[str, Any], device_obj: torch.device, seed: int):
@@ -312,6 +354,7 @@ def _build_pack_training_algo(
     ppo_vf_coef: float,
     ppo_normalize_advantage: bool,
     ppo_target_kl: float | None,
+    ppo_pack_prior_milestone: str,
     single_eval_pos: int,
     sb3_reward_normalization_enabled: bool,
     sb3_observation_normalization_enabled: bool,
@@ -324,7 +367,7 @@ def _build_pack_training_algo(
         frozen_h=None,
         frozen_h_list=None,
         frozen_h_list_env_seeds=None,
-        prior_mode="sampled_topology",
+        prior_mode=_prior_mode_for_milestone(ppo_pack_prior_milestone),
         device_obj=device_obj,
         num_features=int(cfg["prior"]["num_features"]),
         n_envs=int(n_envs),
@@ -539,6 +582,7 @@ def _compare_sampled_topology_generator(
     ppo_vf_coef: float,
     ppo_normalize_advantage: bool,
     ppo_target_kl: float | None,
+    ppo_pack_prior_milestone: str,
     single_eval_pos: int,
     sb3_reward_normalization_enabled: bool,
     sb3_observation_normalization_enabled: bool,
@@ -556,6 +600,7 @@ def _compare_sampled_topology_generator(
         ppo_vf_coef=float(ppo_vf_coef),
         ppo_normalize_advantage=bool(ppo_normalize_advantage),
         ppo_target_kl=ppo_target_kl,
+        ppo_pack_prior_milestone=str(ppo_pack_prior_milestone),
         single_eval_pos=int(single_eval_pos),
         sb3_reward_normalization_enabled=bool(sb3_reward_normalization_enabled),
         sb3_observation_normalization_enabled=bool(sb3_observation_normalization_enabled),
@@ -566,6 +611,11 @@ def _compare_sampled_topology_generator(
         cfg["prior"]["environment"],
         single_eval_pos=int(single_eval_pos),
         ppo_reset_env_state_at_sep=True,
+    )
+    _install_fit_prior_milestone_if_needed(
+        fit_prior,
+        env_cfg=cfg["prior"]["environment"],
+        ppo_pack_prior_milestone=str(ppo_pack_prior_milestone),
     )
     fit_algo, _fit_callback, fit_vec_env, bridge_summary, bridge_kwargs = _build_fit_model_algo(
         cfg=cfg,
@@ -664,6 +714,7 @@ def _compare_update_from_pack(
     ppo_vf_coef: float,
     ppo_normalize_advantage: bool,
     ppo_target_kl: float | None,
+    ppo_pack_prior_milestone: str,
     single_eval_pos: int,
     sb3_reward_normalization_enabled: bool,
     sb3_observation_normalization_enabled: bool,
@@ -689,6 +740,7 @@ def _compare_update_from_pack(
         ppo_vf_coef=float(ppo_vf_coef),
         ppo_normalize_advantage=bool(ppo_normalize_advantage),
         ppo_target_kl=ppo_target_kl,
+        ppo_pack_prior_milestone=str(ppo_pack_prior_milestone),
         single_eval_pos=int(single_eval_pos),
         sb3_reward_normalization_enabled=bool(sb3_reward_normalization_enabled),
         sb3_observation_normalization_enabled=bool(sb3_observation_normalization_enabled),
@@ -741,6 +793,7 @@ def _compare_update_from_pack(
             ppo_vf_coef=float(ppo_vf_coef),
             ppo_normalize_advantage=bool(ppo_normalize_advantage),
             ppo_target_kl=ppo_target_kl,
+            ppo_pack_prior_milestone=str(ppo_pack_prior_milestone),
             single_eval_pos=int(single_eval_pos),
             sb3_reward_normalization_enabled=bool(sb3_reward_normalization_enabled),
             sb3_observation_normalization_enabled=bool(sb3_observation_normalization_enabled),
@@ -751,6 +804,11 @@ def _compare_update_from_pack(
             cfg["prior"]["environment"],
             single_eval_pos=int(single_eval_pos),
             ppo_reset_env_state_at_sep=True,
+        )
+        _install_fit_prior_milestone_if_needed(
+            fit_prior,
+            env_cfg=cfg["prior"]["environment"],
+            ppo_pack_prior_milestone=str(ppo_pack_prior_milestone),
         )
         fit_algo, _fit_callback, fit_vec_env, bridge_summary, bridge_kwargs = _build_fit_model_algo(
             cfg=cfg,
@@ -844,9 +902,6 @@ def _compare_update_from_pack(
                 "train/approx_kl",
                 "train/clip_fraction",
                 "train/explained_variance",
-                "train/explained_variance_normalized",
-                "train/explained_variance_raw_value_target",
-                "train/explained_variance_raw_discounted_return",
                 "train/normalized_q_value_weight",
                 "train/next_state_flow_matching_weight",
             ],
@@ -897,6 +952,16 @@ def _compare_update_from_pack(
             "ppo_target_kl": None if ppo_target_kl is None else float(ppo_target_kl),
             "normalized_q_value_weight": 0.0,
             "next_state_flow_matching_weight": 0.0,
+            "official_update_similarity_metrics": [
+                "train/explained_variance",
+                "train/approx_kl",
+                "train/clip_fraction",
+            ],
+            "official_update_similarity_metric_notes": {
+                "train/explained_variance": "SB3 RecurrentPPO value-target explained variance.",
+                "train/approx_kl": "SB3 RecurrentPPO reverse-KL approximation for policy update size.",
+                "train/clip_fraction": "SB3 RecurrentPPO fraction of policy ratios outside the clip range.",
+            },
         },
     }
 
@@ -904,7 +969,7 @@ def _compare_update_from_pack(
 def main() -> None:
     parser = argparse.ArgumentParser(
         description=(
-            "Numerically compare the sampled-topology healthy prior generator and "
+            "Numerically compare an explicit prior milestone generator and "
             "current gym/prior pack PPO update path against the fit_model PPO bridge."
         )
     )
@@ -921,6 +986,16 @@ def main() -> None:
     parser.add_argument("--ppo-vf-coef", type=float, default=0.1)
     parser.add_argument("--ppo-normalize-advantage", type=str2bool, default=True)
     parser.add_argument("--ppo-target-kl", type=float, default=None)
+    parser.add_argument(
+        "--ppo-pack-prior-milestone",
+        type=str,
+        default=SAMPLED_TOPOLOGY_MILESTONE,
+        choices=[
+            SAMPLED_TOPOLOGY_MILESTONE,
+            GATED_REWARD_PATH_MILESTONE,
+            GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+        ],
+    )
     parser.add_argument("--topology-state-gain-min", type=float, default=0.7)
     parser.add_argument("--topology-action-gain-min", type=float, default=0.06)
     parser.add_argument("--topology-state-to-action-ratio-max", type=float, default=10.0)
@@ -939,13 +1014,15 @@ def main() -> None:
     output_path = Path(str(args.output_json)).expanduser().resolve()
     output_path.parent.mkdir(parents=True, exist_ok=True)
     device_obj = torch.device(str(args.device))
+    prior_milestone = normalize_prior_milestone(args.ppo_pack_prior_milestone)
     cfg = _load_contract_config(args)
     env_cfg = cfg["prior"]["environment"]
     result: dict[str, Any] = {
         "script": "phase2_fit_model_pack_ppo_migration_parity",
         "args": _jsonable(vars(args)),
         "contract": {
-            "generator": "sampled_topology_conditioned",
+            "generator": str(prior_milestone),
+            "prior_milestone": str(prior_milestone),
             "batch_parallel_backend": env_cfg.get("batch_parallel_backend"),
             "batch_vectorized_grouping": env_cfg.get("batch_vectorized_grouping"),
             "reward_topology_conditioned_sampling_enabled": bool(
@@ -985,7 +1062,7 @@ def main() -> None:
             ),
         },
     }
-    result["sampled_topology_generator_parity"] = _compare_sampled_topology_generator(
+    prior_generator_parity = _compare_sampled_topology_generator(
         cfg=cfg,
         device_obj=device_obj,
         build_seed=int(args.build_seed),
@@ -997,14 +1074,18 @@ def main() -> None:
         ppo_vf_coef=float(args.ppo_vf_coef),
         ppo_normalize_advantage=bool(args.ppo_normalize_advantage),
         ppo_target_kl=args.ppo_target_kl,
+        ppo_pack_prior_milestone=str(prior_milestone),
         single_eval_pos=int(args.single_eval_pos),
         sb3_reward_normalization_enabled=bool(args.sb3_reward_normalization_enabled),
         sb3_observation_normalization_enabled=bool(args.sb3_observation_normalization_enabled),
         sb3_observation_normalization_clip=float(args.sb3_observation_normalization_clip),
         sb3_observation_normalization_epsilon=float(args.sb3_observation_normalization_epsilon),
     )
+    result["prior_generator_parity"] = prior_generator_parity
+    # Compatibility for older read-only gates and reports.
+    result["sampled_topology_generator_parity"] = prior_generator_parity
     result["prior_pack_ppo_update_parity"] = _compare_update_from_pack(
-        label="prior_sampled_topology_pack",
+        label=f"prior_{prior_milestone}_pack",
         cfg=cfg,
         device_obj=device_obj,
         build_seed=int(args.build_seed),
@@ -1016,6 +1097,7 @@ def main() -> None:
         ppo_vf_coef=float(args.ppo_vf_coef),
         ppo_normalize_advantage=bool(args.ppo_normalize_advantage),
         ppo_target_kl=args.ppo_target_kl,
+        ppo_pack_prior_milestone=str(prior_milestone),
         single_eval_pos=int(args.single_eval_pos),
         sb3_reward_normalization_enabled=bool(args.sb3_reward_normalization_enabled),
         sb3_observation_normalization_enabled=bool(args.sb3_observation_normalization_enabled),
@@ -1037,6 +1119,7 @@ def main() -> None:
             ppo_vf_coef=float(args.ppo_vf_coef),
             ppo_normalize_advantage=bool(args.ppo_normalize_advantage),
             ppo_target_kl=args.ppo_target_kl,
+            ppo_pack_prior_milestone=str(prior_milestone),
             single_eval_pos=int(args.single_eval_pos),
             sb3_reward_normalization_enabled=bool(args.sb3_reward_normalization_enabled),
             sb3_observation_normalization_enabled=bool(args.sb3_observation_normalization_enabled),
@@ -1045,7 +1128,7 @@ def main() -> None:
             gym_env_ids=_normalize_env_id_list(str(args.gym_env_ids), int(args.n_envs)),
         )
     result["hard_pass"] = bool(
-        result["sampled_topology_generator_parity"]["hard_pass"]
+        result["prior_generator_parity"]["hard_pass"]
         and result["prior_pack_ppo_update_parity"]["hard_pass"]
         and (
             not bool(args.run_gym_parity)

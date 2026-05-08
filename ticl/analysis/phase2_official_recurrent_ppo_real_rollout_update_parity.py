@@ -41,6 +41,7 @@ def _patch_cv2_for_vendored_sb3() -> None:
 _patch_cv2_for_vendored_sb3()
 
 from stable_baselines3.common.running_mean_std import RunningMeanStd  # noqa: E402
+from stable_baselines3.common.utils import explained_variance  # noqa: E402
 from stable_baselines3.common.vec_env.base_vec_env import VecEnv, VecEnvObs, VecEnvStepReturn  # noqa: E402
 from stable_baselines3.common.vec_env.vec_normalize import VecNormalize  # noqa: E402
 from sb3_contrib.common.recurrent.buffers import RecurrentRolloutBuffer  # noqa: E402
@@ -420,11 +421,37 @@ def _collect_buffers(seed: int) -> dict[str, Any]:
         "old_values_max_abs_diff": _max_abs(official_buffer.values, custom_buffer.values),
         "old_log_probs_max_abs_diff": _max_abs(official_buffer.log_probs, custom_buffer.log_probs),
     }
+    ppo_side_ev = {
+        "official_formula_ev": float(
+            explained_variance(official_buffer.values.flatten(), official_buffer.returns.flatten())
+        ),
+        "custom_formula_ev": float(
+            explained_variance(custom_buffer.values.flatten(), custom_buffer.returns.flatten())
+        ),
+        "values_max_abs_diff": _max_abs(official_buffer.values, custom_buffer.values),
+        "returns_value_targets_max_abs_diff": _max_abs(official_buffer.returns, custom_buffer.returns),
+        "formula_ev_abs_diff": abs(
+            float(explained_variance(official_buffer.values.flatten(), official_buffer.returns.flatten()))
+            - float(explained_variance(custom_buffer.values.flatten(), custom_buffer.returns.flatten()))
+        ),
+        "values_source": "PPO rollout buffer old_values; not environment-side reward.",
+        "targets_source": "PPO rollout buffer returns from official GAE/value-target compute_returns_and_advantage.",
+    }
+    environment_side = {
+        "action_buffer_max_abs_diff": _max_abs(official_buffer.actions, custom_buffer.actions),
+        "obs_to_ppo_buffer_max_abs_diff": rollout_diffs["buffer_observations_max_abs_diff"],
+        "reward_to_ppo_buffer_max_abs_diff": rollout_diffs["buffer_rewards_max_abs_diff"],
+        "vecnormalize_obs_step_max_abs_diff": vecnorm_diffs["obs_step_max_abs_diff"],
+        "vecnormalize_reward_step_max_abs_diff": vecnorm_diffs["reward_step_max_abs_diff"],
+        "action_contract": "Environment side consumes actions only; PPO side consumes the resulting normalized obs/reward.",
+    }
     return {
         "official_buffer": official_buffer,
         "custom_buffer": custom_buffer,
         "vecnorm": vecnorm_diffs,
         "rollout": rollout_diffs,
+        "environment_side_contract": environment_side,
+        "ppo_side_ev_contract": ppo_side_ev,
         "config": {
             "n_steps": n_steps,
             "n_envs": n_envs,
@@ -593,12 +620,18 @@ def _run_train_pair(official_sample: Any, custom_sample: Any, *, normalize_advan
     official_policy = _ParametricPolicy(lr=0.01)
     official_initial = official_policy.param.detach().clone()
     official_algo = _make_official_algo(official_sample, official_policy, cfg=cfg, logger=official_logger)
+    official_formula_ev = float(
+        explained_variance(official_algo.rollout_buffer.values.flatten(), official_algo.rollout_buffer.returns.flatten())
+    )
     RecurrentPPO.train(official_algo)  # type: ignore[arg-type]
 
     custom_logger = _CaptureLogger()
     custom_policy = _ParametricPolicy(lr=0.01)
     custom_initial = custom_policy.param.detach().clone()
     custom_algo = _make_custom_algo(custom_sample, custom_policy, cfg=cfg, logger=custom_logger)
+    custom_formula_ev = float(
+        explained_variance(custom_algo.rollout_buffer.values.flatten(), custom_algo.rollout_buffer.returns.flatten())
+    )
     MaskedRecurrentPPO.train(custom_algo)  # type: ignore[arg-type]
 
     keys = [
@@ -621,6 +654,11 @@ def _run_train_pair(official_sample: Any, custom_sample: Any, *, normalize_advan
     out["grad_max_abs_diff"] = _tensor_max_abs(official_policy.param.grad, custom_policy.param.grad)
     out["grad_l2_official"] = float(th.linalg.vector_norm(official_policy.param.grad.detach()).cpu())
     out["grad_l2_custom"] = float(th.linalg.vector_norm(custom_policy.param.grad.detach()).cpu())
+    out["ppo_side_ev_formula_official"] = official_formula_ev
+    out["ppo_side_ev_formula_custom"] = custom_formula_ev
+    out["ppo_side_ev_formula_abs_diff"] = abs(official_formula_ev - custom_formula_ev)
+    out["official_logger_ev_formula_abs_diff"] = abs(float(official_logger.rows["train/explained_variance"]) - official_formula_ev)
+    out["custom_logger_ev_formula_abs_diff"] = abs(float(custom_logger.rows["train/explained_variance"]) - custom_formula_ev)
     out["param_delta_max_abs_diff"] = _tensor_max_abs(
         official_policy.param.detach() - official_initial,
         custom_policy.param.detach() - custom_initial,
@@ -631,7 +669,14 @@ def _run_train_pair(official_sample: Any, custom_sample: Any, *, normalize_advan
 
 def _max_report_diff(report: dict[str, Any]) -> float:
     max_diff = 0.0
-    for section in ("vecnormalize", "rollout_buffer", "train"):
+    for section in (
+        "vecnormalize",
+        "rollout_buffer",
+        "environment_side_contract",
+        "ppo_side_ev_contract",
+        "official_update_similarity_contract",
+        "train",
+    ):
         obj = report.get(section)
         if isinstance(obj, dict):
             iterator = obj.values()
@@ -693,12 +738,31 @@ def main() -> None:
             seed=args.seed + 104,
         ),
     }
+    official_update_similarity_contract = {
+        "metrics": {
+            "train/explained_variance": "SB3 RecurrentPPO value-target explained variance.",
+            "train/approx_kl": "SB3 RecurrentPPO reverse-KL approximation for policy update size.",
+            "train/clip_fraction": "SB3 RecurrentPPO fraction of policy ratios outside the clip range.",
+        },
+        "note": "SB3/RecurrentPPO does not provide an official Pearson-correlation training diagnostic.",
+        "per_train_case_abs_diffs": {
+            name: {
+                "explained_variance_abs_diff": float(row["explained_variance_abs_diff"]),
+                "approx_kl_abs_diff": float(row["approx_kl_abs_diff"]),
+                "clip_fraction_abs_diff": float(row["clip_fraction_abs_diff"]),
+            }
+            for name, row in train.items()
+        },
+    }
     report = {
         "seed": int(args.seed),
         "tolerance": float(args.tol),
         "config": collected["config"],
         "vecnormalize": collected["vecnorm"],
         "rollout_buffer": collected["rollout"],
+        "environment_side_contract": collected["environment_side_contract"],
+        "ppo_side_ev_contract": collected["ppo_side_ev_contract"],
+        "official_update_similarity_contract": official_update_similarity_contract,
         "train": train,
         "scope": {
             "compared": [

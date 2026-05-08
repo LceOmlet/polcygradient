@@ -199,17 +199,6 @@ def _validate(
             failures.append(
                 f"phase2_launch_anchor.{mode_name}.eval_suite_critic_quality_after_train.objective_total drift"
             )
-        if float(quality.get("raw_corr", float("-inf"))) < float(quality_spec["raw_corr_min"]):
-            failures.append(
-                f"phase2_launch_anchor.{mode_name}.eval_suite_critic_quality_after_train.raw_corr too low"
-            )
-        if float(quality.get("explained_variance_raw", float("-inf"))) < float(
-            quality_spec["explained_variance_raw_min"]
-        ):
-            failures.append(
-                "phase2_launch_anchor."
-                f"{mode_name}.eval_suite_critic_quality_after_train.explained_variance_raw too low"
-            )
 
     bridge_spec = manifest["phase2_to_phase3_anchor_compare"]
     validated_sections.append("phase2_to_phase3_anchor_compare")
@@ -457,26 +446,12 @@ def main(argv: list[str] | None = None) -> int:
             "zero_delta_smp_gap": float(
                 copied["phase2_launch_anchor"]["modes"]["zero"]["delta_smp_gap"]
             ),
-            "learned_eval_suite_raw_corr": float(
-                copied["phase2_launch_anchor"]["modes"]["learned"][
-                    "eval_suite_critic_quality_after_train"
-                ]["raw_corr"]
-            ),
-            "learned_eval_suite_explained_variance_raw": float(
-                copied["phase2_launch_anchor"]["modes"]["learned"][
-                    "eval_suite_critic_quality_after_train"
-                ]["explained_variance_raw"]
-            ),
-            "zero_eval_suite_raw_corr": float(
-                copied["phase2_launch_anchor"]["modes"]["zero"][
-                    "eval_suite_critic_quality_after_train"
-                ]["raw_corr"]
-            ),
-            "zero_eval_suite_explained_variance_raw": float(
-                copied["phase2_launch_anchor"]["modes"]["zero"][
-                    "eval_suite_critic_quality_after_train"
-                ]["explained_variance_raw"]
-            ),
+            "disabled_untrusted_metrics": [
+                "raw_corr",
+                "explained_variance_raw",
+                "raw_corr_min",
+                "explained_variance_raw_min",
+            ],
         },
         "phase2_to_phase3_anchor_compare": copied["phase2_to_phase3_anchor_compare"][
             "grad_compare"

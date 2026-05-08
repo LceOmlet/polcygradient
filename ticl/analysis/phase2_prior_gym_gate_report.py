@@ -408,7 +408,8 @@ def _progress_summary(path: str | Path) -> dict[str, Any]:
         "train/legacy_pre_rollout_input_reward_sample_std",
         "train/legacy_pre_rollout_normalized_return_std",
         "train/explained_variance",
-        "train/explained_variance_normalized",
+        "train/approx_kl",
+        "train/clip_fraction",
     ]
     out = {
         "path": str(path),

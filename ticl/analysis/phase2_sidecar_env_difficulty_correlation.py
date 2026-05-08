@@ -12,6 +12,11 @@ DEFAULT_PRIOR_DIR = (
     "/home/chen/RLPFN/artifacts/"
     "phase2_prior_pack_semprobe_sampledgain_fixedgroup_n1024_u200_0428"
 )
+DISABLED_REASON = (
+    "phase2_sidecar_env_difficulty_correlation is disabled: it is built around "
+    "hand-written correlation metrics that are not official SB3/PPO diagnostics "
+    "and have not been accepted as trusted parity evidence."
+)
 
 
 BASELINE_FEATURES = [
@@ -391,6 +396,7 @@ def _quantile_trajectories(
 
 
 def run_analysis(experiment_dir: str, arm: str, output_dir: str | None, early_count: int, late_count: int) -> dict[str, Any]:
+    raise RuntimeError(DISABLED_REASON)
     exp_dir = Path(experiment_dir).expanduser().resolve()
     out_dir = Path(output_dir).expanduser().resolve() if output_dir else exp_dir / "analysis"
     sidecars = _load_sidecars(exp_dir, arm)

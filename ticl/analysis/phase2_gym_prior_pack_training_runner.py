@@ -52,6 +52,12 @@ from ticl.sb3_recurrent_ppo import (  # noqa: E402
 )
 from stable_baselines3.common.logger import configure as configure_logger  # noqa: E402
 from stable_baselines3.common.running_mean_std import RunningMeanStd  # noqa: E402
+from ticl.analysis.phase2_gated_reward_path_milestone import (  # noqa: E402
+    GATED_REWARD_PATH_MILESTONE,
+    GATED_REWARD_PATH_MILESTONES,
+    GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+    install_gated_reward_path_balance_milestone,
+)
 
 
 DEFAULT_OUTPUT_DIR = (
@@ -66,6 +72,49 @@ def _trim_host_allocator_after_pack_release() -> None:
         ctypes.CDLL("libc.so.6").malloc_trim(0)
     except Exception:
         return
+
+
+def _release_prior_vec_env_before_update(vec_env: EnvironmentPriorPPOBatchVecEnv | None) -> dict[str, Any]:
+    if vec_env is None:
+        return {"enabled": False, "reason": "missing_vec_env"}
+    release_fn = getattr(vec_env, "release_current_exact_scm_batch", None)
+    if not callable(release_fn):
+        return {"enabled": False, "reason": "release_method_unavailable"}
+    summary = release_fn()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {"enabled": True, **dict(summary or {})}
+
+
+def _release_policy_rollout_cache_before_update(algo: Any) -> dict[str, Any]:
+    policy = getattr(algo, "policy", None)
+    reset_fn = getattr(policy, "reset_rollout_cache", None)
+    if not callable(reset_fn):
+        return {"enabled": False, "reason": "reset_rollout_cache_unavailable"}
+
+    device = getattr(algo, "device", None)
+
+    def _cuda_memory(prefix: str) -> dict[str, float]:
+        if device is None or not torch.cuda.is_available():
+            return {}
+        try:
+            return {
+                f"{prefix}_cuda_alloc_gib": float(torch.cuda.memory_allocated(device)) / float(1024**3),
+                f"{prefix}_cuda_reserved_gib": float(torch.cuda.memory_reserved(device)) / float(1024**3),
+            }
+        except Exception:
+            return {}
+
+    summary: dict[str, Any] = {"enabled": True}
+    summary.update(_cuda_memory("before"))
+    batch_size = getattr(policy, "_rollout_cache_batch_size", None)
+    if batch_size is None:
+        batch_size = getattr(algo, "n_envs", 0)
+    reset_fn(int(batch_size))
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    summary.update(_cuda_memory("after"))
+    return summary
 
 
 def _normalize_env_id_list(value: str, n_envs: int) -> list[str]:
@@ -618,6 +667,20 @@ def _add_prior_reward_component_meta_from_h_list(
         _enabled(h, "_survival_reward_enable_u", "survival_reward_enable_prob")
         for h in h_list[: int(n_envs)]
     ]
+    meta["terminal_reset_enabled"] = [
+        bool(h.get("terminal_reset_enabled", False)) for h in h_list[: int(n_envs)]
+    ]
+    meta["terminal_reset_count_target"] = [
+        float(h.get("terminal_reset_count_target", 0.0) or 0.0) for h in h_list[: int(n_envs)]
+    ]
+    for key in (
+        "gated_terminal_coverage_bucket",
+        "gated_terminal_coverage_applied",
+        "gated_terminal_coverage_original_target",
+        "gated_terminal_coverage_target",
+    ):
+        if any(key in h for h in h_list[: int(n_envs)]):
+            meta[key] = [h.get(key) for h in h_list[: int(n_envs)]]
     meta["reinforce_reward_transform"] = [
         str(h.get("reinforce_reward_transform", "none")) for h in h_list[: int(n_envs)]
     ]
@@ -720,7 +783,6 @@ def _semantic_probe_from_pack(
     )
     active_action_concat = np.concatenate(action_active_values) if action_active_values else np.asarray([], dtype=np.float32)
     raw_unit_clip_excess = np.maximum(np.abs(active_action_concat) - 1.0, 0.0)
-    reward_next_for_delta = raw_rewards[1:] if n_steps > 1 else np.zeros((0, n_envs), dtype=np.float32)
     per_env_training_returns = np.sum(rewards, axis=0)
     per_env_training_reward_std = np.std(rewards, axis=0)
     per_env_raw_returns = np.sum(raw_rewards, axis=0)
@@ -734,14 +796,22 @@ def _semantic_probe_from_pack(
         "reward_state_input_gain_fraction",
         "reward_action_input_gain_fraction",
         "reward_noise_input_gain_fraction",
-    "reward_state_to_noise_gain_ratio",
-    "reward_state_to_action_gain_ratio",
-    "reward_state_input_gain_fraction_conditioned_accepted_gain",
-    "reward_action_input_gain_fraction_conditioned_accepted_gain",
-    "reward_state_to_action_gain_ratio_conditioned_accepted_ratio",
-    "reward_state_input_gain_fraction_conditioned_attempt",
-    "reward_topology_conditioned_attempt",
-    "reward_topology_conditioned_total_candidate_draws",
+        "reward_state_to_noise_gain_ratio",
+        "reward_state_to_action_gain_ratio",
+        "reward_state_input_gain_fraction_conditioned_accepted_gain",
+        "reward_action_input_gain_fraction_conditioned_accepted_gain",
+        "reward_state_to_action_gain_ratio_conditioned_accepted_ratio",
+        "reward_state_input_gain_fraction_conditioned_attempt",
+        "reward_topology_conditioned_attempt",
+        "reward_topology_conditioned_total_candidate_draws",
+    ]
+    prior_terminal_keys = [
+        "terminal_reset_enabled",
+        "terminal_reset_count_target",
+        "gated_terminal_coverage_bucket",
+        "gated_terminal_coverage_applied",
+        "gated_terminal_coverage_original_target",
+        "gated_terminal_coverage_target",
     ]
     prior_gain_summary = {
         key: _vector_stats(meta[key])
@@ -756,7 +826,6 @@ def _semantic_probe_from_pack(
             "no RNG consumption, no PPO semantic mutation"
         ),
         "limitations": [
-            "reward-action sensitivity here is rollout-correlation/proxy only, not a causal a±eps counterfactual",
             "Gym next_state is observation-space next obs; Prior next_state is prior state target under the shared boundary",
         ],
         "arm": str(arm),
@@ -830,14 +899,6 @@ def _semantic_probe_from_pack(
             "step_l2_delta": _vector_stats(next_state_drift_l2),
             "step_l2_delta_to_state_rms_ratio": _vector_stats(next_state_drift_to_norm_ratio),
         },
-        "rollout_reward_action_proxy": {
-            "corr_action_norm_reward": _safe_corrcoef(action_norm, raw_rewards),
-            "corr_action_delta_norm_next_reward": _safe_corrcoef(action_delta_norm, reward_next_for_delta),
-            "corr_action_delta_norm_next_reward_delta": _safe_corrcoef(
-                action_delta_norm,
-                np.diff(raw_rewards, axis=0) if n_steps > 1 else [],
-            ),
-        },
         "prior_gain_summary": prior_gain_summary,
     }
 
@@ -884,6 +945,14 @@ def _per_env_semantic_probe_rows_from_pack(
         "reward_state_input_gain_fraction_conditioned_attempt",
         "reward_topology_conditioned_attempt",
         "reward_topology_conditioned_total_candidate_draws",
+    )
+    prior_terminal_keys = (
+        "terminal_reset_enabled",
+        "terminal_reset_count_target",
+        "gated_terminal_coverage_bucket",
+        "gated_terminal_coverage_applied",
+        "gated_terminal_coverage_original_target",
+        "gated_terminal_coverage_target",
     )
     rows: list[dict[str, Any]] = []
     for env_idx in range(n_envs):
@@ -1090,13 +1159,6 @@ def _per_env_semantic_probe_rows_from_pack(
                 if step_l2_delta.size and next_state_rms is not None
                 else None
             ),
-            "corr_action_norm_reward": _safe_corrcoef(action_norm, reward),
-            "corr_action_delta_norm_next_reward": (
-                _safe_corrcoef(action_delta_norm, reward[1:]) if action_delta_norm.size else None
-            ),
-            "corr_action_delta_norm_next_reward_delta": (
-                _safe_corrcoef(action_delta_norm, np.diff(reward)) if action_delta_norm.size else None
-            ),
             "reward_component_logging": reward_component_meta,
         }
         for component_name, component_values in reward_components.items():
@@ -1104,6 +1166,10 @@ def _per_env_semantic_probe_rows_from_pack(
             for stat_key, stat_value in stats.items():
                 row[f"{component_name}_{stat_key}"] = stat_value
         for key in prior_gain_keys:
+            values = meta.get(key)
+            if isinstance(values, list) and env_idx < len(values):
+                row[key] = values[env_idx]
+        for key in prior_terminal_keys:
             values = meta.get(key)
             if isinstance(values, list) and env_idx < len(values):
                 row[key] = values[env_idx]
@@ -1185,7 +1251,26 @@ def _build_algo(
             state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
             max_attempts=int(topology_max_attempts),
         )
+    elif prior_mode_norm in GATED_REWARD_PATH_MILESTONES:
+        _set_topology_conditioned_sampling(
+            prior_cfg,
+            state_gain_min=float(topology_state_gain_min),
+            action_gain_min=float(topology_action_gain_min),
+            state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+            max_attempts=int(topology_max_attempts),
+        )
     prior = EnvironmentPrior(prior_cfg)
+    if prior_mode_norm in GATED_REWARD_PATH_MILESTONES:
+        install_gated_reward_path_balance_milestone(
+            prior,
+            state_gain_min=float(topology_state_gain_min),
+            action_gain_min=float(topology_action_gain_min),
+            state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+            max_attempts=int(topology_max_attempts),
+            terminal_count_coverage_enabled=(
+                prior_mode_norm == GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE
+            ),
+        )
     if prior_mode_norm == "fixed_frozen":
         if frozen_h is None:
             raise ValueError("prior_mode=fixed_frozen requires a frozen_h.")
@@ -1210,6 +1295,8 @@ def _build_algo(
                 )
         prior._phase2_fixed_env_group_h_list = fixed_h_list
         prior._phase2_fixed_env_group_env_seeds = fixed_env_seeds
+        prior.config["reward_state_input_gain_fraction_conditioned_sampling_enabled"] = False
+        prior.config["reward_topology_conditioned_sampling_enabled"] = False
 
         def _sample_fixed_frozen_list(batch_n, _fixed_h_list=fixed_h_list):
             if int(batch_n) != len(_fixed_h_list):
@@ -1220,7 +1307,7 @@ def _build_algo(
             return [copy.deepcopy(h) for h in _fixed_h_list]
 
         prior._sample_batch_hypers = _sample_fixed_frozen_list
-    elif prior_mode_norm in {"sampled_gain", "sampled_topology"}:
+    elif prior_mode_norm in {"sampled_gain", "sampled_topology", *GATED_REWARD_PATH_MILESTONES}:
         if bool(fixed_env_group_across_updates):
             base_seeds = [int(build_seed) + int(env_idx) for env_idx in range(int(n_envs))]
             fixed_h_list, _unused_env, fixed_env_seeds = (
@@ -1250,7 +1337,9 @@ def _build_algo(
             prior._sample_batch_hypers = _sample_fixed_group
     else:
         raise ValueError(
-            "prior_mode must be 'fixed_frozen', 'fixed_frozen_list', 'sampled_gain', or 'sampled_topology'."
+            "prior_mode must be 'fixed_frozen', 'fixed_frozen_list', 'sampled_gain', "
+            "'sampled_topology', 'gated_reward_path_balance', or "
+            "'gated_reward_path_balance_terminal_coverage'."
         )
     prior._phase2_original_sample_single_eval_pos = prior._sample_single_eval_pos
     if fixed_single_eval_pos is not None:
@@ -1457,6 +1546,8 @@ def _collect_prior_policy_pack(
     values = np.zeros_like(rewards)
     log_probs = np.zeros_like(rewards)
 
+    original_defer_time_limit_reset = getattr(vec_env, "_defer_time_limit_reset_at_rollout_end", False)
+    vec_env._defer_time_limit_reset_at_rollout_end = True
     for step_idx in range(int(n_steps)):
         masks = vec_env.action_masks().astype(np.float32, copy=False)
         obs_for_policy, obs_norm_last_stats = _apply_observation_normalization_if_enabled(
@@ -1525,6 +1616,7 @@ def _collect_prior_policy_pack(
         obs_slot_dim=int(obs_slot_dim),
     )
     last_values = _predict_terminal_values_from_tokens(algo, final_obs_for_value, episode_starts_t)
+    vec_env._defer_time_limit_reset_at_rollout_end = original_defer_time_limit_reset
 
     pack = {
         "tokens": tokens,
@@ -1600,6 +1692,11 @@ def _collect_prior_policy_pack(
             "survival_reward_weight",
             "survival_reward_enabled",
             "reward_clip",
+            "terminal_reset_enabled",
+            "terminal_reset_count_target",
+            "gated_terminal_coverage_applied",
+            "gated_terminal_coverage_original_target",
+            "gated_terminal_coverage_target",
         ):
             if key not in meta:
                 meta_values = _tensor_vector(env_batch, key)
@@ -2159,6 +2256,9 @@ def _run_pack_update_once(
     meta["single_eval_pos"] = int(effective_single_eval_pos)
     meta["next_state_targets_stored"] = bool(store_next_state_targets)
     meta["rollout_buffer_next_state_dim"] = int(getattr(algo.rollout_buffer, "next_state_dim", 0))
+    if str(arm) == "prior":
+        meta["pre_update_env_release"] = _release_prior_vec_env_before_update(vec_env)
+    meta["pre_update_policy_rollout_cache_release"] = _release_policy_rollout_cache_before_update(algo)
     semantic_probe = (
         _semantic_probe_from_pack(
             arm=str(arm),
@@ -2559,7 +2659,6 @@ def run_runner(
                 "masked_action_distribution",
                 "action_temporal_constancy",
                 "state_or_obs_drift",
-                "rollout_reward_action_proxy",
                 "prior_reward_gain_metadata",
             ],
             "prior_mode": str(prior_mode),
@@ -2594,7 +2693,14 @@ def main(argv: list[str] | None = None) -> None:
         "--prior-mode",
         type=str,
         default="fixed_frozen",
-        choices=["fixed_frozen", "fixed_frozen_list", "sampled_gain", "sampled_topology"],
+        choices=[
+            "fixed_frozen",
+            "fixed_frozen_list",
+            "sampled_gain",
+            "sampled_topology",
+            GATED_REWARD_PATH_MILESTONE,
+            GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+        ],
     )
     parser.add_argument("--fixed-frozen-h-json", type=str, default=DEFAULT_FROZEN_H_JSON)
     parser.add_argument("--fixed-frozen-h-list-csv", type=str, default=None)

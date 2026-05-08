@@ -5114,17 +5114,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
         self._n_updates += self.n_epochs
         update_wall_time_sec = float(time.perf_counter() - train_wall_t0)
         setattr(self, "_rwkv_last_update_wall_time_sec", update_wall_time_sec)
-        raw_values_flat = None
-        raw_value_targets_flat = None
-        raw_discounted_returns_flat = None
-        if isinstance(self.rollout_buffer, MaskedRecurrentRolloutBuffer):
-            raw_values_flat = self.rollout_buffer._get_flat_raw_values_tensor(dtype=torch.float32).cpu().numpy()
-            raw_value_targets_flat = (
-                self.rollout_buffer._get_flat_raw_value_targets_tensor(dtype=torch.float32).cpu().numpy()
-            )
-            raw_discounted_returns_flat = (
-                self.rollout_buffer._get_flat_raw_returns_tensor(dtype=torch.float32).cpu().numpy()
-            )
         objective_masks_np = getattr(self.rollout_buffer, "objective_masks", None)
         value_space_values_flat = self.rollout_buffer.values.flatten()
         value_space_targets_flat = self.rollout_buffer.returns.flatten()
@@ -5133,39 +5122,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
             value_space_targets_flat,
             mask=None,
         )
-        explained_var_value_target_objective = _explained_variance_with_mask(
-            value_space_values_flat,
-            value_space_targets_flat,
-            mask=objective_masks_np,
-        )
-        if raw_values_flat is not None and raw_value_targets_flat is not None:
-            explained_var_raw_value_target = _explained_variance_with_mask(
-                raw_values_flat,
-                raw_value_targets_flat,
-                mask=None,
-            )
-            explained_var_raw_value_target_objective = _explained_variance_with_mask(
-                raw_values_flat,
-                raw_value_targets_flat,
-                mask=objective_masks_np,
-            )
-        else:
-            explained_var_raw_value_target = float("nan")
-            explained_var_raw_value_target_objective = float("nan")
-        if raw_values_flat is not None and raw_discounted_returns_flat is not None:
-            explained_var_raw_discounted_return = _explained_variance_with_mask(
-                raw_values_flat,
-                raw_discounted_returns_flat,
-                mask=None,
-            )
-            explained_var_raw_discounted_return_objective = _explained_variance_with_mask(
-                raw_values_flat,
-                raw_discounted_returns_flat,
-                mask=objective_masks_np,
-            )
-        else:
-            explained_var_raw_discounted_return = float("nan")
-            explained_var_raw_discounted_return_objective = float("nan")
         rollout_quality: dict[str, float] = {}
         objective_mask_flat = (
             np.asarray(objective_masks_np).reshape(-1) > 1e-8
@@ -5192,52 +5148,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 prefix="value_space_target",
             )
         )
-        rollout_quality["explained_variance_value_target"] = float(explained_var_value_target)
-        rollout_quality["explained_variance_value_target_objective"] = float(explained_var_value_target_objective)
-        rollout_quality["explained_variance_raw_value_target"] = float(explained_var_raw_value_target)
-        rollout_quality["explained_variance_raw_value_target_objective"] = float(
-            explained_var_raw_value_target_objective
-        )
-        rollout_quality["explained_variance_raw_discounted_return"] = float(explained_var_raw_discounted_return)
-        rollout_quality["explained_variance_raw_discounted_return_objective"] = float(
-            explained_var_raw_discounted_return_objective
-        )
-        if raw_values_flat is not None and raw_value_targets_flat is not None:
-            rollout_quality.update(
-                _masked_array_summary(
-                    raw_values_flat,
-                    mask=objective_masks_np,
-                    prefix="raw_value",
-                )
-            )
-            rollout_quality.update(
-                _masked_array_summary(
-                    raw_value_targets_flat,
-                    mask=objective_masks_np,
-                    prefix="raw_value_target",
-                )
-            )
-            rollout_quality["raw_value_target_corr"] = _masked_corrcoef_np(
-                raw_values_flat,
-                raw_value_targets_flat,
-                objective_masks_np,
-            )
-            if raw_discounted_returns_flat is not None:
-                rollout_quality.update(
-                    _masked_array_summary(
-                        raw_discounted_returns_flat,
-                        mask=objective_masks_np,
-                        prefix="raw_discounted_return",
-                    )
-                )
-                rollout_quality["raw_discounted_return_corr"] = _masked_corrcoef_np(
-                    raw_values_flat,
-                    raw_discounted_returns_flat,
-                    objective_masks_np,
-                )
-        else:
-            rollout_quality["raw_value_target_corr"] = float("nan")
-            rollout_quality["raw_discounted_return_corr"] = float("nan")
         if isinstance(self.rollout_buffer, MaskedRecurrentRolloutBuffer):
             rollout_return_stds = np.asarray(self.rollout_buffer.rollout_return_stds, dtype=np.float32)
             rollout_return_means = np.asarray(self.rollout_buffer.rollout_return_means, dtype=np.float32)
@@ -5298,9 +5208,6 @@ class MaskedRecurrentPPO(RecurrentPPO):
         self.logger.record("train/clip_fraction", _mean_tensor_scalar(clip_fractions))
         self.logger.record("train/loss", loss.item())
         self.logger.record("train/explained_variance", explained_var_value_target)
-        self.logger.record("train/explained_variance_normalized", explained_var_value_target)
-        self.logger.record("train/explained_variance_raw_value_target", explained_var_raw_value_target)
-        self.logger.record("train/explained_variance_raw_discounted_return", explained_var_raw_discounted_return)
         for metric_key, metric_value in rollout_quality.items():
             self.logger.record(f"train/{metric_key}", metric_value)
         self.logger.record("train/update_wall_time_sec", update_wall_time_sec)
@@ -6019,6 +5926,40 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
     def enable_direct_collect_reset_stub(self, enabled: bool = True) -> None:
         self._direct_collect_reset_stub = bool(enabled)
 
+    def release_current_exact_scm_batch(self) -> dict[str, Any]:
+        """Release GPU-resident exact-SCM state after a pack has been collected.
+
+        The canonical pack runner updates PPO from the already-materialized
+        rollout buffer, so the live transition generator and rollout state are
+        dead weight during ``algo.train()``.  Keeping this as an explicit method
+        avoids changing rollout semantics while giving the runner a trusted
+        place to lower the update-time memory peak.
+        """
+
+        had_env = isinstance(getattr(self, "_env", None), dict)
+        if had_env:
+            self._env["transition_generator"] = None
+            self._env["policy_generator"] = None
+        self._pending_actions = None
+        self._h_list = None
+        self._env = None
+        self._rollout_generators = None
+        self._initial_state_t = None
+        self._state_t = None
+        self._action_t = None
+        self._reward_t = None
+        self._reward_mask_t = None
+        self._terminal_t = None
+        self._terminal_signal_history = None
+        self._zero_pad_t = None
+        self._single_eval_pos = None
+        self._single_eval_pos_np = None
+        self._action_masks_np = None
+        clear_artifacts = getattr(self.env_prior, "clear_rollout_artifacts", None)
+        if callable(clear_artifacts):
+            clear_artifacts()
+        return {"released_exact_scm_batch": bool(had_env)}
+
     def _vector_action_masks(self) -> np.ndarray:
         if self._action_masks_np is None:
             action_dims = self._env["action_dim_per_sample"].detach().cpu().numpy().astype(np.int64, copy=True)
@@ -6479,13 +6420,19 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
                     infos[env_idx]["terminal_observation"] = terminal_obs[env_idx].copy()
                 self._episode_returns[env_idx] = 0.0
                 self._episode_lengths[env_idx] = 0
-            if bool(truncated.any()):
+            defer_final_time_limit_reset = bool(
+                getattr(self, "_defer_time_limit_reset_at_rollout_end", False)
+                and bool(truncated.all())
+                and int(self._step_idx) >= int(self.n_steps)
+            )
+            if bool(truncated.any()) and not defer_final_time_limit_reset:
                 obs_next = self._full_reset_batch()
 
         self._pending_actions = None
         return obs_next, rewards_np.copy(), dones, infos
 
     def close(self) -> None:
+        self.release_current_exact_scm_batch()
         return None
 
     def get_images(self):

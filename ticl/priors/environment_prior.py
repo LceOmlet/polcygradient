@@ -5434,6 +5434,9 @@ class EnvironmentPrior:
         signal_enabled = signal_t.reshape(-1).index_select(0, enabled_idx)
         terminal_enabled = torch.zeros_like(signal_enabled, dtype=torch.bool)
         history_t = signal_history
+        n_hist = 0
+        less_count = torch.zeros_like(enabled_idx, dtype=torch.long)
+        equal_count = torch.zeros_like(enabled_idx, dtype=torch.long)
         if (history_t is not None) and (history_len > 0):
             if not torch.is_tensor(history_t):
                 history_t = torch.as_tensor(history_t, device=signal_t.device, dtype=signal_t.dtype)
@@ -5451,66 +5454,34 @@ class EnvironmentPrior:
             if history_t.shape[0] > 0:
                 hist_enabled = history_t.index_select(1, enabled_idx)
                 n_hist = int(hist_enabled.shape[0])
-                sorted_history, _ = torch.sort(hist_enabled, dim=0)
-                tail_prob = torch.clamp(prob_enabled * 0.5, min=0.0, max=0.5)
-                tail_count_real = tail_prob * float(n_hist + 1)
-                tail_count_floor = torch.floor(tail_count_real).to(dtype=torch.long)
-                tail_count_frac = torch.clamp(
-                    tail_count_real - tail_count_floor.to(dtype=signal_t.dtype),
-                    min=0.0,
-                    max=1.0,
-                )
-                resolvable = tail_count_floor > 0
-                if bool(resolvable.any().item()):
-                    history_idx = torch.nonzero(resolvable, as_tuple=False).reshape(-1)
-                    signal_hist = signal_enabled.index_select(0, history_idx)
-                    draw_hist = draw_enabled.index_select(0, history_idx)
-                    tail_floor_hist = tail_count_floor.index_select(0, history_idx)
-                    tail_frac_hist = tail_count_frac.index_select(0, history_idx)
-                    sorted_hist = sorted_history.index_select(1, history_idx)
-                    cols = torch.arange(history_idx.numel(), device=signal_t.device, dtype=torch.long)
+                signal_cmp = signal_enabled.reshape(1, -1)
+                less_count = torch.sum(hist_enabled < signal_cmp, dim=0).to(dtype=torch.long)
+                equal_count = torch.sum(hist_enabled == signal_cmp, dim=0).to(dtype=torch.long)
 
-                    lower_cut = sorted_hist[tail_floor_hist - 1, cols]
-                    lower_strict = signal_hist < lower_cut
-                    lower_boundary = torch.zeros_like(lower_strict)
-                    has_lower_boundary = tail_floor_hist < n_hist
-                    if bool(has_lower_boundary.any().item()):
-                        hb_idx = torch.nonzero(has_lower_boundary, as_tuple=False).reshape(-1)
-                        next_lower_cut = sorted_hist[
-                            tail_floor_hist.index_select(0, hb_idx),
-                            cols.index_select(0, hb_idx),
-                        ]
-                        lower_boundary.index_copy_(
-                            0,
-                            hb_idx,
-                            (
-                                (signal_hist.index_select(0, hb_idx) >= lower_cut.index_select(0, hb_idx))
-                                & (signal_hist.index_select(0, hb_idx) < next_lower_cut)
-                                & (draw_hist.index_select(0, hb_idx) < tail_frac_hist.index_select(0, hb_idx))
-                            ),
-                        )
+        n_rank = int(n_hist + 1)
+        tie_count = equal_count + 1
+        side_count = torch.clamp(prob_enabled * (0.5 * float(n_rank)), min=0.0, max=0.5 * float(n_rank))
 
-                    upper_cut = sorted_hist[n_hist - tail_floor_hist, cols]
-                    upper_strict = signal_hist > upper_cut
-                    upper_boundary = torch.zeros_like(upper_strict)
-                    has_upper_boundary = tail_floor_hist < n_hist
-                    if bool(has_upper_boundary.any().item()):
-                        hb_idx = torch.nonzero(has_upper_boundary, as_tuple=False).reshape(-1)
-                        prev_upper_cut = sorted_hist[
-                            (n_hist - tail_floor_hist.index_select(0, hb_idx) - 1),
-                            cols.index_select(0, hb_idx),
-                        ]
-                        upper_boundary.index_copy_(
-                            0,
-                            hb_idx,
-                            (
-                                (signal_hist.index_select(0, hb_idx) <= upper_cut.index_select(0, hb_idx))
-                                & (signal_hist.index_select(0, hb_idx) > prev_upper_cut)
-                                & (draw_hist.index_select(0, hb_idx) < tail_frac_hist.index_select(0, hb_idx))
-                            ),
-                        )
-                    history_result = lower_strict | lower_boundary | upper_strict | upper_boundary
-                    terminal_enabled.index_copy_(0, history_idx, history_result)
+        def _tail_probability_average(start_rank: torch.Tensor, rank_count: torch.Tensor) -> torch.Tensor:
+            start = start_rank.to(device=signal_t.device, dtype=torch.long)
+            count = rank_count.to(device=signal_t.device, dtype=torch.long).clamp_min(1)
+            end = start + count - 1
+            floor_count = torch.floor(side_count).to(dtype=torch.long)
+            frac = torch.clamp(side_count - floor_count.to(dtype=signal_t.dtype), min=0.0, max=1.0)
+            full_high = floor_count - 1
+            full_count = torch.minimum(end, full_high) - start + 1
+            full_count = torch.clamp(full_count, min=0)
+            full_count = torch.minimum(full_count, count)
+            has_fractional_rank = (frac > 0) & (start <= floor_count) & (floor_count <= end)
+            fractional_count = torch.where(has_fractional_rank, frac, torch.zeros_like(frac))
+            total = full_count.to(dtype=signal_t.dtype) + fractional_count
+            return total / count.to(dtype=signal_t.dtype)
+
+        lower_event_prob = _tail_probability_average(less_count, tie_count)
+        upper_start = int(n_rank) - less_count - tie_count
+        upper_event_prob = _tail_probability_average(upper_start, tie_count)
+        event_prob = torch.clamp(lower_event_prob + upper_event_prob, min=0.0, max=1.0)
+        terminal_enabled = draw_enabled < event_prob
         terminal_out = torch.zeros_like(signal_t.reshape(-1), dtype=torch.bool)
         terminal_out.index_copy_(0, enabled_idx, terminal_enabled)
         return terminal_out.reshape(signal_t.shape) & enabled_t
