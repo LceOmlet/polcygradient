@@ -139,6 +139,7 @@ _RLPFN_CONTINUE_RUN_RESUME_SAFE_DEFAULT_KEYS = (
     ("prior", "environment", "terminal_bonus_tanh_c"),
     ("prior", "environment", "terminal_bonus_scale_min"),
     ("prior", "environment", "terminal_bonus_scale_max"),
+    ("prior", "environment", "terminal_reset_count_target"),
     ("prior", "environment", "ctrl_reward_weight"),
     ("prior", "environment", "ctrl_reward_enable_prob"),
     ("prior", "environment", "survival_reward_weight"),

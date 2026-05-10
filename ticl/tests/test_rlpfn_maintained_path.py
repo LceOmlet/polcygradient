@@ -43,7 +43,12 @@ from ticl.priors.maintained_exact_scm import (
 from ticl.priors.environment_prior import EnvironmentPrior
 from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
-from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
+from ticl.fit_model import _apply_continue_run_resume_safe_defaults
+from ticl.train import (
+    _build_policy_step_fn,
+    _compute_policy_rollout_chunk_loss,
+    _resolve_resume_start_epoch_from_config,
+)
 from ticl.priors.maintained_policy_rollout import (
     normalize_policy_objective_kind,
     policy_rollout_objective_flags,
@@ -73,6 +78,30 @@ def _seed_everything(seed):
     random.seed(seed)
     np.random.seed(seed)
     torch.manual_seed(seed)
+
+
+def test_rlpfn_continue_run_terminal_target_uses_current_milestone_default():
+    config = {
+        "prior": {
+            "environment": {
+                "terminal_reset_count_target": {
+                    "distribution": "uniform",
+                    "min": 0.0,
+                    "max": 20.0,
+                }
+            }
+        }
+    }
+    new_defaults = get_model_default_config("rlpfn")
+    _apply_continue_run_resume_safe_defaults(config, new_defaults, "rlpfn")
+    target = config["prior"]["environment"]["terminal_reset_count_target"]
+    assert float(target["max"]) == TERMINAL_RESET_COUNT_TARGET_MAX
+
+
+def test_ppo_continue_run_start_epoch_uses_checkpoint_epoch():
+    assert _resolve_resume_start_epoch_from_config({"epoch_in_training": 32}) == 33
+    assert _resolve_resume_start_epoch_from_config({"epoch_in_training": 0}) == 1
+    assert _resolve_resume_start_epoch_from_config({}) == 1
 
 
 def _legacy_coerce_bool(value):

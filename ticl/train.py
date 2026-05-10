@@ -51,6 +51,16 @@ def _looks_like_maintained_rlpfn_env_prior(env_prior) -> bool:
     )
 
 
+def _resolve_resume_start_epoch_from_config(config, *, default: int = 1) -> int:
+    try:
+        epoch_in_training = int((config or {}).get("epoch_in_training", 0) or 0)
+    except (TypeError, ValueError):
+        epoch_in_training = 0
+    if epoch_in_training <= 0:
+        return int(default)
+    return int(epoch_in_training + 1)
+
+
 def _get_host_memory_snapshot():
     if psutil is None:
         return None
@@ -7480,6 +7490,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ppo_pack_topology_action_gain_min=0.06,
           ppo_pack_topology_state_to_action_ratio_max=10.0,
           ppo_pack_topology_max_attempts=4096,
+          epoch_in_training=0,
           ):
     del train_host_rss_limit_gib, train_host_rss_limit_poll_interval_sec, train_host_rss_limit_try_rlimit_as
     using_dist, rank, device = init_dist(device)
@@ -8185,6 +8196,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             configured_batch_size=ppo_batch_size,
         )
         ppo_pack_runner_active = bool(ppo_trusted_pack_runner_required)
+        ppo_phase_log_stdout_enabled = _env_flag_enabled("TICL_PPO_PHASE_LOG_ENABLED", "0")
         if rank == 0 and verbose:
             print(
                 (
@@ -8203,6 +8215,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 ppo_progress_min_interval_print = 10.0
             print(
                 "PPO phase progress logging:",
+                f"stdout={'enabled' if ppo_phase_log_stdout_enabled else 'disabled'}",
                 f"every_batches={int(max(1, int(pg_phase_log_every_batches)))}",
                 f"min_interval_sec={float(max(0.0, ppo_progress_min_interval_print)):.1f}",
                 f"log_file={pg_phase_log_file if (pg_phase_log_file is not None and str(pg_phase_log_file).strip() != '') else 'disabled'}",
@@ -8346,7 +8359,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             if module_target is not None:
                 module_target.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
                 module_target.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
-            start_epoch = 1
+            start_epoch = _resolve_resume_start_epoch_from_config({"epoch_in_training": epoch_in_training})
         else:
             if bool(ppo_trusted_pack_runner_required):
                 raise RuntimeError("Internal error: trusted PPO pack runner was required but not activated.")
@@ -8428,7 +8441,7 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     live_policy=ppo_algo.policy,
                     saved_policy_state=validation_ppo_policy_state,
                 )
-            start_epoch = 1
+            start_epoch = _resolve_resume_start_epoch_from_config({"epoch_in_training": epoch_in_training})
     else:
         adamw_kwargs = dict(lr=learning_rate, weight_decay=weight_decay, betas=(adam_beta1, 0.999))
         if bool(adamw_fused) and ("cuda" in str(device)):
@@ -8494,7 +8507,8 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
     epoch = start_epoch
     pg_phase_log_file_rank0 = pg_phase_log_file if int(rank) == 0 else None
     if rl_objective == "ppo" and ppo_algo is not None:
-        setattr(ppo_algo, "_rwkv_progress_log_enabled", bool(int(rank) == 0 and verbose))
+        ppo_phase_log_stdout_enabled = _env_flag_enabled("TICL_PPO_PHASE_LOG_ENABLED", "0")
+        setattr(ppo_algo, "_rwkv_progress_log_enabled", bool(int(rank) == 0 and verbose and ppo_phase_log_stdout_enabled))
         setattr(ppo_algo, "_rwkv_progress_log_every", int(max(1, int(pg_phase_log_every_batches))))
         try:
             ppo_progress_min_interval_sec = float(

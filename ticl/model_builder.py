@@ -398,8 +398,10 @@ def get_model(
             device=device,
             model = model_attr,
         )
+        optimizer_config = dict(config["optimizer"])
+        optimizer_config.setdefault("epoch_in_training", config.get("epoch_in_training", 0))
         model = train(dl, model, criterion=criterion, optimizer_state=optimizer_state, scheduler=scheduler,
-                      epoch_callback=epoch_callback, verbose=verbose_train, device=device, progress_bar=config['orchestration']['progress_bar'], **config['optimizer'])
+                      epoch_callback=epoch_callback, verbose=verbose_train, device=device, progress_bar=config['orchestration']['progress_bar'], **optimizer_config)
     else:
         model = None, model, None, None
 
