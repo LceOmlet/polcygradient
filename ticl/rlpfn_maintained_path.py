@@ -1,5 +1,7 @@
 from copy import deepcopy
 
+from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
+
 
 RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "family": {"distribution": "meta_choice", "choice_values": ["scm"]},
@@ -55,7 +57,7 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "reward_dropout_ratio_max": 1.0,
     "reward_dropout_impute_zero": True,
     "terminal_reset_enabled": True,
-    "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": 80.0},
+    "terminal_reset_count_target": {"distribution": "uniform", "min": 0.0, "max": TERMINAL_RESET_COUNT_TARGET_MAX},
     "terminal_bonus_tanh_c": 10.0,
     "terminal_bonus_scale_min": 1.0,
     "terminal_bonus_scale_max": 2.0,
@@ -193,6 +195,21 @@ def validate_rlpfn_maintained_path_config(config):
         raise ValueError("Maintained RLPFN path requires exact-SCM strict_joint_transition_enabled=True.")
     if not bool(env_cfg.get("reinforce_sequence_replay_enabled", False)):
         raise ValueError("Maintained RLPFN path requires reinforce_sequence_replay_enabled=True.")
+    terminal_target = env_cfg.get("terminal_reset_count_target", 0.0)
+    terminal_max = None
+    if isinstance(terminal_target, dict):
+        terminal_max = terminal_target.get("max", None)
+    else:
+        terminal_max = terminal_target
+    try:
+        terminal_max_value = float(terminal_max)
+    except (TypeError, ValueError):
+        terminal_max_value = 0.0
+    if terminal_max_value > TERMINAL_RESET_COUNT_TARGET_MAX:
+        raise ValueError(
+            "Maintained RLPFN path requires terminal_reset_count_target max "
+            f"<= {TERMINAL_RESET_COUNT_TARGET_MAX:g}."
+        )
     optimizer_cfg = config["optimizer"]
     if not bool(optimizer_cfg.get("ppo_trusted_pack_runner_required", False)):
         raise ValueError("Maintained RLPFN path requires ppo_trusted_pack_runner_required=True.")

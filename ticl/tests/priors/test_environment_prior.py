@@ -7892,27 +7892,72 @@ def _zero_policy_step(obs_t, action_t, reward_t, reward_mask_t, cache, step_idx,
     return torch.zeros_like(action_t)
 
 
-def test_environment_prior_terminal_tail_event_uses_current_rank_without_history():
+def test_environment_prior_terminal_tail_event_uses_batch_warmup_before_sample_history():
     prior = EnvironmentPrior({})
-    signal = torch.zeros(4, dtype=torch.float32)
-    enabled = torch.ones(4, dtype=torch.bool)
-    reset_prob = torch.full((4,), 0.25, dtype=torch.float32)
-    draw = torch.tensor([0.0, 0.249, 0.25, 0.9], dtype=torch.float32)
+    signal = torch.tensor([[-0.5], [0.5]], dtype=torch.float32)
+    enabled = torch.tensor([True, True])
+    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    history = torch.tensor([[0.0, 0.0]], dtype=torch.float32)
 
     out = prior._terminal_tail_event_from_signal(
         signal,
         enabled=enabled,
         reset_prob=reset_prob,
-        terminal_draw=draw,
+        terminal_draw=torch.tensor([0.2, 0.8], dtype=torch.float32),
+        signal_history=history,
+        history_length=1,
+        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+    )
+
+    assert torch.equal(out, torch.tensor([True, False]))
+
+
+def test_environment_prior_terminal_tail_event_keeps_forced_reset_during_cold_start():
+    prior = EnvironmentPrior({})
+    signal = torch.zeros(4, dtype=torch.float32)
+    enabled = torch.ones(4, dtype=torch.bool)
+
+    out = prior._terminal_tail_event_from_signal(
+        signal,
+        enabled=enabled,
+        reset_prob=torch.ones(4, dtype=torch.float32),
+        terminal_draw=torch.full((4,), 0.9, dtype=torch.float32),
         signal_history=None,
         history_length=0,
     )
 
-    assert torch.equal(out, torch.tensor([True, True, False, False]))
+    assert torch.equal(out, torch.tensor([True, True, True, True]))
 
 
-@pytest.mark.parametrize("history_len", [0, 1, 2, 4, 8, 16, 64])
-def test_environment_prior_terminal_tail_event_calibrates_short_history(history_len):
+def test_environment_prior_terminal_tail_event_uses_sample_history_after_warmup():
+    prior = EnvironmentPrior({})
+    signal = torch.tensor([[1.0], [1.0]], dtype=torch.float32)
+    enabled = torch.tensor([True, True])
+    reset_prob = torch.full((2,), 0.5, dtype=torch.float32)
+    history = torch.tensor(
+        [
+            [-1.0, -10.0],
+            [0.0, 0.0],
+            [1.0, 10.0],
+        ],
+        dtype=torch.float32,
+    )
+
+    out = prior._terminal_tail_event_from_signal(
+        signal,
+        enabled=enabled,
+        reset_prob=reset_prob,
+        signal_history=history,
+        history_length=3,
+        history_warmup_count=torch.tensor([2.0, 2.0], dtype=torch.float32),
+        history_relaxed_mask=torch.ones(2, dtype=torch.bool),
+    )
+
+    assert torch.equal(out, torch.tensor([True, False]))
+
+
+@pytest.mark.parametrize("history_len", [8, 16, 64])
+def test_environment_prior_terminal_tail_event_calibrates_batch_warmup(history_len):
     _seed_everything(20260507 + int(history_len))
     prior = EnvironmentPrior({})
     batch_size = 8192
@@ -7932,6 +7977,7 @@ def test_environment_prior_terminal_tail_event_calibrates_short_history(history_
         terminal_draw=draw,
         signal_history=history,
         history_length=history_len,
+        history_warmup_count=torch.full((batch_size,), float(history_len + 1), dtype=torch.float32),
     )
 
     assert float(out.to(dtype=torch.float32).mean()) == pytest.approx(target_prob, abs=0.025)

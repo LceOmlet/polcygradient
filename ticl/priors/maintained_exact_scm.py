@@ -3,6 +3,7 @@ import numpy as np
 import torch
 
 from ticl.distributions import sample_distributions
+from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
 
 
 def coerce_bool(value):
@@ -198,7 +199,7 @@ def resolve_terminal_reset_count_target(h):
     v = resolve_scalar(h.get("terminal_reset_count_target", 0))
     if not math.isfinite(v):
         return 0.0
-    return float(max(0.0, float(v)))
+    return float(min(TERMINAL_RESET_COUNT_TARGET_MAX, max(0.0, float(v))))
 
 
 def resolve_terminal_bonus_tanh_c(h):

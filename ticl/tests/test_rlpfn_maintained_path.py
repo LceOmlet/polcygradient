@@ -3,6 +3,7 @@ import math
 import random
 
 import numpy as np
+import pytest
 import torch
 
 from ticl.distributions import parse_distributions, sample_distributions
@@ -40,6 +41,7 @@ from ticl.priors.maintained_exact_scm import (
     transition_reference_mode,
 )
 from ticl.priors.environment_prior import EnvironmentPrior
+from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config
 from ticl.train import _build_policy_step_fn, _compute_policy_rollout_chunk_loss
 from ticl.priors.maintained_policy_rollout import (
@@ -1069,6 +1071,11 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["prior"]["environment"]["ctrl_reward_enable_prob"] == 0.7
     assert cfg["prior"]["environment"]["survival_reward_weight"] == 0.0
     assert cfg["prior"]["environment"]["survival_reward_enable_prob"] == 0.0
+    assert cfg["prior"]["environment"]["terminal_reset_count_target"] == {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": TERMINAL_RESET_COUNT_TARGET_MAX,
+    }
     assert cfg["prior"]["environment"]["reinforce_action_transform"] == "none"
     assert cfg["prior"]["environment"]["reinforce_action_rms_eps"] == 1e-6
     assert cfg["prior"]["environment"]["reinforce_action_clip_bound"] == 5.0
@@ -1101,6 +1108,23 @@ def test_rlpfn_maintained_path_default_contract():
     assert layout["default_num_features"] == 434
     assert layout["x_obs_dim"] == 404
     assert layout["x_action_dim"] == 30
+
+
+def test_rlpfn_maintained_terminal_reset_target_clamps_to_confirmed_max():
+    assert resolve_terminal_reset_count_target({"terminal_reset_count_target": -3.0}) == 0.0
+    assert resolve_terminal_reset_count_target({"terminal_reset_count_target": 12.5}) == 12.5
+    assert resolve_terminal_reset_count_target({"terminal_reset_count_target": 100.0}) == TERMINAL_RESET_COUNT_TARGET_MAX
+
+
+def test_rlpfn_maintained_path_rejects_terminal_reset_target_above_confirmed_max():
+    cfg = get_model_default_config("rlpfn")
+    cfg["prior"]["environment"]["terminal_reset_count_target"] = {
+        "distribution": "uniform",
+        "min": 0.0,
+        "max": TERMINAL_RESET_COUNT_TARGET_MAX + 1.0,
+    }
+    with pytest.raises(ValueError, match="terminal_reset_count_target max"):
+        validate_rlpfn_maintained_path_config(cfg)
 
 
 def test_rlpfn_maintained_token_layout_helper_matches_terminal_toggle():
