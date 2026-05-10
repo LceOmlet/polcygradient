@@ -6,7 +6,9 @@ import gc
 import hashlib
 import json
 import math
+import os
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +34,7 @@ from ticl.analysis.phase2_gym_prior_pack_isomorphism_sentinel import (  # noqa: 
     _param_delta_summary,
     _policy_param_snapshot,
     _summarize_pack,
+    _summarize_pack_light,
     _token_env_info,
 )
 from ticl.analysis.phase2_legacy_bar_longrun_probe import (  # noqa: E402
@@ -64,6 +67,195 @@ DEFAULT_OUTPUT_DIR = (
     "/home/chen/RLPFN/artifacts/"
     "phase2_gym_prior_pack_training_runner_0428"
 )
+
+UPDATE_PACK_CACHE_FORMAT = "rlpfn_update_pack_cache_v1"
+
+
+def _env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _env_path(name: str) -> Path | None:
+    value = os.environ.get(name, "").strip()
+    if not value:
+        return None
+    return Path(value).expanduser()
+
+
+def _pack_phase_logging_enabled() -> bool:
+    return _env_truthy("TICL_PPO_PACK_PHASE_LOG_ENABLED", default=_env_truthy("TICL_PPO_PHASE_LOG_ENABLED", False))
+
+
+def _pack_phase_log(message: str) -> None:
+    if bool(_pack_phase_logging_enabled()):
+        print(f"[ppo-pack-phase] {message}", flush=True)
+
+
+def _torch_load_local(path: Path) -> Any:
+    try:
+        return torch.load(path, map_location="cpu", weights_only=False)
+    except TypeError:
+        return torch.load(path, map_location="cpu")
+
+
+def _pack_cache_array_shape(payload: dict[str, Any], key: str) -> tuple[int, ...]:
+    value = payload.get(key)
+    if value is None:
+        raise ValueError(f"Update pack cache missing {key!r}.")
+    return tuple(int(v) for v in np.asarray(value).shape)
+
+
+def _validate_update_pack_cache(
+    *,
+    path: Path,
+    payload: dict[str, Any],
+    arm: str,
+    n_steps: int,
+    n_envs: int,
+    num_features: int,
+    action_slot_dim: int,
+    next_state_target_dim: int,
+    single_eval_pos: int,
+    store_next_state_targets: bool,
+) -> None:
+    if not isinstance(payload, dict) or payload.get("format") != UPDATE_PACK_CACHE_FORMAT:
+        raise ValueError(f"{path} is not a {UPDATE_PACK_CACHE_FORMAT} cache.")
+    dimensions = dict(payload.get("dimensions") or {})
+    expected = {
+        "arm": str(arm),
+        "n_steps": int(n_steps),
+        "n_envs": int(n_envs),
+        "num_features": int(num_features),
+        "action_slot_dim": int(action_slot_dim),
+        "next_state_target_dim": int(next_state_target_dim),
+        "single_eval_pos": int(single_eval_pos),
+        "store_next_state_targets": bool(store_next_state_targets),
+    }
+    mismatches = {
+        key: {"expected": value, "actual": dimensions.get(key)}
+        for key, value in expected.items()
+        if dimensions.get(key) != value
+    }
+    if mismatches:
+        raise ValueError(f"Update pack cache dimension mismatch for {path}: {mismatches}")
+    pack = payload.get("pack")
+    if not isinstance(pack, dict):
+        raise ValueError(f"Update pack cache {path} missing pack dict.")
+    if _pack_cache_array_shape(pack, "tokens") != (int(n_steps), int(n_envs), int(num_features)):
+        raise ValueError(f"Update pack cache {path} tokens shape does not match current run.")
+    if _pack_cache_array_shape(pack, "actions") != (int(n_steps), int(n_envs), int(action_slot_dim)):
+        raise ValueError(f"Update pack cache {path} actions shape does not match current run.")
+    if _pack_cache_array_shape(payload, "values") != (int(n_steps), int(n_envs)):
+        raise ValueError(f"Update pack cache {path} values shape does not match current run.")
+    if _pack_cache_array_shape(payload, "log_probs") != (int(n_steps), int(n_envs)):
+        raise ValueError(f"Update pack cache {path} log_probs shape does not match current run.")
+    if bool(store_next_state_targets):
+        expected_next = (int(n_steps), int(n_envs), int(next_state_target_dim))
+        if _pack_cache_array_shape(pack, "next_state_targets") != expected_next:
+            raise ValueError(f"Update pack cache {path} next_state_targets shape does not match current run.")
+        if _pack_cache_array_shape(pack, "next_state_masks") != expected_next:
+            raise ValueError(f"Update pack cache {path} next_state_masks shape does not match current run.")
+
+
+def _save_update_pack_cache(
+    *,
+    path: Path,
+    arm: str,
+    update_idx: int,
+    env_seed: int,
+    n_steps: int,
+    n_envs: int,
+    num_features: int,
+    action_slot_dim: int,
+    next_state_target_dim: int,
+    single_eval_pos: int,
+    store_next_state_targets: bool,
+    pack: dict[str, np.ndarray],
+    values: np.ndarray,
+    log_probs: np.ndarray,
+    meta: dict[str, Any],
+) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "format": UPDATE_PACK_CACHE_FORMAT,
+        "arm": str(arm),
+        "update_idx": int(update_idx),
+        "env_seed": int(env_seed),
+        "dimensions": {
+            "arm": str(arm),
+            "n_steps": int(n_steps),
+            "n_envs": int(n_envs),
+            "num_features": int(num_features),
+            "action_slot_dim": int(action_slot_dim),
+            "next_state_target_dim": int(next_state_target_dim),
+            "single_eval_pos": int(single_eval_pos),
+            "store_next_state_targets": bool(store_next_state_targets),
+        },
+        "pack": pack,
+        "values": np.asarray(values, dtype=np.float32),
+        "log_probs": np.asarray(log_probs, dtype=np.float32),
+        "meta": copy.deepcopy(meta),
+    }
+    torch.save(payload, path, pickle_protocol=4)
+    print(
+        "[ppo-update-pack-cache-save]"
+        f" path={path}"
+        f" bytes={path.stat().st_size}"
+        f" update_idx={int(update_idx)}"
+        f" n_steps={int(n_steps)}"
+        f" n_envs={int(n_envs)}",
+        flush=True,
+    )
+
+
+def _load_update_pack_cache(
+    *,
+    path: Path,
+    arm: str,
+    update_idx: int,
+    n_steps: int,
+    n_envs: int,
+    num_features: int,
+    action_slot_dim: int,
+    next_state_target_dim: int,
+    single_eval_pos: int,
+    store_next_state_targets: bool,
+) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, Any]]:
+    payload = _torch_load_local(path)
+    _validate_update_pack_cache(
+        path=path,
+        payload=payload,
+        arm=str(arm),
+        n_steps=int(n_steps),
+        n_envs=int(n_envs),
+        num_features=int(num_features),
+        action_slot_dim=int(action_slot_dim),
+        next_state_target_dim=int(next_state_target_dim),
+        single_eval_pos=int(single_eval_pos),
+        store_next_state_targets=bool(store_next_state_targets),
+    )
+    pack = payload["pack"]
+    values = np.asarray(payload["values"], dtype=np.float32)
+    log_probs = np.asarray(payload["log_probs"], dtype=np.float32)
+    meta = copy.deepcopy(payload.get("meta") or {})
+    meta["update_pack_cache"] = {
+        "loaded": True,
+        "path": str(path),
+        "source_update_idx": int(payload.get("update_idx", -1)),
+        "current_update_idx": int(update_idx),
+    }
+    print(
+        "[ppo-update-pack-cache-load]"
+        f" path={path}"
+        f" bytes={path.stat().st_size}"
+        f" source_update_idx={int(payload.get('update_idx', -1))}"
+        f" current_update_idx={int(update_idx)}",
+        flush=True,
+    )
+    return pack, values, log_probs, meta
 
 
 def _trim_host_allocator_after_pack_release() -> None:
@@ -1398,6 +1590,30 @@ def _build_algo(
     algo._rwkv_sb3_observation_normalization_count = np.full((int(num_features),), 1e-4, dtype=np.float64)
     algo.rollout_buffer._enable_q_target_cache = False
     algo.rollout_buffer.set_deterministic_batch_plan(True)
+    train_outer_snapshot_path = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_PATH", "").strip()
+    if train_outer_snapshot_path:
+        algo._rwkv_train_outer_batch_snapshot_path = train_outer_snapshot_path
+        algo._rwkv_train_outer_batch_snapshot_written = False
+        target_outer = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_TARGET_OUTER_BATCH", "").strip()
+        if target_outer:
+            algo._rwkv_train_outer_batch_snapshot_target_outer_batch_idx = int(target_outer)
+        target_env = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_TARGET_ENV", "").strip()
+        if target_env:
+            algo._rwkv_train_outer_batch_snapshot_target_env_index = int(target_env)
+        target_episode = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_TARGET_OBJECTIVE_EPISODE", "").strip()
+        if target_episode:
+            algo._rwkv_train_outer_batch_snapshot_target_objective_episode_index = int(target_episode)
+        target_pos_start = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_TARGET_POSITION_START", "").strip()
+        if target_pos_start:
+            algo._rwkv_train_outer_batch_snapshot_target_objective_position_start = int(target_pos_start)
+        target_pos_end = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SNAPSHOT_TARGET_POSITION_END", "").strip()
+        if target_pos_end:
+            algo._rwkv_train_outer_batch_snapshot_target_objective_position_end = int(target_pos_end)
+    train_outer_trace_path = os.environ.get("TICL_PPO_TRAIN_OUTER_BATCH_SELECTOR_TRACE_PATH", "").strip()
+    if train_outer_trace_path:
+        algo._rwkv_train_outer_batch_selector_trace_path = train_outer_trace_path
+        algo._rwkv_train_outer_batch_selector_trace_rows = []
+        algo._rwkv_train_outer_batch_selector_trace_completed = False
     algo.set_logger(configure_logger(folder=None, format_strings=[]))
     return algo, vec_env
 
@@ -1502,6 +1718,8 @@ def _collect_prior_policy_pack(
     next_state_target_dim: int,
     store_next_state_targets: bool = True,
 ) -> tuple[dict[str, np.ndarray], np.ndarray, np.ndarray, dict[str, Any]]:
+    collect_t0 = time.perf_counter()
+    collect_log_every = int(os.environ.get("TICL_PPO_PACK_COLLECT_LOG_EVERY_STEPS", "256"))
     n_envs = int(vec_env.num_envs)
     fixed_env_seeds = getattr(vec_env.env_prior, "_phase2_fixed_env_group_env_seeds", None)
     env_group_seeds = (
@@ -1509,7 +1727,14 @@ def _collect_prior_policy_pack(
         if fixed_env_seeds is not None
         else [int(seed) + int(env_idx) for env_idx in range(n_envs)]
     )
+    reset_t0 = time.perf_counter()
     obs = vec_env._full_reset_batch(seeds=env_group_seeds)
+    reset_elapsed_s = float(time.perf_counter() - reset_t0)
+    _pack_phase_log(
+        "collect_prior_reset_done "
+        f"elapsed_s={reset_elapsed_s:.3f} "
+        f"total_s={float(time.perf_counter() - collect_t0):.3f}"
+    )
     obs_dims = [int(obs_slot_dim)] * n_envs
     obs_slot_dims = [int(obs_slot_dim)] * n_envs
     if isinstance(getattr(vec_env, "_env", None), dict):
@@ -1547,9 +1772,25 @@ def _collect_prior_policy_pack(
     log_probs = np.zeros_like(rewards)
 
     original_defer_time_limit_reset = getattr(vec_env, "_defer_time_limit_reset_at_rollout_end", False)
+    original_compact_pack_step_infos = getattr(vec_env, "_compact_pack_step_infos", False)
     vec_env._defer_time_limit_reset_at_rollout_end = True
+    vec_env._compact_pack_step_infos = True
+    collect_probe_max_steps = int(os.environ.get("TICL_PPO_COLLECT_PROBE_MAX_STEPS_EXIT", "0") or "0")
+    phase_acc = {
+        "mask": 0.0,
+        "obs_norm": 0.0,
+        "policy": 0.0,
+        "env_step": 0.0,
+        "reward": 0.0,
+        "next_state": 0.0,
+        "obs_post": 0.0,
+    }
     for step_idx in range(int(n_steps)):
+        step_t0 = time.perf_counter()
+        phase_t0 = time.perf_counter()
         masks = vec_env.action_masks().astype(np.float32, copy=False)
+        phase_acc["mask"] += float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
         obs_for_policy, obs_norm_last_stats = _apply_observation_normalization_if_enabled(
             algo,
             np.asarray(obs, dtype=np.float32),
@@ -1557,26 +1798,46 @@ def _collect_prior_policy_pack(
             obs_slot_dim=int(obs_slot_dim),
             stats_acc=obs_norm_acc,
         )
+        phase_acc["obs_norm"] += float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
         action, value, log_prob = _policy_step(algo, obs_for_policy, episode_starts_t, masks)
+        phase_acc["policy"] += float(time.perf_counter() - phase_t0)
         tokens[step_idx] = np.asarray(obs_for_policy, dtype=np.float32)
         actions[step_idx] = action
         action_masks[step_idx] = masks
         episode_starts[step_idx] = episode_starts_t
         values[step_idx] = value
         log_probs[step_idx] = log_prob
+        phase_t0 = time.perf_counter()
         vec_env.step_async(action)
         obs, reward, done, infos = vec_env.step_wait()
+        phase_acc["env_step"] += float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
         done_arr = np.asarray(done, dtype=bool)
         raw_reward_arr = np.asarray(reward, dtype=np.float32)
-        truncated_arr = np.asarray([bool(info.get("TimeLimit.truncated", False)) for info in infos], dtype=bool)
+        truncated_cached = getattr(vec_env, "_last_truncated_np", None)
+        if truncated_cached is not None and tuple(np.asarray(truncated_cached).shape) == (n_envs,):
+            truncated_arr = np.asarray(truncated_cached, dtype=bool)
+        else:
+            truncated_arr = np.asarray([bool(info.get("TimeLimit.truncated", False)) for info in infos], dtype=bool)
         scaled_reward_arr = _normalize_reward_step_online(algo, raw_reward_arr, done_arr)
         if bool(truncated_arr.any()):
             terminal_tokens = np.asarray(obs, dtype=np.float32).copy()
-            for env_idx, info in enumerate(infos):
-                if bool(truncated_arr[env_idx]) and info.get("terminal_observation") is not None:
-                    terminal_observation = np.asarray(info["terminal_observation"], dtype=np.float32).reshape(-1)
-                    copy_dim = int(min(int(terminal_observation.shape[0]), int(num_features)))
-                    terminal_tokens[env_idx, :copy_dim] = terminal_observation[:copy_dim]
+            terminal_observations = getattr(vec_env, "_last_terminal_observation_np", None)
+            if (
+                terminal_observations is not None
+                and np.asarray(terminal_observations).ndim == 2
+                and int(np.asarray(terminal_observations).shape[0]) == n_envs
+            ):
+                terminal_obs_arr = np.asarray(terminal_observations, dtype=np.float32)
+                copy_dim = int(min(int(terminal_obs_arr.shape[1]), int(num_features)))
+                terminal_tokens[truncated_arr, :copy_dim] = terminal_obs_arr[truncated_arr, :copy_dim]
+            else:
+                for env_idx, info in enumerate(infos):
+                    if bool(truncated_arr[env_idx]) and info.get("terminal_observation") is not None:
+                        terminal_observation = np.asarray(info["terminal_observation"], dtype=np.float32).reshape(-1)
+                        copy_dim = int(min(int(terminal_observation.shape[0]), int(num_features)))
+                        terminal_tokens[env_idx, :copy_dim] = terminal_observation[:copy_dim]
             terminal_tokens[:, int(obs_slot_dim)] = scaled_reward_arr
             terminal_tokens = _apply_observation_normalization_snapshot(
                 algo,
@@ -1596,18 +1857,75 @@ def _collect_prior_policy_pack(
         raw_rewards[step_idx] = raw_reward_arr
         dones[step_idx] = done_arr
         truncated[step_idx] = truncated_arr
-        terminated[step_idx] = dones[step_idx] & ~truncated[step_idx]
+        terminated_cached = getattr(vec_env, "_last_terminated_np", None)
+        if terminated_cached is not None and tuple(np.asarray(terminated_cached).shape) == (n_envs,):
+            terminated[step_idx] = np.asarray(terminated_cached, dtype=bool)
+        else:
+            terminated[step_idx] = dones[step_idx] & ~truncated[step_idx]
+        phase_acc["reward"] += float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
         if bool(store_next_state_targets):
-            for env_idx, info in enumerate(infos):
-                target = np.asarray(info.get("next_state_target"), dtype=np.float32).reshape(-1)
-                mask = np.asarray(info.get("next_state_mask"), dtype=np.float32).reshape(-1)
-                copy_dim = int(min(target.shape[0], int(next_state_target_dim)))
-                next_state_targets[step_idx, env_idx, :copy_dim] = target[:copy_dim]
-                next_state_masks[step_idx, env_idx, :copy_dim] = mask[:copy_dim]
+            batch_next_state_targets = getattr(vec_env, "_last_next_state_target_np", None)
+            batch_next_state_masks = getattr(vec_env, "_last_next_state_mask_np", None)
+            if (
+                batch_next_state_targets is not None
+                and batch_next_state_masks is not None
+                and tuple(np.asarray(batch_next_state_targets).shape) == (n_envs, int(next_state_target_dim))
+                and tuple(np.asarray(batch_next_state_masks).shape) == (n_envs, int(next_state_target_dim))
+            ):
+                next_state_targets[step_idx] = np.asarray(batch_next_state_targets, dtype=np.float32)
+                next_state_masks[step_idx] = np.asarray(batch_next_state_masks, dtype=np.float32)
+            else:
+                for env_idx, info in enumerate(infos):
+                    target = np.asarray(info.get("next_state_target"), dtype=np.float32).reshape(-1)
+                    mask = np.asarray(info.get("next_state_mask"), dtype=np.float32).reshape(-1)
+                    copy_dim = int(min(target.shape[0], int(next_state_target_dim)))
+                    next_state_targets[step_idx, env_idx, :copy_dim] = target[:copy_dim]
+                    next_state_masks[step_idx, env_idx, :copy_dim] = mask[:copy_dim]
+        phase_acc["next_state"] += float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
         obs = np.asarray(obs, dtype=np.float32).copy()
         if not bool(truncated_arr.any()) and int(obs.shape[1]) > int(obs_slot_dim):
             obs[:, int(obs_slot_dim)] = scaled_reward_arr
         episode_starts_t = dones[step_idx].astype(np.float32, copy=False)
+        phase_acc["obs_post"] += float(time.perf_counter() - phase_t0)
+        if (
+            bool(_pack_phase_logging_enabled())
+            and int(collect_log_every) > 0
+            and ((int(step_idx) + 1) % int(collect_log_every) == 0 or int(step_idx) + 1 == int(n_steps))
+        ):
+            _pack_phase_log(
+                "collect_prior_progress "
+                f"step={int(step_idx) + 1}/{int(n_steps)} "
+                f"step_s={float(time.perf_counter() - step_t0):.3f} "
+                f"elapsed_s={float(time.perf_counter() - collect_t0):.1f} "
+                f"avg_mask_s={float(phase_acc['mask'] / float(step_idx + 1)):.4f} "
+                f"avg_obs_norm_s={float(phase_acc['obs_norm'] / float(step_idx + 1)):.4f} "
+                f"avg_policy_s={float(phase_acc['policy'] / float(step_idx + 1)):.4f} "
+                f"avg_env_step_s={float(phase_acc['env_step'] / float(step_idx + 1)):.4f} "
+                f"avg_reward_s={float(phase_acc['reward'] / float(step_idx + 1)):.4f} "
+                f"avg_next_state_s={float(phase_acc['next_state'] / float(step_idx + 1)):.4f} "
+                f"avg_obs_post_s={float(phase_acc['obs_post'] / float(step_idx + 1)):.4f}"
+            )
+        if int(collect_probe_max_steps) > 0 and int(step_idx) + 1 >= int(collect_probe_max_steps):
+            elapsed_s = float(time.perf_counter() - collect_t0)
+            measured_steps = int(step_idx) + 1
+            step_elapsed_s = max(0.0, elapsed_s - float(reset_elapsed_s))
+            projected_s = float(reset_elapsed_s) + (
+                float(int(n_steps)) * step_elapsed_s / max(1, measured_steps)
+            )
+            vec_env._defer_time_limit_reset_at_rollout_end = original_defer_time_limit_reset
+            vec_env._compact_pack_step_infos = original_compact_pack_step_infos
+            _pack_phase_log(
+                "collect_prior_probe_exit "
+                f"step={measured_steps}/{int(n_steps)} "
+                f"elapsed_s={elapsed_s:.1f} "
+                f"projected_collect_s={projected_s:.1f} "
+                f"avg_policy_s={float(phase_acc['policy'] / float(measured_steps)):.4f} "
+                f"avg_env_step_s={float(phase_acc['env_step'] / float(measured_steps)):.4f} "
+                f"avg_obs_norm_s={float(phase_acc['obs_norm'] / float(measured_steps)):.4f}"
+            )
+            raise SystemExit(0)
 
     final_obs_for_value = _apply_observation_normalization_snapshot(
         algo,
@@ -1617,6 +1935,12 @@ def _collect_prior_policy_pack(
     )
     last_values = _predict_terminal_values_from_tokens(algo, final_obs_for_value, episode_starts_t)
     vec_env._defer_time_limit_reset_at_rollout_end = original_defer_time_limit_reset
+    vec_env._compact_pack_step_infos = original_compact_pack_step_infos
+    _pack_phase_log(
+        "collect_prior_done "
+        f"elapsed_s={float(time.perf_counter() - collect_t0):.1f} "
+        f"n_steps={int(n_steps)} n_envs={int(n_envs)}"
+    )
 
     pack = {
         "tokens": tokens,
@@ -2156,7 +2480,10 @@ def _run_update_from_pack(
     next_state_target_dim: int,
     single_eval_pos: int,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
+    bridge_t0 = time.perf_counter()
     buffer_pack, reward_norm_stats = _apply_reward_normalization_if_enabled(algo, pack)
+    _pack_phase_log(f"reward_normalization_done elapsed_s={float(time.perf_counter() - bridge_t0):.3f}")
+    fill_t0 = time.perf_counter()
     buffer_summary = _fill_existing_rollout_buffer_from_pack(
         algo.rollout_buffer,
         buffer_pack,
@@ -2168,13 +2495,23 @@ def _run_update_from_pack(
         log_probs_by_step_env=log_probs,
         last_values_by_env=pack.get("last_values"),
         compute_returns=True,
+        summary_mode=os.environ.get("TICL_PPO_ROLLOUT_BUFFER_SUMMARY_MODE", "light"),
+    )
+    _pack_phase_log(
+        "rollout_buffer_fill_done "
+        f"elapsed_s={float(time.perf_counter() - fill_t0):.3f} "
+        f"summary_mode={buffer_summary.get('summary_mode')} "
+        f"timings={json.dumps(_json_safe(buffer_summary.get('timings', {})), sort_keys=True)}"
     )
     before = _policy_param_snapshot(algo)
+    _pack_phase_log(f"param_snapshot_done elapsed_s={float(time.perf_counter() - bridge_t0):.3f}")
     exception = None
+    train_t0 = time.perf_counter()
     try:
         algo.train()
     except Exception as exc:  # pragma: no cover
         exception = repr(exc)
+    _pack_phase_log(f"algo_train_returned elapsed_s={float(time.perf_counter() - train_t0):.1f}")
     update = {
         "exception": exception,
         "n_updates": int(getattr(algo, "_n_updates", 0)),
@@ -2212,6 +2549,7 @@ def _run_pack_update_once(
     force_checkpoint: bool,
     progress_path: Path | None,
 ) -> tuple[dict[str, Any], str]:
+    run_t0 = time.perf_counter()
     sidecar_dir = output_dir / "semantic_sidecars"
     checkpoint_dir = output_dir / "checkpoints"
     effective_single_eval_pos = (
@@ -2224,7 +2562,27 @@ def _run_pack_update_once(
         or float(getattr(algo, "_rwkv_aux_flow_weight", 0.0)) > 0.0
         or int(getattr(algo.rollout_buffer, "next_state_dim", 0)) > 0
     )
-    if str(arm) == "gym":
+    update_pack_load_path = _env_path("TICL_PPO_UPDATE_PACK_LOAD_PATH")
+    update_pack_save_path = _env_path("TICL_PPO_UPDATE_PACK_SAVE_PATH")
+    if update_pack_load_path is not None:
+        phase_t0 = time.perf_counter()
+        _pack_phase_log(f"load_pack_start path={update_pack_load_path}")
+        pack, values, log_probs, meta = _load_update_pack_cache(
+            path=update_pack_load_path,
+            arm=str(arm),
+            update_idx=int(update_idx),
+            n_steps=int(n_steps),
+            n_envs=int(n_envs),
+            num_features=int(num_features),
+            action_slot_dim=int(action_slot_dim),
+            next_state_target_dim=int(next_state_target_dim),
+            single_eval_pos=int(effective_single_eval_pos),
+            store_next_state_targets=bool(store_next_state_targets),
+        )
+        _pack_phase_log(f"load_pack_done elapsed_s={float(time.perf_counter() - phase_t0):.1f}")
+    elif str(arm) == "gym":
+        phase_t0 = time.perf_counter()
+        _pack_phase_log(f"collect_gym_start update_idx={int(update_idx)}")
         pack, values, log_probs, meta = _collect_gym_policy_pack(
             algo=algo,
             gym_env_ids=_normalize_env_id_list(gym_env_ids_arg, int(n_envs)),
@@ -2239,7 +2597,12 @@ def _run_pack_update_once(
             device_obj=device_obj,
             store_next_state_targets=bool(store_next_state_targets),
         )
+        _pack_phase_log(f"collect_gym_done elapsed_s={float(time.perf_counter() - phase_t0):.1f}")
     elif str(arm) == "prior":
+        phase_t0 = time.perf_counter()
+        _pack_phase_log(
+            f"collect_prior_start update_idx={int(update_idx)} n_steps={int(n_steps)} n_envs={int(n_envs)}"
+        )
         pack, values, log_probs, meta = _collect_prior_policy_pack(
             algo=algo,
             vec_env=vec_env,
@@ -2251,14 +2614,47 @@ def _run_pack_update_once(
             next_state_target_dim=int(next_state_target_dim),
             store_next_state_targets=bool(store_next_state_targets),
         )
+        _pack_phase_log(f"collect_prior_phase_done elapsed_s={float(time.perf_counter() - phase_t0):.1f}")
     else:
         raise ValueError(f"Unsupported arm={arm!r}")
     meta["single_eval_pos"] = int(effective_single_eval_pos)
     meta["next_state_targets_stored"] = bool(store_next_state_targets)
     meta["rollout_buffer_next_state_dim"] = int(getattr(algo.rollout_buffer, "next_state_dim", 0))
+    if update_pack_save_path is not None:
+        phase_t0 = time.perf_counter()
+        _pack_phase_log(f"save_pack_start path={update_pack_save_path}")
+        _save_update_pack_cache(
+            path=update_pack_save_path,
+            arm=str(arm),
+            update_idx=int(update_idx),
+            env_seed=int(env_seed),
+            n_steps=int(n_steps),
+            n_envs=int(n_envs),
+            num_features=int(num_features),
+            action_slot_dim=int(action_slot_dim),
+            next_state_target_dim=int(next_state_target_dim),
+            single_eval_pos=int(effective_single_eval_pos),
+            store_next_state_targets=bool(store_next_state_targets),
+            pack=pack,
+            values=values,
+            log_probs=log_probs,
+            meta=meta,
+        )
+        _pack_phase_log(f"save_pack_done elapsed_s={float(time.perf_counter() - phase_t0):.1f}")
+        if _env_truthy("TICL_PPO_UPDATE_PACK_SAVE_EXIT", default=False):
+            print(
+                f"[ppo-update-pack-cache-save-exit] path={update_pack_save_path} update_idx={int(update_idx)}",
+                flush=True,
+            )
+            raise SystemExit(0)
     if str(arm) == "prior":
+        phase_t0 = time.perf_counter()
         meta["pre_update_env_release"] = _release_prior_vec_env_before_update(vec_env)
+        _pack_phase_log(f"prior_env_release_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
+    phase_t0 = time.perf_counter()
     meta["pre_update_policy_rollout_cache_release"] = _release_policy_rollout_cache_before_update(algo)
+    _pack_phase_log(f"policy_rollout_cache_release_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
+    phase_t0 = time.perf_counter()
     semantic_probe = (
         _semantic_probe_from_pack(
             arm=str(arm),
@@ -2270,12 +2666,15 @@ def _run_pack_update_once(
         if bool(semantic_probes_enabled)
         else {"enabled": False}
     )
+    _pack_phase_log(f"semantic_probe_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
+    phase_t0 = time.perf_counter()
     reward_component_summary = _rollout_reward_stats_from_pack(
         arm=str(arm),
         pack=pack,
         meta=meta,
         single_eval_pos=int(effective_single_eval_pos),
     )
+    _pack_phase_log(f"reward_summary_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
     semantic_sidecar_path = None
     if (
         bool(semantic_probes_enabled)
@@ -2283,6 +2682,7 @@ def _run_pack_update_once(
         and int(semantic_probe_sidecar_every) > 0
         and int(update_idx) % int(semantic_probe_sidecar_every) == 0
     ):
+        phase_t0 = time.perf_counter()
         semantic_sidecar_path = sidecar_dir / f"{arm}_update_{int(update_idx):06d}_envs.jsonl"
         _write_jsonl(
             semantic_sidecar_path,
@@ -2295,6 +2695,8 @@ def _run_pack_update_once(
                 action_slot_dim=int(action_slot_dim),
             ),
         )
+        _pack_phase_log(f"semantic_sidecar_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
+    phase_t0 = time.perf_counter()
     update, bridge = _run_update_from_pack(
         algo=algo,
         pack=pack,
@@ -2305,6 +2707,23 @@ def _run_pack_update_once(
         next_state_target_dim=int(next_state_target_dim),
         single_eval_pos=int(effective_single_eval_pos),
     )
+    _pack_phase_log(
+        "update_from_pack_done "
+        f"elapsed_s={float(time.perf_counter() - phase_t0):.1f} "
+        f"total_s={float(time.perf_counter() - run_t0):.1f}"
+    )
+    pack_summary_mode = str(os.environ.get("TICL_PPO_PACK_SUMMARY_MODE", "light")).strip().lower()
+    pack_summary_t0 = time.perf_counter()
+    pack_summary = (
+        _summarize_pack(pack, label=str(arm))
+        if pack_summary_mode in {"full", "complete", "digest"}
+        else _summarize_pack_light(pack, label=str(arm))
+    )
+    _pack_phase_log(
+        "pack_summary_done "
+        f"elapsed_s={float(time.perf_counter() - pack_summary_t0):.3f} "
+        f"summary_mode={pack_summary.get('summary_mode', 'full')}"
+    )
     row = {
         "arm": str(arm),
         "update_idx": int(update_idx),
@@ -2313,7 +2732,7 @@ def _run_pack_update_once(
         "fixed_env_group_across_updates": bool(fixed_env_group_across_updates),
         "fixed_group_dump": fixed_group_dump,
         "collector": meta,
-        "pack_summary": _summarize_pack(pack, label=str(arm)),
+        "pack_summary": pack_summary,
         "reward_component_summary": reward_component_summary,
         "semantic_probe": semantic_probe,
         "semantic_probe_sidecar_path": None if semantic_sidecar_path is None else str(semantic_sidecar_path),
@@ -2337,11 +2756,19 @@ def _run_pack_update_once(
         )
         row["checkpoint_path"] = str(checkpoint_path)
     if progress_path is not None:
+        phase_t0 = time.perf_counter()
         progress_path.parent.mkdir(parents=True, exist_ok=True)
         with progress_path.open("a", encoding="utf-8") as f:
             f.write(json.dumps(_json_safe(row), sort_keys=True) + "\n")
+        _pack_phase_log(f"progress_row_write_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
     del pack, values, log_probs
+    phase_t0 = time.perf_counter()
     _trim_host_allocator_after_pack_release()
+    _pack_phase_log(
+        "pack_release_trim_done "
+        f"elapsed_s={float(time.perf_counter() - phase_t0):.3f} "
+        f"total_s={float(time.perf_counter() - run_t0):.1f}"
+    )
     return row, str(meta.get("env_group_digest", ""))
 
 

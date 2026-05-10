@@ -1901,18 +1901,18 @@ class MaskedRecurrentRolloutBufferSamples(NamedTuple):
 class MaskedRecurrentFlatBatchSamples(NamedTuple):
     observations: torch.Tensor
     actions: torch.Tensor
-    old_values: torch.Tensor
+    old_values: Optional[torch.Tensor]
     old_log_prob: torch.Tensor
     advantages: torch.Tensor
     returns: torch.Tensor
     objective_masks: torch.Tensor
-    rollout_return_means: torch.Tensor
-    rollout_return_stds: torch.Tensor
+    rollout_return_means: Optional[torch.Tensor]
+    rollout_return_stds: Optional[torch.Tensor]
     lstm_states: RNNStates
     episode_starts: torch.Tensor
     action_masks: torch.Tensor
-    next_states: torch.Tensor
-    next_state_masks: torch.Tensor
+    next_states: Optional[torch.Tensor]
+    next_state_masks: Optional[torch.Tensor]
     seq_start_indices: np.ndarray
     seq_lengths: np.ndarray
     actor_advantages: Optional[torch.Tensor] = None
@@ -2991,9 +2991,24 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         for batch_inds, env_change in self._iter_batch_plan(batch_size):
             yield self._get_samples_gpu(batch_inds, env_change)
 
-    def get_gpu_flat(self, batch_size: Optional[int] = None):
+    def get_gpu_flat(
+        self,
+        batch_size: Optional[int] = None,
+        *,
+        include_old_values: bool = True,
+        include_value_affine: bool = True,
+        include_aux_tensors: bool = True,
+        include_position_metadata: bool = True,
+    ):
         for batch_inds, env_change in self._iter_batch_plan(batch_size):
-            yield self._get_flat_batch_gpu(batch_inds, env_change)
+            yield self._get_flat_batch_gpu(
+                batch_inds,
+                env_change,
+                include_old_values=include_old_values,
+                include_value_affine=include_value_affine,
+                include_aux_tensors=include_aux_tensors,
+                include_position_metadata=include_position_metadata,
+            )
 
     def _get_samples_gpu(
         self,
@@ -3144,6 +3159,11 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self,
         batch_inds: np.ndarray,
         env_change: np.ndarray,
+        *,
+        include_old_values: bool = True,
+        include_value_affine: bool = True,
+        include_aux_tensors: bool = True,
+        include_position_metadata: bool = True,
     ) -> MaskedRecurrentFlatBatchSamples:
         self.seq_start_indices, _, _ = self._create_sequencers(batch_inds, env_change)
         seq_start_indices = np.asarray(self.seq_start_indices, dtype=np.int64)
@@ -3154,19 +3174,39 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
 
         observations_flat = self.to_torch(self.observations[batch_inds]).contiguous()
         actions_flat = self.to_torch(self.actions[batch_inds]).contiguous()
-        values_flat = self.to_torch(self.values[batch_inds]).reshape(-1).contiguous()
+        values_flat = (
+            self.to_torch(self.values[batch_inds]).reshape(-1).contiguous()
+            if bool(include_old_values)
+            else None
+        )
         log_probs_flat = self.to_torch(self.log_probs[batch_inds]).reshape(-1).contiguous()
         advantages_flat = self.to_torch(self.advantages[batch_inds]).reshape(-1).contiguous()
         actor_advantages_flat = self.to_torch(self.actor_advantages[batch_inds]).reshape(-1).contiguous()
         returns_flat = self.to_torch(self.returns[batch_inds]).reshape(-1).contiguous()
         value_target_bucket_idx_flat = self.to_torch(self.value_target_bucket_idx[batch_inds]).reshape(-1).contiguous()
         objective_masks_flat = self.to_torch(self.objective_masks[batch_inds]).reshape(-1).contiguous()
-        rollout_return_means_flat = self.to_torch(self.rollout_return_means[batch_inds]).reshape(-1).contiguous()
-        rollout_return_stds_flat = self.to_torch(self.rollout_return_stds[batch_inds]).reshape(-1).contiguous()
+        rollout_return_means_flat = (
+            self.to_torch(self.rollout_return_means[batch_inds]).reshape(-1).contiguous()
+            if bool(include_value_affine)
+            else None
+        )
+        rollout_return_stds_flat = (
+            self.to_torch(self.rollout_return_stds[batch_inds]).reshape(-1).contiguous()
+            if bool(include_value_affine)
+            else None
+        )
         episode_starts_flat = self.to_torch(self.episode_starts[batch_inds]).reshape(-1).contiguous()
         action_masks_flat = self.to_torch(self.action_masks[batch_inds]).contiguous()
-        next_states_flat = self.to_torch(self.next_states[batch_inds]).contiguous()
-        next_state_masks_flat = self.to_torch(self.next_state_masks[batch_inds]).contiguous()
+        next_states_flat = (
+            self.to_torch(self.next_states[batch_inds]).contiguous()
+            if bool(include_aux_tensors)
+            else None
+        )
+        next_state_masks_flat = (
+            self.to_torch(self.next_state_masks[batch_inds]).contiguous()
+            if bool(include_aux_tensors)
+            else None
+        )
         n_seq = int(len(seq_start_indices))
         dummy_lstm_state = torch.zeros((1, n_seq, 1), device=self.device, dtype=torch.float32)
         normalized_q_targets_flat = None
@@ -3178,7 +3218,18 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
                 returns_flat=returns_flat,
                 objective_masks_flat=objective_masks_flat,
             )
-        position_metadata = self.get_flat_position_metadata(batch_inds)
+        position_metadata = (
+            self.get_flat_position_metadata(batch_inds)
+            if bool(include_position_metadata)
+            else {
+                "flat_batch_indices": None,
+                "flat_env_indices": None,
+                "flat_step_indices": None,
+                "flat_objective_episode_indices": None,
+                "flat_objective_episode_positions": None,
+                "flat_objective_global_positions": None,
+            }
+        )
 
         return MaskedRecurrentFlatBatchSamples(
             observations=observations_flat,
@@ -3452,6 +3503,8 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 "Train outer-batch snapshot requires flat batch metadata, missing "
                 f"{missing!r}"
             )
+        if rollout_data.old_values is None:
+            raise ValueError("Train outer-batch snapshot requires old_values in the flat batch sample.")
         objective_mask_np = objective_mask.detach().to(dtype=torch.bool).cpu().numpy().reshape(-1)
         payload = {
             "snapshot_entry": "phase3_train_outer_batch_snapshot",
@@ -4438,12 +4491,46 @@ class MaskedRecurrentPPO(RecurrentPPO):
         train_wall_t0 = time.perf_counter()
         total_transitions = int(self.rollout_buffer.buffer_size * self.rollout_buffer.n_envs)
         total_outer_batches = int(max(1, math.ceil(float(total_transitions) / float(max(1, int(self.batch_size))))))
+        probe_max_outer_batches = int(os.environ.get("TICL_PPO_TRAIN_PROBE_MAX_OUTER_BATCHES_EXIT", "0") or "0")
+        probe_total_outer_batches = int(max(1, int(self.n_epochs) * int(total_outer_batches)))
         progress_every = self._progress_log_every()
         progress_min_interval_sec = self._progress_log_min_interval_sec()
         last_progress_t = train_wall_t0 - progress_min_interval_sec
         outer_batches_total_processed = 0
         subbatches_total_processed = 0
         loss = torch.zeros((), device=self.device, dtype=torch.float32)
+        train_profile_enabled = bool(int(os.environ.get("TICL_PPO_TRAIN_UNIT_PROFILE_ENABLED", "0") or "0"))
+        train_profile_sync = bool(int(os.environ.get("TICL_PPO_TRAIN_UNIT_PROFILE_SYNC", "1") or "1"))
+        legacy_full_flat_batch = bool(int(os.environ.get("TICL_PPO_TRAIN_LEGACY_FULL_FLAT_BATCH", "0") or "0"))
+        legacy_eval_values = bool(int(os.environ.get("TICL_PPO_TRAIN_LEGACY_EVAL_VALUES", "0") or "0"))
+        train_profile: dict[str, float] = {}
+
+        def _train_profile_now() -> float:
+            if train_profile_enabled and train_profile_sync:
+                try:
+                    if torch.device(self.device).type == "cuda":
+                        torch.cuda.synchronize(self.device)
+                except Exception:
+                    pass
+            return float(time.perf_counter())
+
+        def _train_profile_add(name: str, start_t: float) -> None:
+            if not train_profile_enabled:
+                return
+            elapsed = float(_train_profile_now() - float(start_t))
+            train_profile[name] = float(train_profile.get(name, 0.0) + elapsed)
+
+        def _emit_train_profile(tag: str) -> None:
+            if not train_profile_enabled or not self._progress_logging_enabled():
+                return
+            payload = {
+                key: round(float(value), 6)
+                for key, value in sorted(train_profile.items())
+            }
+            payload["outer_batches"] = int(outer_batches_total_processed)
+            payload["subbatches"] = int(subbatches_total_processed)
+            self._emit_progress_log(f"[ppo-train-unit-profile] tag={tag} {json.dumps(payload, sort_keys=True)}")
+
         if self._progress_logging_enabled():
             self._emit_progress_log(
                 "[ppo-train-start] "
@@ -4451,10 +4538,48 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 f"batch_size={int(self.batch_size)} n_envs={int(self.n_envs)} n_steps={int(self.n_steps)}"
             )
 
+        def _maybe_exit_train_probe() -> None:
+            if int(probe_max_outer_batches) <= 0:
+                return
+            if int(outer_batches_total_processed) < int(probe_max_outer_batches):
+                return
+            elapsed_s = float(time.perf_counter() - train_wall_t0)
+            projected_update_s = elapsed_s * float(probe_total_outer_batches) / max(
+                1,
+                int(outer_batches_total_processed),
+            )
+            if self._progress_logging_enabled():
+                self._emit_progress_log(
+                    "[ppo-train-probe-exit] "
+                    f"outer_batches={int(outer_batches_total_processed)}/{int(probe_total_outer_batches)} "
+                    f"subbatches={int(subbatches_total_processed)} "
+                    f"elapsed_s={elapsed_s:.1f} "
+                    f"projected_update_s={projected_update_s:.1f}"
+                )
+            _emit_train_profile("probe_exit")
+            raise SystemExit(0)
+
         buffer_getter_flat = getattr(self.rollout_buffer, "get_gpu_flat", None)
         buffer_getter_padded = getattr(self.rollout_buffer, "get_gpu", None)
         if not callable(buffer_getter_padded):
             buffer_getter_padded = self.rollout_buffer.get
+        should_capture_selector_trace = getattr(
+            self,
+            "_should_capture_train_outer_batch_selector_trace",
+            lambda: False,
+        )
+        should_capture_snapshot = getattr(
+            self,
+            "_should_capture_train_outer_batch_snapshot",
+            lambda: False,
+        )
+        needs_debug_flat_metadata = bool(
+            should_capture_selector_trace()
+            or should_capture_snapshot()
+        )
+        needs_q_aux_tensors = bool(float(getattr(self, "_rwkv_aux_q_weight", 0.0)) > 0.0)
+        needs_flow_aux_tensors = bool(float(getattr(self, "_rwkv_aux_flow_weight", 0.0)) > 0.0)
+        include_eval_values = bool(legacy_eval_values)
 
         for epoch in range(self.n_epochs):
             if getattr(self.policy, "value_path_adapter_impl", "none") == "frozen_zscore":
@@ -4487,15 +4612,34 @@ class MaskedRecurrentPPO(RecurrentPPO):
             approx_kl_divs = []
             outer_batch_idx = 0
             if callable(buffer_getter_flat):
-                rollout_iterator = buffer_getter_flat(self.batch_size)
+                if isinstance(self.rollout_buffer, MaskedRecurrentRolloutBuffer):
+                    rollout_iterator = buffer_getter_flat(
+                        self.batch_size,
+                        include_old_values=bool(legacy_full_flat_batch or needs_debug_flat_metadata),
+                        include_value_affine=bool(legacy_full_flat_batch or needs_q_aux_tensors),
+                        include_aux_tensors=bool(legacy_full_flat_batch or needs_flow_aux_tensors),
+                        include_position_metadata=bool(legacy_full_flat_batch or needs_debug_flat_metadata),
+                    )
+                else:
+                    rollout_iterator = buffer_getter_flat(self.batch_size)
             else:
                 rollout_iterator = buffer_getter_padded(self.batch_size)
-            for rollout_data in rollout_iterator:
+            rollout_iterator = iter(rollout_iterator)
+            while True:
+                profile_t = _train_profile_now() if train_profile_enabled else 0.0
+                try:
+                    rollout_data = next(rollout_iterator)
+                except StopIteration:
+                    break
+                _train_profile_add("rollout_iterator_next_s", profile_t)
                 outer_batch_idx += 1
                 outer_batches_total_processed += 1
                 if isinstance(rollout_data, MaskedRecurrentFlatBatchSamples):
+                    profile_t = _train_profile_now() if train_profile_enabled else 0.0
                     objective_mask = rollout_data.objective_masks > 1e-8
                     objective_total = int(objective_mask.sum().detach().cpu())
+                    _train_profile_add("flat_objective_mask_s", profile_t)
+                    profile_t = _train_profile_now() if train_profile_enabled else 0.0
                     self._append_train_outer_batch_selector_trace_row_flat(
                         rollout_data=rollout_data,
                         objective_mask=objective_mask,
@@ -4503,6 +4647,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                         outer_batch_idx=int(outer_batch_idx),
                         total_outer_batches=int(total_outer_batches),
                     )
+                    _train_profile_add("flat_selector_trace_s", profile_t)
                     valid_total = objective_mask.to(
                         device=rollout_data.returns.device,
                         dtype=rollout_data.returns.dtype,
@@ -4534,12 +4679,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 f"outer_batch={int(outer_batch_idx)}/{int(total_outer_batches)} "
                                 f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
                             )
+                        _maybe_exit_train_probe()
                         continue
 
                     advantages = None
                     snapshot_target_mask = None
                     snapshot_requested = False
                     if not exact_value_only_mode:
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         advantages = _resolve_actor_advantages(rollout_data)
                         snapshot_target_mask = self._resolve_train_outer_batch_snapshot_match_mask_flat(
                             rollout_data=rollout_data,
@@ -4553,6 +4700,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             )
                         if self.normalize_advantage:
                             advantages = _normalize_advantages_with_mask(advantages, objective_mask, eps=1e-8)
+                        _train_profile_add("flat_advantage_norm_s", profile_t)
                         if snapshot_requested:
                             post_normalization_advantages_snapshot = (
                                 advantages.detach().to(dtype=torch.float32).cpu().numpy().copy()
@@ -4580,8 +4728,11 @@ class MaskedRecurrentPPO(RecurrentPPO):
                     flow_xt_full = flow_t_full = flow_dx_full = None
                     flow_denom_total = None
                     if float(getattr(self, "_rwkv_aux_q_weight", 0.0)) > 0.0:
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         q_targets_full = rollout_data.normalized_q_targets
                         if q_targets_full is None:
+                            if rollout_data.rollout_return_means is None or rollout_data.rollout_return_stds is None:
+                                raise RuntimeError("Flat PPO Q aux requires rollout return affine tensors.")
                             raw_returns_full = _recover_raw_from_value_space(
                                 rollout_data.returns.detach(),
                                 value_means=rollout_data.rollout_return_means.detach(),
@@ -4594,17 +4745,23 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 valid_mask_flat=objective_mask.detach(),
                                 eps=1e-6,
                             )
+                        _train_profile_add("flat_q_target_prep_s", profile_t)
                     if float(getattr(self, "_rwkv_aux_flow_weight", 0.0)) > 0.0:
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         env_prior = getattr(self, "_rwkv_env_prior", None)
                         if env_prior is None:
                             raise RuntimeError("PPO flow aux requires bound EnvironmentPrior.")
+                        if rollout_data.next_states is None or rollout_data.next_state_masks is None:
+                            raise RuntimeError("Flat PPO flow aux requires next-state tensors.")
                         flow_xt_full, flow_t_full, flow_dx_full = env_prior._sample_condot_flow_matching_path(
                             rollout_data.next_states.detach()
                         )
                         flow_denom_total = rollout_data.next_state_masks.sum().clamp_min(1.0)
+                        _train_profile_add("flat_flow_target_prep_s", profile_t)
 
                     subbatch_idx = 0
                     for start_seq in range(0, n_seq_total, seq_subbatch_size):
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         subbatch_idx += 1
                         subbatches_total_processed += 1
                         end_seq = min(n_seq_total, start_seq + seq_subbatch_size)
@@ -4638,6 +4795,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             sub_flow_t = flow_t_full[flat_start:flat_end]
                             sub_flow_dx = flow_dx_full[flat_start:flat_end]
                         aux_loss_info = None
+                        _train_profile_add("flat_subbatch_slice_s", profile_t)
+                        eval_kwargs = {}
+                        if (
+                            not include_eval_values
+                            and bool(getattr(self.policy, "supports_skipping_eval_values", False))
+                        ):
+                            eval_kwargs["include_values"] = False
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         with _ppo_autocast_context(autocast_dtype=autocast_dtype, device=self.device):
                             eval_outputs = self.policy.evaluate_actions_with_hidden_flat(
                                 rollout_data.observations[flat_start:flat_end],
@@ -4647,6 +4812,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 include_normalized_q_logits=(sub_q_targets is not None),
                                 flow_matching_xt=sub_flow_xt,
                                 flow_matching_t=sub_flow_t,
+                                **eval_kwargs,
                             )
                             value_logits = eval_outputs["value_logits"]
                             value_loss = self.policy.compute_value_loss_from_logits(
@@ -4741,11 +4907,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 if aux_loss_info is not None:
                                     aux_loss, aux_stats = aux_loss_info
                                     subbatch_loss = subbatch_loss + aux_loss
+                        _train_profile_add("flat_forward_loss_s", profile_t)
 
+                        profile_t = _train_profile_now() if train_profile_enabled else 0.0
                         if grad_scaler is None:
                             subbatch_loss.backward()
                         else:
                             grad_scaler.scale(subbatch_loss).backward()
+                        _train_profile_add("flat_backward_s", profile_t)
                         loss_total = loss_total + subbatch_loss.detach()
 
                         policy_num_total = policy_num_total + policy_num.detach()
@@ -4781,6 +4950,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             last_progress_t = now
 
                         if not exact_value_only_mode:
+                            profile_t = _train_profile_now() if train_profile_enabled else 0.0
                             with torch.no_grad():
                                 log_ratio = log_prob - sub_old_log_prob
                                 approx_kl_terms = (torch.exp(log_ratio) - 1) - log_ratio
@@ -4794,6 +4964,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                     * sub_objective_f.to(device=ratio.device, dtype=ratio.dtype)
                                 ).sum()
                                 clip_num_total = clip_num_total + clip_num.detach()
+                            _train_profile_add("flat_metric_kl_clip_s", profile_t)
                     if snapshot_requested:
                         self._maybe_capture_train_outer_batch_snapshot_flat(
                             rollout_data=rollout_data,
@@ -4842,6 +5013,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                                 f"outer_batch={int(outer_batch_idx)}/{int(total_outer_batches)} "
                                 f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
                             )
+                        _maybe_exit_train_probe()
                         continue
 
                     advantages = _resolve_actor_advantages(rollout_data)
@@ -4941,14 +5113,20 @@ class MaskedRecurrentPPO(RecurrentPPO):
                             end_seq=end_seq,
                         )
                         with _ppo_autocast_context(autocast_dtype=autocast_dtype, device=self.device):
+                            eval_kwargs = {}
+                            if (
+                                not include_eval_values
+                                and bool(getattr(self.policy, "supports_skipping_eval_values", False))
+                            ):
+                                eval_kwargs["include_values"] = False
                             eval_outputs = self.policy.evaluate_actions_with_hidden(
                                 sub_rollout_data.observations,
                                 sub_rollout_data.actions,
                                 sub_rollout_data.lstm_states,
                                 sub_rollout_data.episode_starts,
                                 action_masks=sub_rollout_data.action_masks,
+                                **eval_kwargs,
                             )
-                            values = eval_outputs["values"].flatten()
                             value_logits = eval_outputs["value_logits"]
                             log_prob = eval_outputs["log_prob"]
                             entropy = eval_outputs["entropy"]
@@ -5088,6 +5266,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                         print(f"Early stopping at step {epoch} due to reaching max kl: {float(approx_kl_div.cpu()):.2f}")
                     break
 
+                profile_t = _train_profile_now() if train_profile_enabled else 0.0
                 if grad_scaler is not None:
                     grad_scaler.unscale_(self.policy.optimizer)
                 torch.nn.utils.clip_grad_norm_(self.policy.parameters(), self.max_grad_norm)
@@ -5096,6 +5275,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                 else:
                     grad_scaler.step(self.policy.optimizer)
                     grad_scaler.update()
+                _train_profile_add("optimizer_step_s", profile_t)
                 if self._progress_logging_enabled() and (
                     outer_batch_idx == total_outer_batches
                     or (outer_batch_idx % progress_every) == 0
@@ -5106,6 +5286,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
                         f"outer_batch={int(outer_batch_idx)}/{int(total_outer_batches)} "
                         f"elapsed_s={float(time.perf_counter() - train_wall_t0):.1f}"
                     )
+                _maybe_exit_train_probe()
 
             if not continue_training:
                 break
@@ -5114,6 +5295,7 @@ class MaskedRecurrentPPO(RecurrentPPO):
         self._n_updates += self.n_epochs
         update_wall_time_sec = float(time.perf_counter() - train_wall_t0)
         setattr(self, "_rwkv_last_update_wall_time_sec", update_wall_time_sec)
+        _emit_train_profile("train_end")
         objective_masks_np = getattr(self.rollout_buffer, "objective_masks", None)
         value_space_values_flat = self.rollout_buffer.values.flatten()
         value_space_targets_flat = self.rollout_buffer.returns.flatten()
@@ -5918,6 +6100,13 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._single_eval_pos = None
         self._single_eval_pos_np = None
         self._action_masks_np = None
+        self._last_next_state_target_np = None
+        self._last_next_state_mask_np = None
+        self._last_dones_np = None
+        self._last_terminated_np = None
+        self._last_truncated_np = None
+        self._last_terminal_observation_np = None
+        self._compact_pack_step_infos = False
         self._step_idx = 0
         self._episode_returns = np.zeros((self.num_envs,), dtype=np.float32)
         self._episode_lengths = np.zeros((self.num_envs,), dtype=np.int32)
@@ -5955,6 +6144,12 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._single_eval_pos = None
         self._single_eval_pos_np = None
         self._action_masks_np = None
+        self._last_next_state_target_np = None
+        self._last_next_state_mask_np = None
+        self._last_dones_np = None
+        self._last_terminated_np = None
+        self._last_truncated_np = None
+        self._last_terminal_observation_np = None
         clear_artifacts = getattr(self.env_prior, "clear_rollout_artifacts", None)
         if callable(clear_artifacts):
             clear_artifacts()
@@ -6064,6 +6259,12 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._single_eval_pos = None
         self._single_eval_pos_np = np.zeros((self.num_envs,), dtype=np.int64)
         self._action_masks_np = None
+        self._last_next_state_target_np = None
+        self._last_next_state_mask_np = None
+        self._last_dones_np = None
+        self._last_terminated_np = None
+        self._last_truncated_np = None
+        self._last_terminal_observation_np = None
         self._step_idx = 0
         self._episode_returns.fill(0.0)
         self._episode_lengths.fill(0)
@@ -6156,6 +6357,12 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         )
         self._single_eval_pos_np = self._single_eval_pos.detach().cpu().numpy().astype(np.int64, copy=True)
         self._action_masks_np = None
+        self._last_next_state_target_np = None
+        self._last_next_state_mask_np = None
+        self._last_dones_np = None
+        self._last_terminated_np = None
+        self._last_truncated_np = None
+        self._last_terminal_observation_np = None
         self._step_idx = 0
         self._episode_returns.fill(0.0)
         self._episode_lengths.fill(0)
@@ -6382,6 +6589,8 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
 
         obs_next = self._build_obs_batch()
         next_state_target, next_state_mask = self._build_next_state_targets()
+        self._last_next_state_target_np = next_state_target
+        self._last_next_state_mask_np = next_state_mask
         rewards_np = reward_return.detach().cpu().numpy().astype(np.float32, copy=False)
         terminal_flags_np = self._terminal_t.detach().cpu().numpy().astype(np.float32, copy=False)
         single_eval_pos_np = self._single_eval_pos_np
@@ -6391,33 +6600,43 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         terminated = np.logical_or(terminal_flags_np > 1e-8, sep_forced_reset)
         truncated = np.full((self.num_envs,), bool(self._step_idx >= self.n_steps), dtype=bool)
         dones = np.logical_or(terminated, truncated)
+        self._last_dones_np = dones
+        self._last_terminated_np = terminated
+        self._last_truncated_np = truncated
+        self._last_terminal_observation_np = None
         self._episode_returns += rewards_np
         self._episode_lengths += 1
-        infos = [
-            {
-                "step_idx": int(self._step_idx),
-                "single_eval_pos": int(single_eval_pos_np[env_idx]),
-                "terminal_flag": float(terminal_flags_np[env_idx]),
-                "sep_forced_reset": bool(sep_forced_reset[env_idx]),
-                "sep_state_reset": bool(sep_state_only_reset[env_idx]),
-                "next_state_target": next_state_target[env_idx],
-                "next_state_mask": next_state_mask[env_idx],
-                "TimeLimit.truncated": bool(truncated[env_idx] and not terminated[env_idx]),
-            }
-            for env_idx in range(self.num_envs)
-        ]
+        compact_infos = bool(getattr(self, "_compact_pack_step_infos", False))
+        if compact_infos:
+            infos = [{} for _ in range(self.num_envs)]
+        else:
+            infos = [
+                {
+                    "step_idx": int(self._step_idx),
+                    "single_eval_pos": int(single_eval_pos_np[env_idx]),
+                    "terminal_flag": float(terminal_flags_np[env_idx]),
+                    "sep_forced_reset": bool(sep_forced_reset[env_idx]),
+                    "sep_state_reset": bool(sep_state_only_reset[env_idx]),
+                    "next_state_target": next_state_target[env_idx],
+                    "next_state_mask": next_state_mask[env_idx],
+                    "TimeLimit.truncated": bool(truncated[env_idx] and not terminated[env_idx]),
+                }
+                for env_idx in range(self.num_envs)
+            ]
 
         if bool(dones.any()):
             terminal_obs = obs_next.copy()
+            self._last_terminal_observation_np = terminal_obs
             for env_idx in range(self.num_envs):
                 if not bool(dones[env_idx]):
                     continue
-                infos[env_idx]["episode"] = {
-                    "r": float(self._episode_returns[env_idx]),
-                    "l": int(self._episode_lengths[env_idx]),
-                }
-                if bool(truncated[env_idx]):
-                    infos[env_idx]["terminal_observation"] = terminal_obs[env_idx].copy()
+                if not compact_infos:
+                    infos[env_idx]["episode"] = {
+                        "r": float(self._episode_returns[env_idx]),
+                        "l": int(self._episode_lengths[env_idx]),
+                    }
+                    if bool(truncated[env_idx]):
+                        infos[env_idx]["terminal_observation"] = terminal_obs[env_idx].copy()
                 self._episode_returns[env_idx] = 0.0
                 self._episode_lengths[env_idx] = 0
             defer_final_time_limit_reset = bool(
@@ -6427,6 +6646,12 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
             )
             if bool(truncated.any()) and not defer_final_time_limit_reset:
                 obs_next = self._full_reset_batch()
+                self._last_next_state_target_np = next_state_target
+                self._last_next_state_mask_np = next_state_mask
+                self._last_dones_np = dones
+                self._last_terminated_np = terminated
+                self._last_truncated_np = truncated
+                self._last_terminal_observation_np = terminal_obs
 
         self._pending_actions = None
         return obs_next, rewards_np.copy(), dones, infos
@@ -6474,6 +6699,8 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
 
 
 class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
+    supports_skipping_eval_values = True
+
     def __init__(
         self,
         observation_space: spaces.Space,
@@ -6748,9 +6975,9 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         value_target_bucket_idx: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         objective_mask = objective_mask.reshape(-1).to(device=targets.device, dtype=torch.bool)
-        if not bool(objective_mask.any().item()):
-            return value_logits.new_zeros(())
         if self.has_value_vendor_head():
+            if not bool(objective_mask.any().item()):
+                return value_logits.new_zeros(())
             logits_flat = value_logits.reshape(-1, int(value_logits.shape[-1]))
             targets_flat = targets.reshape(-1).to(device=value_logits.device, dtype=torch.float32)
             selected_logits = logits_flat[objective_mask.to(device=value_logits.device)].unsqueeze(0)
@@ -6871,6 +7098,13 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
             return self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
         with self._value_backbone_context():
             return self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
+
+    def _should_share_train_value_hidden(self) -> bool:
+        if bool(getattr(self, "separate_value_backbone", False)):
+            return False
+        if bool(int(os.environ.get("TICL_PPO_TRAIN_LEGACY_SEPARATE_VALUE_HIDDEN", "0") or "0")):
+            return False
+        return bool(int(os.environ.get("TICL_PPO_TRAIN_SHARE_VALUE_SEQUENCE_HIDDEN", "1") or "1"))
 
     @staticmethod
     def _flat_to_time_major_sequence(tensor: torch.Tensor, *, n_seq: int) -> torch.Tensor:
@@ -7911,12 +8145,15 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         lstm_states: RNNStates,
         episode_starts: torch.Tensor,
         action_masks=None,
+        include_values: bool = True,
     ):
         n_seq = int(lstm_states.pi[0].shape[1])
         hidden = self._official_sequence_hidden(obs, episode_starts, n_seq=n_seq)
-        # See forward(): legacy parity requires a distinct value-path graph even
-        # for shared-backbone actor/critic.
-        value_hidden = self._value_sequence_hidden(obs, episode_starts, n_seq=n_seq)
+        value_hidden = (
+            hidden
+            if self._should_share_train_value_hidden()
+            else self._value_sequence_hidden(obs, episode_starts, n_seq=n_seq)
+        )
         latent_pi = self.mlp_extractor.forward_actor(hidden)
         latent_vf = self.mlp_extractor.forward_critic(value_hidden)
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -7924,7 +8161,7 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         actions = self._masked_action_tensor(actions, action_mask_t)
         log_prob, entropy = self._masked_diag_gaussian_stats(distribution, actions, action_mask_t)
         value_logits = self._value_logits_from_latent(latent_vf)
-        values = self._value_from_logits(value_logits)
+        values = self._value_from_logits(value_logits) if bool(include_values) else None
         return {
             "values": values,
             "value_logits": value_logits,
@@ -7945,6 +8182,7 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         include_normalized_q_logits: bool = False,
         flow_matching_xt: Optional[torch.Tensor] = None,
         flow_matching_t: Optional[torch.Tensor] = None,
+        include_values: bool = True,
     ):
         fused_aux_requested = bool(include_normalized_q_logits or (flow_matching_xt is not None and flow_matching_t is not None))
         if fused_aux_requested:
@@ -7960,9 +8198,11 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         else:
             fused_outputs = None
             hidden = self._official_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
-        # See forward(): legacy parity requires a distinct value-path graph even
-        # for shared-backbone actor/critic.
-        value_hidden = self._value_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
+        value_hidden = (
+            hidden
+            if self._should_share_train_value_hidden()
+            else self._value_sequence_hidden_flat(obs, seq_lengths=seq_lengths)
+        )
         latent_pi = self.mlp_extractor.forward_actor(hidden)
         latent_vf = self.mlp_extractor.forward_critic(value_hidden)
         distribution = self._get_action_dist_from_latent(latent_pi)
@@ -7970,7 +8210,7 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         actions = self._masked_action_tensor(actions, action_mask_t)
         log_prob, entropy = self._masked_diag_gaussian_stats(distribution, actions, action_mask_t)
         value_logits = self._value_logits_from_latent(latent_vf)
-        values = self._value_from_logits(value_logits)
+        values = self._value_from_logits(value_logits) if bool(include_values) else None
         outputs = {
             "values": values,
             "value_logits": value_logits,

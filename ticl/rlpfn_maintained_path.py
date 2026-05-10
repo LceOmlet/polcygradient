@@ -1,3 +1,4 @@
+import os
 from copy import deepcopy
 
 from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
@@ -118,8 +119,12 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["single_eval_causal"] = True
     config["transformer"]["backbone"] = "rwkv7"
     config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
-    config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = 64
-    config["transformer"]["rwkv_sequence_replay_token_budget"] = 262144
+    config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = int(
+        os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_BATCH_CHUNK_SIZE", "48")
+    )
+    config["transformer"]["rwkv_sequence_replay_token_budget"] = int(
+        os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_TOKEN_BUDGET", "262144")
+    )
     config["optimizer"]["rl_objective"] = "ppo"
     # Keep fit_model rlpfn on the pack-trainer PPO contract by default.
     # These values are intentionally set here rather than requiring every

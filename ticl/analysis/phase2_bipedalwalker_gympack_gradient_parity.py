@@ -60,6 +60,7 @@ from ticl.analysis.phase2_gym_prior_pack_training_runner import (  # noqa: E402
     _load_full_frozen_h,
     _sanitize_loaded_frozen_h_for_batch_use,
 )
+from ticl.config_utils import str2bool  # noqa: E402
 from ticl.model_configs import get_model_default_config  # noqa: E402
 from ticl.priors.environment_prior import EnvironmentPrior  # noqa: E402
 from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout, validate_rlpfn_maintained_path_config  # noqa: E402
@@ -245,6 +246,12 @@ def _make_algo(
     n_steps: int,
     seed: int,
     checkpoint_path: str | Path | None,
+    ppo_learning_rate: float,
+    ppo_batch_size: int | None,
+    ppo_n_epochs: int,
+    ppo_vf_coef: float,
+    ppo_normalize_advantage: bool,
+    ppo_target_kl: float | None,
 ):
     algo, vec_env = _build_algo(
         cfg=copy.deepcopy(prepared["cfg"]),
@@ -268,6 +275,12 @@ def _make_algo(
         topology_state_to_action_ratio_max=15.0,
         topology_max_attempts=512,
         fixed_env_group_across_updates=True,
+        ppo_learning_rate=float(ppo_learning_rate),
+        ppo_batch_size=None if ppo_batch_size is None else int(ppo_batch_size),
+        ppo_n_epochs=int(ppo_n_epochs),
+        ppo_vf_coef=float(ppo_vf_coef),
+        ppo_normalize_advantage=bool(ppo_normalize_advantage),
+        ppo_target_kl=None if ppo_target_kl is None else float(ppo_target_kl),
     )
     checkpoint = _load_checkpoint_into_algo(algo, checkpoint_path)
     return algo, vec_env, checkpoint
@@ -391,6 +404,12 @@ def _run_train_case(
     seed: int,
     checkpoint_path: str | Path | None,
     single_eval_pos: int,
+    ppo_learning_rate: float,
+    ppo_batch_size: int | None,
+    ppo_n_epochs: int,
+    ppo_vf_coef: float,
+    ppo_normalize_advantage: bool,
+    ppo_target_kl: float | None,
     force_one_sequence_subbatch: bool,
     patch_value_loss_to_mse: bool,
 ) -> dict[str, Any]:
@@ -402,6 +421,12 @@ def _run_train_case(
         n_steps=int(n_steps),
         seed=int(seed),
         checkpoint_path=checkpoint_path,
+        ppo_learning_rate=float(ppo_learning_rate),
+        ppo_batch_size=None if ppo_batch_size is None else int(ppo_batch_size),
+        ppo_n_epochs=int(ppo_n_epochs),
+        ppo_vf_coef=float(ppo_vf_coef),
+        ppo_normalize_advantage=bool(ppo_normalize_advantage),
+        ppo_target_kl=None if ppo_target_kl is None else float(ppo_target_kl),
     )
     try:
         logger = _CaptureLogger()
@@ -482,6 +507,12 @@ def run_probe(
     gym_env_id: str,
     single_eval_pos: int,
     frozen_h_json: str | Path,
+    ppo_learning_rate: float,
+    ppo_batch_size: int | None,
+    ppo_n_epochs: int,
+    ppo_vf_coef: float,
+    ppo_normalize_advantage: bool,
+    ppo_target_kl: float | None,
 ) -> dict[str, Any]:
     device_obj = torch.device(device)
     prepared = _prepare_config(frozen_h_json=frozen_h_json)
@@ -493,6 +524,12 @@ def run_probe(
         n_steps=int(n_steps),
         seed=int(seed),
         checkpoint_path=checkpoint_path,
+        ppo_learning_rate=float(ppo_learning_rate),
+        ppo_batch_size=None if ppo_batch_size is None else int(ppo_batch_size),
+        ppo_n_epochs=int(ppo_n_epochs),
+        ppo_vf_coef=float(ppo_vf_coef),
+        ppo_normalize_advantage=bool(ppo_normalize_advantage),
+        ppo_target_kl=None if ppo_target_kl is None else float(ppo_target_kl),
     )
     try:
         gym_env_ids = ",".join([str(gym_env_id)] * int(n_envs))
@@ -550,6 +587,12 @@ def run_probe(
         "n_steps": int(n_steps),
         "seed": int(seed),
         "checkpoint_path": checkpoint_path,
+        "ppo_learning_rate": float(ppo_learning_rate),
+        "ppo_batch_size": None if ppo_batch_size is None else int(ppo_batch_size),
+        "ppo_n_epochs": int(ppo_n_epochs),
+        "ppo_vf_coef": float(ppo_vf_coef),
+        "ppo_normalize_advantage": bool(ppo_normalize_advantage),
+        "ppo_target_kl": None if ppo_target_kl is None else float(ppo_target_kl),
     }
     official = _run_train_case(
         case_name="official_fullslot_fullobjective_mse",
@@ -689,6 +732,12 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gym-env-id", type=str, default="BipedalWalker-v3")
     parser.add_argument("--single-eval-pos", type=int, default=64)
     parser.add_argument("--frozen-h-json", type=str, default=DEFAULT_FROZEN_H_JSON)
+    parser.add_argument("--ppo-learning-rate", type=float, default=2e-4)
+    parser.add_argument("--ppo-batch-size", type=int, default=None)
+    parser.add_argument("--ppo-n-epochs", type=int, default=4)
+    parser.add_argument("--ppo-vf-coef", type=float, default=0.1)
+    parser.add_argument("--ppo-normalize-advantage", type=str2bool, default=True)
+    parser.add_argument("--ppo-target-kl", type=float, default=0.03)
     args = parser.parse_args(argv)
     report = run_probe(
         output_json=args.output_json,
@@ -700,6 +749,12 @@ def main(argv: list[str] | None = None) -> None:
         gym_env_id=args.gym_env_id,
         single_eval_pos=int(args.single_eval_pos),
         frozen_h_json=args.frozen_h_json,
+        ppo_learning_rate=float(args.ppo_learning_rate),
+        ppo_batch_size=args.ppo_batch_size,
+        ppo_n_epochs=int(args.ppo_n_epochs),
+        ppo_vf_coef=float(args.ppo_vf_coef),
+        ppo_normalize_advantage=bool(args.ppo_normalize_advantage),
+        ppo_target_kl=args.ppo_target_kl,
     )
     print(json.dumps({"hard_pass": bool(report["hard_pass"]), "output_json": str(args.output_json)}, sort_keys=True))
 

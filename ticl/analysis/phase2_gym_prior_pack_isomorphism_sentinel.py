@@ -3,6 +3,7 @@ import copy
 import json
 import math
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -210,6 +211,64 @@ def _summarize_pack(pack: dict[str, np.ndarray], *, label: str) -> dict[str, Any
     }
 
 
+def _array_light_payload(array: Any, *, sample_size: int = 8) -> dict[str, Any]:
+    arr = np.asarray(array)
+    payload: dict[str, Any] = {
+        "shape": [int(v) for v in arr.shape],
+        "dtype": str(arr.dtype),
+        "size": int(arr.size),
+    }
+    if int(arr.size) <= 0:
+        return payload
+    sample = arr.reshape(-1)[: int(sample_size)]
+    if np.issubdtype(arr.dtype, np.bool_):
+        payload["sample"] = sample.astype(np.int64, copy=False).tolist()
+    elif np.issubdtype(arr.dtype, np.integer):
+        payload["sample"] = sample.astype(np.int64, copy=False).tolist()
+    elif np.issubdtype(arr.dtype, np.number):
+        payload["sample"] = sample.astype(np.float64, copy=False).tolist()
+    else:
+        payload["sample"] = sample.tolist()
+    return payload
+
+
+def _summarize_pack_light(pack: dict[str, np.ndarray], *, label: str) -> dict[str, Any]:
+    rewards = np.asarray(pack["rewards"], dtype=np.float32)
+    raw_rewards = np.asarray(pack.get("raw_rewards", pack["rewards"]), dtype=np.float32)
+    episode_starts = np.asarray(pack["episode_starts"], dtype=np.float32)
+    dones = np.asarray(pack["dones"], dtype=bool)
+    truncated = np.asarray(pack["truncated"], dtype=bool)
+    reward_returns = rewards.sum(axis=0) if rewards.ndim >= 2 else rewards.reshape(-1)
+    raw_reward_returns = raw_rewards.sum(axis=0) if raw_rewards.ndim >= 2 else raw_rewards.reshape(-1)
+    return {
+        "label": str(label),
+        "summary_mode": "light",
+        "shapes": {
+            key: [int(v) for v in np.asarray(value).shape]
+            for key, value in pack.items()
+            if isinstance(value, np.ndarray)
+        },
+        "samples": {
+            key: _array_light_payload(pack[key])
+            for key in ("tokens", "actions", "action_masks", "rewards", "episode_starts", "dones", "truncated")
+            if key in pack
+        },
+        "stats": {
+            "reward_mean": float(np.mean(rewards, dtype=np.float64)),
+            "reward_std": float(np.std(rewards, dtype=np.float64)),
+            "reward_return_mean": float(np.mean(reward_returns, dtype=np.float64)),
+            "reward_return_std": float(np.std(reward_returns, dtype=np.float64)),
+            "raw_reward_mean": float(np.mean(raw_rewards, dtype=np.float64)),
+            "raw_reward_std": float(np.std(raw_rewards, dtype=np.float64)),
+            "raw_reward_return_mean": float(np.mean(raw_reward_returns, dtype=np.float64)),
+            "raw_reward_return_std": float(np.std(raw_reward_returns, dtype=np.float64)),
+            "episode_start_count": int((episode_starts > 0.5).sum()),
+            "done_count": int(dones.sum()),
+            "truncated_count": int(truncated.sum()),
+        },
+    }
+
+
 def _finite_stats(array: np.ndarray) -> dict[str, Any]:
     stats = _chunked_numeric_stats(array)
     return {
@@ -265,6 +324,23 @@ def _summarize_rollout_buffer(buffer: MaskedRecurrentRolloutBuffer) -> dict[str,
     }
 
 
+def _summarize_rollout_buffer_light(
+    buffer: MaskedRecurrentRolloutBuffer,
+    *,
+    timings: dict[str, float] | None = None,
+) -> dict[str, Any]:
+    return {
+        "buffer_full": bool(buffer.full),
+        "pos": int(buffer.pos),
+        "buffer_size": int(buffer.buffer_size),
+        "n_envs": int(buffer.n_envs),
+        "objective_mask_sum": float(np.asarray(buffer.objective_masks, dtype=np.float32).sum()),
+        "episode_start_count": int((np.asarray(buffer.episode_starts, dtype=np.float32) > 0.5).sum()),
+        "summary_mode": "light",
+        "timings": {} if timings is None else {str(k): float(v) for k, v in timings.items()},
+    }
+
+
 def _fill_existing_rollout_buffer_from_pack(
     buffer: MaskedRecurrentRolloutBuffer,
     pack: dict[str, np.ndarray],
@@ -277,7 +353,10 @@ def _fill_existing_rollout_buffer_from_pack(
     log_probs_by_step_env: np.ndarray | None = None,
     last_values_by_env: np.ndarray | None = None,
     compute_returns: bool = True,
+    summary_mode: str = "full",
 ) -> dict[str, Any]:
+    fill_t0 = time.perf_counter()
+    timings: dict[str, float] = {}
     tokens = np.asarray(pack["tokens"], dtype=np.float32)
     actions = np.asarray(pack["actions"], dtype=np.float32)
     rewards = np.asarray(pack["rewards"], dtype=np.float32)
@@ -312,45 +391,60 @@ def _fill_existing_rollout_buffer_from_pack(
     if log_probs_by_step_env is not None:
         log_probs_arr[:] = np.asarray(log_probs_by_step_env, dtype=np.float32).reshape((int(n_steps), int(n_envs)))
 
+    phase_t0 = time.perf_counter()
     buffer.reset()
+    timings["reset_s"] = float(time.perf_counter() - phase_t0)
     device_obj = torch.device(buffer.device)
-    lstm_states = RNNStates(
-        pi=(
-            torch.zeros((1, int(n_envs), 1), device=device_obj, dtype=torch.float32),
-            torch.zeros((1, int(n_envs), 1), device=device_obj, dtype=torch.float32),
-        ),
-        vf=(
-            torch.zeros((1, int(n_envs), 1), device=device_obj, dtype=torch.float32),
-            torch.zeros((1, int(n_envs), 1), device=device_obj, dtype=torch.float32),
-        ),
-    )
+    phase_t0 = time.perf_counter()
     objective_masks = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
     suffix_start = int(min(int(single_eval_pos), int(n_steps)))
     if suffix_start < int(n_steps):
         objective_masks[suffix_start:] = 1.0
-    for step_idx in range(int(n_steps)):
-        buffer.add(
-            tokens[step_idx],
-            actions[step_idx],
-            rewards[step_idx],
-            episode_starts[step_idx],
-            torch.as_tensor(values_arr[step_idx], device=device_obj, dtype=torch.float32),
-            torch.as_tensor(log_probs_arr[step_idx], device=device_obj, dtype=torch.float32),
-            lstm_states=lstm_states,
-            action_masks=np.asarray(pack["action_masks"][step_idx], dtype=np.float32),
-            next_states=(
-                None
-                if buffer_next_state_dim <= 0
-                else np.asarray(pack_next_states[step_idx], dtype=np.float32)
-            ),
-            next_state_masks=(
-                None
-                if buffer_next_state_dim <= 0
-                else np.asarray(pack_next_state_masks[step_idx], dtype=np.float32)
-            ),
-            objective_masks=objective_masks[step_idx],
+    timings["objective_mask_s"] = float(time.perf_counter() - phase_t0)
+
+    def _assign_step_env_last_dim(dst: np.ndarray, src: np.ndarray, *, name: str) -> None:
+        src_arr = np.asarray(src, dtype=np.float32)
+        if tuple(src_arr.shape) == tuple(dst.shape):
+            dst[:] = src_arr
+            return
+        if src_arr.ndim != dst.ndim or tuple(src_arr.shape[:-1]) != tuple(dst.shape[:-1]):
+            raise ValueError(f"{name} shape mismatch: source={tuple(src_arr.shape)} target={tuple(dst.shape)}")
+        dst.fill(0.0)
+        copy_dim = int(min(int(src_arr.shape[-1]), int(dst.shape[-1])))
+        if copy_dim > 0:
+            dst[..., :copy_dim] = src_arr[..., :copy_dim]
+
+    if tuple(tokens.shape) != tuple(buffer.observations.shape):
+        raise ValueError(f"tokens shape mismatch: source={tuple(tokens.shape)} target={tuple(buffer.observations.shape)}")
+    if tuple(rewards.shape) != tuple(buffer.rewards.shape):
+        raise ValueError(f"rewards shape mismatch: source={tuple(rewards.shape)} target={tuple(buffer.rewards.shape)}")
+    if tuple(episode_starts.shape) != tuple(buffer.episode_starts.shape):
+        raise ValueError(
+            f"episode_starts shape mismatch: source={tuple(episode_starts.shape)} "
+            f"target={tuple(buffer.episode_starts.shape)}"
         )
+    phase_t0 = time.perf_counter()
+    buffer.observations[:] = tokens
+    _assign_step_env_last_dim(buffer.actions, actions, name="actions")
+    buffer.rewards[:] = rewards
+    buffer.episode_starts[:] = episode_starts
+    buffer.values[:] = values_arr
+    buffer.log_probs[:] = log_probs_arr
+    _assign_step_env_last_dim(buffer.action_masks, np.asarray(pack["action_masks"], dtype=np.float32), name="action_masks")
+    if buffer_next_state_dim > 0:
+        _assign_step_env_last_dim(buffer.next_states, np.asarray(pack_next_states, dtype=np.float32), name="next_states")
+        _assign_step_env_last_dim(
+            buffer.next_state_masks,
+            np.asarray(pack_next_state_masks, dtype=np.float32),
+            name="next_state_masks",
+        )
+    buffer.objective_masks[:] = objective_masks
+    buffer.pos = int(buffer.buffer_size)
+    buffer.full = True
+    buffer.generator_ready = False
+    timings["array_assign_s"] = float(time.perf_counter() - phase_t0)
     if bool(compute_returns):
+        phase_t0 = time.perf_counter()
         dones = np.asarray(pack["dones"][-1], dtype=bool)
         if last_values_by_env is None:
             last_values_arr = np.zeros((int(n_envs),), dtype=np.float32)
@@ -360,7 +454,19 @@ def _fill_existing_rollout_buffer_from_pack(
             torch.as_tensor(last_values_arr, device=device_obj, dtype=torch.float32),
             dones,
         )
-    return _summarize_rollout_buffer(buffer)
+        timings["compute_returns_s"] = float(time.perf_counter() - phase_t0)
+    summary_mode_norm = str(summary_mode).strip().lower()
+    timings["pre_summary_total_s"] = float(time.perf_counter() - fill_t0)
+    if summary_mode_norm in {"light", "minimal", "none", "off", "false", "0"}:
+        timings["total_s"] = float(time.perf_counter() - fill_t0)
+        return _summarize_rollout_buffer_light(buffer, timings=timings)
+    phase_t0 = time.perf_counter()
+    summary = _summarize_rollout_buffer(buffer)
+    timings["summary_s"] = float(time.perf_counter() - phase_t0)
+    timings["total_s"] = float(time.perf_counter() - fill_t0)
+    summary["summary_mode"] = "full"
+    summary["timings"] = timings
+    return summary
 
 
 def _materialize_pack_rollout_buffer(

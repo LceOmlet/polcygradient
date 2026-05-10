@@ -465,6 +465,25 @@ def main(argv, extra_config=None):
         if args.orchestration.extra_fast_test:
             _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
 
+    rwkv_replay_chunk_override = os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_BATCH_CHUNK_SIZE", "").strip()
+    if rwkv_replay_chunk_override:
+        config.setdefault(attention_type, {})["rwkv_sequence_replay_batch_chunk_size"] = int(
+            rwkv_replay_chunk_override
+        )
+        print(
+            "[env-override] rwkv_sequence_replay_batch_chunk_size set to",
+            config[attention_type]["rwkv_sequence_replay_batch_chunk_size"],
+        )
+    rwkv_replay_token_budget_override = os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_TOKEN_BUDGET", "").strip()
+    if rwkv_replay_token_budget_override:
+        config.setdefault(attention_type, {})["rwkv_sequence_replay_token_budget"] = int(
+            rwkv_replay_token_budget_override
+        )
+        print(
+            "[env-override] rwkv_sequence_replay_token_budget set to",
+            config[attention_type]["rwkv_sequence_replay_token_budget"],
+        )
+
     config = _apply_rlpfn_anchor_compare_contract_if_requested(config, args)
 
     if config['orchestration']['detect_anomaly']:
