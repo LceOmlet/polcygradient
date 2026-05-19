@@ -1,0 +1,84 @@
+{
+  "gae": {
+    "actor_advantages_max_abs_diff": 0.0,
+    "advantages_max_abs_diff": 0.0,
+    "returns_max_abs_diff": 0.0
+  },
+  "max_abs_diff": 1.1920928955078125e-07,
+  "passed": true,
+  "scope": {
+    "compared": [
+      "GAE advantages",
+      "TD(lambda) returns",
+      "PPO clipped policy loss",
+      "value MSE loss without clip_range_vf",
+      "entropy loss",
+      "reverse-KL approximation",
+      "clip fraction",
+      "official explained_variance on PPO value targets"
+    ],
+    "held_equal": [
+      "objective mask equals official valid/padding mask",
+      "single minibatch, one epoch",
+      "clip_range_vf disabled",
+      "auxiliary Q/flow losses disabled",
+      "policy outputs identical by construction"
+    ],
+    "not_covered": [
+      "RWKV policy forward/evaluate_actions implementation",
+      "pack/rollout collection bridge",
+      "VecNormalize online plumbing",
+      "custom objective masks different from official mask",
+      "value distribution/bar head",
+      "multi-minibatch optimizer side effects"
+    ]
+  },
+  "seed": 20260501,
+  "tolerance": 2e-06,
+  "train_adv_norm": {
+    "approx_kl_abs_diff": 3.725290298461914e-09,
+    "approx_kl_custom": 0.016454800963401794,
+    "approx_kl_official": 0.016454804688692093,
+    "clip_fraction_abs_diff": 0.0,
+    "clip_fraction_custom": 0.3333333432674408,
+    "clip_fraction_official": 0.3333333432674408,
+    "entropy_loss_abs_diff": 1.1920928955078125e-07,
+    "entropy_loss_custom": -0.7839979529380798,
+    "entropy_loss_official": -0.7839980721473694,
+    "explained_variance_abs_diff": 0.0,
+    "explained_variance_custom": -0.5027822256088257,
+    "explained_variance_official": -0.5027822256088257,
+    "loss_abs_diff": 0.0,
+    "loss_custom": 1.7608628273010254,
+    "loss_official": 1.7608628273010254,
+    "policy_gradient_loss_abs_diff": 3.725290298461914e-09,
+    "policy_gradient_loss_custom": -0.007184134796261787,
+    "policy_gradient_loss_official": -0.007184131070971489,
+    "value_loss_abs_diff": 0.0,
+    "value_loss_custom": 3.5831336975097656,
+    "value_loss_official": 3.5831336975097656
+  },
+  "train_no_adv_norm": {
+    "approx_kl_abs_diff": 0.0,
+    "approx_kl_custom": 0.015366085804998875,
+    "approx_kl_official": 0.015366085804998875,
+    "clip_fraction_abs_diff": 0.0,
+    "clip_fraction_custom": 0.2222222238779068,
+    "clip_fraction_official": 0.2222222238779068,
+    "entropy_loss_abs_diff": 1.1920928955078125e-07,
+    "entropy_loss_custom": -0.9446612596511841,
+    "entropy_loss_official": -0.9446611404418945,
+    "explained_variance_abs_diff": 0.0,
+    "explained_variance_custom": -0.9543545246124268,
+    "explained_variance_official": -0.9543545246124268,
+    "loss_abs_diff": 0.0,
+    "loss_custom": 2.0345911979675293,
+    "loss_official": 2.0345911979675293,
+    "policy_gradient_loss_abs_diff": 7.450580596923828e-09,
+    "policy_gradient_loss_custom": 0.1046043410897255,
+    "policy_gradient_loss_official": 0.1046043336391449,
+    "value_loss_abs_diff": 0.0,
+    "value_loss_custom": 3.916653633117676,
+    "value_loss_official": 3.916653633117676
+  }
+}

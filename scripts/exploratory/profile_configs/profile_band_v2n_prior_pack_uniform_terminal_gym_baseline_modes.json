@@ -1,0 +1,188 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.296875,
+      "min_rate": 0.296875,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "joint_profile_cell_cap_rate": 0.25,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "strict feedback is a lower-bound protected component; exact-count capping was identified as one source of state-conditioned mode loss.",
+      "trust_status": "lower_bound_component_guard_not_exact_cap"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "future-basin detector remains prior-side coverage/health guard only; no quota until coverage definition is stable",
+      "trust_status": "candidate_detector_not_quota_ready"
+    },
+    "pendulum_sustained_closed_loop_settle": {
+      "reason": "minimal prior-internal repair branch driven only by cached labels from existing Exact-SCM/prior candidates; standalone quadratic specimen is not used",
+      "trust_status": "candidate_prior_internal_cached_repair_minimal_branch"
+    },
+    "prior_pack_optimizability_surface": {
+      "reason": "reductionist repair: keep uniform terminal bins and global low-terminal/action proxy, but remove q90 per-bin action-count quotas because they directly conflict with Gym-like state-conditioned mode counts.",
+      "trust_status": "uniform_terminal_global_proxy_no_per_bin_action_quota"
+    }
+  },
+  "pendulum_settle_yield_repair_branch": {
+    "branch_id": "prior_internal_cached_settle_yield_repair_v2n_prior_pack_uniform_terminal_gym_baseline_modes",
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 4
+    },
+    "prefer_missing_cached_guard": true,
+    "require_cached_label_available": true,
+    "trust_status": "prior_internal_materialized_repair_minimal_branch"
+  },
+  "prior_pack_optimizability_guard": {
+    "action_gain_objective_weight": 0.04,
+    "balanced_action_gain_min": 0.18,
+    "balanced_action_gain_min_by_rule": {
+      "gym_full_obs_action_range": 0.227,
+      "gym_q90_obs_action_range": 0.18
+    },
+    "enabled": true,
+    "high_terminal_objective_weight": 0.0,
+    "max_high_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 50,
+      "gym_q90_obs_action_range": 50
+    },
+    "min_low_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 14,
+      "gym_q90_obs_action_range": 14
+    },
+    "min_proxy_count_by_rule": {
+      "gym_full_obs_action_range": 14,
+      "gym_q90_obs_action_range": 14
+    },
+    "proxy_objective_weight": 0.04,
+    "terminal_distribution_guard": {
+      "edges": [
+        0.0,
+        20.0,
+        40.0,
+        60.0,
+        80.0
+      ],
+      "enabled": true,
+      "max_count_by_rule": {
+        "gym_full_obs_action_range": [
+          18,
+          18,
+          18,
+          18
+        ],
+        "gym_q90_obs_action_range": [
+          18,
+          18,
+          18,
+          18
+        ]
+      },
+      "min_count_by_rule": {
+        "gym_full_obs_action_range": [
+          14,
+          14,
+          14,
+          14
+        ],
+        "gym_q90_obs_action_range": [
+          14,
+          14,
+          14,
+          14
+        ]
+      },
+      "mode_min_count_by_rule": {
+        "gym_q90_obs_action_range": {
+          "locomotion_witness": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "low_energy_not_ctrl_only": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "pendulum_settle_effective_support": [
+            2,
+            2,
+            2,
+            2
+          ],
+          "sign_or_phase_sensitive": [
+            6,
+            6,
+            6,
+            6
+          ],
+          "state_conditioned_energy_injection": [
+            4,
+            4,
+            4,
+            4
+          ],
+          "strict_feedback_candidate": [
+            4,
+            4,
+            4,
+            4
+          ]
+        }
+      },
+      "trust_status": "uniform_terminal_bins_and_q90_mode_support_without_action_quota"
+    },
+    "terminal_reset_count_target_max": 20.0,
+    "trust_status": "same_prior_pack_runner_global_delta_proxy_guard"
+  },
+  "profile_version_id": "profile_band_v2n_prior_pack_uniform_terminal_gym_baseline_modes",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "include_all_non_gain2": false,
+    "include_all_nonconstant": false,
+    "max_count_by_rule": {
+      "gym_full_obs_action_range": 64,
+      "gym_q90_obs_action_range": 64
+    },
+    "min_count_by_rule": {
+      "gym_full_obs_action_range": 20,
+      "gym_q90_obs_action_range": 20
+    },
+    "min_non_gain2_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 2
+    },
+    "min_nonconstant_by_rule": {
+      "gym_full_obs_action_range": 10,
+      "gym_q90_obs_action_range": 10
+    },
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "lower_bound_only_to_preserve_state_conditioned_gym_like_component"
+  },
+  "target_per_rule": 64
+}

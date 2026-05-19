@@ -7476,6 +7476,9 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
           ppo_pack_seed=4040,
           ppo_pack_prior_milestone="sampled_topology",
           ppo_pack_prior_mode="sampled_topology",
+          ppo_pack_fixed_frozen_h_list_csv=None,
+          ppo_pack_fixed_frozen_h_list_rule=None,
+          ppo_pack_fixed_frozen_h_list_limit=None,
           ppo_pack_fixed_env_group_across_updates=False,
           ppo_pack_sb3_reward_normalization_enabled=True,
           ppo_pack_sb3_observation_normalization_enabled=True,
@@ -8267,26 +8270,55 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
             from ticl.analysis.phase2_gym_prior_pack_training_runner import (
                 _build_algo as _build_trusted_pack_algo,
                 _dump_fixed_prior_group_if_available,
+                _pack_phase_log,
             )
-            from ticl.analysis.phase2_gated_reward_path_milestone import (
-                GATED_REWARD_PATH_MILESTONE,
-                GATED_REWARD_PATH_MILESTONES,
-                SAMPLED_TOPOLOGY_MILESTONE,
+            from ticl.analysis.phase2_m4_potential_progress_milestone import (
+                M4_POTENTIAL_PROGRESS_MILESTONE,
                 normalize_prior_milestone,
             )
             from ticl.rlpfn_maintained_path import resolve_rlpfn_token_layout
 
             env_cfg_for_pack = copy.deepcopy(getattr(env_prior, "config", {}) or {})
             prior_milestone_norm = normalize_prior_milestone(ppo_pack_prior_milestone)
-            trusted_pack_prior_mode = str(ppo_pack_prior_mode)
-            if prior_milestone_norm in GATED_REWARD_PATH_MILESTONES:
-                trusted_pack_prior_mode = prior_milestone_norm
-            elif prior_milestone_norm != SAMPLED_TOPOLOGY_MILESTONE:
-                raise RuntimeError(f"Unsupported trusted PPO prior milestone: {ppo_pack_prior_milestone!r}")
+            requested_pack_prior_mode = str(ppo_pack_prior_mode).strip().lower()
+            trusted_pack_prior_mode = requested_pack_prior_mode
+            _pack_phase_log(
+                "pack_setup_start "
+                f"prior_mode={requested_pack_prior_mode} "
+                f"milestone={prior_milestone_norm} "
+                f"n_envs={int(ppo_n_envs)} n_steps={int(ppo_n_steps)} "
+                f"ppo_batch_size={int(ppo_batch_size)}"
+            )
+            fixed_h_list = None
+            fixed_h_list_env_seeds = None
+            if requested_pack_prior_mode != "sampled_topology":
+                raise RuntimeError(
+                    "Maintained fit_model PPO pack training is live sampled_topology only. "
+                    "fixed_frozen/fixed_frozen_list/sampled_gain runner paths are audit-only and "
+                    "must not be used for M2-M4 training."
+                )
+            if bool(ppo_pack_fixed_env_group_across_updates):
+                raise RuntimeError(
+                    "Maintained fit_model PPO pack training requires fresh sampled environments each "
+                    "outer epoch; ppo_pack_fixed_env_group_across_updates must be False."
+                )
+            if str(ppo_pack_fixed_frozen_h_list_csv or "").strip():
+                raise RuntimeError(
+                    "Maintained fit_model PPO pack training must not receive "
+                    "ppo_pack_fixed_frozen_h_list_csv. Use the analysis parity runner for fixed-list audits."
+                )
+            if prior_milestone_norm != M4_POTENTIAL_PROGRESS_MILESTONE:
+                raise RuntimeError(
+                    "Maintained fit_model PPO pack training is M4 live only. "
+                    "sampled_topology and gated/balanced milestones are analysis-only runner branches and "
+                    f"must not be used for long training; got {ppo_pack_prior_milestone!r}."
+                )
+            trusted_pack_prior_mode = M4_POTENTIAL_PROGRESS_MILESTONE
             layout = resolve_rlpfn_token_layout(env_cfg_for_pack, num_features=int(ppo_num_features))
             dim_probe_prior = EnvironmentPrior(copy.deepcopy(env_cfg_for_pack))
             next_state_target_dim = int(
                 max(
+                    *[int((h or {}).get("state_dim", 1)) for h in (fixed_h_list or [])],
                     int(dim_probe_prior._resolve_dim_upper_bound(env_cfg_for_pack.get("state_dim", None), default=0)),
                     1,
                 )
@@ -8300,13 +8332,19 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                     "ppo_max_grad_norm": float(ppo_max_grad_norm),
                 }
             }
+            phase_t0 = time.perf_counter()
+            _pack_phase_log(
+                "pack_setup_build_algo_start "
+                f"prior_mode={trusted_pack_prior_mode} "
+                f"n_envs={int(ppo_n_envs)} n_steps={int(ppo_n_steps)}"
+            )
             ppo_algo, ppo_vec_env = _build_trusted_pack_algo(
                 cfg=pack_cfg,
                 env_cfg=env_cfg_for_pack,
                 model_override=model,
                 frozen_h=None,
-                frozen_h_list=None,
-                frozen_h_list_env_seeds=None,
+                frozen_h_list=fixed_h_list,
+                frozen_h_list_env_seeds=fixed_h_list_env_seeds,
                 prior_mode=str(trusted_pack_prior_mode),
                 device_obj=torch.device(str(device)),
                 num_features=int(ppo_num_features),
@@ -8321,8 +8359,16 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 gain_min=float(ppo_pack_topology_state_gain_min),
                 topology_state_gain_min=float(ppo_pack_topology_state_gain_min),
                 topology_action_gain_min=float(ppo_pack_topology_action_gain_min),
+                topology_noise_gain_min=0.0,
+                topology_state_gain_metric="fraction",
+                topology_action_gain_metric="fraction",
+                topology_noise_gain_metric="fraction",
                 topology_state_to_action_ratio_max=float(ppo_pack_topology_state_to_action_ratio_max),
+                topology_state_to_action_ratio_metric="total_gain",
+                topology_state_to_noise_ratio_max=0.0,
+                topology_state_to_noise_ratio_metric="total_gain",
                 topology_max_attempts=int(ppo_pack_topology_max_attempts),
+                topology_freeze_h_across_attempts=False,
                 fixed_env_group_across_updates=bool(ppo_pack_fixed_env_group_across_updates),
                 ppo_learning_rate=float(learning_rate),
                 ppo_batch_size=int(ppo_batch_size),
@@ -8331,16 +8377,25 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 ppo_normalize_advantage=bool(ppo_normalize_advantage),
                 ppo_target_kl=ppo_target_kl,
             )
+            _pack_phase_log(f"pack_setup_build_algo_done elapsed_s={float(time.perf_counter() - phase_t0):.1f}")
             pack_output_dir = Path(str(ppo_pack_output_dir)).expanduser().resolve()
             pack_output_dir.mkdir(parents=True, exist_ok=True)
+            phase_t0 = time.perf_counter()
+            _pack_phase_log(f"pack_setup_group_sidecar_dump_check_start output_dir={pack_output_dir}")
+            fixed_group_dump = _dump_fixed_prior_group_if_available(
+                vec_env=ppo_vec_env,
+                output_dir=pack_output_dir,
+                arm="prior",
+            )
+            _pack_phase_log(
+                "pack_setup_group_sidecar_dump_check_done "
+                f"elapsed_s={float(time.perf_counter() - phase_t0):.1f}"
+            )
             ppo_pack_runner_state = {
                 "output_dir": pack_output_dir,
                 "progress_path": pack_output_dir / "prior_progress.jsonl",
-                "fixed_group_dump": _dump_fixed_prior_group_if_available(
-                    vec_env=ppo_vec_env,
-                    output_dir=pack_output_dir,
-                    arm="prior",
-                ),
+                "runner_path": "family_vectorized_live",
+                "fixed_group_dump": fixed_group_dump,
                 "num_features": int(ppo_num_features),
                 "obs_slot_dim": int(layout["obs_slot_dim"]),
                 "action_slot_dim": int(layout["action_slot_dim"]),
@@ -8349,10 +8404,32 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 "n_steps": int(ppo_n_steps),
                 "prior_milestone": str(prior_milestone_norm),
                 "prior_mode": str(trusted_pack_prior_mode),
+                "fixed_frozen_h_list_csv": (
+                    None
+                    if not str(ppo_pack_fixed_frozen_h_list_csv or "").strip()
+                    else str(ppo_pack_fixed_frozen_h_list_csv)
+                ),
+                "fixed_frozen_h_list_rule": (
+                    None
+                    if not str(ppo_pack_fixed_frozen_h_list_rule or "").strip()
+                    else str(ppo_pack_fixed_frozen_h_list_rule)
+                ),
+                "fixed_frozen_h_list_limit": (
+                    None
+                    if ppo_pack_fixed_frozen_h_list_limit is None
+                    else int(ppo_pack_fixed_frozen_h_list_limit)
+                ),
+                "fixed_frozen_h_list_count": 0 if fixed_h_list is None else int(len(fixed_h_list)),
                 "single_eval_pos": None if ppo_single_eval_pos is None else int(ppo_single_eval_pos),
                 "terminal_token_enabled": bool(layout["terminal_token_enabled"]),
             }
+            phase_t0 = time.perf_counter()
+            _pack_phase_log("pack_setup_validation_policy_state_start")
             validation_ppo_policy_state = extract_validation_recurrent_ppo_policy_state(ppo_algo.policy)
+            _pack_phase_log(
+                "pack_setup_validation_policy_state_done "
+                f"elapsed_s={float(time.perf_counter() - phase_t0):.1f}"
+            )
             model.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
             model.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
             module_target = getattr(model, "module", None)
@@ -8360,6 +8437,30 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 module_target.__dict__["_validation_sb3_policy_live"] = ppo_algo.policy
                 module_target.__dict__["_validation_ppo_policy_state"] = validation_ppo_policy_state
             start_epoch = _resolve_resume_start_epoch_from_config({"epoch_in_training": epoch_in_training})
+            ppo_total_timesteps_target = int(max(1, int(epochs))) * int(ppo_n_envs) * int(ppo_n_steps)
+            ppo_setup_reset_stub_enabled = False
+            if hasattr(ppo_vec_env, "enable_direct_collect_reset_stub"):
+                ppo_vec_env.enable_direct_collect_reset_stub(True)
+                ppo_setup_reset_stub_enabled = True
+            try:
+                ppo_total_timesteps_target, ppo_callback = ppo_algo._setup_learn(
+                    int(ppo_total_timesteps_target),
+                    callback=None,
+                    reset_num_timesteps=True,
+                    tb_log_name="ppo",
+                    progress_bar=False,
+                )
+            finally:
+                if ppo_setup_reset_stub_enabled:
+                    ppo_vec_env.enable_direct_collect_reset_stub(False)
+            ppo_callback.on_training_start(locals(), globals())
+            ppo_callback_started = True
+            ppo_pack_runner_state["ppo_total_timesteps_target"] = int(ppo_total_timesteps_target)
+            if rank == 0 and verbose:
+                print(
+                    "[m4-live-runner] trusted M4 guard active; using family-vectorized "
+                    "collect_rollouts/train path, not the legacy pack collector."
+                )
         else:
             if bool(ppo_trusted_pack_runner_required):
                 raise RuntimeError("Internal error: trusted PPO pack runner was required but not activated.")
@@ -8569,21 +8670,32 @@ def train(dl, model, criterion, optimizer_state=None, scheduler=None,
                 if bool(ppo_pack_runner_active):
                     if ppo_pack_runner_state is None:
                         raise RuntimeError("Trusted PPO pack runner is active but its runner state was not initialized.")
-                    new_loss, nan_share, ignore_share = train_epoch_trusted_pack_recurrent_ppo(
-                        model=model,
-                        ppo_algo=ppo_algo,
-                        ppo_vec_env=ppo_vec_env,
-                        ppo_pack_runner_state=ppo_pack_runner_state,
-                        epoch_idx=int(epoch),
-                        total_epochs=int(epochs),
-                        seed=int(ppo_pack_seed),
-                        fixed_env_group_across_updates=bool(ppo_pack_fixed_env_group_across_updates),
-                        semantic_probes_enabled=bool(ppo_pack_semantic_probes_enabled),
-                        semantic_probe_sidecar_enabled=bool(ppo_pack_semantic_probe_sidecar_enabled),
-                        semantic_probe_sidecar_every=int(ppo_pack_semantic_probe_sidecar_every),
-                        checkpoint_every=int(ppo_pack_checkpoint_every),
-                        checkpoint_include_optimizer=bool(ppo_pack_checkpoint_include_optimizer),
-                    )
+                    if str(ppo_pack_runner_state.get("runner_path", "")).strip().lower() == "family_vectorized_live":
+                        if ppo_callback is None or ppo_total_timesteps_target is None:
+                            raise RuntimeError("M4 live family-vectorized runner was not initialized.")
+                        new_loss, nan_share, ignore_share = train_epoch_official_recurrent_ppo(
+                            model=model,
+                            ppo_algo=ppo_algo,
+                            ppo_callback=ppo_callback,
+                            ppo_total_timesteps_target=int(ppo_total_timesteps_target),
+                            epoch_idx=epoch,
+                        )
+                    else:
+                        new_loss, nan_share, ignore_share = train_epoch_trusted_pack_recurrent_ppo(
+                            model=model,
+                            ppo_algo=ppo_algo,
+                            ppo_vec_env=ppo_vec_env,
+                            ppo_pack_runner_state=ppo_pack_runner_state,
+                            epoch_idx=int(epoch),
+                            total_epochs=int(epochs),
+                            seed=int(ppo_pack_seed),
+                            fixed_env_group_across_updates=bool(ppo_pack_fixed_env_group_across_updates),
+                            semantic_probes_enabled=bool(ppo_pack_semantic_probes_enabled),
+                            semantic_probe_sidecar_enabled=bool(ppo_pack_semantic_probe_sidecar_enabled),
+                            semantic_probe_sidecar_every=int(ppo_pack_semantic_probe_sidecar_every),
+                            checkpoint_every=int(ppo_pack_checkpoint_every),
+                            checkpoint_include_optimizer=bool(ppo_pack_checkpoint_include_optimizer),
+                        )
                 else:
                     new_loss, nan_share, ignore_share = train_epoch_official_recurrent_ppo(
                         model=model,

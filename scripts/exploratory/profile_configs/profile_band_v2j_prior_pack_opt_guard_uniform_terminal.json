@@ -1,0 +1,122 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.296875,
+      "min_rate": 0.296875,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.016,
+      "role": "protected_band",
+      "trust_status": "protected_monitor_only_reference_bias_warning_not_strengthened"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.035,
+      "role": "protected_band",
+      "trust_status": "quota_ready_protected_band_but_not_sufficient"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.15,
+      "role": "protected_band",
+      "trust_status": "cheap_obs2_relaxed_guard_due_q90_feedback_state_intersection_pressure"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "joint_profile_cell_cap_rate": 0.25,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "uses strict_or_time_profile_core_no_random effective feedback source-pool to repair constant-profile collapse; gain=2.0 dominance remains a logged unresolved pressure point",
+      "trust_status": "candidate_source_pool_definition_repair_profile_only"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "future-basin detector remains prior-side coverage/health guard only; no quota until coverage definition is stable",
+      "trust_status": "candidate_detector_not_quota_ready"
+    },
+    "pendulum_sustained_closed_loop_settle": {
+      "reason": "minimal prior-internal repair branch driven only by cached labels from existing Exact-SCM/prior candidates; standalone quadratic specimen is not used",
+      "trust_status": "candidate_prior_internal_cached_repair_minimal_branch"
+    },
+    "prior_pack_optimizability_surface": {
+      "reason": "uniform terminal distribution is restored as a first-class guard; low-terminal action-coupled rows are required only inside the first terminal bin instead of globally skewing terminal pressure",
+      "trust_status": "candidate_uniform_terminal_selector_guard_from_same_runner_reduction"
+    },
+    "state_conditioned_energy_injection_cheap_label_pressure": {
+      "reason": "obs2/n64 cheap labels under-cover the original centered state-conditioned band when combined with strict feedback branch; full audit or source-pool balancing should be calibrated separately.",
+      "trust_status": "known_pressure_point_not_pendulum_repair_root"
+    }
+  },
+  "pendulum_settle_yield_repair_branch": {
+    "branch_id": "prior_internal_cached_settle_yield_repair_v2j_prior_pack_opt_guard_uniform_terminal",
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 4
+    },
+    "prefer_missing_cached_guard": true,
+    "require_cached_label_available": true,
+    "trust_status": "prior_internal_materialized_repair_minimal_branch"
+  },
+  "prior_pack_optimizability_guard": {
+    "enabled": true,
+    "terminal_reset_count_target_max": 20.0,
+    "balanced_action_gain_min": 0.18,
+    "balanced_action_gain_min_by_rule": {
+      "gym_full_obs_action_range": 0.227,
+      "gym_q90_obs_action_range": 0.18
+    },
+    "min_proxy_count_by_rule": {
+      "gym_full_obs_action_range": 14,
+      "gym_q90_obs_action_range": 14
+    },
+    "max_high_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 50,
+      "gym_q90_obs_action_range": 50
+    },
+    "min_low_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 14,
+      "gym_q90_obs_action_range": 14
+    },
+    "proxy_objective_weight": 0.04,
+    "high_terminal_objective_weight": 0.0,
+    "action_gain_objective_weight": 0.04,
+    "terminal_distribution_guard": {
+      "enabled": true,
+      "edges": [0.0, 20.0, 40.0, 60.0, 80.0],
+      "min_count_by_rule": {
+        "gym_full_obs_action_range": [14, 14, 14, 14],
+        "gym_q90_obs_action_range": [14, 14, 14, 14]
+      },
+      "max_count_by_rule": {
+        "gym_full_obs_action_range": [18, 18, 18, 18],
+        "gym_q90_obs_action_range": [18, 18, 18, 18]
+      },
+      "trust_status": "uniform_terminal_0_80_four_bin_guard"
+    },
+    "trust_status": "same_prior_pack_runner_uniform_terminal_high_action_low_terminal_tail_guard"
+  },
+  "profile_version_id": "profile_band_v2j_prior_pack_opt_guard_uniform_terminal",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 20,
+      "gym_q90_obs_action_range": 20
+    },
+    "include_all_non_gain2": false,
+    "include_all_nonconstant": false,
+    "min_non_gain2_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 2
+    },
+    "min_nonconstant_by_rule": {
+      "gym_full_obs_action_range": 10,
+      "gym_q90_obs_action_range": 10
+    },
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "candidate_effective_source_pool_profile_repair_gain_unresolved"
+  },
+  "target_per_rule": 64
+}

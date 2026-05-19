@@ -1062,6 +1062,89 @@ def test_official_rollout_hidden_from_cache_handles_batch1_flat_official_eval_st
     assert isinstance(state_inputs[2][0], tuple)
 
 
+def test_official_rollout_hidden_chunked_cache_matches_full_batch_stateful_path():
+    num_features = 8
+    obs_slot_dim = 4
+    action_dim = 2
+    torch.manual_seed(7)
+    fake_model = _FakeRWKVModel(
+        num_features=num_features,
+        x_obs_dim=6,
+        action_dim=action_dim,
+        emsize=12,
+        replay_batch_chunk_size=None,
+    )
+
+    def _stateful_forward_step(token, state=None):
+        if state is None:
+            state = fake_model.rwkv_core.init_state(
+                int(token.shape[0]),
+                device=token.device,
+                dtype=token.dtype,
+            )
+        carry = state[0][0][:, :1].expand_as(token)
+        hidden = token + carry
+        next_state = []
+        for att_x_prev, att_kv, ffn_x_prev in state:
+            next_state.append(
+                (
+                    att_x_prev + 1.0,
+                    att_kv + 1.0,
+                    ffn_x_prev + 1.0,
+                )
+            )
+        return hidden, next_state
+
+    fake_model.rwkv_core.forward_step = _stateful_forward_step
+    policy = OfficialRWKVRecurrentPPOPolicy(
+        observation_space=spaces.Box(low=-np.inf, high=np.inf, shape=(num_features,), dtype=np.float32),
+        action_space=spaces.Box(low=-1.0, high=1.0, shape=(action_dim,), dtype=np.float32),
+        lr_schedule=lambda _: 1e-3,
+        rlpfn_model=fake_model,
+        num_features=num_features,
+        obs_slot_dim=obs_slot_dim,
+        net_arch=[],
+    )
+    policy.eval()
+    obs = torch.randn((5, num_features), dtype=torch.float32)
+    starts = torch.zeros((5,), dtype=torch.float32)
+
+    full_hidden_0, full_cache_0 = policy._official_rollout_hidden_from_cache(
+        obs,
+        starts,
+        cache=None,
+    )
+    full_hidden_1, full_cache_1 = policy._official_rollout_hidden_from_cache(
+        obs,
+        starts,
+        cache=full_cache_0,
+    )
+
+    fake_model.replay_batch_chunk_size = 2
+    chunk_hidden_0, chunk_cache_0 = policy._official_rollout_hidden_from_cache(
+        obs,
+        starts,
+        cache=None,
+    )
+    chunk_hidden_1, chunk_cache_1 = policy._official_rollout_hidden_from_cache(
+        obs,
+        starts,
+        cache=chunk_cache_0,
+    )
+    materialized_cache_1 = sb3_recurrent_ppo_module._materialize_rollout_cache_batch(
+        chunk_cache_1,
+        0,
+        int(obs.shape[0]),
+    )
+
+    assert sb3_recurrent_ppo_module._is_rollout_chunked_cache(chunk_cache_0)
+    assert torch.allclose(chunk_hidden_0, full_hidden_0)
+    assert torch.allclose(chunk_hidden_1, full_hidden_1)
+    assert torch.allclose(materialized_cache_1[0][0], full_cache_1[0][0])
+    assert torch.allclose(materialized_cache_1[0][1], full_cache_1[0][1])
+    assert torch.allclose(materialized_cache_1[0][2], full_cache_1[0][2])
+
+
 def test_policy_evaluate_actions_uses_official_separate_actor_critic_sequence_paths():
     device = _cuda_or_skip()
     num_features = 8
@@ -4517,6 +4600,8 @@ def test_environment_prior_ppo_env_step_returns_terminated_on_terminal(monkeypat
     env._env["terminal_reset_enabled"] = torch.tensor(True, device=device, dtype=torch.bool)
 
     def _force_terminal(**kwargs):
+        assert kwargs["history_warmup_count"] is env._env.get("terminal_reset_count_target", None)
+        assert kwargs["history_relaxed_mask"] is env._terminal_history_relaxed
         return kwargs["state_next"], kwargs["reward_next"], torch.ones_like(kwargs["reward_next"])
 
     monkeypatch.setattr(prior, "_apply_terminal_reset_step", _force_terminal)
@@ -4612,6 +4697,8 @@ def test_environment_prior_ppo_batch_vec_env_step_wait_returns_done_on_terminal(
     vec_env._env["terminal_reset_enabled"] = torch.ones((vec_env.num_envs,), device=device, dtype=torch.bool)
 
     def _force_terminal(**kwargs):
+        assert kwargs["history_warmup_count"] is vec_env._env.get("terminal_reset_count_target", None)
+        assert kwargs["history_relaxed_mask"] is vec_env._terminal_history_relaxed
         return kwargs["state_next"], kwargs["reward_next"], torch.ones_like(kwargs["reward_next"])
 
     monkeypatch.setattr(prior, "_apply_terminal_reset_step", _force_terminal)

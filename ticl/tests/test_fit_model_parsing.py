@@ -38,6 +38,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
             "--batch-parallel-backend", "torch_vectorized",
             "--batch-shared-environment", "true",
             "--batch-vectorized-strict-rng-match", "true",
+            "--transition-inner-grouping", "family",
             "--rl-objective", "policy_gradient",
         ]
     )
@@ -52,6 +53,7 @@ def test_rlpfn_parser_exposes_new_environment_and_causal_flags():
     assert args.prior.environment.batch_shared_environment is True
     assert args.prior.environment.batch_vectorized_strict_rng_match is True
     assert args.prior.environment.batch_vectorized_grouping == "family"
+    assert args.prior.environment.transition_inner_grouping == "family"
     assert args.optimizer.rl_objective == "policy_gradient"
     assert args.optimizer.policy_rollout_chunk_size is None
     assert args.optimizer.policy_rollout_chunk_autotune is False
@@ -191,7 +193,7 @@ def test_rlpfn_parser_defaults_match_legacy_ppo_mainline_defaults():
     assert args.orchestration.seed_everything_value is None
     assert args.orchestration.rlpfn_anchor_compare_contract is False
     assert args.optimizer.learning_rate == pytest.approx(2e-4)
-    assert args.optimizer.ppo_batch_size == 256
+    assert args.optimizer.ppo_batch_size is None
     assert args.optimizer.ppo_n_epochs == 4
     assert args.optimizer.ppo_normalize_advantage is True
     assert args.optimizer.ppo_space_contract == "raw"
@@ -206,13 +208,16 @@ def test_rlpfn_parser_defaults_match_legacy_ppo_mainline_defaults():
     assert args.optimizer.ppo_vf_coef == pytest.approx(0.1)
     assert args.optimizer.ppo_trusted_pack_runner_required is True
     assert args.optimizer.ppo_pack_prior_mode == "sampled_topology"
+    assert args.optimizer.ppo_pack_fixed_frozen_h_list_csv is None
+    assert args.optimizer.ppo_pack_fixed_frozen_h_list_rule is None
+    assert args.optimizer.ppo_pack_fixed_frozen_h_list_limit is None
     assert args.optimizer.ppo_pack_fixed_env_group_across_updates is False
     assert args.optimizer.ppo_pack_sb3_reward_normalization_enabled is True
     assert args.optimizer.ppo_pack_sb3_observation_normalization_enabled is True
     assert args.optimizer.ppo_pack_semantic_probe_sidecar_enabled is False
     assert args.optimizer.ppo_pack_checkpoint_every == 0
     assert cfg["optimizer"]["learning_rate"] == pytest.approx(2e-4)
-    assert cfg["optimizer"]["ppo_batch_size"] == 256
+    assert cfg["optimizer"]["ppo_batch_size"] is None
     assert cfg["optimizer"]["ppo_n_epochs"] == 4
     assert cfg["optimizer"]["ppo_gamma"] == pytest.approx(0.98)
     assert cfg["optimizer"]["ppo_gae_lambda"] == pytest.approx(0.90)
@@ -233,6 +238,9 @@ def test_rlpfn_parser_defaults_match_legacy_ppo_mainline_defaults():
     assert cfg["optimizer"]["ppo_runtime_next_state_flow_matching_weight_override"] == pytest.approx(0.0)
     assert cfg["optimizer"]["ppo_trusted_pack_runner_required"] is True
     assert cfg["optimizer"]["ppo_pack_prior_mode"] == "sampled_topology"
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_csv"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_rule"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_limit"] is None
     assert cfg["optimizer"]["ppo_pack_fixed_env_group_across_updates"] is False
     assert cfg["optimizer"]["ppo_pack_topology_state_gain_min"] == pytest.approx(0.7)
     assert cfg["optimizer"]["ppo_pack_topology_action_gain_min"] == pytest.approx(0.06)
@@ -264,6 +272,51 @@ def test_rlpfn_parser_accepts_ppo_anchor_bridge_flags():
     assert args.optimizer.ppo_deterministic_actor_sampling is True
     assert args.optimizer.ppo_deterministic_batch_plan is True
     assert args.optimizer.ppo_strict_native_rollout is True
+
+
+def test_rlpfn_parser_rejects_trusted_pack_fixed_frozen_list_training_mode():
+    parser = make_model_level_argparser()
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "rlpfn",
+                "--ppo-pack-prior-mode",
+                "fixed_frozen_list",
+                "--ppo-pack-fixed-frozen-h-list-csv",
+                "/tmp/selected_profile_band_prior_envs.csv",
+            ]
+        )
+
+
+def test_rlpfn_parser_accepts_m4_potential_progress_live_milestone():
+    parser = make_model_level_argparser()
+    args = parser.parse_args(
+        [
+            "rlpfn",
+            "--ppo-pack-prior-milestone",
+            "m4_potential_progress_live",
+            "--ppo-pack-prior-mode",
+            "sampled_topology",
+        ]
+    )
+
+    assert args.optimizer.ppo_pack_prior_milestone == "m4_potential_progress_live"
+    assert args.optimizer.ppo_pack_prior_mode == "sampled_topology"
+
+
+def test_rlpfn_parser_rejects_fit_model_balanced_milestone_runner():
+    parser = make_model_level_argparser()
+
+    with pytest.raises(SystemExit):
+        parser.parse_args(
+            [
+                "rlpfn",
+                "--ppo-pack-prior-milestone",
+                "gated_reward_path_balance",
+                "--ppo-pack-prior-mode",
+                "sampled_topology",
+            ]
+        )
 
 
 def test_rlpfn_parser_accepts_anchor_compare_contract_flag():
@@ -518,7 +571,7 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     cfg = get_model_default_config("rlpfn")
 
     assert cfg["optimizer"]["rl_objective"] == "ppo"
-    assert cfg["optimizer"]["ppo_batch_size"] == 256
+    assert cfg["optimizer"]["ppo_batch_size"] is None
     assert cfg["optimizer"]["ppo_n_epochs"] == 4
     assert cfg["optimizer"]["ppo_normalize_advantage"] is True
     assert cfg["optimizer"]["ppo_space_contract"] == "raw"
@@ -526,10 +579,14 @@ def test_rlpfn_parser_defaults_enable_joint_env_and_budgeted_dims():
     assert cfg["optimizer"]["ppo_value_head_impl"] == "vendor_official"
     assert cfg["optimizer"]["ppo_vf_coef"] == pytest.approx(0.1)
     assert cfg["optimizer"]["ppo_trusted_pack_runner_required"] is True
+    assert cfg["optimizer"]["ppo_pack_prior_milestone"] == "m4_potential_progress_live"
     assert cfg["optimizer"]["ppo_pack_prior_mode"] == "sampled_topology"
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_csv"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_rule"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_limit"] is None
     assert cfg["transformer"]["backbone"] == "rwkv7"
     assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
-    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
+    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 1024
     assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["prior"]["n_samples"] == 2048
     assert cfg["dataloader"]["batch_size"] == 2048

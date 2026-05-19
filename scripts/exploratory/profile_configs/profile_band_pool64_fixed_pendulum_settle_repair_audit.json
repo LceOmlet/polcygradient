@@ -1,0 +1,73 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 1.0,
+      "min_rate": 0.0,
+      "objective_weight": 0.0,
+      "role": "raised_band",
+      "trust_status": "fixed_pool64_audit_only_not_quota"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 1.0,
+      "role": "protected_band",
+      "trust_status": "fixed_pool64_audit_only_not_quota"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 1.0,
+      "role": "protected_band",
+      "trust_status": "fixed_pool64_audit_only_not_quota"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 1.0,
+      "role": "protected_band",
+      "trust_status": "fixed_pool64_audit_only_not_quota"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "generator_level_read": "fixed pool64 full/q90 same-artifact audit with prior-internal Pendulum settle-yield materialization",
+  "joint_profile_cell_cap_rate": 1.0,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "fixed pool64 has no selection freedom; feedback labels are audited, not quota-optimized",
+      "trust_status": "audit_only_fixed_pool"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "MountainCar future-basin remains coverage-only; no quota in this fixed-pool复查",
+      "trust_status": "coverage_only_not_quota"
+    }
+  },
+  "pendulum_settle_yield_repair_branch": {
+    "branch_id": "prior_internal_cached_settle_yield_repair_fixed_pool64_audit",
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 16,
+      "gym_q90_obs_action_range": 16
+    },
+    "prefer_missing_cached_guard": true,
+    "require_cached_label_available": true,
+    "trust_status": "prior_internal_materialized_repair_fixed_pool64_audit"
+  },
+  "profile_version_id": "profile_band_pool64_fixed_pendulum_settle_repair_audit",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "include_all_non_gain2": false,
+    "include_all_nonconstant": false,
+    "min_count_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "min_non_gain2_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "min_nonconstant_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "audit_only_fixed_pool"
+  },
+  "target_per_rule": 64
+}

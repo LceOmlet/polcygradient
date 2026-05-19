@@ -1,0 +1,148 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.296875,
+      "min_rate": 0.296875,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.0,
+      "role": "protected_band",
+      "trust_status": "gym_like_baseline_protected_no_downshift"
+    }
+  },
+  "background_milestone": "reductive_distribution_independence_probe",
+  "joint_profile_cell_cap_rate": 0.25,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "strict feedback remains a lower-bound protected component; this probe removes hidden terminal-bin mode binding instead of adding more constructive quotas.",
+      "trust_status": "lower_bound_component_guard_without_terminal_bin_binding"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "future-basin detector remains prior-side coverage/health guard only; no quota until coverage definition is stable.",
+      "trust_status": "candidate_detector_not_quota_ready"
+    },
+    "pendulum_sustained_closed_loop_settle": {
+      "reason": "materialized pendulum repair is disabled for this reductive probe because previous selected-set audit showed hidden coupling with terminal/obs structure.",
+      "trust_status": "observed_only_no_materialized_repair"
+    },
+    "prior_pack_optimizability_surface": {
+      "reason": "keep terminal marginal uniformity only; remove mode-per-terminal-bin quotas and proxy/action-gain objectives so trainability is checked downstream instead of encoded by hidden structure bindings.",
+      "trust_status": "uniform_terminal_marginal_no_mode_terminal_or_gain_binding"
+    }
+  },
+  "pendulum_settle_yield_repair_branch": {
+    "branch_id": "disabled_for_reductive_independence_probe_v2o",
+    "enabled": false,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "prefer_missing_cached_guard": true,
+    "require_cached_label_available": true,
+    "trust_status": "disabled_hidden_structure_coupling_probe"
+  },
+  "prior_pack_optimizability_guard": {
+    "action_gain_objective_weight": 0.0,
+    "balanced_action_gain_min": 0.18,
+    "balanced_action_gain_min_by_rule": {
+      "gym_full_obs_action_range": 0.227,
+      "gym_q90_obs_action_range": 0.18
+    },
+    "enabled": true,
+    "high_terminal_objective_weight": 0.0,
+    "max_high_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 64,
+      "gym_q90_obs_action_range": 64
+    },
+    "min_low_terminal_count_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "min_proxy_count_by_rule": {
+      "gym_full_obs_action_range": 0,
+      "gym_q90_obs_action_range": 0
+    },
+    "proxy_objective_weight": 0.0,
+    "terminal_distribution_guard": {
+      "edges": [
+        0.0,
+        20.0,
+        40.0,
+        60.0,
+        80.0
+      ],
+      "enabled": true,
+      "max_count_by_rule": {
+        "gym_full_obs_action_range": [
+          18,
+          18,
+          18,
+          18
+        ],
+        "gym_q90_obs_action_range": [
+          18,
+          18,
+          18,
+          18
+        ]
+      },
+      "min_count_by_rule": {
+        "gym_full_obs_action_range": [
+          14,
+          14,
+          14,
+          14
+        ],
+        "gym_q90_obs_action_range": [
+          14,
+          14,
+          14,
+          14
+        ]
+      },
+      "trust_status": "uniform_terminal_marginal_without_conditional_mode_quota"
+    },
+    "terminal_reset_count_target_max": 20.0,
+    "trust_status": "marginal_terminal_only_trainability_checked_by_sidecar"
+  },
+  "profile_version_id": "profile_band_v2o_reductive_independent_uniform_terminal",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "include_all_non_gain2": false,
+    "include_all_nonconstant": false,
+    "max_count_by_rule": {
+      "gym_full_obs_action_range": 64,
+      "gym_q90_obs_action_range": 64
+    },
+    "min_count_by_rule": {
+      "gym_full_obs_action_range": 20,
+      "gym_q90_obs_action_range": 20
+    },
+    "min_non_gain2_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 2
+    },
+    "min_nonconstant_by_rule": {
+      "gym_full_obs_action_range": 10,
+      "gym_q90_obs_action_range": 10
+    },
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "lower_bound_only_no_terminal_bin_binding"
+  },
+  "target_per_rule": 64
+}

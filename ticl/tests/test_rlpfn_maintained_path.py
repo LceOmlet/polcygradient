@@ -1116,7 +1116,7 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["optimizer"]["pg_saved_tensors_cpu_offload_auto_disable_when_safe"] is False
     assert cfg["transformer"]["backbone"] == "rwkv7"
     assert cfg["transformer"]["rwkv_sequence_replay_checkpoint"] is True
-    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 64
+    assert cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 1024
     assert cfg["transformer"]["rwkv_sequence_replay_token_budget"] == 262144
     assert cfg["transformer"]["x_encoder_type"] == "split_obs_action"
     assert cfg["transformer"]["x_obs_dim"] == 404
@@ -1124,16 +1124,22 @@ def test_rlpfn_maintained_path_default_contract():
     assert cfg["transformer"]["single_eval_causal"] is True
     assert cfg["prior"]["environment"]["action_noise_train_std"] == 0.0
     assert cfg["prior"]["environment"]["action_noise_eval_std"] == 0.0
+    assert cfg["prior"]["environment"]["constrained_dim_sampling_policy"] == "gym_state_obs_coupled"
     assert cfg["prior"]["n_samples"] == 2048
     assert cfg["dataloader"]["batch_size"] == 2048
     assert cfg["optimizer"]["ppo_batch_size"] is None
-    assert cfg["prior"]["n_samples"] * cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 131072
+    assert cfg["prior"]["n_samples"] * cfg["transformer"]["rwkv_sequence_replay_batch_chunk_size"] == 2097152
     assert cfg["optimizer"]["ppo_n_epochs"] == 4
     assert cfg["optimizer"]["ppo_normalize_advantage"] is True
     assert cfg["optimizer"]["ppo_space_contract"] == "raw"
     assert cfg["optimizer"]["ppo_target_kl"] is None
     assert cfg["optimizer"]["ppo_value_head_impl"] == "vendor_official"
     assert cfg["optimizer"]["ppo_vf_coef"] == 0.1
+    assert cfg["optimizer"]["ppo_pack_prior_milestone"] == "m4_potential_progress_live"
+    assert cfg["optimizer"]["ppo_pack_prior_mode"] == "sampled_topology"
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_csv"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_rule"] is None
+    assert cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_limit"] is None
     assert layout["default_num_features"] == 434
     assert layout["x_obs_dim"] == 404
     assert layout["x_action_dim"] == 30
@@ -1153,6 +1159,24 @@ def test_rlpfn_maintained_path_rejects_terminal_reset_target_above_confirmed_max
         "max": TERMINAL_RESET_COUNT_TARGET_MAX + 1.0,
     }
     with pytest.raises(ValueError, match="terminal_reset_count_target max"):
+        validate_rlpfn_maintained_path_config(cfg)
+
+
+def test_rlpfn_maintained_path_rejects_explicit_fixed_frozen_list_pack_csv():
+    cfg = get_model_default_config("rlpfn")
+    cfg["optimizer"]["ppo_pack_prior_mode"] = "fixed_frozen_list"
+    cfg["optimizer"]["ppo_pack_fixed_frozen_h_list_csv"] = "/tmp/selected_profile_band_prior_envs.csv"
+    cfg["optimizer"]["ppo_pack_fixed_env_group_across_updates"] = True
+
+    with pytest.raises(ValueError, match="sampled_topology"):
+        validate_rlpfn_maintained_path_config(cfg)
+
+
+def test_rlpfn_maintained_path_rejects_fixed_frozen_list_without_csv():
+    cfg = get_model_default_config("rlpfn")
+    cfg["optimizer"]["ppo_pack_prior_mode"] = "fixed_frozen_list"
+
+    with pytest.raises(ValueError, match="sampled_topology"):
         validate_rlpfn_maintained_path_config(cfg)
 
 

@@ -466,6 +466,141 @@ def _clone_tree(value):
     return copy.deepcopy(value)
 
 
+_ROLLOUT_CHUNKED_CACHE_SENTINEL = "__ticl_rollout_chunked_cache_v1__"
+
+
+def _is_rollout_chunked_cache(value) -> bool:
+    return isinstance(value, dict) and bool(value.get(_ROLLOUT_CHUNKED_CACHE_SENTINEL, False))
+
+
+def _slice_cache_batch_dim(value, start: int, end: int):
+    if value is None:
+        return None
+    start = int(start)
+    end = int(end)
+    if _is_rollout_chunked_cache(value):
+        return _materialize_rollout_cache_batch(value, start, end)
+    if torch.is_tensor(value):
+        return value[start:end]
+    if isinstance(value, list):
+        return [_slice_cache_batch_dim(v, start, end) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_slice_cache_batch_dim(v, start, end) for v in value)
+    if isinstance(value, dict):
+        return {k: _slice_cache_batch_dim(v, start, end) for k, v in value.items()}
+    return copy.deepcopy(value)
+
+
+def _concat_cache_batch_dim(items: Sequence[Any]):
+    items = [item for item in items if item is not None]
+    if len(items) == 0:
+        return None
+    first = items[0]
+    if torch.is_tensor(first):
+        return torch.cat(items, dim=0)
+    if isinstance(first, list):
+        return [_concat_cache_batch_dim([item[idx] for item in items]) for idx in range(len(first))]
+    if isinstance(first, tuple):
+        return tuple(_concat_cache_batch_dim([item[idx] for item in items]) for idx in range(len(first)))
+    if isinstance(first, dict):
+        return {k: _concat_cache_batch_dim([item[k] for item in items]) for k in first.keys()}
+    return copy.deepcopy(first)
+
+
+def _cache_to_device(value, *, device: torch.device):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        if value.device == device:
+            return value
+        return value.to(device=device, non_blocking=True)
+    if isinstance(value, list):
+        return [_cache_to_device(v, device=device) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_cache_to_device(v, device=device) for v in value)
+    if isinstance(value, dict):
+        return {k: _cache_to_device(v, device=device) for k, v in value.items()}
+    return copy.deepcopy(value)
+
+
+def _cache_detach_to_cpu(value):
+    if value is None:
+        return None
+    if torch.is_tensor(value):
+        return value.detach().to(device="cpu", non_blocking=True)
+    if isinstance(value, list):
+        return [_cache_detach_to_cpu(v) for v in value]
+    if isinstance(value, tuple):
+        return tuple(_cache_detach_to_cpu(v) for v in value)
+    if isinstance(value, dict):
+        return {k: _cache_detach_to_cpu(v) for k, v in value.items()}
+    return copy.deepcopy(value)
+
+
+def _is_rollout_oom_exception(exc: BaseException) -> bool:
+    if isinstance(exc, torch.OutOfMemoryError):
+        return True
+    msg = str(exc).strip().lower()
+    return bool(msg) and (
+        "out of memory" in msg
+        or "cudaerrormemoryallocation" in msg
+        or "cudnn_status_alloc_failed" in msg
+        or "cublas_status_alloc_failed" in msg
+    )
+
+
+def _make_rollout_chunked_cache(chunks: Sequence[Any], sizes: Sequence[int]) -> dict[str, Any]:
+    sizes_i = [int(size) for size in sizes]
+    if len(chunks) != len(sizes_i):
+        raise ValueError("Rollout chunked cache chunks/sizes length mismatch.")
+    return {
+        _ROLLOUT_CHUNKED_CACHE_SENTINEL: True,
+        "chunks": list(chunks),
+        "sizes": sizes_i,
+        "batch_size": int(sum(sizes_i)),
+    }
+
+
+def _rollout_chunked_cache_max_chunk_size(value) -> Optional[int]:
+    if not _is_rollout_chunked_cache(value):
+        return None
+    sizes = value.get("sizes", [])
+    if len(sizes) == 0:
+        return None
+    return int(max(int(size) for size in sizes))
+
+
+def _materialize_rollout_cache_batch(value, start: int, end: int):
+    if not _is_rollout_chunked_cache(value):
+        raise TypeError("Expected a rollout chunked cache.")
+    start = int(start)
+    end = int(end)
+    if start < 0 or end < start or end > int(value.get("batch_size", 0)):
+        raise IndexError(
+            f"Invalid rollout chunked cache slice [{start}, {end}) for batch_size={value.get('batch_size')!r}."
+        )
+    pieces = []
+    offset = 0
+    for chunk, size in zip(value.get("chunks", []), value.get("sizes", [])):
+        size = int(size)
+        chunk_start = offset
+        chunk_end = offset + size
+        offset = chunk_end
+        if chunk_end <= start or chunk_start >= end:
+            continue
+        local_start = max(0, start - chunk_start)
+        local_end = min(size, end - chunk_start)
+        if local_start == 0 and local_end == size:
+            pieces.append(chunk)
+        else:
+            pieces.append(_slice_cache_batch_dim(chunk, local_start, local_end))
+    if len(pieces) == 0:
+        return None
+    if len(pieces) == 1:
+        return pieces[0]
+    return _concat_cache_batch_dim(pieces)
+
+
 def _masked_mean_std(
     values: torch.Tensor,
     mask: torch.Tensor,
@@ -2236,13 +2371,17 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self._flat_objective_episode_indices = None
         self._flat_objective_episode_positions = None
         self._flat_objective_global_positions = None
+        self._lazy_step_env_flatten = False
+        self._lazy_step_env_unflattened = False
         super().reset()
 
     def clear_device_cache(self) -> None:
         return None
 
-    def _ensure_generator_ready(self) -> None:
-        if self.generator_ready:
+    def _ensure_generator_ready(self, *, lazy_step_env: bool = False) -> None:
+        if self.generator_ready and (
+            bool(lazy_step_env) or not bool(getattr(self, "_lazy_step_env_unflattened", False))
+        ):
             return
         position_metadata = _build_objective_position_metadata(
             self.episode_starts,
@@ -2265,6 +2404,11 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self._flat_objective_global_positions = self.swap_and_flatten(
             position_metadata["objective_global_positions"]
         ).reshape(-1).astype(np.int64, copy=False)
+        if bool(lazy_step_env):
+            self._lazy_step_env_unflattened = True
+            self.generator_ready = True
+            return
+        self._lazy_step_env_unflattened = False
         for tensor in ["hidden_states_pi", "cell_states_pi", "hidden_states_vf", "cell_states_vf"]:
             self.__dict__[tensor] = self.__dict__[tensor].swapaxes(1, 2)
 
@@ -2356,7 +2500,7 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         self._global_q_target_seq_lengths = seq_lengths
 
     def get_flat_position_metadata(self, batch_inds: np.ndarray) -> dict[str, np.ndarray]:
-        self._ensure_generator_ready()
+        self._ensure_generator_ready(lazy_step_env=bool(getattr(self, "_lazy_step_env_unflattened", False)))
         batch_inds = np.asarray(batch_inds, dtype=np.int64)
         return {
             "flat_batch_indices": batch_inds.astype(np.int64, copy=True),
@@ -2382,7 +2526,7 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         dtype: torch.dtype = torch.float32,
         device: Optional[torch.device] = None,
     ) -> torch.Tensor:
-        self._ensure_generator_ready()
+        self._ensure_generator_ready(lazy_step_env=bool(getattr(self, "_lazy_step_env_unflattened", False)))
         raw_returns_flat = torch.as_tensor(self.rollout_raw_returns, dtype=dtype, device=device).reshape(-1)
         return raw_returns_flat.reshape(-1)
 
@@ -2820,9 +2964,9 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         del seq_start_indices, seq_lengths, returns_flat, objective_masks_flat, eps
         return cached_targets
 
-    def _iter_batch_plan(self, batch_size: Optional[int] = None):
+    def _iter_batch_plan(self, batch_size: Optional[int] = None, *, lazy_step_env: bool = False):
         assert self.full, "Rollout buffer must be full before sampling from it"
-        self._ensure_generator_ready()
+        self._ensure_generator_ready(lazy_step_env=bool(lazy_step_env))
         batch_size = self._resolve_batch_size(batch_size)
 
         total = self.buffer_size * self.n_envs
@@ -3000,7 +3144,8 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         include_aux_tensors: bool = True,
         include_position_metadata: bool = True,
     ):
-        for batch_inds, env_change in self._iter_batch_plan(batch_size):
+        lazy_step_env = bool(getattr(self, "_lazy_step_env_flatten", False))
+        for batch_inds, env_change in self._iter_batch_plan(batch_size, lazy_step_env=lazy_step_env):
             yield self._get_flat_batch_gpu(
                 batch_inds,
                 env_change,
@@ -3172,38 +3317,40 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
         seq_end_exclusive[-1] = int(len(batch_inds))
         seq_lengths = (seq_end_exclusive - seq_start_indices).astype(np.int64, copy=False)
 
-        observations_flat = self.to_torch(self.observations[batch_inds]).contiguous()
-        actions_flat = self.to_torch(self.actions[batch_inds]).contiguous()
+        observations_flat = self.to_torch(self._flat_numpy_batch("observations", batch_inds)).contiguous()
+        actions_flat = self.to_torch(self._flat_numpy_batch("actions", batch_inds)).contiguous()
         values_flat = (
-            self.to_torch(self.values[batch_inds]).reshape(-1).contiguous()
+            self.to_torch(self._flat_numpy_batch("values", batch_inds)).reshape(-1).contiguous()
             if bool(include_old_values)
             else None
         )
-        log_probs_flat = self.to_torch(self.log_probs[batch_inds]).reshape(-1).contiguous()
-        advantages_flat = self.to_torch(self.advantages[batch_inds]).reshape(-1).contiguous()
-        actor_advantages_flat = self.to_torch(self.actor_advantages[batch_inds]).reshape(-1).contiguous()
-        returns_flat = self.to_torch(self.returns[batch_inds]).reshape(-1).contiguous()
-        value_target_bucket_idx_flat = self.to_torch(self.value_target_bucket_idx[batch_inds]).reshape(-1).contiguous()
-        objective_masks_flat = self.to_torch(self.objective_masks[batch_inds]).reshape(-1).contiguous()
+        log_probs_flat = self.to_torch(self._flat_numpy_batch("log_probs", batch_inds)).reshape(-1).contiguous()
+        advantages_flat = self.to_torch(self._flat_numpy_batch("advantages", batch_inds)).reshape(-1).contiguous()
+        actor_advantages_flat = self.to_torch(self._flat_numpy_batch("actor_advantages", batch_inds)).reshape(-1).contiguous()
+        returns_flat = self.to_torch(self._flat_numpy_batch("returns", batch_inds)).reshape(-1).contiguous()
+        value_target_bucket_idx_flat = (
+            self.to_torch(self._flat_numpy_batch("value_target_bucket_idx", batch_inds)).reshape(-1).contiguous()
+        )
+        objective_masks_flat = self.to_torch(self._flat_numpy_batch("objective_masks", batch_inds)).reshape(-1).contiguous()
         rollout_return_means_flat = (
-            self.to_torch(self.rollout_return_means[batch_inds]).reshape(-1).contiguous()
+            self.to_torch(self._flat_numpy_batch("rollout_return_means", batch_inds)).reshape(-1).contiguous()
             if bool(include_value_affine)
             else None
         )
         rollout_return_stds_flat = (
-            self.to_torch(self.rollout_return_stds[batch_inds]).reshape(-1).contiguous()
+            self.to_torch(self._flat_numpy_batch("rollout_return_stds", batch_inds)).reshape(-1).contiguous()
             if bool(include_value_affine)
             else None
         )
-        episode_starts_flat = self.to_torch(self.episode_starts[batch_inds]).reshape(-1).contiguous()
-        action_masks_flat = self.to_torch(self.action_masks[batch_inds]).contiguous()
+        episode_starts_flat = self.to_torch(self._flat_numpy_batch("episode_starts", batch_inds)).reshape(-1).contiguous()
+        action_masks_flat = self.to_torch(self._flat_numpy_batch("action_masks", batch_inds)).contiguous()
         next_states_flat = (
-            self.to_torch(self.next_states[batch_inds]).contiguous()
+            self.to_torch(self._flat_numpy_batch("next_states", batch_inds)).contiguous()
             if bool(include_aux_tensors)
             else None
         )
         next_state_masks_flat = (
-            self.to_torch(self.next_state_masks[batch_inds]).contiguous()
+            self.to_torch(self._flat_numpy_batch("next_state_masks", batch_inds)).contiguous()
             if bool(include_aux_tensors)
             else None
         )
@@ -3265,7 +3412,24 @@ class MaskedRecurrentRolloutBuffer(RecurrentRolloutBuffer):
     def _create_sequencers(self, batch_inds: np.ndarray, env_change: np.ndarray):
         from sb3_contrib.common.recurrent.buffers import create_sequencers
 
-        return create_sequencers(self.episode_starts[batch_inds], env_change[batch_inds], self.device)
+        batch_inds = np.asarray(batch_inds, dtype=np.int64)
+        return create_sequencers(
+            self._flat_numpy_batch("episode_starts", batch_inds),
+            env_change[batch_inds],
+            self.device,
+        )
+
+    def _flat_numpy_batch(self, name: str, batch_inds: np.ndarray) -> np.ndarray:
+        array = self.__dict__[name]
+        batch_inds = np.asarray(batch_inds, dtype=np.int64)
+        if bool(getattr(self, "_lazy_step_env_unflattened", False)):
+            step_indices = np.remainder(batch_inds, int(self.buffer_size))
+            env_indices = np.floor_divide(batch_inds, int(self.buffer_size))
+            gathered = array[step_indices, env_indices]
+            if getattr(array, "ndim", 0) == 2:
+                gathered = gathered.reshape(-1, 1)
+            return gathered
+        return array[batch_inds]
 
 
 class MaskedRecurrentPPO(RecurrentPPO):
@@ -3716,7 +3880,14 @@ class MaskedRecurrentPPO(RecurrentPPO):
         if not self._progress_logging_enabled():
             return
         stamped = f"[{time.strftime('%Y-%m-%d %H:%M:%S')}] {message}"
-        print(stamped)
+        if str(os.environ.get("TICL_PPO_PHASE_LOG_STDOUT_SUPPRESS", "")).strip().lower() not in {
+            "1",
+            "true",
+            "yes",
+            "y",
+            "on",
+        }:
+            print(stamped, flush=True)
         log_file = self._progress_log_file()
         if log_file is None or str(log_file).strip() == "":
             return
@@ -4072,6 +4243,8 @@ class MaskedRecurrentPPO(RecurrentPPO):
         callback.on_rollout_start()
         env_prior = self._rwkv_env_prior
         env_prior.clear_rollout_artifacts()
+        if bool(int(os.environ.get("TICL_PPO_ROLLOUT_BUFFER_LAZY_STEP_ENV_FLATTEN", "0") or "0")):
+            setattr(rollout_buffer, "_lazy_step_env_flatten", True)
         # This strict collect path bypasses VecEnv.step_wait and performs the
         # environment rollout directly through EnvironmentPrior below. The
         # transition generator cached by the mandatory SB3 reset is therefore
@@ -4116,6 +4289,9 @@ class MaskedRecurrentPPO(RecurrentPPO):
         rollout_continue = True
         rollout_cpu_marshal_wall_s = 0.0
         rollout_buffer_add_wall_s = 0.0
+        rollout_progress_every_steps = int(
+            max(0, int(os.environ.get("TICL_PPO_PACK_COLLECT_LOG_EVERY_STEPS", "0") or "0"))
+        )
 
         def _ppo_step_sink(step_payload):
             nonlocal dones_np
@@ -4233,6 +4409,21 @@ class MaskedRecurrentPPO(RecurrentPPO):
             )
             rollout_buffer_add_wall_s += float(time.perf_counter() - buffer_add_t0)
             rollout_step_count += 1
+            if (
+                rollout_progress_every_steps > 0
+                and self._progress_logging_enabled()
+                and (
+                    int(rollout_step_count) == int(n_rollout_steps)
+                    or int(rollout_step_count) % int(rollout_progress_every_steps) == 0
+                )
+            ):
+                elapsed_s = float(time.perf_counter() - rollout_wall_t0)
+                fps = float(int(rollout_step_count) * int(env.num_envs)) / max(1e-9, elapsed_s)
+                self._emit_progress_log(
+                    "[ppo-rollout-progress] "
+                    f"steps={int(rollout_step_count)}/{int(n_rollout_steps)} "
+                    f"envs={int(env.num_envs)} elapsed_s={elapsed_s:.1f} fps={fps:.1f}"
+                )
             return True
 
         with torch.no_grad():
@@ -5785,6 +5976,7 @@ class EnvironmentPriorPPOGymEnv(Env):
         self._reward_mask_t = None
         self._terminal_t = None
         self._terminal_signal_history = None
+        self._terminal_history_relaxed = None
         self._zero_pad_t = None
         self._step_idx = 0
         self._single_eval_pos = 1
@@ -5872,6 +6064,11 @@ class EnvironmentPriorPPOGymEnv(Env):
         self._terminal_t = torch.zeros((), device=self.device, dtype=torch.float32)
         self._terminal_signal_history = (
             torch.zeros((self.n_steps, 1), device=self.device, dtype=torch.float32)
+            if bool(self._env.get("terminal_reset_enabled", False))
+            else None
+        )
+        self._terminal_history_relaxed = (
+            torch.zeros((1,), device=self.device, dtype=torch.bool)
             if bool(self._env.get("terminal_reset_enabled", False))
             else None
         )
@@ -6006,6 +6203,10 @@ class EnvironmentPriorPPOGymEnv(Env):
                 terminal_bonus_base=None if terminal_bonus_base_next is None else terminal_bonus_base_next.reshape(1),
                 terminal_signal_history=self._terminal_signal_history,
                 history_index=self._step_idx,
+                history_warmup_count=self._env.get("terminal_reset_count_target", None),
+                history_relaxed_mask=self._terminal_history_relaxed,
+                terminal_reset_min_step_target=self._env.get("terminal_reset_min_step_target", 0.0),
+                step_index=self._step_idx,
             )
             state_next = state_next.squeeze(0)
             reward_next = reward_next.reshape(())
@@ -6096,6 +6297,7 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._reward_mask_t = None
         self._terminal_t = None
         self._terminal_signal_history = None
+        self._terminal_history_relaxed = None
         self._zero_pad_t = None
         self._single_eval_pos = None
         self._single_eval_pos_np = None
@@ -6106,6 +6308,11 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._last_terminated_np = None
         self._last_truncated_np = None
         self._last_terminal_observation_np = None
+        self._last_reward_env_np = None
+        self._last_reward_ctrl_np = None
+        self._last_reward_survival_np = None
+        self._last_reward_terminal_bonus_np = None
+        self._last_exact_scm_lowtail_reward_components_np = None
         self._compact_pack_step_infos = False
         self._step_idx = 0
         self._episode_returns = np.zeros((self.num_envs,), dtype=np.float32)
@@ -6140,6 +6347,7 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._reward_mask_t = None
         self._terminal_t = None
         self._terminal_signal_history = None
+        self._terminal_history_relaxed = None
         self._zero_pad_t = None
         self._single_eval_pos = None
         self._single_eval_pos_np = None
@@ -6150,6 +6358,11 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._last_terminated_np = None
         self._last_truncated_np = None
         self._last_terminal_observation_np = None
+        self._last_reward_env_np = None
+        self._last_reward_ctrl_np = None
+        self._last_reward_survival_np = None
+        self._last_reward_terminal_bonus_np = None
+        self._last_exact_scm_lowtail_reward_components_np = None
         clear_artifacts = getattr(self.env_prior, "clear_rollout_artifacts", None)
         if callable(clear_artifacts):
             clear_artifacts()
@@ -6265,12 +6478,18 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._last_terminated_np = None
         self._last_truncated_np = None
         self._last_terminal_observation_np = None
+        self._last_reward_env_np = None
+        self._last_reward_ctrl_np = None
+        self._last_reward_survival_np = None
+        self._last_reward_terminal_bonus_np = None
+        self._last_exact_scm_lowtail_reward_components_np = None
         self._step_idx = 0
         self._episode_returns.fill(0.0)
         self._episode_lengths.fill(0)
         self.reset_infos = [{"single_eval_pos": 0} for _ in range(self.num_envs)]
         return np.zeros((self.num_envs, self.num_features), dtype=np.float32)
 
+    @torch.no_grad()
     def _full_reset_batch(self, *, seeds: Optional[list[int]] = None) -> np.ndarray:
         if bool(getattr(self, "_direct_collect_reset_stub", False)):
             return self._direct_collect_reset_obs_stub(seeds=seeds)
@@ -6349,6 +6568,11 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
             if bool(self._env["terminal_reset_enabled"].any().item())
             else None
         )
+        self._terminal_history_relaxed = (
+            torch.zeros((self.num_envs,), device=self.device, dtype=torch.bool)
+            if bool(self._env["terminal_reset_enabled"].any().item())
+            else None
+        )
         self._zero_pad_t = torch.zeros((self.num_envs, zero_pad_dim), device=self.device, dtype=torch.float32)
         self._single_eval_pos = torch.tensor(
             [int(self.env_prior._sample_single_eval_pos(self.n_steps, None)) for _ in range(self.num_envs)],
@@ -6363,6 +6587,11 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         self._last_terminated_np = None
         self._last_truncated_np = None
         self._last_terminal_observation_np = None
+        self._last_reward_env_np = None
+        self._last_reward_ctrl_np = None
+        self._last_reward_survival_np = None
+        self._last_reward_terminal_bonus_np = None
+        self._last_exact_scm_lowtail_reward_components_np = None
         self._step_idx = 0
         self._episode_returns.fill(0.0)
         self._episode_lengths.fill(0)
@@ -6376,9 +6605,11 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
     def step_async(self, actions: np.ndarray) -> None:
         self._pending_actions = np.asarray(actions, dtype=np.float32).reshape((self.num_envs, self.action_dim))
 
+    @torch.no_grad()
     def step_wait(self) -> VecEnvStepReturn:
         if self._pending_actions is None:
             raise RuntimeError("step_async() must be called before step_wait().")
+        self._last_exact_scm_lowtail_reward_components_np = None
         action_t = torch.as_tensor(self._pending_actions, device=self.device, dtype=torch.float32)
         action_t = torch.clamp(action_t, min=-1.0, max=1.0)
         action_mask_t = torch.as_tensor(self._vector_action_masks(), device=self.device, dtype=torch.float32)
@@ -6419,15 +6650,54 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
         x_next, reward_unit, terminal_signal_next, terminal_bonus_base_next = self.env_prior._unpack_transition_output(
             transition_out
         )
+        collect_lowtail_components = bool(
+            getattr(self, "_collect_exact_scm_lowtail_reward_components_for_pack", False)
+        )
+        lowtail_component_payload = (
+            getattr(
+                transition_generator,
+                "_last_exact_scm_lowtail_reward_components",
+                None,
+            )
+            if bool(collect_lowtail_components)
+            else None
+        )
+        step_lowtail_components_np = None
+        if bool(collect_lowtail_components) and isinstance(lowtail_component_payload, dict):
+            lowtail_components_np: dict[str, np.ndarray] = {}
+            for component_name, component_value in lowtail_component_payload.items():
+                if torch.is_tensor(component_value):
+                    component_arr = component_value.detach().cpu().numpy().astype(np.float32, copy=False)
+                else:
+                    component_arr = np.asarray(component_value, dtype=np.float32)
+                if tuple(component_arr.shape) == (self.num_envs,):
+                    lowtail_components_np[str(component_name)] = component_arr
+            if lowtail_components_np:
+                reward_scale_value = self._env.get("reward_scale", None)
+                if torch.is_tensor(reward_scale_value):
+                    reward_scale_arr = reward_scale_value.detach().cpu().numpy().astype(np.float32, copy=False)
+                    if tuple(reward_scale_arr.shape) == (self.num_envs,):
+                        lowtail_components_np["reward_scale"] = reward_scale_arr
+                step_lowtail_components_np = lowtail_components_np
+                self._last_exact_scm_lowtail_reward_components_np = lowtail_components_np
         reward_next_raw = self._env["reward_scale"] * reward_unit.reshape(self.num_envs)
 
-        aux_reward_next = self.env_prior._exact_scm_aux_reward_terms(
+        reward_next_ctrl, reward_next_survival = self.env_prior._exact_scm_aux_reward_components(
             action_t,
             action_mask=action_mask_t,
             ctrl_weight=self._env.get("ctrl_reward_weight", 0.0),
             ctrl_enabled=self._env.get("ctrl_reward_enabled", False),
             survival_weight=self._env.get("survival_reward_weight", 0.0),
             survival_enabled=self._env.get("survival_reward_enabled", False),
+        )
+        aux_reward_next = reward_next_ctrl + reward_next_survival
+        reward_env_next = self.env_prior._transform_exact_scm_base_reward(
+            reward_next_raw,
+            reward_clip=self._env.get("reward_clip", 10.0),
+            mode=self._env.get("reinforce_reward_transform", "none"),
+            rms_eps=self._env.get("reinforce_reward_rms_eps", 1e-6),
+            tanh_c=self._env.get("reinforce_reward_tanh_c", 1.0),
+            tanh_bound=self._env.get("reinforce_reward_tanh_bound", 2.0),
         )
         reward_next = self.env_prior._compose_exact_scm_reward(
             reward_next_raw,
@@ -6452,6 +6722,13 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
             reward_mask_next = torch.where(drop_mask, torch.zeros_like(reward_mask_next), reward_mask_next)
             impute_mask = drop_mask & self._env.get("reward_dropout_impute_zero", False)
             reward_next = torch.where(impute_mask, torch.zeros_like(reward_next), reward_next)
+            reward_env_next = torch.where(impute_mask, torch.zeros_like(reward_env_next), reward_env_next)
+            reward_next_ctrl = torch.where(impute_mask, torch.zeros_like(reward_next_ctrl), reward_next_ctrl)
+            reward_next_survival = torch.where(
+                impute_mask,
+                torch.zeros_like(reward_next_survival),
+                reward_next_survival,
+            )
 
         state_next = (1.0 - self._env["alpha"][:, None]) * self._state_t + self._env["alpha"][:, None] * x_next
         if bool(torch.any(self._env["state_noise_std"] > 0).item()):
@@ -6483,6 +6760,7 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
             target=self._env.get("state_full_rms_target", 1.0),
         )
 
+        reward_terminal_bonus_next = torch.zeros((self.num_envs,), device=self.device, dtype=reward_next.dtype)
         if bool(torch.any(self._env.get("terminal_reset_enabled", False)).item()):
             reset_prob = self.env_prior._terminal_reset_prob_from_count(
                 self._env.get("terminal_reset_count_target", 0.0),
@@ -6500,7 +6778,7 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
                 device=self.device,
                 dtype=torch.float32,
             )
-            state_next, reward_next, terminal_next = self.env_prior._apply_terminal_reset_step(
+            state_next, reward_next, terminal_next, terminal_aux = self.env_prior._apply_terminal_reset_step(
                 state_next=state_next,
                 reward_next=reward_next,
                 terminal_draw=terminal_draw,
@@ -6515,6 +6793,15 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
                 terminal_bonus_base=terminal_bonus_base_next,
                 terminal_signal_history=self._terminal_signal_history,
                 history_index=self._step_idx,
+                history_warmup_count=self._env.get("terminal_reset_count_target", None),
+                history_relaxed_mask=self._terminal_history_relaxed,
+                terminal_reset_min_step_target=self._env.get("terminal_reset_min_step_target", 0.0),
+                step_index=self._step_idx,
+                return_aux=True,
+            )
+            reward_terminal_bonus_next = terminal_aux["terminal_bonus_applied"].to(
+                device=self.device,
+                dtype=reward_next.dtype,
             )
         else:
             terminal_next = torch.zeros((self.num_envs,), device=self.device, dtype=reward_next.dtype)
@@ -6652,6 +6939,33 @@ class EnvironmentPriorPPOBatchVecEnv(VecEnv):
                 self._last_terminated_np = terminated
                 self._last_truncated_np = truncated
                 self._last_terminal_observation_np = terminal_obs
+
+        if bool(getattr(self, "_collect_reward_component_arrays_for_pack", True)):
+            self._last_reward_env_np = reward_env_next.detach().cpu().numpy().astype(np.float32, copy=False)
+            self._last_reward_ctrl_np = reward_next_ctrl.detach().cpu().numpy().astype(np.float32, copy=False)
+            self._last_reward_survival_np = reward_next_survival.detach().cpu().numpy().astype(np.float32, copy=False)
+            self._last_reward_terminal_bonus_np = reward_terminal_bonus_next.detach().cpu().numpy().astype(
+                np.float32,
+                copy=False,
+            )
+        else:
+            self._last_reward_env_np = None
+            self._last_reward_ctrl_np = None
+            self._last_reward_survival_np = None
+            self._last_reward_terminal_bonus_np = None
+        if bool(collect_lowtail_components) and isinstance(step_lowtail_components_np, dict):
+            step_lowtail_components_np["reward_raw_scaled"] = (
+                reward_next_raw.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            step_lowtail_components_np["reward_env_transformed"] = (
+                reward_env_next.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            step_lowtail_components_np["reward_total_return"] = (
+                reward_return.detach().cpu().numpy().astype(np.float32, copy=False)
+            )
+            self._last_exact_scm_lowtail_reward_components_np = step_lowtail_components_np
+        elif not bool(collect_lowtail_components):
+            self._last_exact_scm_lowtail_reward_components_np = None
 
         self._pending_actions = None
         return obs_next, rewards_np.copy(), dones, infos
@@ -7370,15 +7684,34 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         if self._rollout_kv_cache is None:
             current_cache = None
         else:
-            current_cache = self._rollout_kv_cache if mutate_cache else _clone_tree(self._rollout_kv_cache)
+            current_cache = self._rollout_kv_cache if (mutate_cache or _is_rollout_chunked_cache(self._rollout_kv_cache)) else _clone_tree(self._rollout_kv_cache)
         hidden, next_cache = self._official_rollout_hidden_from_cache(
             obs,
             episode_flags,
             cache=current_cache,
+            consume_cache=bool(mutate_cache),
+            store_next_cache=bool(mutate_cache),
         )
         if mutate_cache:
             self._rollout_kv_cache = next_cache
         return hidden
+
+    def _resolve_rollout_cache_batch_chunk_size(self, *, batch_size: int, cache) -> int:
+        batch_size = int(max(1, batch_size))
+        chunk_size = batch_size
+        resolve_chunk = getattr(self.rlpfn_model, "resolve_replay_batch_chunk_size", None)
+        if callable(resolve_chunk):
+            chunk_size = int(resolve_chunk(seq_len=1, total_batch=batch_size))
+        raw_override = os.environ.get("TICL_PPO_ROLLOUT_CACHE_BATCH_CHUNK_SIZE", "").strip()
+        if raw_override:
+            try:
+                chunk_size = min(chunk_size, int(max(1, int(raw_override))))
+            except Exception:
+                pass
+        existing_chunk = _rollout_chunked_cache_max_chunk_size(cache)
+        if existing_chunk is not None:
+            chunk_size = min(chunk_size, int(existing_chunk))
+        return int(max(1, min(batch_size, chunk_size)))
 
     def _official_rollout_hidden_from_cache(
         self,
@@ -7386,6 +7719,143 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         episode_starts: torch.Tensor,
         *,
         cache,
+        consume_cache: bool = False,
+        store_next_cache: bool = True,
+    ) -> tuple[torch.Tensor, Any]:
+        batch_size = int(obs.shape[0])
+        chunk_size = self._resolve_rollout_cache_batch_chunk_size(
+            batch_size=batch_size,
+            cache=cache,
+        )
+        if chunk_size < batch_size or _is_rollout_chunked_cache(cache):
+            while True:
+                try:
+                    return self._official_rollout_hidden_from_cache_chunked(
+                        obs,
+                        episode_starts,
+                        cache=cache,
+                        chunk_size=chunk_size,
+                        consume_cache=bool(consume_cache),
+                        store_next_cache=bool(store_next_cache),
+                    )
+                except RuntimeError as exc:
+                    if (
+                        (not _is_rollout_oom_exception(exc))
+                        or int(chunk_size) <= 1
+                        or (bool(consume_cache) and _is_rollout_chunked_cache(cache))
+                    ):
+                        raise
+                    if obs.is_cuda:
+                        try:
+                            torch.cuda.empty_cache()
+                        except Exception:
+                            pass
+                    next_chunk_size = max(1, int(chunk_size) // 2)
+                    if next_chunk_size >= int(chunk_size):
+                        raise
+                    print(
+                        "[ppo-rollout-cache-chunk-oom] "
+                        f"batch_size={batch_size} chunk_size={int(chunk_size)} "
+                        f"retry_chunk_size={int(next_chunk_size)}",
+                        flush=True,
+                    )
+                    chunk_size = int(next_chunk_size)
+        return self._official_rollout_hidden_from_cache_unchunked(
+            obs,
+            episode_starts,
+            cache=cache,
+            store_next_cache=bool(store_next_cache),
+        )
+
+    def _official_rollout_hidden_from_cache_chunked(
+        self,
+        obs: torch.Tensor,
+        episode_starts: torch.Tensor,
+        *,
+        cache,
+        chunk_size: int,
+        consume_cache: bool = False,
+        store_next_cache: bool = True,
+    ) -> tuple[torch.Tensor, Any]:
+        if obs.ndim != 2:
+            raise ValueError(f"PPO rollout expects obs with shape (B, F), got {tuple(obs.shape)}")
+        batch_size = int(obs.shape[0])
+        chunk_size = int(max(1, min(batch_size, int(chunk_size))))
+        episode_flags = episode_starts.reshape(batch_size).to(device=obs.device, dtype=torch.bool)
+        hidden_out = None
+        next_chunks = [] if bool(store_next_cache) else None
+        next_sizes = []
+        cache_chunks = cache.get("chunks") if _is_rollout_chunked_cache(cache) else None
+        cache_sizes = cache.get("sizes") if _is_rollout_chunked_cache(cache) else None
+        cache_offsets = None
+        if isinstance(cache_sizes, list):
+            cache_offsets = []
+            offset = 0
+            for size in cache_sizes:
+                cache_offsets.append(int(offset))
+                offset += int(size)
+        cpu_offload_cache = str(os.environ.get("TICL_PPO_ROLLOUT_CACHE_CPU_OFFLOAD", "0")).strip().lower() in {
+            "1",
+            "true",
+            "yes",
+            "on",
+        }
+        for start in range(0, batch_size, chunk_size):
+            end = min(batch_size, start + chunk_size)
+            cache_chunk = None
+            chunk_index = len(next_sizes)
+            cache_chunk_exact = False
+            if (
+                isinstance(cache_chunks, list)
+                and isinstance(cache_sizes, list)
+                and isinstance(cache_offsets, list)
+                and chunk_index < len(cache_chunks)
+                and chunk_index < len(cache_sizes)
+                and chunk_index < len(cache_offsets)
+            ):
+                chunk_start = int(cache_offsets[chunk_index])
+                chunk_end = chunk_start + int(cache_sizes[chunk_index])
+                if chunk_start == int(start) and chunk_end == int(end):
+                    cache_chunk = cache_chunks[chunk_index]
+                    cache_chunk_exact = True
+            if cache is not None:
+                if cache_chunk is None:
+                    cache_chunk = _slice_cache_batch_dim(cache, start, end)
+                cache_chunk = _cache_to_device(cache_chunk, device=obs.device)
+            hidden_chunk, next_chunk = self._official_rollout_hidden_from_cache_unchunked(
+                obs[start:end],
+                episode_flags[start:end],
+                cache=cache_chunk,
+                store_next_cache=True,
+            )
+            if hidden_out is None:
+                hidden_out = torch.empty(
+                    (batch_size, int(hidden_chunk.shape[-1])),
+                    device=hidden_chunk.device,
+                    dtype=hidden_chunk.dtype,
+                )
+            hidden_out[start:end].copy_(hidden_chunk)
+            if bool(store_next_cache):
+                if bool(cpu_offload_cache) and obs.is_cuda:
+                    next_chunks.append(_cache_detach_to_cpu(next_chunk))
+                else:
+                    next_chunks.append(next_chunk)
+                next_sizes.append(int(end - start))
+            if bool(consume_cache) and cache_chunk_exact and isinstance(cache_chunks, list) and chunk_index < len(cache_chunks):
+                cache_chunks[chunk_index] = None
+            del cache_chunk, next_chunk, hidden_chunk
+        if hidden_out is None:
+            raise RuntimeError("RWKV PPO rollout chunked hidden path produced no chunks.")
+        next_cache = _make_rollout_chunked_cache(next_chunks, next_sizes) if bool(store_next_cache) else None
+        return hidden_out, next_cache
+
+    def _official_rollout_hidden_from_cache_unchunked(
+        self,
+        obs: torch.Tensor,
+        episode_starts: torch.Tensor,
+        *,
+        cache,
+        store_next_cache: bool = True,
     ) -> tuple[torch.Tensor, Any]:
         if obs.ndim != 2:
             raise ValueError(f"PPO rollout expects obs with shape (B, F), got {tuple(obs.shape)}")
@@ -7419,6 +7889,8 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
         ):
             current_cache = _zero_batch_rows(current_cache, episode_flags)
         hidden, next_cache = self.rlpfn_model.rwkv_core.forward_step(token[0], current_cache)
+        if not bool(store_next_cache):
+            next_cache = None
         return hidden, next_cache
 
     def _official_sequence_hidden(
@@ -7934,6 +8406,8 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
             obs_full,
             episode_starts,
             cache=actor_cache,
+            consume_cache=True,
+            store_next_cache=True,
         )
         latent_pi = self.mlp_extractor.forward_actor(hidden)
         if bool(getattr(self, "separate_value_backbone", False)):
@@ -7942,6 +8416,8 @@ class OfficialRWKVRecurrentPPOPolicy(RecurrentActorCriticPolicy):
                     obs_full,
                     episode_starts,
                     cache=value_cache,
+                    consume_cache=True,
+                    store_next_cache=True,
                 )
             latent_vf = self.mlp_extractor.forward_critic(value_hidden)
             next_cache = {

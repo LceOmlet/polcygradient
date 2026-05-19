@@ -9,8 +9,10 @@ RLPFN_MAINTAINED_ENV_DEFAULTS = {
     "obs_slot_dim": 400,
     "action_slot_dim": 30,
     "constrained_dim_sampling_enabled": True,
+    "constrained_dim_sampling_policy": "gym_state_obs_coupled",
     "constrained_dim_sampling_total_budget": 400,
     "strict_joint_transition_enabled": True,
+    "reference_scm_zero_pad_inactive_init_enabled": True,
     "state_input_scale_enabled": False,
     "state_input_scale": 1.0,
     "scm_standard_linear_init_enabled": True,
@@ -120,7 +122,7 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["transformer"]["backbone"] = "rwkv7"
     config["transformer"]["rwkv_sequence_replay_checkpoint"] = True
     config["transformer"]["rwkv_sequence_replay_batch_chunk_size"] = int(
-        os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_BATCH_CHUNK_SIZE", "48")
+        os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_BATCH_CHUNK_SIZE", "1024")
     )
     config["transformer"]["rwkv_sequence_replay_token_budget"] = int(
         os.environ.get("TICL_RWKV_SEQUENCE_REPLAY_TOKEN_BUDGET", "262144")
@@ -151,8 +153,11 @@ def apply_rlpfn_maintained_path_defaults(config):
     config["optimizer"]["ppo_actor_baseline_mode"] = "learned"
     config["optimizer"]["ppo_vf_coef"] = 0.1
     config["optimizer"]["ppo_trusted_pack_runner_required"] = True
-    config["optimizer"]["ppo_pack_prior_milestone"] = "sampled_topology"
+    config["optimizer"]["ppo_pack_prior_milestone"] = "m4_potential_progress_live"
     config["optimizer"]["ppo_pack_prior_mode"] = "sampled_topology"
+    config["optimizer"]["ppo_pack_fixed_frozen_h_list_csv"] = None
+    config["optimizer"]["ppo_pack_fixed_frozen_h_list_rule"] = None
+    config["optimizer"]["ppo_pack_fixed_frozen_h_list_limit"] = None
     config["optimizer"]["ppo_pack_fixed_env_group_across_updates"] = False
     config["optimizer"]["ppo_pack_sb3_reward_normalization_enabled"] = True
     config["optimizer"]["ppo_pack_sb3_observation_normalization_enabled"] = True
@@ -226,29 +231,26 @@ def validate_rlpfn_maintained_path_config(config):
         raise ValueError("Maintained RLPFN path requires ppo_value_path_adapter_impl='none'.")
     if not bool(optimizer_cfg.get("ppo_deterministic_batch_plan", False)):
         raise ValueError("Maintained RLPFN path requires ppo_deterministic_batch_plan=True.")
-    if str(optimizer_cfg.get("ppo_pack_prior_mode", "")).strip().lower() != "sampled_topology":
-        raise ValueError("Maintained RLPFN path requires ppo_pack_prior_mode='sampled_topology'.")
+    prior_mode = str(optimizer_cfg.get("ppo_pack_prior_mode", "")).strip().lower()
+    if prior_mode != "sampled_topology":
+        raise ValueError(
+            "Maintained RLPFN fit_model training requires live ppo_pack_prior_mode='sampled_topology'. "
+            "Fixed frozen h-list runners are audit-only and must not be used for M2-M4 training."
+        )
+    if str(optimizer_cfg.get("ppo_pack_fixed_frozen_h_list_csv") or "").strip():
+        raise ValueError("Maintained RLPFN fit_model training must not set ppo_pack_fixed_frozen_h_list_csv.")
     prior_milestone = str(optimizer_cfg.get("ppo_pack_prior_milestone", "sampled_topology")).strip().lower()
     prior_milestone = {
-        "sampled": "sampled_topology",
-        "sampled_topology_conditioned": "sampled_topology",
-        "gated": "gated_reward_path_balance",
-        "gated_reward_path": "gated_reward_path_balance",
-        "gated_reward_path_balancing": "gated_reward_path_balance",
-        "gated_terminal": "gated_reward_path_balance_terminal_coverage",
-        "gated_reward_path_terminal": "gated_reward_path_balance_terminal_coverage",
-        "gated_reward_path_terminal_coverage": "gated_reward_path_balance_terminal_coverage",
-        "gated_reward_path_balance_terminal": "gated_reward_path_balance_terminal_coverage",
+        "m4": "m4_potential_progress_live",
+        "milestone4": "m4_potential_progress_live",
+        "m4_potential_progress": "m4_potential_progress_live",
+        "potential_progress": "m4_potential_progress_live",
+        "potential_progress_live": "m4_potential_progress_live",
     }.get(prior_milestone, prior_milestone)
-    if prior_milestone not in {
-        "sampled_topology",
-        "gated_reward_path_balance",
-        "gated_reward_path_balance_terminal_coverage",
-    }:
+    if prior_milestone != "m4_potential_progress_live":
         raise ValueError(
-            "Maintained RLPFN path requires ppo_pack_prior_milestone to be "
-            "'sampled_topology', 'gated_reward_path_balance', or "
-            "'gated_reward_path_balance_terminal_coverage'."
+            "Maintained RLPFN fit_model training requires ppo_pack_prior_milestone="
+            "'m4_potential_progress_live'. Retired balanced/gated runner milestones are not supported."
         )
     if bool(optimizer_cfg.get("ppo_pack_fixed_env_group_across_updates", True)):
         raise ValueError("Maintained RLPFN path requires a fresh sampled topology batch each PPO update.")

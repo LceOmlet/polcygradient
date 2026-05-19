@@ -1,6 +1,9 @@
 import math
 import os
+import sys
 import threading
+import time
+import traceback
 
 try:
     import psutil
@@ -11,6 +14,26 @@ try:
     import resource
 except Exception:  # pragma: no cover - platform dependent
     resource = None
+
+
+_RSS_CONTEXT_LOCK = threading.Lock()
+_RSS_CONTEXT = {
+    "phase": None,
+    "detail": None,
+    "updated_at": None,
+}
+
+
+def set_host_rss_context(phase, detail=None):
+    with _RSS_CONTEXT_LOCK:
+        _RSS_CONTEXT["phase"] = None if phase is None else str(phase)
+        _RSS_CONTEXT["detail"] = None if detail is None else str(detail)
+        _RSS_CONTEXT["updated_at"] = float(time.time())
+
+
+def _host_rss_context_snapshot():
+    with _RSS_CONTEXT_LOCK:
+        return dict(_RSS_CONTEXT)
 
 
 def _current_rss_bytes():
@@ -81,16 +104,44 @@ class HostRSSLimitGuard:
     def _trip(self, rss_bytes):
         rss_gib = float(rss_bytes) / (1024.0 ** 3)
         limit_gib = float(self.limit_bytes) / (1024.0 ** 3)
+        context = _host_rss_context_snapshot()
+        phase = context.get("phase")
+        detail = context.get("detail")
+        updated_at = context.get("updated_at")
+        context_age_sec = None
+        if updated_at is not None:
+            context_age_sec = max(0.0, float(time.time()) - float(updated_at))
         msg = (
             f"[host-rss-limit] rss_gib={rss_gib:.2f} "
             f"limit_gib={limit_gib:.2f} "
             f"poll_interval_sec={self.poll_interval_sec:.3f} "
+            f"context_phase={phase!r} "
+            f"context_detail={detail!r} "
+            f"context_age_sec={context_age_sec if context_age_sec is None else round(context_age_sec, 3)} "
             "-> exiting immediately\n"
         )
         try:
             os.write(2, msg.encode("utf-8", "replace"))
         except Exception:
             pass
+        try:
+            current_frames = sys._current_frames()
+            current_thread = threading.current_thread()
+            thread_names = {thread.ident: thread.name for thread in threading.enumerate()}
+            for thread_id, frame in current_frames.items():
+                header = (
+                    f"[host-rss-limit-stack] thread_id={thread_id} "
+                    f"name={thread_names.get(thread_id, 'unknown')} "
+                    f"is_guard_thread={bool(thread_id == current_thread.ident)}\n"
+                )
+                stack = "".join(traceback.format_stack(frame))
+                os.write(2, header.encode("utf-8", "replace"))
+                os.write(2, stack.encode("utf-8", "replace"))
+        except Exception as exc:
+            try:
+                os.write(2, f"[host-rss-limit-stack-error] {exc!r}\n".encode("utf-8", "replace"))
+            except Exception:
+                pass
         os._exit(self.exit_code)
 
     def _run(self):

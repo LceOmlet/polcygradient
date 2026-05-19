@@ -22,6 +22,7 @@ except Exception:  # pragma: no cover - optional CUDA path
     tl_libdevice = None
 
 from ticl.distributions import parse_distributions, sample_distributions
+from ticl.rlpfn_constants import TERMINAL_RESET_COUNT_TARGET_MAX
 from ticl.priors.maintained_exact_scm import (
     resolve_ctrl_reward_enable_prob as maintained_resolve_ctrl_reward_enable_prob,
     resolve_ctrl_reward_weight as maintained_resolve_ctrl_reward_weight,
@@ -1440,7 +1441,10 @@ class EnvironmentPrior:
         cfg.setdefault("noise_dim", {"distribution": "uniform_int", "min": 1, "max": 64})
         cfg.setdefault("zero_pad_dim", {"distribution": "uniform_int", "min": 0, "max": 400})
         cfg.setdefault("constrained_dim_sampling_enabled", False)
+        cfg.setdefault("constrained_dim_sampling_policy", "state_first")
         cfg.setdefault("constrained_dim_sampling_total_budget", 400)
+        cfg.setdefault("constrained_dim_noise_policy", "remaining_uniform")
+        cfg.setdefault("reference_scm_zero_pad_inactive_init_enabled", False)
         cfg.setdefault("strict_joint_transition_enabled", True)
         cfg.setdefault("obs_slot_dim", 400)
         cfg.setdefault("action_slot_dim", 30)
@@ -1455,9 +1459,17 @@ class EnvironmentPrior:
         cfg.setdefault("reward_state_input_gain_fraction_conditioned_sampling_enabled", False)
         cfg.setdefault("reward_state_input_gain_fraction_conditioned_min", 0.0)
         cfg.setdefault("reward_topology_conditioned_sampling_enabled", False)
+        cfg.setdefault("reward_topology_conditioned_state_gain_metric", "fraction")
         cfg.setdefault("reward_action_input_gain_fraction_conditioned_min", 0.0)
+        cfg.setdefault("reward_noise_input_gain_fraction_conditioned_min", 0.0)
+        cfg.setdefault("reward_topology_conditioned_action_gain_metric", "fraction")
+        cfg.setdefault("reward_topology_conditioned_noise_gain_metric", "fraction")
         cfg.setdefault("reward_state_to_action_gain_ratio_conditioned_max", 0.0)
+        cfg.setdefault("reward_topology_conditioned_state_to_action_ratio_metric", "total_gain")
+        cfg.setdefault("reward_state_to_noise_gain_ratio_conditioned_max", 0.0)
+        cfg.setdefault("reward_topology_conditioned_state_to_noise_ratio_metric", "total_gain")
         cfg.setdefault("reward_topology_conditioned_sampling_max_attempts", 4096)
+        cfg.setdefault("reward_topology_conditioned_freeze_h_across_attempts", False)
         cfg.setdefault("fixed_frozen_h_json", None)
         # Batch-level rollout parallelism for get_batch():
         # each batch column is independent and can be generated concurrently.
@@ -1491,17 +1503,97 @@ class EnvironmentPrior:
         cfg.setdefault("reward_clip", 10.0)
         cfg.setdefault("state_clip", 8.0)
         cfg.setdefault("state_output_scale", 1.0)
+        cfg.setdefault("obs_output_scale", 1.0)
         cfg.setdefault("state_input_scale_enabled", False)
         cfg.setdefault("state_input_scale", 1.0)
         cfg.setdefault("state_full_rms_enabled", False)
         cfg.setdefault("state_full_rms_target", 1.0)
+        cfg.setdefault("state_full_rms_floor_enabled", False)
+        cfg.setdefault("state_full_rms_max_upscale", 4.0)
         cfg.setdefault("reference_state_inertia_enabled", False)
+        cfg.setdefault("reference_state_inertia_post_sample_policy", "none")
+        cfg.setdefault("reference_state_inertia_post_sample_fraction", 0.5)
+        cfg.setdefault("reference_state_inertia_post_sample_hash_seed", 0)
         cfg.setdefault("ctrl_reward_weight", 0.0)
         cfg.setdefault("ctrl_reward_enable_prob", 0.0)
         cfg.setdefault("survival_reward_weight", 0.0)
         cfg.setdefault("survival_reward_enable_prob", 0.0)
+        # Opt-in Exact-SCM-local repair for the Pendulum-style sustained
+        # closed-loop settle mode.  This is deliberately not a standalone
+        # generator: when enabled, it reuses existing state/action slots inside
+        # the sampled prior environment and leaves the default milestone path
+        # unchanged.
+        cfg.setdefault("pendulum_settle_yield_repair_enabled", False)
+        cfg.setdefault("pendulum_settle_yield_repair_prob", 0.0)
+        cfg.setdefault("pendulum_settle_yield_dt", 0.12)
+        cfg.setdefault("pendulum_settle_yield_damping", 0.92)
+        cfg.setdefault("pendulum_settle_yield_spring", 0.0)
+        cfg.setdefault("pendulum_settle_yield_position_coupling", 0.0)
+        cfg.setdefault("pendulum_settle_yield_action_controls_position", False)
+        cfg.setdefault("pendulum_settle_yield_action_gain", 0.45)
+        cfg.setdefault("pendulum_settle_yield_action_bound", 1.0)
+        cfg.setdefault("pendulum_settle_yield_state_mix", 1.0)
+        cfg.setdefault("pendulum_settle_yield_reward_mix", 1.0)
+        cfg.setdefault("pendulum_settle_yield_reward_bias", 1.0)
+        cfg.setdefault("pendulum_settle_yield_q_weight", 1.0)
+        cfg.setdefault("pendulum_settle_yield_v_weight", 0.25)
+        cfg.setdefault("pendulum_settle_yield_ctrl_weight", 0.02)
+        # Opt-in Exact-SCM source family for simple Gym-like observed dynamics.
+        # It is kept inside the SCM family and reuses sampled state/action/noise
+        # slots, so it is a generator primitive rather than a selector quota.
+        cfg.setdefault("exact_scm_gym_lowtail_family_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_family_prob", 0.0)
+        cfg.setdefault("exact_scm_gym_lowtail_terminal_override_enabled", True)
+        cfg.setdefault("exact_scm_gym_lowtail_terminal_count_min", 4.0)
+        cfg.setdefault("exact_scm_gym_lowtail_terminal_count_max", 28.0)
+        cfg.setdefault("exact_scm_gym_lowtail_state_rho", 0.96)
+        cfg.setdefault("exact_scm_gym_lowtail_neighbor_coupling", 0.04)
+        cfg.setdefault("exact_scm_gym_lowtail_action_gain", 0.60)
+        cfg.setdefault("exact_scm_gym_lowtail_noise_gain", 0.35)
+        cfg.setdefault("exact_scm_gym_lowtail_state_mix", 1.0)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_mix", 1.0)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_bias", 0.0)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_linear_weight", 1.25)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_potential_delta_weight", 0.0)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_state_cost", 0.05)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_ctrl_cost", 0.02)
+        cfg.setdefault("exact_scm_gym_lowtail_shared_energy_terminal_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_preimage_shared_scalar_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_rank_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_markov_carrier_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta", None)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta_obs_dim", 30)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta_rank", 6)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta_basis_count", 8)
+        cfg.setdefault("exact_scm_gym_lowtail_materialized_theta_horizon", 512)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_rank_preimage_rank", 5)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale", 1.0)
+        cfg.setdefault("exact_scm_gym_lowtail_state_obs_hetero_scale_strength", 1.0)
+        cfg.setdefault("exact_scm_gym_lowtail_markov_carrier_horizon", 512)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_distribution_head_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_distribution_head_scale", 0.75)
+        cfg.setdefault("exact_scm_gym_lowtail_reward_distribution_head_vol_scale", 0.35)
+        cfg.setdefault("exact_scm_gym_lowtail_clock_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_clock_omega", 0.19634954084936207)
+        cfg.setdefault("exact_scm_gym_lowtail_paired_response_preimage_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_paired_response_reward_scale", 0.75)
+        cfg.setdefault("exact_scm_gym_lowtail_paired_response_done_scale", 0.75)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_source_label_enabled", False)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_source_label_prob", 0.5)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_reward_mix", 0.35)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_linear_weight", 1.25)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_progress_delta_weight", 0.0)
+        cfg.setdefault("exact_scm_gym_lowtail_potential_progress_delta_progress_delta_weight", 0.65)
         cfg.setdefault("terminal_reset_enabled", False)
         cfg.setdefault("terminal_reset_count_target", 0)
+        cfg.setdefault("terminal_reset_min_step_enabled", False)
+        cfg.setdefault("terminal_reset_min_step_target", 0)
+        cfg.setdefault("terminal_reset_min_step_post_sample_policy", "none")
+        cfg.setdefault("terminal_reset_min_step_post_sample_hash_seed", 0)
         cfg.setdefault("terminal_bonus_tanh_c", 10.0)
         cfg.setdefault("terminal_bonus_scale_min", 1.0)
         cfg.setdefault("terminal_bonus_scale_max", 2.0)
@@ -1921,13 +2013,13 @@ class EnvironmentPrior:
             return activation()
         if isinstance(activation, str):
             act = activation.strip().lower()
-            if act == "relu":
+            if "relu" in act:
                 return nn.ReLU()
-            if act in {"identity", "linear", "none"}:
+            if "identity" in act or "linear" in act or act == "none":
                 return nn.Identity()
-            if act == "sin":
+            if "sin" in act:
                 return torch.sin
-            if act == "tanh":
+            if "tanh" in act:
                 return nn.Tanh()
         return nn.Tanh()
 
@@ -2810,9 +2902,10 @@ class EnvironmentPrior:
         state_cap = int(max(1, int(state_dims.max().item())))
         outputs_flat_cap = int(max_hidden_blocks * hidden_cap)
 
+        active_input_counts = input_mask_t.sum(dim=1).to(dtype=torch.long).clamp_min(1)
         first_weight = torch.zeros((batch_size, in_cap, hidden_cap), device=device, dtype=torch.float32)
         first_bias = torch.zeros((batch_size, hidden_cap), device=device, dtype=torch.float32)
-        packed_input_cap = int(max(1, int(in_dims.max().item())))
+        packed_input_cap = int(max(1, int(active_input_counts.max().item())))
         first_weight_packed = None if input_mask is None else torch.zeros(
             (batch_size, packed_input_cap, hidden_cap),
             device=device,
@@ -2849,7 +2942,6 @@ class EnvironmentPrior:
 
         for bi, h in enumerate(h_list):
             g = None if generators is None else generators[bi]
-            in_i = int(in_dims[bi].item())
             state_dim_i = int(state_dims[bi].item())
             hidden_dim_i = int(hidden_dims[bi].item())
             num_hidden_blocks_i = int(num_hidden_blocks[bi].item())
@@ -2869,10 +2961,11 @@ class EnvironmentPrior:
             activation_codes.append(self._activation_code(activation_name))
 
             active_idx = torch.nonzero(input_mask_t[bi] > 0, as_tuple=False).squeeze(1)
-            if int(active_idx.numel()) != in_i:
-                raise ValueError("reference SCM padded builder expected input_mask active width to match in_dims")
+            active_in_i = int(active_idx.numel())
+            if active_in_i <= 0:
+                raise ValueError("reference SCM padded builder expected at least one active input")
 
-            first_weight_i = torch.empty((in_i, hidden_dim_i), device=device, dtype=torch.float32)
+            first_weight_i = torch.empty((active_in_i, hidden_dim_i), device=device, dtype=torch.float32)
             self._reference_scm_apply_weight_init(
                 first_weight_i,
                 init_std=init_std,
@@ -2884,10 +2977,10 @@ class EnvironmentPrior:
                 generator=g,
             )
             first_bias_i = torch.empty((hidden_dim_i,), device=device, dtype=torch.float32)
-            self._reference_scm_init_bias(first_bias_i, in_i, generator=g)
+            self._reference_scm_init_bias(first_bias_i, active_in_i, generator=g)
             first_weight[bi, active_idx, :hidden_dim_i] = first_weight_i
             if first_weight_packed is not None:
-                first_weight_packed[bi, :in_i, :hidden_dim_i] = first_weight_i
+                first_weight_packed[bi, :active_in_i, :hidden_dim_i] = first_weight_i
             first_bias[bi, :hidden_dim_i] = first_bias_i
 
             for layer_idx in range(num_hidden_blocks_i):
@@ -2981,6 +3074,11 @@ class EnvironmentPrior:
                 hidden_cap,
                 device=device,
             )
+            if bool(h.get("reward_output_bias_zero_enabled", False)):
+                reward_layer_idx = int(reward_index_compact[0].item()) // hidden_dim_i
+                reward_hidden_idx = int(reward_index_padded[0].item()) - (reward_layer_idx * hidden_cap)
+                if 0 <= reward_layer_idx < num_hidden_blocks_i and 0 <= reward_hidden_idx < hidden_dim_i:
+                    hidden_biases_stack[bi, reward_layer_idx, reward_hidden_idx] = 0.0
             state_select_idx[bi, :state_dim_i] = state_indices_padded
             state_mask[bi, :state_dim_i] = 1.0
             reward_select_idx[bi, 0] = reward_index_padded[0]
@@ -3023,6 +3121,30 @@ class EnvironmentPrior:
             hidden_prefix_out_tile_batch.append(out_tile_batch)
             hidden_prefix_out_tile_offsets.append(out_tile_offsets)
         hidden_noise_stack_present = bool(torch.any(hidden_noise_scale_stack > 0).item())
+        full_multilayer_active_work = float(
+            torch.sum(active_input_counts.to(dtype=torch.float64) * hidden_dims.to(dtype=torch.float64)).item()
+            + torch.sum(
+                num_hidden_blocks.to(dtype=torch.float64)
+                * hidden_dims.to(dtype=torch.float64)
+                * hidden_dims.to(dtype=torch.float64)
+            ).item()
+        )
+        full_multilayer_padded_work = float(
+            batch_size
+            * (
+                int(packed_input_cap) * int(hidden_cap)
+                + int(max_hidden_blocks) * int(hidden_cap) * int(hidden_cap)
+            )
+        )
+        full_multilayer_work_fill_ratio = (
+            float(full_multilayer_active_work) / max(1.0, float(full_multilayer_padded_work))
+        )
+        try:
+            full_multilayer_min_fill_ratio = float(
+                os.environ.get("TICL_POLICY_REFERENCE_SCM_FULL_MULTILAYER_FUSED_MIN_FILL_RATIO", "0.20")
+            )
+        except Exception:
+            full_multilayer_min_fill_ratio = 0.20
         runtime_tensor_cache = {}
 
         def _get_runtime_cached(device_obj, dtype_obj):
@@ -3116,6 +3238,7 @@ class EnvironmentPrior:
                 use_full_multilayer_fused = bool(
                     self.reference_scm_full_multilayer_fused
                     and self.reference_scm_hidden_multilayer_fused
+                    and float(full_multilayer_work_fill_ratio) >= float(full_multilayer_min_fill_ratio)
                     and noise_generators is None
                     and (hidden_noise_eps_all is not None or (not hidden_noise_stack_present))
                     and self._reference_scm_memory_guard_allows(x_device, full_fused_bytes)
@@ -3131,7 +3254,7 @@ class EnvironmentPrior:
                         hidden_weights_stack_runtime,
                         hidden_biases_stack_runtime,
                         hidden_noise_eps_all,
-                        in_dims.to(device=x_device, dtype=torch.long),
+                        active_input_counts.to(device=x_device, dtype=torch.long),
                         hidden_dims_runtime,
                         num_hidden_blocks_runtime,
                         activation_codes_runtime,
@@ -3414,19 +3537,37 @@ class EnvironmentPrior:
         random_feature_rotation = bool(h.get("random_feature_rotation", False))
         num_hidden_blocks = depth - 1
 
-        first_weight = torch.empty((in_dim, hidden_dim), device=device, dtype=torch.float32)
-        self._reference_scm_apply_weight_init(
-            first_weight,
-            init_std=init_std,
-            activation_name=activation_name,
-            standard_init_enabled=standard_init_enabled,
-            prior_mlp_dropout_prob=0.0,
-            block_wise_dropout=block_wise_dropout,
-            prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
-            generator=generator,
-        )
+        zero_pad_inactive_init = self._resolve_reference_scm_zero_pad_inactive_init_enabled(h)
+        zero_pad_dim = int(self._sample_dims(h)[4]) if bool(zero_pad_inactive_init) else 0
+        first_fan_in = int(max(1, min(int(in_dim), int(in_dim) - max(0, zero_pad_dim))))
+        if bool(zero_pad_inactive_init) and first_fan_in < int(in_dim):
+            first_weight = torch.zeros((in_dim, hidden_dim), device=device, dtype=torch.float32)
+            first_weight_active = torch.empty((first_fan_in, hidden_dim), device=device, dtype=torch.float32)
+            self._reference_scm_apply_weight_init(
+                first_weight_active,
+                init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
+                prior_mlp_dropout_prob=0.0,
+                block_wise_dropout=block_wise_dropout,
+                prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+                generator=generator,
+            )
+            first_weight[:first_fan_in] = first_weight_active
+        else:
+            first_weight = torch.empty((in_dim, hidden_dim), device=device, dtype=torch.float32)
+            self._reference_scm_apply_weight_init(
+                first_weight,
+                init_std=init_std,
+                activation_name=activation_name,
+                standard_init_enabled=standard_init_enabled,
+                prior_mlp_dropout_prob=0.0,
+                block_wise_dropout=block_wise_dropout,
+                prior_mlp_scale_weights_sqrt=prior_mlp_scale_weights_sqrt,
+                generator=generator,
+            )
         first_bias = torch.empty((hidden_dim,), device=device, dtype=torch.float32)
-        self._reference_scm_init_bias(first_bias, in_dim, generator=generator)
+        self._reference_scm_init_bias(first_bias, first_fan_in, generator=generator)
 
         hidden_weights = []
         hidden_biases = []
@@ -3624,6 +3765,19 @@ class EnvironmentPrior:
         reward_action_gain = _group_sum("action_input")
         reward_noise_gain = _group_sum("noise_input")
         reward_pad_gain = _group_sum("zero_pad_input")
+        def _slice_len(key):
+            group_slice = groups[key]
+            return max(0, int(group_slice.stop) - int(group_slice.start))
+
+        nonpad_count = max(_slice_len("non_pad_input"), 1)
+        nonpad_density = reward_nonpad_gain / float(nonpad_count)
+
+        def _density_ratio(gain, key):
+            count = _slice_len(key)
+            if count <= 0:
+                return 0.0
+            return float((float(gain) / float(count)) / max(nonpad_density, 1e-12))
+
         return {
             "reward_nonpad_input_gain_total": float(reward_nonpad_gain),
             "reward_state_input_gain": float(reward_state_gain),
@@ -3635,6 +3789,17 @@ class EnvironmentPrior:
             "reward_noise_input_gain_fraction": float(reward_noise_gain / reward_nonpad_gain),
             "reward_state_to_noise_gain_ratio": float(reward_state_gain / max(reward_noise_gain, 1e-12)),
             "reward_state_to_action_gain_ratio": float(reward_state_gain / max(reward_action_gain, 1e-12)),
+            "reward_state_input_gain_density_ratio": _density_ratio(reward_state_gain, "state_input"),
+            "reward_action_input_gain_density_ratio": _density_ratio(reward_action_gain, "action_input"),
+            "reward_noise_input_gain_density_ratio": _density_ratio(reward_noise_gain, "noise_input"),
+            "reward_state_to_action_gain_density_ratio": float(
+                _density_ratio(reward_state_gain, "state_input")
+                / max(_density_ratio(reward_action_gain, "action_input"), 1e-12)
+            ),
+            "reward_state_to_noise_gain_density_ratio": float(
+                _density_ratio(reward_state_gain, "state_input")
+                / max(_density_ratio(reward_noise_gain, "noise_input"), 1e-12)
+            ),
         }
 
     @staticmethod
@@ -3767,14 +3932,6 @@ class EnvironmentPrior:
         noise_start = int(action_start + action_cap)
         zero_start = int(noise_start + noise_cap)
 
-        cols = torch.arange(in_cap, device=device, dtype=torch.long).unsqueeze(0)
-        state_mask = cols < state_dims.unsqueeze(1)
-        obs_mask = (cols >= obs_start) & (cols < (obs_start + obs_input_dims.unsqueeze(1)))
-        action_mask = (cols >= action_start) & (cols < (action_start + action_dims.unsqueeze(1)))
-        noise_mask = (cols >= noise_start) & (cols < (noise_start + noise_dims.unsqueeze(1)))
-        pad_mask = (cols >= zero_start) & (cols < (zero_start + zero_pad_dims.unsqueeze(1)))
-        nonpad_mask = state_mask | obs_mask | action_mask | noise_mask
-
         reward_index_t = torch.as_tensor(reward_index, device=device, dtype=torch.long).reshape(-1)
         if int(reward_index_t.numel()) == 1:
             reward_index_t = reward_index_t.expand(batch_size)
@@ -3786,40 +3943,224 @@ class EnvironmentPrior:
         hidden_weight_list = list(hidden_weights)
         if not hidden_weight_list:
             return None
-        abs_path = first_weight.detach().abs().to(dtype=torch.float64)
-        reward_path = torch.zeros((batch_size, in_cap), device=device, dtype=torch.float64)
-        for layer_idx, hidden_weight in enumerate(hidden_weight_list):
-            if not torch.is_tensor(hidden_weight):
+        for hidden_weight in hidden_weight_list:
+            if not torch.is_tensor(hidden_weight) or hidden_weight.ndim != 3:
                 return None
-            if hidden_weight.ndim != 3:
-                return None
-            abs_path = torch.bmm(
-                abs_path,
-                hidden_weight.detach().abs().to(device=device, dtype=torch.float64),
-            )
-            active = reward_layer == int(layer_idx)
-            if bool(torch.any(active).item()):
-                active_units = reward_unit[active].view(-1, 1, 1).expand(-1, in_cap, 1)
-                reward_path[active] = abs_path[active].gather(2, active_units).squeeze(-1)
 
-        mask_dtype = reward_path.dtype
-        state_gain = (reward_path * state_mask.to(dtype=mask_dtype)).sum(dim=1)
-        action_gain = (reward_path * action_mask.to(dtype=mask_dtype)).sum(dim=1)
-        noise_gain = (reward_path * noise_mask.to(dtype=mask_dtype)).sum(dim=1)
-        pad_gain = (reward_path * pad_mask.to(dtype=mask_dtype)).sum(dim=1)
-        nonpad_gain = (reward_path * nonpad_mask.to(dtype=mask_dtype)).sum(dim=1).clamp_min(1e-12)
-        return {
-            "reward_nonpad_input_gain_total": nonpad_gain.to(dtype=torch.float32),
-            "reward_state_input_gain": state_gain.to(dtype=torch.float32),
-            "reward_action_input_gain": action_gain.to(dtype=torch.float32),
-            "reward_noise_input_gain": noise_gain.to(dtype=torch.float32),
-            "reward_pad_input_gain": pad_gain.to(dtype=torch.float32),
-            "reward_state_input_gain_fraction": (state_gain / nonpad_gain).to(dtype=torch.float32),
-            "reward_action_input_gain_fraction": (action_gain / nonpad_gain).to(dtype=torch.float32),
-            "reward_noise_input_gain_fraction": (noise_gain / nonpad_gain).to(dtype=torch.float32),
-            "reward_state_to_noise_gain_ratio": (state_gain / noise_gain.clamp_min(1e-12)).to(dtype=torch.float32),
-            "reward_state_to_action_gain_ratio": (state_gain / action_gain.clamp_min(1e-12)).to(dtype=torch.float32),
+        def _summary_chunk_size() -> int:
+            raw = os.environ.get("TICL_REWARD_INPUT_GAIN_SUMMARY_BATCH_CHUNK_SIZE", "").strip()
+            if raw:
+                try:
+                    value = int(raw)
+                except ValueError:
+                    value = 64
+            else:
+                value = 64
+            return max(1, value)
+
+        def _compute_slice(start: int, end: int):
+            sl = slice(int(start), int(end))
+            n = int(end) - int(start)
+            cols = torch.arange(in_cap, device=device, dtype=torch.long).unsqueeze(0)
+            state_mask = cols < state_dims[sl].unsqueeze(1)
+            obs_mask = (cols >= obs_start) & (cols < (obs_start + obs_input_dims[sl].unsqueeze(1)))
+            action_mask = (cols >= action_start) & (cols < (action_start + action_dims[sl].unsqueeze(1)))
+            noise_mask = (cols >= noise_start) & (cols < (noise_start + noise_dims[sl].unsqueeze(1)))
+            pad_mask = (cols >= zero_start) & (cols < (zero_start + zero_pad_dims[sl].unsqueeze(1)))
+            nonpad_mask = state_mask | obs_mask | action_mask | noise_mask
+
+            abs_path = first_weight[sl].detach().abs().to(dtype=torch.float64)
+            reward_path = torch.zeros((n, in_cap), device=device, dtype=torch.float64)
+            reward_layer_s = reward_layer[sl]
+            reward_unit_s = reward_unit[sl]
+            for layer_idx, hidden_weight in enumerate(hidden_weight_list):
+                abs_path = torch.bmm(
+                    abs_path,
+                    hidden_weight[sl].detach().abs().to(device=device, dtype=torch.float64),
+                )
+                active = reward_layer_s == int(layer_idx)
+                if bool(torch.any(active).item()):
+                    active_units = reward_unit_s[active].view(-1, 1, 1).expand(-1, in_cap, 1)
+                    reward_path[active] = abs_path[active].gather(2, active_units).squeeze(-1)
+
+            mask_dtype = reward_path.dtype
+            state_gain = (reward_path * state_mask.to(dtype=mask_dtype)).sum(dim=1)
+            action_gain = (reward_path * action_mask.to(dtype=mask_dtype)).sum(dim=1)
+            noise_gain = (reward_path * noise_mask.to(dtype=mask_dtype)).sum(dim=1)
+            pad_gain = (reward_path * pad_mask.to(dtype=mask_dtype)).sum(dim=1)
+            nonpad_gain = (reward_path * nonpad_mask.to(dtype=mask_dtype)).sum(dim=1).clamp_min(1e-12)
+            nonpad_count = nonpad_mask.to(dtype=mask_dtype).sum(dim=1).clamp_min(1.0)
+            nonpad_density = (nonpad_gain / nonpad_count).clamp_min(1e-12)
+
+            def _density_ratio(gain, mask):
+                count = mask.to(dtype=mask_dtype).sum(dim=1)
+                density = gain / count.clamp_min(1.0)
+                ratio = density / nonpad_density
+                return torch.where(count > 0, ratio, torch.zeros_like(ratio))
+
+            state_density_ratio = _density_ratio(state_gain, state_mask)
+            action_density_ratio = _density_ratio(action_gain, action_mask)
+            noise_density_ratio = _density_ratio(noise_gain, noise_mask)
+            return {
+                "reward_nonpad_input_gain_total": nonpad_gain.to(dtype=torch.float32),
+                "reward_state_input_gain": state_gain.to(dtype=torch.float32),
+                "reward_action_input_gain": action_gain.to(dtype=torch.float32),
+                "reward_noise_input_gain": noise_gain.to(dtype=torch.float32),
+                "reward_pad_input_gain": pad_gain.to(dtype=torch.float32),
+                "reward_state_input_gain_fraction": (state_gain / nonpad_gain).to(dtype=torch.float32),
+                "reward_action_input_gain_fraction": (action_gain / nonpad_gain).to(dtype=torch.float32),
+                "reward_noise_input_gain_fraction": (noise_gain / nonpad_gain).to(dtype=torch.float32),
+                "reward_state_to_noise_gain_ratio": (state_gain / noise_gain.clamp_min(1e-12)).to(dtype=torch.float32),
+                "reward_state_to_action_gain_ratio": (state_gain / action_gain.clamp_min(1e-12)).to(dtype=torch.float32),
+                "reward_state_input_gain_density_ratio": state_density_ratio.to(dtype=torch.float32),
+                "reward_action_input_gain_density_ratio": action_density_ratio.to(dtype=torch.float32),
+                "reward_noise_input_gain_density_ratio": noise_density_ratio.to(dtype=torch.float32),
+                "reward_state_to_action_gain_density_ratio": (
+                    state_density_ratio / action_density_ratio.clamp_min(1e-12)
+                ).to(dtype=torch.float32),
+                "reward_state_to_noise_gain_density_ratio": (
+                    state_density_ratio / noise_density_ratio.clamp_min(1e-12)
+                ).to(dtype=torch.float32),
+            }
+
+        chunk = _summary_chunk_size()
+        if int(batch_size) <= int(chunk):
+            return _compute_slice(0, batch_size)
+        pieces = []
+        for start in range(0, int(batch_size), int(chunk)):
+            pieces.append(_compute_slice(start, min(int(batch_size), int(start) + int(chunk))))
+        return {key: torch.cat([piece[key] for piece in pieces], dim=0) for key in pieces[0]}
+
+    @staticmethod
+    def _exact_scm_gym_lowtail_reward_input_gain_summary_batch(env):
+        active = env.get("exact_scm_gym_lowtail_family_active", None)
+        if active is None:
+            return None
+        device = None
+        for key in ("state_dim_per_sample", "action_dim_per_sample", "noise_dim_per_sample"):
+            value = env.get(key, None)
+            if torch.is_tensor(value):
+                device = value.device
+                break
+        if device is None:
+            device = torch.device("cpu")
+
+        active_t = torch.as_tensor(active, device=device, dtype=torch.bool).reshape(-1)
+        batch_size = int(active_t.numel())
+        if batch_size <= 0 or not bool(active_t.any().item()):
+            return None
+
+        def _dim(key, fallback):
+            value = env.get(key, env.get(fallback, 0))
+            if torch.is_tensor(value):
+                out = value.to(device=device, dtype=torch.float32).reshape(-1)
+                if int(out.numel()) == batch_size:
+                    return out
+                if int(out.numel()) == 1:
+                    return out.expand(batch_size)
+                raise ValueError(f"{key} must be scalar or length batch_size")
+            if isinstance(value, (list, tuple)):
+                if len(value) == batch_size:
+                    return torch.tensor([float(v) for v in value], device=device, dtype=torch.float32)
+                if len(value) == 1:
+                    return torch.full((batch_size,), float(value[0]), device=device, dtype=torch.float32)
+            return torch.full((batch_size,), float(value), device=device, dtype=torch.float32)
+
+        def _env_vec(key, default):
+            value = env.get(key, default)
+            if torch.is_tensor(value):
+                out = value.to(device=device, dtype=torch.float32).reshape(-1)
+                if int(out.numel()) == batch_size:
+                    return out
+                if int(out.numel()) == 1:
+                    return out.expand(batch_size)
+                raise ValueError(f"{key} must be scalar or length batch_size")
+            if isinstance(value, (list, tuple)):
+                if len(value) == batch_size:
+                    return torch.tensor([float(v) for v in value], device=device, dtype=torch.float32)
+                if len(value) == 1:
+                    return torch.full((batch_size,), float(value[0]), device=device, dtype=torch.float32)
+            return torch.full((batch_size,), float(value), device=device, dtype=torch.float32)
+
+        state_dim = _dim("state_dim_per_sample", "state_dim").clamp_min(1.0)
+        action_dim = _dim("action_dim_per_sample", "action_dim").clamp_min(1.0)
+        noise_dim = _dim("noise_dim_per_sample", "noise_dim").clamp_min(0.0)
+        obs_dim = _dim("obs_dim_per_sample", "obs_dim").clamp_min(1.0)
+
+        reward_linear = _env_vec("exact_scm_gym_lowtail_reward_linear_weight", 1.25).abs()
+        reward_potential_delta = _env_vec(
+            "exact_scm_gym_lowtail_reward_potential_delta_weight",
+            0.0,
+        ).abs()
+        reward_state_cost = _env_vec("exact_scm_gym_lowtail_reward_state_cost", 0.05).abs()
+        reward_ctrl_cost = _env_vec("exact_scm_gym_lowtail_reward_ctrl_cost", 0.02).abs()
+        action_gain = _env_vec("exact_scm_gym_lowtail_action_gain", 0.60).abs()
+        noise_gain = _env_vec("exact_scm_gym_lowtail_noise_gain", 0.35).abs()
+
+        state_density = (reward_linear + reward_state_cost + reward_potential_delta).clamp_min(1e-6)
+        action_density = (
+            reward_ctrl_cost + (reward_linear + reward_potential_delta) * action_gain
+        ).clamp_min(1e-6)
+        noise_density = ((reward_linear + reward_potential_delta) * noise_gain).clamp_min(1e-6)
+        state_gain = state_density * state_dim
+        action_gain_total = action_density * action_dim
+        noise_gain_total = noise_density * noise_dim
+        nonpad_count = (state_dim + action_dim + noise_dim).clamp_min(1.0)
+        nonpad_gain = (state_gain + action_gain_total + noise_gain_total).clamp_min(1e-12)
+        nonpad_density = (nonpad_gain / nonpad_count).clamp_min(1e-12)
+
+        def _density_ratio(gain, count):
+            density = gain / count.clamp_min(1.0)
+            return torch.where(count > 0, density / nonpad_density, torch.zeros_like(density))
+
+        zeros = torch.zeros_like(nonpad_gain)
+        out = {
+            "reward_nonpad_input_gain_total": nonpad_gain,
+            "reward_state_input_gain": state_gain,
+            "reward_action_input_gain": action_gain_total,
+            "reward_noise_input_gain": noise_gain_total,
+            "reward_pad_input_gain": zeros,
+            "reward_state_input_gain_fraction": state_gain / nonpad_gain,
+            "reward_action_input_gain_fraction": action_gain_total / nonpad_gain,
+            "reward_noise_input_gain_fraction": noise_gain_total / nonpad_gain,
+            "reward_state_to_noise_gain_ratio": state_gain / noise_gain_total.clamp_min(1e-12),
+            "reward_state_to_action_gain_ratio": state_gain / action_gain_total.clamp_min(1e-12),
+            "reward_state_input_gain_density_ratio": _density_ratio(state_gain, state_dim),
+            "reward_action_input_gain_density_ratio": _density_ratio(action_gain_total, action_dim),
+            "reward_noise_input_gain_density_ratio": _density_ratio(noise_gain_total, noise_dim),
+            "reward_state_to_action_gain_density_ratio": (
+                _density_ratio(state_gain, state_dim)
+                / _density_ratio(action_gain_total, action_dim).clamp_min(1e-12)
+            ),
+            "reward_state_to_noise_gain_density_ratio": (
+                _density_ratio(state_gain, state_dim)
+                / _density_ratio(noise_gain_total, noise_dim).clamp_min(1e-12)
+            ),
         }
+        return {key: torch.where(active_t, value.to(dtype=torch.float32), torch.zeros_like(value, dtype=torch.float32)) for key, value in out.items()}
+
+    @staticmethod
+    def _merge_exact_scm_gym_lowtail_reward_input_gain_summary(base_summary, lowtail_summary, active):
+        if lowtail_summary is None:
+            return base_summary
+        active_t = torch.as_tensor(active, dtype=torch.bool).reshape(-1)
+        if not bool(active_t.any().item()):
+            return base_summary
+        if base_summary is None:
+            return lowtail_summary
+        merged = {}
+        for key, base_value in base_summary.items():
+            override = lowtail_summary.get(key, None)
+            if override is None:
+                merged[key] = base_value
+                continue
+            base_t = torch.as_tensor(base_value)
+            override_t = override.to(device=base_t.device, dtype=base_t.dtype)
+            active_rt = active_t.to(device=base_t.device)
+            while active_rt.ndim < base_t.ndim:
+                active_rt = active_rt.unsqueeze(-1)
+            merged[key] = torch.where(active_rt, override_t, base_t)
+        return merged
 
     def _build_reference_scm_joint_transition_batch_fn(self, in_dim, state_dim, h_list, device, generators=None):
         batch_size = int(len(h_list))
@@ -4617,6 +4958,1842 @@ class EnvironmentPrior:
             return True
         return bool(self._latent_uniform_from_h(h, latent_key) < prob)
 
+    def _sample_pendulum_settle_yield_repair_enabled(self, h):
+        if bool(self._coerce_bool(h.get("pendulum_settle_yield_repair_enabled", False))):
+            return True
+        prob = float(self._resolve_scalar(h.get("pendulum_settle_yield_repair_prob", 0.0)))
+        if (not math.isfinite(prob)) or prob <= 0.0:
+            return False
+        if prob >= 1.0:
+            return True
+        return bool(self._latent_uniform_from_h(h, "_pendulum_settle_yield_repair_u") < prob)
+
+    def _sample_exact_scm_gym_lowtail_family_enabled(self, h):
+        selected = h.get("exact_scm_gym_lowtail_family_selected", None)
+        if selected is not None:
+            return bool(self._coerce_bool(selected))
+        if bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_family_enabled", False))):
+            h["exact_scm_gym_lowtail_family_selected"] = True
+            return True
+        prob = float(self._resolve_scalar(h.get("exact_scm_gym_lowtail_family_prob", 0.0)))
+        if (not math.isfinite(prob)) or prob <= 0.0:
+            h["exact_scm_gym_lowtail_family_selected"] = False
+            return False
+        if prob >= 1.0:
+            h["exact_scm_gym_lowtail_family_selected"] = True
+            return True
+        selected_value = bool(self._latent_uniform_from_h(h, "_exact_scm_gym_lowtail_family_u") < prob)
+        h["exact_scm_gym_lowtail_family_selected"] = bool(selected_value)
+        return bool(selected_value)
+
+    @staticmethod
+    def _resolve_exact_scm_gym_lowtail_param(h, key, default, *, min_value=None, max_value=None):
+        value = float(EnvironmentPrior._resolve_scalar(h.get(key, default)))
+        if not math.isfinite(value):
+            value = float(default)
+        if min_value is not None:
+            value = max(float(min_value), value)
+        if max_value is not None:
+            value = min(float(max_value), value)
+        return float(value)
+
+    def _apply_exact_scm_gym_lowtail_family_post_sample_policy(self, h_list):
+        for h in h_list:
+            if not self._sample_exact_scm_gym_lowtail_family_enabled(h):
+                continue
+            if not self._coerce_bool(h.get("exact_scm_gym_lowtail_terminal_override_enabled", True)):
+                h["exact_scm_gym_lowtail_family_terminal_count_source"] = "independent_terminal_source"
+                continue
+            lo = self._resolve_exact_scm_gym_lowtail_param(
+                h,
+                "exact_scm_gym_lowtail_terminal_count_min",
+                4.0,
+                min_value=0.0,
+                max_value=TERMINAL_RESET_COUNT_TARGET_MAX,
+            )
+            hi = self._resolve_exact_scm_gym_lowtail_param(
+                h,
+                "exact_scm_gym_lowtail_terminal_count_max",
+                28.0,
+                min_value=0.0,
+                max_value=TERMINAL_RESET_COUNT_TARGET_MAX,
+            )
+            if hi < lo:
+                hi = lo
+            u = self._latent_uniform_from_h(h, "_exact_scm_gym_lowtail_terminal_count_u")
+            h["terminal_reset_enabled"] = True
+            h["terminal_reset_count_target"] = float(lo + (hi - lo) * u)
+            h["exact_scm_gym_lowtail_family_terminal_count_source"] = "uniform_lowtail"
+        return h_list
+
+    def _apply_exact_scm_gym_lowtail_potential_progress_source_label_policy(self, h_list):
+        if not self._coerce_bool(
+            self.config.get("exact_scm_gym_lowtail_potential_progress_source_label_enabled", False)
+        ):
+            return h_list
+        prob = float(
+            self._resolve_scalar(
+                self.config.get("exact_scm_gym_lowtail_potential_progress_source_label_prob", 0.5)
+            )
+        )
+        if not math.isfinite(prob):
+            prob = 0.5
+        prob = min(1.0, max(0.0, prob))
+        mix = float(
+            self._resolve_scalar(
+                self.config.get("exact_scm_gym_lowtail_potential_progress_reward_mix", 0.35)
+            )
+        )
+        if not math.isfinite(mix):
+            mix = 0.35
+        mix = min(1.0, max(0.0, mix))
+        linear_weight = float(
+            self._resolve_scalar(
+                self.config.get("exact_scm_gym_lowtail_potential_progress_linear_weight", 1.25)
+            )
+        )
+        if not math.isfinite(linear_weight):
+            linear_weight = 1.25
+        progress_delta_weight = float(
+            self._resolve_scalar(
+                self.config.get("exact_scm_gym_lowtail_potential_progress_progress_delta_weight", 0.0)
+            )
+        )
+        if not math.isfinite(progress_delta_weight):
+            progress_delta_weight = 0.0
+        delta_progress_delta_weight = float(
+            self._resolve_scalar(
+                self.config.get(
+                    "exact_scm_gym_lowtail_potential_progress_delta_progress_delta_weight",
+                    0.65,
+                )
+            )
+        )
+        if not math.isfinite(delta_progress_delta_weight):
+            delta_progress_delta_weight = 0.65
+
+        valid_targets = {"progress_only", "potential_delta_progress"}
+        for h in h_list:
+            target = str(h.get("potential_progress_reward_axis_target", "") or "").strip()
+            if target not in valid_targets:
+                u = self._latent_uniform_from_h(h, "_exact_scm_gym_lowtail_potential_progress_source_u")
+                target = "potential_delta_progress" if float(u) < prob else "progress_only"
+            h["exact_scm_gym_lowtail_family_enabled"] = True
+            h["exact_scm_gym_lowtail_family_prob"] = 1.0
+            h["exact_scm_gym_lowtail_family_selected"] = True
+            h["exact_scm_gym_lowtail_reward_mix"] = float(mix)
+            h["exact_scm_gym_lowtail_reward_linear_weight"] = float(linear_weight)
+            h["exact_scm_gym_lowtail_reward_potential_delta_weight"] = (
+                float(delta_progress_delta_weight)
+                if target == "potential_delta_progress"
+                else float(progress_delta_weight)
+            )
+            h["base_reward_retention_fraction"] = float(1.0 - mix)
+            h["potential_progress_preserves_base_reward_via_mix"] = True
+            h["potential_progress_reward_axis_target"] = str(target)
+            h["potential_progress_reward_axis_rule"] = "lowtail_progress_potential_delta_source_label_v1"
+            h["potential_progress_reward_formula_path"] = (
+                "reward_progress_component + reward_potential_delta_component + "
+                "state_cost + ctrl_cost, through exact_scm_gym_lowtail wrapper"
+            )
+        return h_list
+
+    @staticmethod
+    def _resolve_pendulum_settle_yield_param(h, key, default, *, min_value=None, max_value=None):
+        value = float(EnvironmentPrior._resolve_scalar(h.get(key, default)))
+        if not math.isfinite(value):
+            value = float(default)
+        if min_value is not None:
+            value = max(float(min_value), value)
+        if max_value is not None:
+            value = min(float(max_value), value)
+        return float(value)
+
+    def _wrap_transition_with_pendulum_settle_yield_repair(
+        self,
+        transition_fn_full,
+        *,
+        h_list,
+        enabled_values,
+        state_dims,
+        obs_input_dims,
+        action_dims,
+        common_action_start,
+        family="scm",
+    ):
+        """Patch an Exact-SCM transition with a small slot-local settle mode.
+
+        The wrapper is intentionally conservative: it never creates a new
+        environment family, never changes dimensions, and only activates for
+        samples whose existing state/action slots can express the 2-state,
+        1-action closed-loop settle motif.  Cached guards/selectors can then
+        decide whether to keep those samples.
+        """
+
+        if str(family).strip().lower() != "scm":
+            return transition_fn_full, {
+                "enabled": enabled_values,
+                "active": [False for _ in enabled_values],
+            }
+
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return transition_fn_full, {"enabled": [], "active": []}
+
+        state_dims_t = torch.as_tensor(state_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        obs_input_dims_t = torch.as_tensor(obs_input_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        action_dims_t = torch.as_tensor(action_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        if int(state_dims_t.numel()) == 1:
+            state_dims_t = state_dims_t.expand(batch_size)
+        if int(obs_input_dims_t.numel()) == 1:
+            obs_input_dims_t = obs_input_dims_t.expand(batch_size)
+        if int(action_dims_t.numel()) == 1:
+            action_dims_t = action_dims_t.expand(batch_size)
+        enabled_t = torch.as_tensor([bool(v) for v in enabled_values], dtype=torch.bool).reshape(-1)
+        if int(enabled_t.numel()) == 1:
+            enabled_t = enabled_t.expand(batch_size)
+        valid_t = enabled_t & (state_dims_t >= 2) & (action_dims_t >= 1)
+        active_list = [bool(v) for v in valid_t.detach().cpu().tolist()]
+        if not any(active_list):
+            return transition_fn_full, {
+                "enabled": [bool(v) for v in enabled_t.detach().cpu().tolist()],
+                "active": active_list,
+            }
+
+        dt_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_dt", 0.12, min_value=1e-4, max_value=1.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        damping_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_damping", 0.92, min_value=0.0, max_value=1.5
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        spring_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_spring", 0.0, min_value=0.0, max_value=4.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        position_coupling_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_position_coupling", 0.0, min_value=0.0, max_value=1.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        action_controls_position_t = torch.as_tensor(
+            [
+                self._coerce_bool(h.get("pendulum_settle_yield_action_controls_position", False))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        action_gain_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_action_gain", 0.45, min_value=-4.0, max_value=4.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        action_bound_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_action_bound", 1.0, min_value=1e-4, max_value=10.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        state_mix_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_state_mix", 1.0, min_value=0.0, max_value=1.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        reward_mix_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_reward_mix", 1.0, min_value=0.0, max_value=1.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        reward_bias_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_reward_bias", 1.0, min_value=-10.0, max_value=10.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        q_weight_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_q_weight", 1.0, min_value=0.0, max_value=10.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        v_weight_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_v_weight", 0.25, min_value=0.0, max_value=10.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        ctrl_weight_t = torch.as_tensor(
+            [
+                self._resolve_pendulum_settle_yield_param(
+                    h, "pendulum_settle_yield_ctrl_weight", 0.02, min_value=0.0, max_value=10.0
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        common_action_start_t = torch.as_tensor(common_action_start, dtype=torch.long).reshape(-1).detach().cpu()
+        if int(common_action_start_t.numel()) == 1:
+            common_action_start_t = common_action_start_t.expand(batch_size)
+
+        def _to_runtime(tensor, *, device, dtype=None):
+            out = tensor.to(device=device)
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            return out
+
+        def transition_fn(x, *args, **kwargs):
+            transition_fn._last_exact_scm_lowtail_reward_components = None
+            x_is_dual_packed = bool(kwargs.get("x_is_dual_packed", False))
+            x_input_is_packed = bool(kwargs.get("x_input_is_packed", False))
+            out = transition_fn_full(x, *args, **kwargs)
+            state_out, reward_out, terminal_signal, terminal_bonus_base = self._unpack_transition_output(out)
+            if state_out.ndim != 2 or reward_out.ndim != 2:
+                return out
+            x_in = x[:batch_size] if x_is_dual_packed else x
+            if x_in.ndim != 2 or int(x_in.shape[0]) != batch_size:
+                return out
+            device = state_out.device
+            dtype = state_out.dtype
+            valid = _to_runtime(valid_t, device=device)
+            if not bool(torch.any(valid).item()):
+                return out
+
+            state_dims_rt = _to_runtime(state_dims_t, device=device)
+            obs_input_dims_rt = _to_runtime(obs_input_dims_t, device=device)
+            common_action_start_rt = _to_runtime(common_action_start_t, device=device)
+            action_idx = state_dims_rt + obs_input_dims_rt if x_input_is_packed else common_action_start_rt
+            action_idx = action_idx.clamp(0, max(0, int(x_in.shape[1]) - 1))
+
+            q = x_in[:, 0].to(dtype=dtype)
+            v = x_in[:, 1].to(dtype=dtype)
+            a_raw = x_in.gather(1, action_idx.view(-1, 1)).squeeze(1).to(dtype=dtype)
+            action_bound = _to_runtime(action_bound_t, device=device, dtype=dtype).clamp_min(1e-4)
+            a_eff = action_bound * torch.tanh(a_raw / action_bound)
+            velocity_v_next = (
+                _to_runtime(damping_t, device=device, dtype=dtype) * v
+                - _to_runtime(spring_t, device=device, dtype=dtype) * q
+                + _to_runtime(action_gain_t, device=device, dtype=dtype) * a_eff
+            )
+            position_v_next = (
+                _to_runtime(damping_t, device=device, dtype=dtype) * v
+                - _to_runtime(spring_t, device=device, dtype=dtype) * q
+            )
+            position_coupling = _to_runtime(position_coupling_t, device=device, dtype=dtype)
+            q_velocity = (1.0 - position_coupling) * v + position_coupling * velocity_v_next
+            q_next = q + _to_runtime(dt_t, device=device, dtype=dtype) * q_velocity
+            position_q_next = q + _to_runtime(dt_t, device=device, dtype=dtype) * (
+                position_v_next + _to_runtime(action_gain_t, device=device, dtype=dtype) * a_eff
+            )
+            action_controls_position = _to_runtime(action_controls_position_t, device=device)
+            v_next = torch.where(action_controls_position, position_v_next, velocity_v_next)
+            q_next = torch.where(action_controls_position, position_q_next, q_next)
+            settle_reward = (
+                _to_runtime(reward_bias_t, device=device, dtype=dtype)
+                - _to_runtime(q_weight_t, device=device, dtype=dtype) * q_next.square()
+                - _to_runtime(v_weight_t, device=device, dtype=dtype) * v_next.square()
+                - _to_runtime(ctrl_weight_t, device=device, dtype=dtype) * a_eff.square()
+            )
+
+            valid_f = valid.to(dtype=dtype)
+            state_mix = (_to_runtime(state_mix_t, device=device, dtype=dtype) * valid_f).view(-1)
+            reward_mix = (_to_runtime(reward_mix_t, device=device, dtype=dtype) * valid_f).view(-1)
+
+            state_new = state_out.clone()
+            state_new[:, 0] = torch.where(
+                valid,
+                (1.0 - state_mix) * state_out[:, 0] + state_mix * q_next,
+                state_out[:, 0],
+            )
+            state_new[:, 1] = torch.where(
+                valid,
+                (1.0 - state_mix) * state_out[:, 1] + state_mix * v_next,
+                state_out[:, 1],
+            )
+            reward_new = reward_out.clone()
+            reward_col0 = reward_out[:, 0]
+            reward_new[:, 0] = torch.where(
+                valid,
+                (1.0 - reward_mix) * reward_col0 + reward_mix * settle_reward,
+                reward_col0,
+            )
+            if terminal_signal is None:
+                return state_new, reward_new
+            if terminal_bonus_base is None:
+                return state_new, reward_new, terminal_signal
+            return state_new, reward_new, terminal_signal, terminal_bonus_base
+
+        self._copy_transition_generator_attrs(transition_fn, transition_fn_full)
+        transition_fn._pendulum_settle_yield_repair_enabled = True
+        transition_fn._pendulum_settle_yield_repair_active_mask = tuple(active_list)
+        transition_fn._pendulum_settle_yield_repair_uses_existing_state_action_slots = True
+        transition_fn._pendulum_settle_yield_repair_standalone_generator = False
+        transition_fn._pendulum_settle_yield_repair_spring_coupling = True
+        transition_fn._pendulum_settle_yield_repair_position_coupling = True
+        transition_fn._pendulum_settle_yield_repair_action_controls_position = True
+        return transition_fn, {
+            "enabled": [bool(v) for v in enabled_t.detach().cpu().tolist()],
+            "active": active_list,
+            "reward_path_summary_valid": False,
+        }
+
+    def _wrap_transition_with_exact_scm_gym_lowtail_family(
+        self,
+        transition_fn_full,
+        *,
+        h_list,
+        enabled_values,
+        state_dims,
+        obs_dims,
+        obs_input_dims,
+        action_dims,
+        noise_dims,
+        common_action_start,
+        common_noise_start,
+        family="scm",
+    ):
+        """Patch exact SCM with a source-sampled simple observed Markov family."""
+
+        if str(family).strip().lower() != "scm":
+            return transition_fn_full, {
+                "enabled": [bool(v) for v in enabled_values],
+                "active": [False for _ in enabled_values],
+            }
+
+        batch_size = int(len(h_list))
+        if batch_size <= 0:
+            return transition_fn_full, {"enabled": [], "active": []}
+
+        state_dims_t = torch.as_tensor(state_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        obs_dims_t = torch.as_tensor(obs_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        obs_input_dims_t = torch.as_tensor(obs_input_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        action_dims_t = torch.as_tensor(action_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        noise_dims_t = torch.as_tensor(noise_dims, dtype=torch.long).reshape(-1).detach().cpu()
+        if int(state_dims_t.numel()) == 1:
+            state_dims_t = state_dims_t.expand(batch_size)
+        if int(obs_dims_t.numel()) == 1:
+            obs_dims_t = obs_dims_t.expand(batch_size)
+        if int(obs_input_dims_t.numel()) == 1:
+            obs_input_dims_t = obs_input_dims_t.expand(batch_size)
+        if int(action_dims_t.numel()) == 1:
+            action_dims_t = action_dims_t.expand(batch_size)
+        if int(noise_dims_t.numel()) == 1:
+            noise_dims_t = noise_dims_t.expand(batch_size)
+        enabled_t = torch.as_tensor([bool(v) for v in enabled_values], dtype=torch.bool).reshape(-1)
+        if int(enabled_t.numel()) == 1:
+            enabled_t = enabled_t.expand(batch_size)
+        valid_t = enabled_t & (state_dims_t >= 1) & (obs_dims_t >= 1) & (action_dims_t >= 1)
+        active_list = [bool(v) for v in valid_t.detach().cpu().tolist()]
+        if not any(active_list):
+            return transition_fn_full, {
+                "enabled": [bool(v) for v in enabled_t.detach().cpu().tolist()],
+                "active": active_list,
+            }
+
+        def _param_tensor(key, default, min_value, max_value):
+            return torch.as_tensor(
+                [
+                    self._resolve_exact_scm_gym_lowtail_param(
+                        h,
+                        key,
+                        default,
+                        min_value=min_value,
+                        max_value=max_value,
+                    )
+                    for h in h_list
+                ],
+                dtype=torch.float32,
+            )
+
+        rho_t = _param_tensor("exact_scm_gym_lowtail_state_rho", 0.96, 0.0, 0.999)
+        neighbor_t = _param_tensor("exact_scm_gym_lowtail_neighbor_coupling", 0.04, -0.5, 0.5)
+        action_gain_t = _param_tensor("exact_scm_gym_lowtail_action_gain", 0.60, -4.0, 4.0)
+        noise_gain_t = _param_tensor("exact_scm_gym_lowtail_noise_gain", 0.35, 0.0, 4.0)
+        state_mix_t = _param_tensor("exact_scm_gym_lowtail_state_mix", 1.0, 0.0, 1.0)
+        reward_mix_t = _param_tensor("exact_scm_gym_lowtail_reward_mix", 1.0, 0.0, 1.0)
+        reward_bias_t = _param_tensor("exact_scm_gym_lowtail_reward_bias", 0.0, -10.0, 10.0)
+        reward_linear_t = _param_tensor("exact_scm_gym_lowtail_reward_linear_weight", 1.25, -10.0, 10.0)
+        reward_potential_delta_t = _param_tensor(
+            "exact_scm_gym_lowtail_reward_potential_delta_weight",
+            0.0,
+            -10.0,
+            10.0,
+        )
+        reward_state_cost_t = _param_tensor("exact_scm_gym_lowtail_reward_state_cost", 0.05, 0.0, 10.0)
+        reward_ctrl_cost_t = _param_tensor("exact_scm_gym_lowtail_reward_ctrl_cost", 0.02, 0.0, 10.0)
+        reward_distribution_head_scale_t = _param_tensor(
+            "exact_scm_gym_lowtail_reward_distribution_head_scale",
+            0.75,
+            0.0,
+            4.0,
+        )
+        reward_distribution_head_vol_scale_t = _param_tensor(
+            "exact_scm_gym_lowtail_reward_distribution_head_vol_scale",
+            0.35,
+            0.0,
+            4.0,
+        )
+        clock_omega_t = _param_tensor(
+            "exact_scm_gym_lowtail_clock_omega",
+            0.19634954084936207,
+            0.01,
+            1.5,
+        )
+        shared_energy_terminal_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_shared_energy_terminal_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        preimage_shared_scalar_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_preimage_shared_scalar_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        state_obs_rank_preimage_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_state_obs_rank_preimage_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        state_obs_temporal_preimage_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        state_obs_envelope_preimage_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        state_obs_hetero_scale_preimage_t = torch.as_tensor(
+            [
+                bool(
+                    self._coerce_bool(
+                        h.get("exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled", False)
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        markov_carrier_preimage_t = torch.as_tensor(
+            [
+                bool(
+                    self._coerce_bool(
+                        h.get("exact_scm_gym_lowtail_markov_carrier_preimage_enabled", False)
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        materialized_theta_preimage_t = torch.as_tensor(
+            [
+                bool(
+                    self._coerce_bool(
+                        h.get("exact_scm_gym_lowtail_materialized_theta_preimage_enabled", False)
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        reward_distribution_head_t = torch.as_tensor(
+            [
+                bool(
+                    self._coerce_bool(
+                        h.get("exact_scm_gym_lowtail_reward_distribution_head_enabled", False)
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        clock_preimage_t = torch.as_tensor(
+            [
+                bool(self._coerce_bool(h.get("exact_scm_gym_lowtail_clock_preimage_enabled", False)))
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        paired_response_preimage_t = torch.as_tensor(
+            [
+                bool(
+                    self._coerce_bool(
+                        h.get("exact_scm_gym_lowtail_paired_response_preimage_enabled", False)
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.bool,
+        )
+        paired_response_reward_scale_t = _param_tensor(
+            "exact_scm_gym_lowtail_paired_response_reward_scale",
+            0.75,
+            0.0,
+            4.0,
+        )
+        paired_response_done_scale_t = _param_tensor(
+            "exact_scm_gym_lowtail_paired_response_done_scale",
+            0.75,
+            0.0,
+            4.0,
+        )
+        state_obs_rank_count_t = torch.as_tensor(
+            [
+                int(
+                    max(
+                        1,
+                        min(
+                            6,
+                            round(
+                                self._resolve_exact_scm_gym_lowtail_param(
+                                    h,
+                                    "exact_scm_gym_lowtail_state_obs_rank_preimage_rank",
+                                    5,
+                                    min_value=1.0,
+                                    max_value=6.0,
+                                )
+                            ),
+                        ),
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.long,
+        )
+        state_obs_rank_scale_t = torch.as_tensor(
+            [
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h,
+                    "exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale",
+                    1.0,
+                    min_value=0.0,
+                    max_value=4.0,
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        state_obs_hetero_scale_strength_t = torch.as_tensor(
+            [
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h,
+                    "exact_scm_gym_lowtail_state_obs_hetero_scale_strength",
+                    1.0,
+                    min_value=0.0,
+                    max_value=4.0,
+                )
+                for h in h_list
+            ],
+            dtype=torch.float32,
+        )
+        markov_carrier_horizon_t = torch.as_tensor(
+            [
+                int(
+                    max(
+                        8,
+                        round(
+                            self._resolve_exact_scm_gym_lowtail_param(
+                                h,
+                                "exact_scm_gym_lowtail_markov_carrier_horizon",
+                                512,
+                                min_value=8.0,
+                                max_value=4096.0,
+                            )
+                        ),
+                    )
+                )
+                for h in h_list
+            ],
+            dtype=torch.long,
+        )
+        max_rank_static = int(min(6, max(1, int(state_obs_rank_count_t.max().item()))))
+
+        def _standardize_np_column(col):
+            arr = np.asarray(col, dtype=np.float64).reshape(-1)
+            arr = arr - float(np.mean(arr))
+            scale = float(np.std(arr))
+            if scale <= 1e-10:
+                return np.zeros_like(arr)
+            return arr / scale
+
+        def _markov_carrier_affine(rank, horizon):
+            horizon = int(max(8, horizon))
+            t = np.arange(horizon, dtype=np.float64) / float(horizon)
+            ramp = 2.0 * t - 1.0
+            cols = [
+                ramp,
+                ramp * ramp,
+                np.sin(2.0 * np.pi * t),
+                np.cos(2.0 * np.pi * t),
+                np.sin(4.0 * np.pi * t),
+                np.cos(4.0 * np.pi * t),
+            ]
+            k = 3
+            while len(cols) < int(rank):
+                cols.append(np.sin(2.0 * np.pi * k * t))
+                if len(cols) < int(rank):
+                    cols.append(np.cos(2.0 * np.pi * k * t))
+                k += 1
+            x = np.stack([_standardize_np_column(col) for col in cols[: int(rank)]], axis=1)
+            design = np.concatenate([x[:-1], np.ones((horizon - 1, 1), dtype=np.float64)], axis=1)
+            coef, *_ = np.linalg.lstsq(design, x[1:], rcond=None)
+            return coef[:-1].T.astype(np.float32), coef[-1].astype(np.float32)
+
+        carrier_horizon_static = int(torch.median(markov_carrier_horizon_t.to(dtype=torch.float32)).item())
+        carrier_A_np, carrier_b_np = _markov_carrier_affine(max_rank_static, carrier_horizon_static)
+        carrier_A_t = torch.as_tensor(carrier_A_np, dtype=torch.float32)
+        carrier_b_t = torch.as_tensor(carrier_b_np, dtype=torch.float32)
+
+        def _materialized_layout(obs_dim, rank, basis_count):
+            pos = 0
+            slices = {}
+
+            def add(name, count):
+                nonlocal pos
+                slices[name] = slice(pos, pos + int(count))
+                pos += int(count)
+
+            add("obs_bias", obs_dim)
+            add("obs_A", obs_dim * rank)
+            add("obs_dA", obs_dim * rank)
+            add("reward_level", rank)
+            add("reward_delta", rank)
+            add("reward_shape", basis_count)
+            add("reward_vol_shape", basis_count)
+            add("reward_bias", 1)
+            add("reward_vol_bias", 1)
+            add("training_shape", basis_count)
+            add("ppo_reward_shape", basis_count)
+            add("training_bias", 1)
+            add("reward_train_scale", 1)
+            add("ppo_reward_scale", 1)
+            add("reward_token_scale", 1)
+            add("reward_token_shape", basis_count)
+            add("done_level", rank)
+            add("done_delta", rank)
+            add("done_bias", 1)
+            add("trunc_level", rank)
+            add("trunc_bias", 1)
+            add("post_latent_shift", rank)
+            add("obs_scale_bias", obs_dim)
+            add("obs_scale_A", obs_dim * rank)
+            add("obs_scale_dA", obs_dim * rank)
+            return slices, pos
+
+        def _materialized_theta_values(h):
+            value = h.get("exact_scm_gym_lowtail_materialized_theta", None)
+            if isinstance(value, str):
+                text = value.strip()
+                if not text:
+                    return []
+                if text.startswith("["):
+                    try:
+                        value = json.loads(text)
+                    except Exception:
+                        return []
+                else:
+                    path = Path(text).expanduser()
+                    try:
+                        payload = json.loads(path.read_text(encoding="utf-8"))
+                    except Exception:
+                        return []
+                    value = payload.get("theta", payload)
+            if isinstance(value, dict):
+                value = value.get("theta", [])
+            if value is None:
+                return []
+            return [float(v) for v in value]
+
+        materialized_theta_active_t = materialized_theta_preimage_t & valid_t
+        materialized_obs_dim_static = int(
+            max(
+                1,
+                max(
+                    [
+                        int(
+                            self._resolve_scalar(
+                                h.get("exact_scm_gym_lowtail_materialized_theta_obs_dim", 30)
+                            )
+                        )
+                        for h in h_list
+                    ]
+                    or [30]
+                ),
+            )
+        )
+        materialized_rank_static = int(
+            max(
+                1,
+                min(
+                    6,
+                    max(
+                        [
+                            int(
+                                self._resolve_scalar(
+                                    h.get("exact_scm_gym_lowtail_materialized_theta_rank", 6)
+                                )
+                            )
+                            for h in h_list
+                        ]
+                        or [6]
+                    ),
+                ),
+            )
+        )
+        materialized_basis_count_static = int(
+            max(
+                1,
+                max(
+                    [
+                        int(
+                            self._resolve_scalar(
+                                h.get("exact_scm_gym_lowtail_materialized_theta_basis_count", 8)
+                            )
+                        )
+                        for h in h_list
+                    ]
+                    or [8]
+                ),
+            )
+        )
+        materialized_horizon_static = int(
+            max(
+                8,
+                max(
+                    [
+                        int(
+                            self._resolve_scalar(
+                                h.get("exact_scm_gym_lowtail_materialized_theta_horizon", 512)
+                            )
+                        )
+                        for h in h_list
+                    ]
+                    or [512]
+                ),
+            )
+        )
+        materialized_slices, materialized_theta_size = _materialized_layout(
+            materialized_obs_dim_static,
+            materialized_rank_static,
+            materialized_basis_count_static,
+        )
+        materialized_theta_rows = np.zeros((batch_size, materialized_theta_size), dtype=np.float32)
+        materialized_theta_valid = materialized_theta_active_t.detach().cpu().numpy().astype(bool)
+        for bi, h in enumerate(h_list):
+            if not bool(materialized_theta_valid[bi]):
+                continue
+            values = _materialized_theta_values(h)
+            if len(values) != materialized_theta_size:
+                materialized_theta_valid[bi] = False
+                continue
+            materialized_theta_rows[bi, :] = np.asarray(values, dtype=np.float32)
+        materialized_theta_active_t = torch.as_tensor(materialized_theta_valid, dtype=torch.bool)
+        materialized_theta_t = torch.as_tensor(materialized_theta_rows, dtype=torch.float32)
+
+        def _materialized_raw_reward_basis_params(rank, horizon, basis_count):
+            x, _, dx = _markov_carrier_latent_sequences_for_materialized(rank, horizon)
+            z0 = _standardize_np_column(x[:, 0])
+            dz0 = _standardize_np_column(dx[:, 0])
+            z1 = _standardize_np_column(x[:, min(1, rank - 1)])
+            dz1 = _standardize_np_column(dx[:, min(1, rank - 1)])
+            z2 = _standardize_np_column(x[:, min(2, rank - 1)])
+            q30 = float(np.quantile(z0, 0.30))
+            q70 = float(np.quantile(z0, 0.70))
+            dq30 = float(np.quantile(dz0, 0.30))
+            dq70 = float(np.quantile(dz0, 0.70))
+            raw = np.stack(
+                [
+                    z0,
+                    dz0,
+                    z1,
+                    dz1,
+                    z2,
+                    z0 * z0,
+                    np.abs(z0),
+                    np.abs(dz0),
+                    np.maximum(z0 - q70, 0.0),
+                    np.maximum(q30 - z0, 0.0),
+                    np.maximum(dz0 - dq70, 0.0),
+                    np.maximum(dq30 - dz0, 0.0),
+                    z0 * dz0,
+                    z1 * dz1,
+                    z2 * dz0,
+                ],
+                axis=1,
+            )
+            means = raw.mean(axis=0)
+            stds = raw.std(axis=0)
+            stds = np.where(stds <= 1e-10, 1.0, stds)
+            coeff = np.zeros((basis_count, basis_count), dtype=np.float32)
+            scales = np.ones((basis_count,), dtype=np.float32)
+            accepted_raw = []
+            cols = []
+            for raw_idx in range(raw.shape[1]):
+                col = (raw[:, raw_idx] - means[raw_idx]) / stds[raw_idx]
+                local_coeffs = []
+                for prev in cols:
+                    c = float(prev @ col) / max(float(prev @ prev), 1e-12)
+                    local_coeffs.append(c)
+                    col = col - prev * c
+                norm = float(np.linalg.norm(col))
+                if norm > 1e-10:
+                    basis_col = col / norm * math.sqrt(float(horizon))
+                    row = len(cols)
+                    accepted_raw.append(raw_idx)
+                    for prev_idx, c in enumerate(local_coeffs):
+                        coeff[row, prev_idx] = float(c)
+                    scales[row] = float(math.sqrt(float(horizon)) / norm)
+                    cols.append(basis_col)
+                if len(cols) >= int(basis_count):
+                    break
+            if len(cols) < int(basis_count):
+                raise ValueError(
+                    f"materialized reward basis only built {len(cols)} columns, need {basis_count}"
+                )
+            return (
+                means.astype(np.float32),
+                stds.astype(np.float32),
+                np.asarray(accepted_raw, dtype=np.int64),
+                coeff,
+                scales,
+                np.asarray([q30, q70, dq30, dq70], dtype=np.float32),
+            )
+
+        def _markov_carrier_latent_sequences_for_materialized(rank, horizon):
+            horizon = int(max(8, horizon))
+            t = np.arange(horizon, dtype=np.float64) / float(horizon)
+            ramp = 2.0 * t - 1.0
+            cols = [
+                ramp,
+                ramp * ramp,
+                np.sin(2.0 * np.pi * t),
+                np.cos(2.0 * np.pi * t),
+                np.sin(4.0 * np.pi * t),
+                np.cos(4.0 * np.pi * t),
+            ]
+            k = 3
+            while len(cols) < int(rank):
+                cols.append(np.sin(2.0 * np.pi * k * t))
+                if len(cols) < int(rank):
+                    cols.append(np.cos(2.0 * np.pi * k * t))
+                k += 1
+            x = np.stack([_standardize_np_column(col) for col in cols[: int(rank)]], axis=1)
+            dx = np.vstack([np.zeros((1, int(rank)), dtype=np.float64), np.diff(x, axis=0)])
+            mix = np.eye(int(rank), dtype=np.float64)
+            for j in range(int(rank)):
+                mix[j, (j + 1) % int(rank)] += 0.25
+                mix[j, (j + 2) % int(rank)] -= 0.10
+            response = x @ mix.T
+            response = np.stack([_standardize_np_column(response[:, j]) for j in range(int(rank))], axis=1)
+            return x, response, dx
+
+        materialized_carrier_A_np, materialized_carrier_b_np = _markov_carrier_affine(
+            materialized_rank_static,
+            materialized_horizon_static,
+        )
+        (
+            basis_raw_mean_np,
+            basis_raw_std_np,
+            basis_accepted_raw_np,
+            basis_orth_coeff_np,
+            basis_orth_scale_np,
+            basis_quantiles_np,
+        ) = _materialized_raw_reward_basis_params(
+            materialized_rank_static,
+            materialized_horizon_static,
+            materialized_basis_count_static,
+        )
+        materialized_carrier_A_t = torch.as_tensor(materialized_carrier_A_np, dtype=torch.float32)
+        materialized_carrier_b_t = torch.as_tensor(materialized_carrier_b_np, dtype=torch.float32)
+        materialized_basis_raw_mean_t = torch.as_tensor(basis_raw_mean_np, dtype=torch.float32)
+        materialized_basis_raw_std_t = torch.as_tensor(basis_raw_std_np, dtype=torch.float32)
+        materialized_basis_accepted_raw_t = torch.as_tensor(basis_accepted_raw_np, dtype=torch.long)
+        materialized_basis_orth_coeff_t = torch.as_tensor(basis_orth_coeff_np, dtype=torch.float32)
+        materialized_basis_orth_scale_t = torch.as_tensor(basis_orth_scale_np, dtype=torch.float32)
+        materialized_basis_quantiles_t = torch.as_tensor(basis_quantiles_np, dtype=torch.float32)
+
+        def _materialized_initial_state_cpu():
+            max_state = int(max(1, int(state_dims_t.max().item())))
+            init = torch.zeros((batch_size, max_state), dtype=torch.float32)
+            x_seq, _, _ = _markov_carrier_latent_sequences_for_materialized(
+                materialized_rank_static,
+                materialized_horizon_static,
+            )
+            latent0 = torch.as_tensor(x_seq[0], dtype=torch.float32).reshape(1, -1)
+            dx0 = torch.zeros_like(latent0)
+            for bi in range(batch_size):
+                if not bool(materialized_theta_active_t[bi].item()):
+                    continue
+                obs_dim_i = int(min(materialized_obs_dim_static, int(obs_dims_t[bi].item()), max_state))
+                rank_i = int(
+                    min(
+                        materialized_rank_static,
+                        max(0, int(state_dims_t[bi].item()) - int(obs_dims_t[bi].item())),
+                    )
+                )
+                if obs_dim_i <= 0 or rank_i <= 0:
+                    continue
+                theta = materialized_theta_t[bi : bi + 1]
+                obs_bias = theta[:, materialized_slices["obs_bias"]][:, :obs_dim_i]
+                obs_A = theta[:, materialized_slices["obs_A"]].reshape(
+                    1,
+                    materialized_obs_dim_static,
+                    materialized_rank_static,
+                )[:, :obs_dim_i, :]
+                obs_dA = theta[:, materialized_slices["obs_dA"]].reshape(
+                    1,
+                    materialized_obs_dim_static,
+                    materialized_rank_static,
+                )[:, :obs_dim_i, :]
+                obs_value = (
+                    obs_bias
+                    + torch.bmm(obs_A, latent0.unsqueeze(2)).squeeze(2)
+                    + torch.bmm(obs_dA, dx0.unsqueeze(2)).squeeze(2)
+                )
+                obs_scale_A = theta[:, materialized_slices["obs_scale_A"]].reshape(
+                    1,
+                    materialized_obs_dim_static,
+                    materialized_rank_static,
+                )[:, :obs_dim_i, :]
+                obs_scale_dA = theta[:, materialized_slices["obs_scale_dA"]].reshape(
+                    1,
+                    materialized_obs_dim_static,
+                    materialized_rank_static,
+                )[:, :obs_dim_i, :]
+                log_scale = (
+                    theta[:, materialized_slices["obs_scale_bias"]][:, :obs_dim_i]
+                    + torch.bmm(obs_scale_A, latent0.unsqueeze(2)).squeeze(2)
+                    + torch.bmm(obs_scale_dA, dx0.unsqueeze(2)).squeeze(2)
+                )
+                obs_value = obs_value * torch.exp(2.0 * torch.tanh(log_scale / 2.0))
+                init[bi, :obs_dim_i] = obs_value[0]
+                hidden_start = int(obs_dims_t[bi].item())
+                hidden_end = min(max_state, hidden_start + rank_i)
+                init[bi, hidden_start:hidden_end] = latent0[0, : hidden_end - hidden_start]
+            return init
+
+        materialized_initial_state_t = _materialized_initial_state_cpu()
+        common_action_start_t = torch.as_tensor(common_action_start, dtype=torch.long).reshape(-1).detach().cpu()
+        common_noise_start_t = torch.as_tensor(common_noise_start, dtype=torch.long).reshape(-1).detach().cpu()
+        if int(common_action_start_t.numel()) == 1:
+            common_action_start_t = common_action_start_t.expand(batch_size)
+        if int(common_noise_start_t.numel()) == 1:
+            common_noise_start_t = common_noise_start_t.expand(batch_size)
+
+        def _to_runtime(tensor, *, device, dtype=None):
+            out = tensor.to(device=device)
+            if dtype is not None:
+                out = out.to(dtype=dtype)
+            return out
+
+        def transition_fn(x, *args, **kwargs):
+            x_is_dual_packed = bool(kwargs.get("x_is_dual_packed", False))
+            x_input_is_packed = bool(kwargs.get("x_input_is_packed", False))
+            out = transition_fn_full(x, *args, **kwargs)
+            state_out, reward_out, terminal_signal, terminal_bonus_base = self._unpack_transition_output(out)
+            if state_out.ndim != 2 or reward_out.ndim != 2:
+                return out
+            x_in = x[:batch_size] if x_is_dual_packed else x
+            if x_in.ndim != 2 or int(x_in.shape[0]) != batch_size:
+                return out
+            device = state_out.device
+            dtype = state_out.dtype
+            valid = _to_runtime(valid_t, device=device)
+            if not bool(torch.any(valid).item()):
+                return out
+
+            state_dims_rt = _to_runtime(state_dims_t, device=device)
+            obs_dims_rt = _to_runtime(obs_dims_t, device=device)
+            obs_input_dims_rt = _to_runtime(obs_input_dims_t, device=device)
+            action_dims_rt = _to_runtime(action_dims_t, device=device)
+            noise_dims_rt = _to_runtime(noise_dims_t, device=device)
+            common_action_start_rt = _to_runtime(common_action_start_t, device=device)
+            common_noise_start_rt = _to_runtime(common_noise_start_t, device=device)
+            if x_input_is_packed:
+                action_start_rt = state_dims_rt + obs_input_dims_rt
+                noise_start_rt = state_dims_rt + obs_input_dims_rt + action_dims_rt
+            else:
+                action_start_rt = common_action_start_rt
+                noise_start_rt = common_noise_start_rt
+
+            obs_cap = int(min(int(state_out.shape[1]), int(max(1, int(obs_dims_t.max().item())))))
+            obs_cols = torch.arange(obs_cap, device=device, dtype=torch.long).unsqueeze(0)
+            obs_mask = obs_cols < obs_dims_rt.unsqueeze(1)
+            obs_prev = x_in[:, :obs_cap].to(dtype=dtype) * obs_mask.to(dtype=dtype)
+            obs_roll = torch.roll(obs_prev, shifts=1, dims=1)
+
+            action_cap = int(max(1, int(action_dims_t.max().item())))
+            action_cols = torch.arange(action_cap, device=device, dtype=torch.long).unsqueeze(0)
+            action_mask = action_cols < action_dims_rt.unsqueeze(1)
+            action_full_idx = (action_start_rt.unsqueeze(1) + action_cols).clamp(0, max(0, int(x_in.shape[1]) - 1))
+            action_full = torch.tanh(torch.gather(x_in, 1, action_full_idx).to(dtype=dtype))
+            action_full = action_full * action_mask.to(dtype=dtype)
+            action_count = action_dims_rt.clamp_min(1).to(dtype=dtype)
+            action_scalar = (action_full * action_mask.to(dtype=dtype)).sum(dim=1) / action_count
+
+            action_mod = torch.remainder(obs_cols, action_dims_rt.clamp_min(1).unsqueeze(1))
+            action_idx = (action_start_rt.unsqueeze(1) + action_mod).clamp(0, max(0, int(x_in.shape[1]) - 1))
+            action_proj = torch.tanh(torch.gather(x_in, 1, action_idx).to(dtype=dtype))
+
+            noise_valid = noise_dims_rt > 0
+            noise_mod = torch.remainder(obs_cols, noise_dims_rt.clamp_min(1).unsqueeze(1))
+            noise_idx = (noise_start_rt.unsqueeze(1) + noise_mod).clamp(0, max(0, int(x_in.shape[1]) - 1))
+            noise_proj = torch.gather(x_in, 1, noise_idx).to(dtype=dtype)
+            noise_proj = torch.where(noise_valid.unsqueeze(1), noise_proj, torch.zeros_like(noise_proj))
+            obs_count = obs_dims_rt.clamp_min(1).to(dtype=dtype)
+            noise_scalar = (noise_proj * obs_mask.to(dtype=dtype)).sum(dim=1) / obs_count
+
+            obs_candidate = (
+                _to_runtime(rho_t, device=device, dtype=dtype).view(-1, 1) * obs_prev
+                + _to_runtime(neighbor_t, device=device, dtype=dtype).view(-1, 1) * obs_roll
+                + _to_runtime(action_gain_t, device=device, dtype=dtype).view(-1, 1) * action_proj
+                + _to_runtime(noise_gain_t, device=device, dtype=dtype).view(-1, 1) * noise_proj
+            ) * obs_mask.to(dtype=dtype)
+            shared_scalar = _to_runtime(preimage_shared_scalar_t, device=device) & valid
+            if bool(torch.any(shared_scalar).item()):
+                scalar_driver = (
+                    _to_runtime(action_gain_t, device=device, dtype=dtype) * action_scalar
+                    + _to_runtime(noise_gain_t, device=device, dtype=dtype) * noise_scalar
+                )
+                obs_candidate_scalar = (
+                    _to_runtime(rho_t, device=device, dtype=dtype).view(-1, 1) * obs_prev
+                    + _to_runtime(neighbor_t, device=device, dtype=dtype).view(-1, 1) * obs_roll
+                    + scalar_driver.reshape(-1, 1)
+                ) * obs_mask.to(dtype=dtype)
+                obs_candidate = torch.where(
+                    shared_scalar.reshape(-1, 1),
+                    obs_candidate_scalar,
+                    obs_candidate,
+                )
+            rank_preimage = _to_runtime(state_obs_rank_preimage_t, device=device) & valid
+            shared_latent_factors = None
+            clock_latent_factors = None
+            clock_preimage_mask = None
+            clock_energy_signal = None
+            if bool(torch.any(rank_preimage).item()):
+                max_rank = int(min(6, max(1, int(state_obs_rank_count_t.max().item()))))
+                rank_cols = torch.arange(max_rank, device=device, dtype=torch.long).unsqueeze(0)
+                action_factor_idx = (
+                    action_start_rt.unsqueeze(1)
+                    + torch.remainder(rank_cols, action_dims_rt.clamp_min(1).unsqueeze(1))
+                ).clamp(0, max(0, int(x_in.shape[1]) - 1))
+                action_factors = torch.tanh(torch.gather(x_in, 1, action_factor_idx).to(dtype=dtype))
+                noise_factor_idx = (
+                    noise_start_rt.unsqueeze(1)
+                    + torch.remainder(rank_cols, noise_dims_rt.clamp_min(1).unsqueeze(1))
+                ).clamp(0, max(0, int(x_in.shape[1]) - 1))
+                noise_factors = torch.gather(x_in, 1, noise_factor_idx).to(dtype=dtype)
+                noise_factors = torch.where(
+                    noise_valid.unsqueeze(1),
+                    noise_factors,
+                    torch.zeros_like(noise_factors),
+                )
+                rank_factor_mask = rank_cols < _to_runtime(state_obs_rank_count_t, device=device).unsqueeze(1)
+                latent_factors = (
+                    _to_runtime(action_gain_t, device=device, dtype=dtype).view(-1, 1) * action_factors
+                    + _to_runtime(noise_gain_t, device=device, dtype=dtype).view(-1, 1) * noise_factors
+                ) * rank_factor_mask.to(dtype=dtype)
+                markov_carrier = _to_runtime(markov_carrier_preimage_t, device=device) & rank_preimage
+                clock_preimage = _to_runtime(clock_preimage_t, device=device) & rank_preimage
+                clock_preimage_mask = clock_preimage
+                if bool(torch.any(clock_preimage).item()):
+                    phase_x = obs_prev[:, 0]
+                    phase_y = obs_prev[:, 1] if obs_cap > 1 else torch.tanh(action_scalar)
+                    radius = torch.sqrt((phase_x.square() + phase_y.square()).clamp_min(1e-8))
+                    phase_x = phase_x / radius
+                    phase_y = phase_y / radius
+                    clock_drive = (
+                        _to_runtime(action_gain_t, device=device, dtype=dtype) * action_scalar
+                        + _to_runtime(noise_gain_t, device=device, dtype=dtype) * noise_scalar
+                    )
+                    omega = _to_runtime(clock_omega_t, device=device, dtype=dtype) + clock_drive
+                    cos_w = torch.cos(omega)
+                    sin_w = torch.sin(omega)
+                    clock_x_unit = cos_w * phase_x - sin_w * phase_y
+                    clock_y_unit = sin_w * phase_x + cos_w * phase_y
+                    phase_scale = _to_runtime(state_obs_rank_scale_t, device=device, dtype=dtype).clamp_min(0.1)
+                    if obs_cap > 2:
+                        energy_prev = obs_prev[:, 2] / phase_scale
+                    else:
+                        energy_prev = 0.25 * phase_x
+                    energy_new = torch.tanh(0.985 * energy_prev + 0.015 * clock_drive)
+                    clock_energy_signal = energy_new
+                    clock_x = phase_scale * clock_x_unit
+                    clock_y = phase_scale * clock_y_unit
+                    clock_energy = phase_scale * energy_new
+                    clock_terms = [
+                        clock_x,
+                        clock_y,
+                        clock_energy,
+                        clock_x * clock_x - clock_y * clock_y,
+                        2.0 * clock_x * clock_y,
+                        torch.tanh(2.0 * clock_x + 0.5 * clock_y),
+                    ][:max_rank]
+                    clock_latent = torch.stack(clock_terms, dim=1) * rank_factor_mask.to(dtype=dtype)
+                    latent_factors = torch.where(
+                        clock_preimage.reshape(-1, 1),
+                        clock_latent,
+                        latent_factors,
+                    )
+                    clock_latent_factors = clock_latent
+                shared_latent_factors = latent_factors
+
+                denom = (obs_dims_rt.clamp_min(2) - 1).to(dtype=dtype).view(-1, 1)
+                pos = obs_cols.to(dtype=dtype) / denom
+                centered = 2.0 * pos - 1.0
+                basis_terms = [
+                    torch.ones_like(pos),
+                    centered,
+                    torch.sin(math.pi * pos),
+                    torch.cos(math.pi * pos),
+                    torch.sin(2.0 * math.pi * pos),
+                    torch.cos(2.0 * math.pi * pos),
+                ][:max_rank]
+                basis = torch.stack(
+                    [
+                        term * obs_mask.to(dtype=dtype)
+                        / torch.sqrt(
+                            (
+                                (term.square() * obs_mask.to(dtype=dtype)).sum(dim=1, keepdim=True)
+                                / obs_count.view(-1, 1)
+                            ).clamp_min(1e-6)
+                        )
+                        for term in basis_terms
+                    ],
+                    dim=1,
+                )
+                if bool(torch.any(markov_carrier).item()):
+                    carrier_prev = torch.sum(obs_prev.unsqueeze(1) * basis, dim=2)
+                    carrier_prev = carrier_prev / obs_count.clamp_min(1.0).view(-1, 1)
+                    carrier_prev = carrier_prev * rank_factor_mask.to(dtype=dtype)
+                    carrier_next = (
+                        carrier_prev
+                        @ _to_runtime(carrier_A_t, device=device, dtype=dtype).T
+                        + _to_runtime(carrier_b_t, device=device, dtype=dtype).view(1, -1)
+                    )
+                    carrier_next = carrier_next.clamp(-4.0, 4.0) * rank_factor_mask.to(dtype=dtype)
+                    latent_factors = torch.where(
+                        markov_carrier.reshape(-1, 1),
+                        carrier_next,
+                        latent_factors,
+                    )
+                innovation = torch.sum(latent_factors.unsqueeze(2) * basis, dim=1)
+                innovation = innovation / torch.sqrt(
+                    _to_runtime(state_obs_rank_count_t, device=device, dtype=dtype).clamp_min(1.0).view(-1, 1)
+                )
+                obs_candidate_rank = (
+                    _to_runtime(rho_t, device=device, dtype=dtype).view(-1, 1) * obs_prev
+                    + _to_runtime(neighbor_t, device=device, dtype=dtype).view(-1, 1) * obs_roll
+                    + _to_runtime(state_obs_rank_scale_t, device=device, dtype=dtype).view(-1, 1) * innovation
+                ) * obs_mask.to(dtype=dtype)
+                clock_preimage = _to_runtime(clock_preimage_t, device=device) & rank_preimage
+                if clock_latent_factors is not None and bool(torch.any(clock_preimage).item()):
+                    obs_candidate_clock = obs_candidate_rank.clone()
+                    obs_candidate_clock[:, 0] = clock_latent_factors[:, 0]
+                    if obs_cap > 1 and int(clock_latent_factors.shape[1]) > 1:
+                        obs_candidate_clock[:, 1] = clock_latent_factors[:, 1]
+                    if obs_cap > 2 and int(clock_latent_factors.shape[1]) > 2:
+                        obs_candidate_clock[:, 2] = clock_latent_factors[:, 2]
+                    obs_candidate_rank = torch.where(
+                        clock_preimage.reshape(-1, 1),
+                        obs_candidate_clock * obs_mask.to(dtype=dtype),
+                        obs_candidate_rank,
+                    )
+                temporal_rank_preimage = _to_runtime(state_obs_temporal_preimage_t, device=device) & rank_preimage
+                if bool(torch.any(temporal_rank_preimage).item()):
+                    factor_prev = torch.sum(obs_prev.unsqueeze(1) * basis, dim=2)
+                    factor_prev = factor_prev / obs_count.clamp_min(1.0).view(-1, 1)
+                    factor_prev = factor_prev * rank_factor_mask.to(dtype=dtype)
+                    factor_new = (
+                        _to_runtime(rho_t, device=device, dtype=dtype).view(-1, 1) * factor_prev
+                        + _to_runtime(state_obs_rank_scale_t, device=device, dtype=dtype).view(-1, 1)
+                        * latent_factors
+                    )
+                    obs_candidate_temporal = (
+                        torch.sum(factor_new.unsqueeze(2) * basis, dim=1) * obs_mask.to(dtype=dtype)
+                    )
+                    obs_candidate_rank = torch.where(
+                        temporal_rank_preimage.reshape(-1, 1),
+                        obs_candidate_temporal,
+                        obs_candidate_rank,
+                    )
+                hetero_scale_preimage = (
+                    _to_runtime(state_obs_hetero_scale_preimage_t, device=device) & rank_preimage
+                )
+                if bool(torch.any(hetero_scale_preimage).item()):
+                    scale_drive = torch.sum(latent_factors.unsqueeze(2) * basis, dim=1)
+                    scale_drive = scale_drive / torch.sqrt(
+                        _to_runtime(state_obs_rank_count_t, device=device, dtype=dtype)
+                        .clamp_min(1.0)
+                        .view(-1, 1)
+                    )
+                    scale_strength = _to_runtime(
+                        state_obs_hetero_scale_strength_t,
+                        device=device,
+                        dtype=dtype,
+                    ).view(-1, 1)
+                    obs_scale = torch.exp(2.0 * torch.tanh(0.5 * scale_strength * scale_drive))
+                    obs_candidate_hetero = obs_candidate_rank * obs_scale * obs_mask.to(dtype=dtype)
+                    obs_candidate_rank = torch.where(
+                        hetero_scale_preimage.reshape(-1, 1),
+                        obs_candidate_hetero,
+                        obs_candidate_rank,
+                    )
+                obs_candidate = torch.where(
+                    rank_preimage.reshape(-1, 1),
+                    obs_candidate_rank,
+                    obs_candidate,
+                )
+            materialized_theta_preimage = _to_runtime(materialized_theta_active_t, device=device) & valid
+            materialized_latent_next = None
+            materialized_reward_candidate = None
+            materialized_done_signal = None
+            if bool(torch.any(materialized_theta_preimage).item()):
+                mat_rank = int(materialized_rank_static)
+                mat_obs_cap = int(min(obs_cap, materialized_obs_dim_static))
+                mat_cols = torch.arange(mat_rank, device=device, dtype=torch.long).unsqueeze(0)
+                hidden_idx = (obs_dims_rt.unsqueeze(1) + mat_cols).clamp(
+                    0,
+                    max(0, int(x_in.shape[1]) - 1),
+                )
+                hidden_mask = (obs_dims_rt.unsqueeze(1) + mat_cols) < state_dims_rt.unsqueeze(1)
+                latent_prev = torch.gather(x_in, 1, hidden_idx).to(dtype=dtype)
+                latent_prev = latent_prev * hidden_mask.to(dtype=dtype)
+                latent_next = (
+                    latent_prev
+                    @ _to_runtime(materialized_carrier_A_t, device=device, dtype=dtype).T
+                    + _to_runtime(materialized_carrier_b_t, device=device, dtype=dtype).view(1, -1)
+                )
+                latent_next = latent_next * hidden_mask.to(dtype=dtype)
+                latent_dx = latent_next - latent_prev
+                theta_mat = _to_runtime(materialized_theta_t, device=device, dtype=dtype)
+
+                def _theta_slice(name):
+                    return theta_mat[:, materialized_slices[name]]
+
+                def _theta_matrix(name, rows):
+                    return _theta_slice(name).reshape(
+                        batch_size,
+                        int(rows),
+                        mat_rank,
+                    )
+
+                obs_bias = _theta_slice("obs_bias")[:, :mat_obs_cap]
+                obs_A = _theta_matrix("obs_A", materialized_obs_dim_static)[:, :mat_obs_cap, :]
+                obs_dA = _theta_matrix("obs_dA", materialized_obs_dim_static)[:, :mat_obs_cap, :]
+                obs_mat = (
+                    obs_bias
+                    + torch.bmm(obs_A, latent_next.unsqueeze(2)).squeeze(2)
+                    + torch.bmm(obs_dA, latent_dx.unsqueeze(2)).squeeze(2)
+                )
+                obs_scale_A = _theta_matrix("obs_scale_A", materialized_obs_dim_static)[:, :mat_obs_cap, :]
+                obs_scale_dA = _theta_matrix("obs_scale_dA", materialized_obs_dim_static)[:, :mat_obs_cap, :]
+                log_scale = (
+                    _theta_slice("obs_scale_bias")[:, :mat_obs_cap]
+                    + torch.bmm(obs_scale_A, latent_next.unsqueeze(2)).squeeze(2)
+                    + torch.bmm(obs_scale_dA, latent_dx.unsqueeze(2)).squeeze(2)
+                )
+                obs_mat = obs_mat * torch.exp(2.0 * torch.tanh(log_scale / 2.0))
+                obs_candidate_materialized = torch.zeros_like(obs_candidate)
+                obs_candidate_materialized[:, :mat_obs_cap] = obs_mat
+                obs_candidate = torch.where(
+                    materialized_theta_preimage.reshape(-1, 1),
+                    obs_candidate_materialized * obs_mask.to(dtype=dtype),
+                    obs_candidate,
+                )
+
+                z0 = latent_next[:, 0]
+                dz0 = latent_dx[:, 0]
+                z1 = latent_next[:, min(1, mat_rank - 1)]
+                dz1 = latent_dx[:, min(1, mat_rank - 1)]
+                z2 = latent_next[:, min(2, mat_rank - 1)]
+                qvals = _to_runtime(materialized_basis_quantiles_t, device=device, dtype=dtype)
+                raw_basis = torch.stack(
+                    [
+                        z0,
+                        dz0,
+                        z1,
+                        dz1,
+                        z2,
+                        z0 * z0,
+                        torch.abs(z0),
+                        torch.abs(dz0),
+                        torch.relu(z0 - qvals[1]),
+                        torch.relu(qvals[0] - z0),
+                        torch.relu(dz0 - qvals[3]),
+                        torch.relu(qvals[2] - dz0),
+                        z0 * dz0,
+                        z1 * dz1,
+                        z2 * dz0,
+                    ],
+                    dim=1,
+                )
+                raw_basis = (
+                    raw_basis - _to_runtime(materialized_basis_raw_mean_t, device=device, dtype=dtype).view(1, -1)
+                ) / _to_runtime(materialized_basis_raw_std_t, device=device, dtype=dtype).view(1, -1).clamp_min(1e-8)
+                accepted_raw = _to_runtime(materialized_basis_accepted_raw_t, device=device)
+                coeff = _to_runtime(materialized_basis_orth_coeff_t, device=device, dtype=dtype)
+                scale = _to_runtime(materialized_basis_orth_scale_t, device=device, dtype=dtype)
+                basis_values = []
+                for local_idx in range(int(materialized_basis_count_static)):
+                    value = raw_basis[:, accepted_raw[local_idx]]
+                    for prev_idx, prev_value in enumerate(basis_values):
+                        value = value - coeff[local_idx, prev_idx] * prev_value
+                    basis_values.append(value * scale[local_idx])
+                reward_basis = torch.stack(basis_values, dim=1)
+
+                reward_base = (
+                    _theta_slice("reward_bias")[:, 0]
+                    + torch.sum(_theta_slice("reward_level") * latent_next, dim=1)
+                    + torch.sum(_theta_slice("reward_delta") * latent_dx, dim=1)
+                    + torch.sum(_theta_slice("reward_shape") * reward_basis, dim=1)
+                )
+                reward_vol = F.softplus(
+                    _theta_slice("reward_vol_bias")[:, 0]
+                    + torch.sum(_theta_slice("reward_vol_shape") * reward_basis, dim=1)
+                )
+                eps_drive = (
+                    2.0
+                    * latent_next[:, min(4, mat_rank - 1)]
+                    * latent_next[:, min(5, mat_rank - 1)]
+                    + 0.35 * torch.sign(latent_next[:, min(2, mat_rank - 1)])
+                )
+                eps_drive = eps_drive / torch.sqrt(torch.mean(eps_drive.square()).clamp_min(1e-8))
+                raw_reward_materialized = reward_base + reward_vol * eps_drive
+                train_reward_materialized = (
+                    _theta_slice("training_bias")[:, 0]
+                    + _theta_slice("reward_train_scale")[:, 0] * raw_reward_materialized
+                    + torch.sum(_theta_slice("training_shape") * reward_basis, dim=1)
+                )
+                ppo_reward_materialized = (
+                    _theta_slice("ppo_reward_scale")[:, 0] * train_reward_materialized
+                    + torch.sum(_theta_slice("ppo_reward_shape") * reward_basis, dim=1)
+                )
+                materialized_reward_candidate = ppo_reward_materialized
+                materialized_done_signal = (
+                    _theta_slice("done_bias")[:, 0]
+                    + torch.sum(_theta_slice("done_level") * latent_next, dim=1)
+                    + torch.sum(_theta_slice("done_delta") * latent_dx, dim=1)
+                )
+                materialized_latent_next = latent_next
+            envelope_preimage = _to_runtime(state_obs_envelope_preimage_t, device=device) & valid
+            if bool(torch.any(envelope_preimage).item()):
+                denom = (obs_dims_rt.clamp_min(2) - 1).to(dtype=dtype).view(-1, 1)
+                pos = obs_cols.to(dtype=dtype) / denom
+                envelope_pattern = (2.0 * pos - 1.0) * obs_mask.to(dtype=dtype)
+                envelope_pattern = envelope_pattern / torch.sqrt(
+                    (
+                        (envelope_pattern.square() * obs_mask.to(dtype=dtype)).sum(dim=1, keepdim=True)
+                        / obs_count.view(-1, 1)
+                    ).clamp_min(1e-6)
+                )
+                obs_mean_prev = (obs_prev * obs_mask.to(dtype=dtype)).sum(dim=1) / obs_count
+                obs_centered_prev = (obs_prev - obs_mean_prev.view(-1, 1)) * obs_mask.to(dtype=dtype)
+                obs_amp_prev = torch.sqrt(
+                    (obs_centered_prev.square().sum(dim=1) / obs_count).clamp_min(1e-8)
+                )
+                envelope_driver = (
+                    _to_runtime(action_gain_t, device=device, dtype=dtype) * action_scalar
+                    + _to_runtime(noise_gain_t, device=device, dtype=dtype) * noise_scalar
+                )
+                envelope_scale = _to_runtime(state_obs_rank_scale_t, device=device, dtype=dtype)
+                obs_amp_new = F.softplus(
+                    _to_runtime(rho_t, device=device, dtype=dtype) * obs_amp_prev
+                    + envelope_scale * envelope_driver
+                )
+                obs_mean_new = (
+                    _to_runtime(rho_t, device=device, dtype=dtype) * obs_mean_prev
+                    + 0.25 * envelope_scale * envelope_driver
+                )
+                obs_candidate_envelope = (
+                    obs_mean_new.view(-1, 1) + obs_amp_new.view(-1, 1) * envelope_pattern
+                ) * obs_mask.to(dtype=dtype)
+                obs_candidate = torch.where(
+                    envelope_preimage.reshape(-1, 1),
+                    obs_candidate_envelope,
+                    obs_candidate,
+                )
+            valid_f = valid.to(dtype=dtype)
+            state_mix = _to_runtime(state_mix_t, device=device, dtype=dtype).view(-1, 1) * valid_f.view(-1, 1)
+            state_new = state_out.clone()
+            state_new[:, :obs_cap] = (
+                (1.0 - state_mix) * state_out[:, :obs_cap]
+                + state_mix * obs_candidate
+            )
+            if materialized_latent_next is not None and bool(torch.any(materialized_theta_preimage).item()):
+                mat_rank = int(materialized_rank_static)
+                mat_cols = torch.arange(mat_rank, device=device, dtype=torch.long).unsqueeze(0)
+                hidden_idx = (obs_dims_rt.unsqueeze(1) + mat_cols).clamp(
+                    0,
+                    max(0, int(state_new.shape[1]) - 1),
+                )
+                hidden_mask = (obs_dims_rt.unsqueeze(1) + mat_cols) < state_dims_rt.unsqueeze(1)
+                current_hidden = torch.gather(state_new, 1, hidden_idx)
+                next_hidden = torch.where(
+                    (materialized_theta_preimage.reshape(-1, 1) & hidden_mask),
+                    materialized_latent_next.to(dtype=dtype),
+                    current_hidden,
+                )
+                state_new = state_new.scatter(1, hidden_idx, next_hidden)
+
+            prev_state_cost = obs_prev.square().sum(dim=1) / obs_count
+            state_cost = obs_candidate.square().sum(dim=1) / obs_count
+            ctrl_cost = (action_full.square() * action_mask.to(dtype=dtype)).sum(dim=1)
+            ctrl_cost = ctrl_cost / action_count
+            reward_bias_component = _to_runtime(reward_bias_t, device=device, dtype=dtype)
+            reward_progress_component = (
+                _to_runtime(reward_linear_t, device=device, dtype=dtype) * obs_candidate[:, 0]
+            )
+            reward_potential_delta_component = (
+                _to_runtime(reward_potential_delta_t, device=device, dtype=dtype)
+                * (prev_state_cost - state_cost)
+            )
+            reward_state_cost_component = (
+                -_to_runtime(reward_state_cost_t, device=device, dtype=dtype) * state_cost
+            )
+            reward_ctrl_cost_component = (
+                -_to_runtime(reward_ctrl_cost_t, device=device, dtype=dtype) * ctrl_cost
+            )
+            reward_base_formula_candidate = (
+                reward_bias_component
+                + reward_progress_component
+                + reward_potential_delta_component
+                + reward_state_cost_component
+                + reward_ctrl_cost_component
+            )
+            reward_candidate = reward_base_formula_candidate
+            materialized_override_mask = torch.zeros_like(valid, dtype=torch.bool)
+            if materialized_reward_candidate is not None and bool(torch.any(materialized_theta_preimage).item()):
+                materialized_override_mask = materialized_theta_preimage
+                reward_candidate = torch.where(
+                    materialized_theta_preimage,
+                    materialized_reward_candidate.to(dtype=dtype),
+                    reward_candidate,
+                )
+            reward_distribution_head = _to_runtime(reward_distribution_head_t, device=device) & valid
+            reward_distribution_head_component = torch.zeros_like(reward_candidate)
+            if shared_latent_factors is not None and bool(torch.any(reward_distribution_head).item()):
+                latent_rank = int(shared_latent_factors.shape[1])
+
+                def _latent_col(idx):
+                    return shared_latent_factors[:, min(int(idx), max(0, latent_rank - 1))]
+
+                z0 = _latent_col(0)
+                z1 = _latent_col(1)
+                z2 = _latent_col(2)
+                z3 = _latent_col(3)
+                z4 = _latent_col(4)
+                z5 = _latent_col(5)
+                head_shape = (
+                    z0
+                    + 0.70 * z1
+                    + 0.50 * z2
+                    + 0.35 * torch.relu(z3)
+                    - 0.35 * torch.relu(-z4)
+                    + 0.25 * z5
+                )
+                head_vol = torch.sqrt(shared_latent_factors.square().mean(dim=1).clamp_min(1e-8))
+                reward_head = (
+                    _to_runtime(reward_distribution_head_scale_t, device=device, dtype=dtype) * head_shape
+                    + _to_runtime(reward_distribution_head_vol_scale_t, device=device, dtype=dtype)
+                    * head_vol
+                    * torch.tanh(noise_scalar)
+                )
+                reward_distribution_head_component = torch.where(
+                    reward_distribution_head,
+                    reward_head,
+                    reward_distribution_head_component,
+                )
+                reward_candidate = torch.where(
+                    reward_distribution_head,
+                    reward_candidate + reward_head,
+                    reward_candidate,
+                )
+            paired_response_preimage = _to_runtime(paired_response_preimage_t, device=device) & valid
+            paired_response_component = torch.zeros_like(reward_candidate)
+            if shared_latent_factors is not None and bool(torch.any(paired_response_preimage).item()):
+                latent_rank = int(shared_latent_factors.shape[1])
+
+                def _paired_col(idx):
+                    return shared_latent_factors[:, min(int(idx), max(0, latent_rank - 1))]
+
+                p0 = _paired_col(0)
+                p1 = _paired_col(1)
+                p2 = _paired_col(2)
+                p3 = _paired_col(3)
+                p4 = _paired_col(4)
+                p5 = _paired_col(5)
+                paired_reward = (
+                    0.50 * p0
+                    + 0.35 * p1
+                    + 0.25 * p2
+                    + 0.20 * torch.tanh(p3)
+                    - 0.15 * torch.relu(-p4)
+                    + 0.10 * p5
+                    + 0.20 * action_scalar
+                )
+                paired_response_component = torch.where(
+                    paired_response_preimage,
+                    _to_runtime(paired_response_reward_scale_t, device=device, dtype=dtype)
+                    * paired_reward,
+                    paired_response_component,
+                )
+                reward_candidate = torch.where(
+                    paired_response_preimage,
+                    reward_candidate + paired_response_component,
+                    reward_candidate,
+                )
+            clock_override_mask = torch.zeros_like(valid, dtype=torch.bool)
+            reward_clock_component = torch.zeros_like(reward_candidate)
+            if clock_energy_signal is not None and clock_preimage_mask is not None:
+                reward_clock = clock_energy_signal
+                clock_override_mask = clock_preimage_mask & valid
+                reward_clock_component = torch.where(
+                    clock_override_mask,
+                    reward_clock,
+                    reward_clock_component,
+                )
+                reward_candidate = torch.where(
+                    clock_preimage_mask,
+                    reward_clock,
+                    reward_candidate,
+                )
+            reward_mix = _to_runtime(reward_mix_t, device=device, dtype=dtype) * valid_f
+            reward_new = reward_out.clone()
+            reward_new[:, 0] = (
+                (1.0 - reward_mix) * reward_out[:, 0]
+                + reward_mix * reward_candidate
+            )
+            reward_component_sum = (
+                reward_base_formula_candidate
+                + reward_distribution_head_component
+                + paired_response_component
+            )
+            reward_override_mask = materialized_override_mask | clock_override_mask
+            reward_reconstruction_residual = torch.where(
+                reward_override_mask,
+                torch.zeros_like(reward_candidate),
+                reward_candidate - reward_component_sum,
+            )
+            reward_new_reconstructed = (
+                (1.0 - reward_mix) * reward_out[:, 0]
+                + reward_mix * reward_candidate
+            )
+            reward_new_reconstruction_residual = reward_new[:, 0] - reward_new_reconstructed
+
+            log_components_flag = str(
+                os.environ.get(
+                    "TICL_EXACT_SCM_LOWTAIL_LOG_COMPONENTS",
+                    os.environ.get("TICL_PACK_LOG_LOWTAIL_REWARD_COMPONENTS", "0"),
+                )
+            ).strip().lower()
+            log_components = log_components_flag in {"1", "true", "yes", "on"}
+            if log_components:
+                def _log_component(value):
+                    return value.detach().to(device="cpu", dtype=torch.float32).clone()
+
+                transition_fn._last_exact_scm_lowtail_reward_components = {
+                    "valid_mask": _log_component(valid.to(dtype=dtype)),
+                    "override_mask": _log_component(reward_override_mask.to(dtype=dtype)),
+                    "materialized_override_mask": _log_component(materialized_override_mask.to(dtype=dtype)),
+                    "clock_override_mask": _log_component(clock_override_mask.to(dtype=dtype)),
+                    "reward_mix": _log_component(reward_mix),
+                    "reward_unit_base_before_mix": _log_component(reward_out[:, 0]),
+                    "reward_bias_component": _log_component(reward_bias_component),
+                    "reward_progress_component": _log_component(reward_progress_component),
+                    "reward_potential_delta_component": _log_component(reward_potential_delta_component),
+                    "reward_state_cost_component": _log_component(reward_state_cost_component),
+                    "reward_ctrl_cost_component": _log_component(reward_ctrl_cost_component),
+                    "reward_distribution_head_component": _log_component(reward_distribution_head_component),
+                    "reward_paired_response_component": _log_component(paired_response_component),
+                    "reward_clock_component": _log_component(reward_clock_component),
+                    "reward_base_formula_candidate": _log_component(reward_base_formula_candidate),
+                    "reward_component_sum": _log_component(reward_component_sum),
+                    "reward_candidate_final": _log_component(reward_candidate),
+                    "reward_unit_after_mix": _log_component(reward_new[:, 0]),
+                    "reward_reconstruction_residual": _log_component(reward_reconstruction_residual),
+                    "reward_new_reconstruction_residual": _log_component(reward_new_reconstruction_residual),
+                }
+            else:
+                transition_fn._last_exact_scm_lowtail_reward_components = None
+            if terminal_signal is None:
+                return state_new, reward_new
+            shared_terminal = _to_runtime(shared_energy_terminal_t, device=device)
+            shared_terminal = shared_terminal & valid
+            terminal_signal_new = terminal_signal
+            if shared_latent_factors is not None and bool(torch.any(paired_response_preimage).item()):
+                latent_rank = int(shared_latent_factors.shape[1])
+
+                def _done_col(idx):
+                    return shared_latent_factors[:, min(int(idx), max(0, latent_rank - 1))]
+
+                d0 = _done_col(0)
+                d1 = _done_col(1)
+                d2 = _done_col(2)
+                d3 = _done_col(3)
+                done_head = (
+                    0.55 * d0
+                    - 0.30 * d1
+                    + 0.25 * torch.tanh(d2 + 0.5 * d3)
+                    + 0.10 * torch.tanh(action_scalar)
+                )
+                terminal_signal_new = torch.where(
+                    paired_response_preimage.reshape(-1, 1),
+                    (
+                        _to_runtime(paired_response_done_scale_t, device=device, dtype=dtype)
+                        * done_head
+                    ).reshape(-1, 1),
+                    terminal_signal_new,
+                )
+            if materialized_done_signal is not None and bool(torch.any(materialized_theta_preimage).item()):
+                terminal_signal_new = torch.where(
+                    materialized_theta_preimage.reshape(-1, 1),
+                    materialized_done_signal.reshape(-1, 1).to(dtype=dtype),
+                    terminal_signal_new,
+                )
+            if bool(torch.any(shared_terminal).item()):
+                shared_energy_signal = reward_candidate.reshape(-1, 1)
+                terminal_signal_new = torch.where(
+                    shared_terminal.reshape(-1, 1),
+                    shared_energy_signal,
+                    terminal_signal,
+                )
+            if terminal_bonus_base is None:
+                return state_new, reward_new, terminal_signal_new
+            return state_new, reward_new, terminal_signal_new, terminal_bonus_base
+
+        self._copy_transition_generator_attrs(transition_fn, transition_fn_full)
+        transition_fn._exact_scm_gym_lowtail_family_enabled = True
+        transition_fn._exact_scm_gym_lowtail_family_active_mask = tuple(active_list)
+        transition_fn._exact_scm_gym_lowtail_family_uses_existing_state_action_noise_slots = True
+        transition_fn._exact_scm_gym_lowtail_shared_energy_terminal_enabled = tuple(
+            bool(v) for v in shared_energy_terminal_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_preimage_shared_scalar_enabled = tuple(
+            bool(v) for v in preimage_shared_scalar_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_state_obs_rank_preimage_enabled = tuple(
+            bool(v) for v in state_obs_rank_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled = tuple(
+            bool(v) for v in state_obs_temporal_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled = tuple(
+            bool(v) for v in state_obs_envelope_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled = tuple(
+            bool(v) for v in state_obs_hetero_scale_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_markov_carrier_preimage_enabled = tuple(
+            bool(v) for v in markov_carrier_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_materialized_theta_preimage_enabled = tuple(
+            bool(v) for v in materialized_theta_active_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_materialized_initial_state = materialized_initial_state_t
+        transition_fn._exact_scm_gym_lowtail_reward_distribution_head_enabled = tuple(
+            bool(v) for v in reward_distribution_head_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_clock_preimage_enabled = tuple(
+            bool(v) for v in clock_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_paired_response_preimage_enabled = tuple(
+            bool(v) for v in paired_response_preimage_t.detach().cpu().tolist()
+        )
+        transition_fn._exact_scm_gym_lowtail_family_standalone_generator = False
+        return transition_fn, {
+            "enabled": [bool(v) for v in enabled_t.detach().cpu().tolist()],
+            "active": active_list,
+            "shared_energy_terminal_enabled": [
+                bool(v) for v in shared_energy_terminal_t.detach().cpu().tolist()
+            ],
+            "preimage_shared_scalar_enabled": [
+                bool(v) for v in preimage_shared_scalar_t.detach().cpu().tolist()
+            ],
+            "state_obs_rank_preimage_enabled": [
+                bool(v) for v in state_obs_rank_preimage_t.detach().cpu().tolist()
+            ],
+            "state_obs_temporal_preimage_enabled": [
+                bool(v) for v in state_obs_temporal_preimage_t.detach().cpu().tolist()
+            ],
+            "state_obs_envelope_preimage_enabled": [
+                bool(v) for v in state_obs_envelope_preimage_t.detach().cpu().tolist()
+            ],
+            "state_obs_hetero_scale_preimage_enabled": [
+                bool(v) for v in state_obs_hetero_scale_preimage_t.detach().cpu().tolist()
+            ],
+            "markov_carrier_preimage_enabled": [
+                bool(v) for v in markov_carrier_preimage_t.detach().cpu().tolist()
+            ],
+            "materialized_theta_preimage_enabled": [
+                bool(v) for v in materialized_theta_active_t.detach().cpu().tolist()
+            ],
+            "reward_distribution_head_enabled": [
+                bool(v) for v in reward_distribution_head_t.detach().cpu().tolist()
+            ],
+            "clock_preimage_enabled": [
+                bool(v) for v in clock_preimage_t.detach().cpu().tolist()
+            ],
+            "paired_response_preimage_enabled": [
+                bool(v) for v in paired_response_preimage_t.detach().cpu().tolist()
+            ],
+            "reward_path_summary_valid": False,
+        }
+
     @staticmethod
     def _resolve_reward_state_input_gain_fraction_rejection_min(h):
         value = float(EnvironmentPrior._resolve_scalar(h.get("reward_state_input_gain_fraction_rejection_min", 0.0)))
@@ -4667,6 +6844,53 @@ class EnvironmentPrior:
             return 0.0
         return max(0.0, value)
 
+    def _resolve_reward_noise_input_gain_fraction_conditioned_min(self):
+        value = float(
+            self._resolve_scalar(
+                self.config.get(
+                    "reward_noise_input_gain_fraction_conditioned_min",
+                    0.0,
+                )
+            )
+        )
+        if not math.isfinite(value):
+            return 0.0
+        return max(0.0, value)
+
+    @staticmethod
+    def _resolve_reward_topology_conditioned_gain_metric_value(value):
+        metric = str(value or "fraction").strip().lower()
+        aliases = {
+            "": "fraction",
+            "gain_fraction": "fraction",
+            "input_gain_fraction": "fraction",
+            "per_dim_density_ratio": "density_ratio",
+            "density": "density_ratio",
+        }
+        metric = aliases.get(metric, metric)
+        if metric not in {"fraction", "density_ratio"}:
+            raise ValueError(
+                "reward topology gain metric must be one of "
+                "{fraction, density_ratio}; got "
+                f"{value!r}."
+            )
+        return metric
+
+    def _resolve_reward_topology_conditioned_state_gain_metric(self):
+        return self._resolve_reward_topology_conditioned_gain_metric_value(
+            self.config.get("reward_topology_conditioned_state_gain_metric", "fraction")
+        )
+
+    def _resolve_reward_topology_conditioned_action_gain_metric(self):
+        return self._resolve_reward_topology_conditioned_gain_metric_value(
+            self.config.get("reward_topology_conditioned_action_gain_metric", "fraction")
+        )
+
+    def _resolve_reward_topology_conditioned_noise_gain_metric(self):
+        return self._resolve_reward_topology_conditioned_gain_metric_value(
+            self.config.get("reward_topology_conditioned_noise_gain_metric", "fraction")
+        )
+
     def _resolve_reward_state_to_action_gain_ratio_conditioned_max(self):
         value = float(
             self._resolve_scalar(
@@ -4680,6 +6904,49 @@ class EnvironmentPrior:
             return 0.0
         return float(value)
 
+    @staticmethod
+    def _resolve_reward_topology_conditioned_ratio_metric_value(value):
+        metric = str(value or "total_gain").strip().lower()
+        aliases = {
+            "": "total_gain",
+            "gain": "total_gain",
+            "total": "total_gain",
+            "fraction": "total_gain",
+            "density": "density_ratio",
+            "per_dim_density_ratio": "density_ratio",
+        }
+        metric = aliases.get(metric, metric)
+        if metric not in {"total_gain", "density_ratio"}:
+            raise ValueError(
+                "reward topology ratio metric must be one of "
+                "{total_gain, density_ratio}; got "
+                f"{value!r}."
+            )
+        return metric
+
+    def _resolve_reward_topology_conditioned_state_to_action_ratio_metric(self):
+        return self._resolve_reward_topology_conditioned_ratio_metric_value(
+            self.config.get("reward_topology_conditioned_state_to_action_ratio_metric", "total_gain")
+        )
+
+    def _resolve_reward_state_to_noise_gain_ratio_conditioned_max(self):
+        value = float(
+            self._resolve_scalar(
+                self.config.get(
+                    "reward_state_to_noise_gain_ratio_conditioned_max",
+                    0.0,
+                )
+            )
+        )
+        if not math.isfinite(value) or value <= 0.0:
+            return 0.0
+        return float(value)
+
+    def _resolve_reward_topology_conditioned_state_to_noise_ratio_metric(self):
+        return self._resolve_reward_topology_conditioned_ratio_metric_value(
+            self.config.get("reward_topology_conditioned_state_to_noise_ratio_metric", "total_gain")
+        )
+
     def _resolve_reward_topology_conditioned_sampling_max_attempts(self):
         value = self._resolve_scalar(
             self.config.get("reward_topology_conditioned_sampling_max_attempts", 4096)
@@ -4687,6 +6954,13 @@ class EnvironmentPrior:
         if not math.isfinite(value):
             return 4096
         return max(1, int(round(value)))
+
+    def _resolve_reward_topology_conditioned_freeze_h_across_attempts(self):
+        return bool(
+            self._resolve_scalar(
+                self.config.get("reward_topology_conditioned_freeze_h_across_attempts", False)
+            )
+        )
 
     def _resolve_reward_topology_conditioned_sampling_enabled(self):
         explicit_enabled = bool(
@@ -4706,10 +6980,22 @@ class EnvironmentPrior:
         return {
             "state_min": float(self._resolve_reward_state_input_gain_fraction_conditioned_min()),
             "action_min": float(self._resolve_reward_action_input_gain_fraction_conditioned_min()),
+            "noise_min": float(self._resolve_reward_noise_input_gain_fraction_conditioned_min()),
+            "state_metric": self._resolve_reward_topology_conditioned_state_gain_metric(),
+            "action_metric": self._resolve_reward_topology_conditioned_action_gain_metric(),
+            "noise_metric": self._resolve_reward_topology_conditioned_noise_gain_metric(),
             "state_to_action_max": float(
                 self._resolve_reward_state_to_action_gain_ratio_conditioned_max()
             ),
+            "state_to_action_metric": self._resolve_reward_topology_conditioned_state_to_action_ratio_metric(),
+            "state_to_noise_max": float(
+                self._resolve_reward_state_to_noise_gain_ratio_conditioned_max()
+            ),
+            "state_to_noise_metric": self._resolve_reward_topology_conditioned_state_to_noise_ratio_metric(),
             "max_attempts": int(self._resolve_reward_topology_conditioned_sampling_max_attempts()),
+            "freeze_h_across_attempts": bool(
+                self._resolve_reward_topology_conditioned_freeze_h_across_attempts()
+            ),
         }
 
     @staticmethod
@@ -4718,6 +7004,13 @@ class EnvironmentPrior:
         if isinstance(enabled, str):
             enabled = enabled.strip().lower() in {"1", "true", "yes", "on"}
         return bool(enabled)
+
+    @staticmethod
+    def _resolve_reference_scm_zero_pad_inactive_init_enabled(h):
+        value = h.get("reference_scm_zero_pad_inactive_init_enabled", False)
+        if isinstance(value, str):
+            value = value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
 
     @staticmethod
     def _resolve_strict_joint_transition_enabled(h):
@@ -4799,13 +7092,143 @@ class EnvironmentPrior:
     def _sample_dims(self, h):
         action_dim = self._clamp_int(h["action_dim"], 1, 30)
         state_dim = self._clamp_int(h["state_dim"], 1, 400)
+        visible_fully_observed = False
         if self._resolve_constrained_dim_sampling_enabled(h):
             total_budget = self._clamp_int(h.get("constrained_dim_sampling_total_budget", 400), 1, 400)
-            state_dim = min(state_dim, total_budget)
+            policy = str(h.get("constrained_dim_sampling_policy", "state_first")).strip().lower()
+            if policy in {
+                "gym_state_obs_coupled",
+                "obs_state_coupled",
+                "gym_compatible",
+                "gym_obs_action_piecewise",
+                "gym_obs_action_visible_state_mix",
+                "gym_empirical_obs_action",
+            }:
+                if policy in {
+                    "gym_obs_action_piecewise",
+                    "gym_obs_action_visible_state_mix",
+                    "gym_empirical_obs_action",
+                }:
+                    def _piecewise_dim(u, bands):
+                        prev_p = 0.0
+                        for p, lo, hi in bands:
+                            p = float(p)
+                            lo = int(lo)
+                            hi = int(hi)
+                            if hi < lo:
+                                hi = lo
+                            if u < p:
+                                local = (float(u) - prev_p) / max(p - prev_p, 1e-12)
+                                return lo + int(local * (hi - lo + 1))
+                            prev_p = p
+                        return int(bands[-1][2])
 
-            obs_u = self._latent_uniform_from_h(h, "_constrained_obs_u")
-            obs_dim = 1 + int(obs_u * state_dim)
-            obs_dim = min(max(1, obs_dim), state_dim)
+                    def _empirical_dim(u, counts):
+                        total = float(sum(int(count) for _value, count in counts))
+                        cursor = 0.0
+                        target = min(max(float(u), 0.0), np.nextafter(1.0, 0.0)) * total
+                        for value, count in counts:
+                            cursor += float(int(count))
+                            if target < cursor:
+                                return int(value)
+                        return int(counts[-1][0])
+
+                    obs_u = self._latent_uniform_from_h(h, "_constrained_obs_u")
+                    if policy == "gym_empirical_obs_action":
+                        obs_dim = _empirical_dim(
+                            obs_u,
+                            (
+                                (2, 5),
+                                (3, 5),
+                                (4, 5),
+                                (8, 10),
+                                (9, 5),
+                                (10, 5),
+                                (11, 5),
+                                (17, 9),
+                                (24, 5),
+                                (105, 5),
+                                (348, 5),
+                            ),
+                        )
+                    else:
+                        obs_dim = _piecewise_dim(
+                            obs_u,
+                            (
+                                (0.75, 2, min(17, total_budget)),
+                                (0.90, min(18, total_budget), min(89, total_budget)),
+                                (1.00, min(90, total_budget), total_budget),
+                            ),
+                        )
+                    obs_dim = self._clamp_int(obs_dim, 1, total_budget)
+                    action_u = self._latent_uniform_from_h(h, "_constrained_action_u")
+                    if policy == "gym_empirical_obs_action":
+                        action_dim = _empirical_dim(
+                            action_u,
+                            (
+                                (1, 20),
+                                (2, 15),
+                                (3, 5),
+                                (4, 5),
+                                (6, 9),
+                                (8, 5),
+                                (17, 5),
+                            ),
+                        )
+                    else:
+                        action_dim = _piecewise_dim(
+                            action_u,
+                            (
+                                (0.75, 1, 6),
+                                (0.90, 7, 8),
+                                (1.00, 9, 17),
+                            ),
+                        )
+                    action_dim = self._clamp_int(action_dim, 1, 30)
+                else:
+                    obs_dim = self._clamp_int(h["obs_dim"], 1, total_budget)
+                hidden_budget = max(0, int(total_budget - obs_dim))
+                hidden_u = self._latent_uniform_from_h(h, "_constrained_state_extra_u")
+                visible_mix_fraction = float(h.get("constrained_dim_visible_state_mix_fraction", 0.15))
+                visible_mix_fraction = min(max(visible_mix_fraction, 0.0), 0.95)
+                visible_force = h.get("constrained_dim_visible_state_mix_fully_observed", None)
+                if visible_force is not None:
+                    visible_fully_observed = bool(visible_force)
+                else:
+                    visible_fully_observed = bool(
+                        policy == "gym_obs_action_visible_state_mix" and hidden_u < visible_mix_fraction
+                    )
+                if visible_fully_observed:
+                    hidden_extra = 0
+                else:
+                    if policy == "gym_obs_action_visible_state_mix":
+                        hidden_u = (hidden_u - visible_mix_fraction) / max(1.0 - visible_mix_fraction, 1e-12)
+                        hidden_u = min(max(hidden_u, 0.0), 1.0)
+                    if hidden_budget <= 0:
+                        hidden_extra = 0
+                    elif hidden_u < 0.60:
+                        local_u = hidden_u / 0.60
+                        hi = min(hidden_budget, max(1, obs_dim // 2))
+                        hidden_extra = int(local_u * (hi + 1))
+                    elif hidden_u < 0.90:
+                        local_u = (hidden_u - 0.60) / 0.30
+                        lo = min(hidden_budget, max(1, obs_dim // 2))
+                        hi = min(hidden_budget, max(lo, 2 * obs_dim))
+                        hidden_extra = lo + int(local_u * (hi - lo + 1))
+                    else:
+                        local_u = (hidden_u - 0.90) / 0.10
+                        lo = min(hidden_budget, max(1, 2 * obs_dim))
+                        hi = hidden_budget
+                        hidden_extra = lo + int(local_u * (hi - lo + 1))
+                if hidden_budget <= 0:
+                    hidden_extra = 0
+                state_dim = min(total_budget, max(obs_dim, obs_dim + hidden_extra))
+            else:
+                state_dim = min(state_dim, total_budget)
+
+                obs_u = self._latent_uniform_from_h(h, "_constrained_obs_u")
+                obs_dim = 1 + int(obs_u * state_dim)
+                obs_dim = min(max(1, obs_dim), state_dim)
 
             remaining_budget = max(0, int(total_budget - state_dim))
             if remaining_budget <= 0:
@@ -4813,9 +7236,37 @@ class EnvironmentPrior:
                 zero_pad_dim = 0
             else:
                 noise_u = self._latent_uniform_from_h(h, "_constrained_noise_u")
-                noise_dim = 1 + int(noise_u * remaining_budget)
-                noise_dim = min(max(1, noise_dim), remaining_budget)
-                zero_pad_dim = remaining_budget - noise_dim
+                noise_policy = str(h.get("constrained_dim_noise_policy", "remaining_uniform")).strip().lower()
+                if noise_policy in {"gym_low", "gym_low_noise", "low_gym"}:
+                    if noise_u < 0.50:
+                        local_u = noise_u / 0.50
+                        hi = min(4, remaining_budget)
+                        noise_dim = int(local_u * (hi + 1))
+                    elif noise_u < 0.85:
+                        local_u = (noise_u - 0.50) / 0.35
+                        lo = min(remaining_budget, 5)
+                        hi = min(remaining_budget, 16)
+                        noise_dim = lo if hi <= lo else lo + int(local_u * (hi - lo + 1))
+                    else:
+                        local_u = (noise_u - 0.85) / 0.15
+                        lo = min(remaining_budget, 17)
+                        hi = min(remaining_budget, 64)
+                        noise_dim = lo if hi <= lo else lo + int(local_u * (hi - lo + 1))
+                    noise_dim = min(max(0, noise_dim), remaining_budget)
+                    zero_pad_dim = remaining_budget - noise_dim
+                elif bool(visible_fully_observed):
+                    noise_cap = min(8, remaining_budget)
+                    if noise_u < 0.50:
+                        noise_dim = 0
+                    else:
+                        local_u = (noise_u - 0.50) / 0.50
+                        noise_dim = 1 + int(local_u * noise_cap)
+                    noise_dim = min(max(0, noise_dim), remaining_budget)
+                    zero_pad_dim = remaining_budget - noise_dim
+                else:
+                    noise_dim = 1 + int(noise_u * remaining_budget)
+                    noise_dim = min(max(1, noise_dim), remaining_budget)
+                    zero_pad_dim = remaining_budget - noise_dim
         else:
             obs_dim = self._clamp_int(h["obs_dim"], 1, 400)
             obs_dim = min(obs_dim, state_dim)  # obs is subset of state.
@@ -4870,12 +7321,34 @@ class EnvironmentPrior:
         return state_t / scale
 
     @staticmethod
+    def _scale_obs_output_token(obs_t, obs_output_scale):
+        scale = obs_output_scale
+        if not torch.is_tensor(scale):
+            scale = torch.as_tensor(scale, device=obs_t.device, dtype=obs_t.dtype)
+        else:
+            scale = scale.to(device=obs_t.device, dtype=obs_t.dtype)
+        while scale.ndim < obs_t.ndim:
+            scale = scale.unsqueeze(-1)
+        return obs_t * torch.clamp(scale, min=1e-6)
+
+    @staticmethod
     def _resolve_state_full_rms_enabled(h):
         return maintained_resolve_state_full_rms_enabled(h)
 
     @staticmethod
     def _resolve_state_full_rms_target(h):
         return maintained_resolve_state_full_rms_target(h)
+
+    @staticmethod
+    def _resolve_state_full_rms_floor_enabled(h):
+        return EnvironmentPrior._coerce_bool(h.get("state_full_rms_floor_enabled", False))
+
+    @staticmethod
+    def _resolve_state_full_rms_max_upscale(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("state_full_rms_max_upscale", 4.0))
+        if not math.isfinite(v):
+            return 1.0
+        return float(max(1.0, v))
 
     @staticmethod
     def _resolve_ctrl_reward_weight(h):
@@ -5074,6 +7547,8 @@ class EnvironmentPrior:
         *,
         enabled=False,
         target=1.0,
+        floor_enabled=False,
+        max_upscale=4.0,
         state_mask=None,
         eps=1e-6,
     ):
@@ -5109,7 +7584,30 @@ class EnvironmentPrior:
         while target_t.ndim < rms.ndim:
             target_t = target_t.unsqueeze(-1)
         target_t = torch.clamp(target_t, min=float(eps))
-        scale = torch.clamp(rms / target_t.squeeze(-1), min=1.0)
+        ratio = rms / target_t.squeeze(-1)
+        floor_value = floor_enabled
+        if torch.is_tensor(floor_value):
+            floor_value = floor_value.to(device=state_next.device)
+            if floor_value.dtype != torch.bool:
+                floor_value = floor_value != 0
+            while floor_value.ndim < ratio.ndim:
+                floor_value = floor_value.unsqueeze(-1)
+        else:
+            floor_value = bool(floor_value)
+        max_up = max_upscale
+        if not torch.is_tensor(max_up):
+            max_up = torch.as_tensor(max_up, device=state_next.device, dtype=state_next.dtype)
+        else:
+            max_up = max_up.to(device=state_next.device, dtype=state_next.dtype)
+        while max_up.ndim < ratio.ndim:
+            max_up = max_up.unsqueeze(-1)
+        min_ratio = torch.reciprocal(max_up.clamp_min(1.0))
+        capped_ratio = torch.clamp(ratio, min=1.0)
+        floored_ratio = torch.clamp(ratio, min=min_ratio)
+        if isinstance(floor_value, bool):
+            scale = floored_ratio if floor_value else capped_ratio
+        else:
+            scale = torch.where(floor_value, floored_ratio, capped_ratio)
         scale = scale.detach()
         while scale.ndim < state_next.ndim:
             scale = scale.unsqueeze(-1)
@@ -5125,6 +7623,20 @@ class EnvironmentPrior:
     @staticmethod
     def _resolve_terminal_reset_count_target(h):
         return maintained_resolve_terminal_reset_count_target(h)
+
+    @staticmethod
+    def _resolve_terminal_reset_min_step_enabled(h):
+        value = h.get("terminal_reset_min_step_enabled", False)
+        if isinstance(value, str):
+            value = value.strip().lower() in {"1", "true", "yes", "on"}
+        return bool(value)
+
+    @staticmethod
+    def _resolve_terminal_reset_min_step_target(h):
+        value = EnvironmentPrior._resolve_scalar(h.get("terminal_reset_min_step_target", 0))
+        if not math.isfinite(float(value)):
+            return 0.0
+        return max(0.0, float(value))
 
     @staticmethod
     def _resolve_terminal_bonus_tanh_c(h):
@@ -5650,6 +8162,8 @@ class EnvironmentPrior:
         history_index=None,
         history_warmup_count=None,
         history_relaxed_mask=None,
+        terminal_reset_min_step_target=None,
+        step_index=None,
         return_aux=False,
     ):
         enabled_t = enabled
@@ -5672,6 +8186,16 @@ class EnvironmentPrior:
         prob_t = torch.as_tensor(reset_prob, device=state_next.device, dtype=state_next.dtype)
         while prob_t.ndim < reward_next.ndim:
             prob_t = prob_t.unsqueeze(0)
+        if terminal_reset_min_step_target is not None and step_index is not None:
+            min_step_t = torch.as_tensor(
+                terminal_reset_min_step_target,
+                device=state_next.device,
+                dtype=state_next.dtype,
+            )
+            while min_step_t.ndim < prob_t.ndim:
+                min_step_t = min_step_t.unsqueeze(0)
+            step_t = torch.as_tensor(float(step_index), device=state_next.device, dtype=state_next.dtype)
+            prob_t = torch.where(step_t >= min_step_t, prob_t, torch.zeros_like(prob_t))
         bonus_scale_t = self._terminal_bonus_scale_from_draw(
             bonus_scale_draw.to(device=state_next.device, dtype=state_next.dtype),
             scale_min=bonus_scale_min,
@@ -6440,6 +8964,13 @@ class EnvironmentPrior:
         return float(max(1e-6, v))
 
     @staticmethod
+    def _resolve_obs_output_scale(h):
+        v = EnvironmentPrior._resolve_scalar(h.get("obs_output_scale", 1.0))
+        if not math.isfinite(v):
+            return 1.0
+        return float(max(1e-6, v))
+
+    @staticmethod
     def _apply_state_postprocess(
         state_next_raw,
         state_prev,
@@ -6488,6 +9019,45 @@ class EnvironmentPrior:
         state_mixed = lam_t * state_prev + (1.0 - lam_t) * state_bounded
         if enabled_mask is not None:
             return torch.where(enabled_mask, state_mixed, state_bounded)
+        return state_mixed
+
+    @staticmethod
+    def _apply_state_highway_only(
+        state_next,
+        state_prev,
+        *,
+        state_highway_enabled=False,
+        state_highway_lambda=0.0,
+    ):
+        enabled = EnvironmentPrior._coerce_bool(state_highway_enabled)
+        if torch.is_tensor(enabled):
+            enabled_mask = enabled.to(device=state_next.device)
+            if enabled_mask.dtype != torch.bool:
+                enabled_mask = enabled_mask != 0
+            if enabled_mask.ndim == state_next.ndim - 1:
+                enabled_mask = enabled_mask.unsqueeze(-1)
+            if not bool(enabled_mask.any().item()):
+                return state_next
+        elif not bool(enabled):
+            return state_next
+        else:
+            enabled_mask = None
+
+        lam = state_highway_lambda
+        if torch.is_tensor(lam):
+            lam_t = lam.to(device=state_next.device, dtype=state_next.dtype)
+            if lam_t.ndim == state_next.ndim - 1:
+                lam_t = lam_t.unsqueeze(-1)
+            lam_t = lam_t.clamp(0.0, 1.0)
+        else:
+            lam_t = float(lam)
+            if not math.isfinite(lam_t):
+                lam_t = 0.0
+            lam_t = min(1.0, max(0.0, lam_t))
+
+        state_mixed = lam_t * state_prev + (1.0 - lam_t) * state_next
+        if enabled_mask is not None:
+            return torch.where(enabled_mask, state_mixed, state_next)
         return state_mixed
 
     @staticmethod
@@ -6545,6 +9115,8 @@ class EnvironmentPrior:
         state_highway_lambda=0.0,
         state_full_rms_enabled=False,
         state_full_rms_target=1.0,
+        state_full_rms_floor_enabled=False,
+        state_full_rms_max_upscale=4.0,
         state_mask=None,
     ):
         visible_state_next = generated_state_next
@@ -6582,12 +9154,37 @@ class EnvironmentPrior:
                     state_highway_lambda=state_highway_lambda,
                 )
                 visible_state_next = torch.where(ref_mask, visible_state_next, visible_state_post)
+            reference_highway_mask = ref_mask
+            highway_enabled = EnvironmentPrior._coerce_bool(state_highway_enabled)
+            if torch.is_tensor(highway_enabled):
+                highway_mask = highway_enabled.to(device=visible_state_next.device)
+                if highway_mask.dtype != torch.bool:
+                    highway_mask = highway_mask != 0
+                if highway_mask.ndim == visible_state_next.ndim - 1:
+                    highway_mask = highway_mask.unsqueeze(-1)
+                reference_highway_mask = reference_highway_mask & highway_mask
+            elif not bool(highway_enabled):
+                reference_highway_mask = torch.zeros_like(reference_highway_mask, dtype=torch.bool)
+            if bool(reference_highway_mask.any().item()):
+                visible_state_next = self._apply_state_highway_only(
+                    visible_state_next,
+                    visible_state_prev,
+                    state_highway_enabled=reference_highway_mask,
+                    state_highway_lambda=state_highway_lambda,
+                )
         elif not bool(ref_enabled):
             visible_state_next = self._apply_state_postprocess(
                 state_next_raw=visible_state_next,
                 state_prev=visible_state_prev,
                 state_clip=state_clip,
                 state_output_scale=state_output_scale,
+                state_highway_enabled=state_highway_enabled,
+                state_highway_lambda=state_highway_lambda,
+            )
+        else:
+            visible_state_next = self._apply_state_highway_only(
+                visible_state_next,
+                visible_state_prev,
                 state_highway_enabled=state_highway_enabled,
                 state_highway_lambda=state_highway_lambda,
             )
@@ -6612,6 +9209,8 @@ class EnvironmentPrior:
             visible_state_next,
             enabled=state_full_rms_enabled,
             target=state_full_rms_target,
+            floor_enabled=state_full_rms_floor_enabled,
+            max_upscale=state_full_rms_max_upscale,
             state_mask=state_mask,
         )
         return visible_state_next
@@ -6671,10 +9270,13 @@ class EnvironmentPrior:
         reward_clip = float(max(0.1, self._resolve_scalar(h.get("reward_clip", 10.0))))
         state_clip = float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0))))
         state_output_scale = float(self._resolve_state_output_scale(h))
+        obs_output_scale = float(self._resolve_obs_output_scale(h))
         state_input_scale_enabled = bool(self._resolve_state_input_scale_enabled(h))
         state_input_scale = float(self._resolve_state_input_scale(h))
         state_full_rms_enabled = bool(self._resolve_state_full_rms_enabled(h))
         state_full_rms_target = float(self._resolve_state_full_rms_target(h))
+        state_full_rms_floor_enabled = bool(self._resolve_state_full_rms_floor_enabled(h))
+        state_full_rms_max_upscale = float(self._resolve_state_full_rms_max_upscale(h))
         ctrl_reward_weight = float(self._resolve_ctrl_reward_weight(h))
         ctrl_reward_enabled = bool(
             self._sample_exact_scm_reward_term_enabled(
@@ -6699,6 +9301,11 @@ class EnvironmentPrior:
         reinforce_action_rms_eps = float(self._resolve_reinforce_action_rms_eps(h))
         reinforce_action_clip_bound = float(self._resolve_reinforce_action_clip_bound(h))
         terminal_reset_count_target = float(self._resolve_terminal_reset_count_target(h))
+        terminal_reset_min_step_target = (
+            float(self._resolve_terminal_reset_min_step_target(h))
+            if self._resolve_terminal_reset_min_step_enabled(h)
+            else 0.0
+        )
         terminal_bonus_tanh_c = float(self._resolve_terminal_bonus_tanh_c(h))
         terminal_bonus_scale_min = float(self._resolve_terminal_bonus_scale_min(h))
         terminal_bonus_scale_max = float(self._resolve_terminal_bonus_scale_max(h))
@@ -6709,6 +9316,35 @@ class EnvironmentPrior:
                 state_dim,
                 terminal_bonus_tanh_c=terminal_bonus_tanh_c,
             )
+        pendulum_settle_enabled = [
+            bool(self._sample_pendulum_settle_yield_repair_enabled(h))
+        ]
+        transition_generator, pendulum_settle_meta = self._wrap_transition_with_pendulum_settle_yield_repair(
+            transition_generator,
+            h_list=[h],
+            enabled_values=pendulum_settle_enabled,
+            state_dims=torch.tensor([state_dim], device=device, dtype=torch.long),
+            obs_input_dims=torch.tensor([int(input_layout["obs_input_dim"])], device=device, dtype=torch.long),
+            action_dims=torch.tensor([action_dim], device=device, dtype=torch.long),
+            common_action_start=torch.tensor([int(input_layout["action_start"])], device=device, dtype=torch.long),
+            family=family,
+        )
+        gym_lowtail_enabled = [
+            bool(self._sample_exact_scm_gym_lowtail_family_enabled(h))
+        ]
+        transition_generator, gym_lowtail_meta = self._wrap_transition_with_exact_scm_gym_lowtail_family(
+            transition_generator,
+            h_list=[h],
+            enabled_values=gym_lowtail_enabled,
+            state_dims=torch.tensor([state_dim], device=device, dtype=torch.long),
+            obs_dims=torch.tensor([obs_dim], device=device, dtype=torch.long),
+            obs_input_dims=torch.tensor([int(input_layout["obs_input_dim"])], device=device, dtype=torch.long),
+            action_dims=torch.tensor([action_dim], device=device, dtype=torch.long),
+            noise_dims=torch.tensor([noise_dim], device=device, dtype=torch.long),
+            common_action_start=torch.tensor([int(input_layout["action_start"])], device=device, dtype=torch.long),
+            common_noise_start=torch.tensor([int(input_layout["noise_start"])], device=device, dtype=torch.long),
+            family=family,
+        )
         state_highway_enabled = bool(self._resolve_state_highway_enabled(h))
         state_highway_lambda = float(self._resolve_state_highway_lambda(h))
         reward_dropout_enabled = bool(h.get("reward_dropout_enabled", True))
@@ -6721,8 +9357,6 @@ class EnvironmentPrior:
             reward_scale = 1.0
             reward_clip = float("inf")
             state_clip = float("inf")
-            state_highway_enabled = False
-            state_highway_lambda = 0.0
             reward_dropout_enabled = False
             reward_dropout_impute_zero = True
             reward_dropout_ratio = 0.0
@@ -6734,6 +9368,19 @@ class EnvironmentPrior:
             dtype=torch.float32,
             generator=local_generator,
         )
+        materialized_initial_state = getattr(
+            transition_generator,
+            "_exact_scm_gym_lowtail_materialized_initial_state",
+            None,
+        )
+        if torch.is_tensor(materialized_initial_state):
+            materialized_initial_state = materialized_initial_state.to(device=device, dtype=initial_state.dtype)
+            if tuple(materialized_initial_state.shape) == (1, int(state_dim)):
+                materialized_mask = bool(
+                    (gym_lowtail_meta.get("materialized_theta_preimage_enabled", [False]) or [False])[0]
+                )
+                if materialized_mask:
+                    initial_state = materialized_initial_state[0].clone()
 
         env = {
             "family": family,
@@ -6771,10 +9418,13 @@ class EnvironmentPrior:
             "reward_clip": reward_clip,
             "state_clip": state_clip,
             "state_output_scale": state_output_scale,
+            "obs_output_scale": obs_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "state_full_rms_floor_enabled": state_full_rms_floor_enabled,
+            "state_full_rms_max_upscale": state_full_rms_max_upscale,
             "ctrl_reward_weight": ctrl_reward_weight,
             "ctrl_reward_enabled": ctrl_reward_enabled,
             "survival_reward_weight": survival_reward_weight,
@@ -6788,6 +9438,7 @@ class EnvironmentPrior:
             "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
+            "terminal_reset_min_step_target": terminal_reset_min_step_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
             "terminal_bonus_scale_min": terminal_bonus_scale_min,
             "terminal_bonus_scale_max": terminal_bonus_scale_max,
@@ -6796,28 +9447,107 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
+            "pendulum_settle_yield_repair_enabled": bool(pendulum_settle_meta["enabled"][0]),
+            "pendulum_settle_yield_repair_active": bool(pendulum_settle_meta["active"][0]),
+            "pendulum_settle_yield_repair_standalone_generator": False,
+            "pendulum_settle_yield_repair_uses_existing_state_action_slots": True,
+            "pendulum_settle_yield_repair_reward_path_summary_valid": bool(
+                pendulum_settle_meta.get("reward_path_summary_valid", True)
+            ),
+            "exact_scm_gym_lowtail_family_enabled": bool(gym_lowtail_meta["enabled"][0]),
+            "exact_scm_gym_lowtail_family_active": bool(gym_lowtail_meta["active"][0]),
+            "exact_scm_gym_lowtail_family_standalone_generator": False,
+            "exact_scm_gym_lowtail_family_uses_existing_state_action_noise_slots": True,
+            "exact_scm_gym_lowtail_shared_energy_terminal_enabled": bool(
+                gym_lowtail_meta.get("shared_energy_terminal_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_preimage_shared_scalar_enabled": bool(
+                gym_lowtail_meta.get("preimage_shared_scalar_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled": bool(
+                gym_lowtail_meta.get("state_obs_rank_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled": bool(
+                gym_lowtail_meta.get("state_obs_temporal_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled": bool(
+                gym_lowtail_meta.get("state_obs_envelope_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled": bool(
+                gym_lowtail_meta.get("state_obs_hetero_scale_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_markov_carrier_preimage_enabled": bool(
+                gym_lowtail_meta.get("markov_carrier_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_reward_distribution_head_enabled": bool(
+                gym_lowtail_meta.get("reward_distribution_head_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_clock_preimage_enabled": bool(
+                gym_lowtail_meta.get("clock_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_paired_response_preimage_enabled": bool(
+                gym_lowtail_meta.get("paired_response_preimage_enabled", [False])[0]
+            ),
+            "exact_scm_gym_lowtail_reward_linear_weight": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_linear_weight", 1.25, min_value=-10.0, max_value=10.0
+                )
+            ),
+            "exact_scm_gym_lowtail_reward_potential_delta_weight": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h,
+                    "exact_scm_gym_lowtail_reward_potential_delta_weight",
+                    0.0,
+                    min_value=-10.0,
+                    max_value=10.0,
+                )
+            ),
+            "exact_scm_gym_lowtail_reward_state_cost": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_state_cost", 0.05, min_value=0.0, max_value=10.0
+                )
+            ),
+            "exact_scm_gym_lowtail_reward_ctrl_cost": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_ctrl_cost", 0.02, min_value=0.0, max_value=10.0
+                )
+            ),
+            "exact_scm_gym_lowtail_action_gain": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_action_gain", 0.60, min_value=-4.0, max_value=4.0
+                )
+            ),
+            "exact_scm_gym_lowtail_noise_gain": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_noise_gain", 0.35, min_value=0.0, max_value=4.0
+                )
+            ),
+            "exact_scm_gym_lowtail_reward_mix": float(
+                self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_mix", 1.0, min_value=0.0, max_value=1.0
+                )
+            ),
+            "base_reward_retention_fraction": float(h.get("base_reward_retention_fraction", 0.0)),
+            "potential_progress_preserves_base_reward_via_mix": bool(
+                h.get("potential_progress_preserves_base_reward_via_mix", False)
+            ),
+            "potential_progress_reward_axis_target": str(
+                h.get("potential_progress_reward_axis_target", "none")
+            ),
+            "potential_progress_reward_axis_rule": str(
+                h.get("potential_progress_reward_axis_rule", "none")
+            ),
+            "potential_progress_reward_formula_path": str(
+                h.get("potential_progress_reward_formula_path", "none")
+            ),
         }
         reward_gain_summary = self._reference_exact_scm_reward_input_gain_summary(env)
-        if reward_gain_summary is not None:
-            env.update(
-                {
-                    "reward_state_input_gain_fraction": float(
-                        reward_gain_summary["reward_state_input_gain_fraction"]
-                    ),
-                    "reward_action_input_gain_fraction": float(
-                        reward_gain_summary["reward_action_input_gain_fraction"]
-                    ),
-                    "reward_noise_input_gain_fraction": float(
-                        reward_gain_summary["reward_noise_input_gain_fraction"]
-                    ),
-                    "reward_state_to_noise_gain_ratio": float(
-                        reward_gain_summary["reward_state_to_noise_gain_ratio"]
-                    ),
-                    "reward_state_to_action_gain_ratio": float(
-                        reward_gain_summary["reward_state_to_action_gain_ratio"]
-                    ),
-                }
-            )
+        if (
+            reward_gain_summary is not None
+            and bool(env.get("pendulum_settle_yield_repair_reward_path_summary_valid", True))
+            and not bool(env.get("exact_scm_gym_lowtail_family_active", False))
+        ):
+            env.update({key: float(value) for key, value in reward_gain_summary.items()})
         return env
 
     def _sample_environment(self, h, device, rng_seed=None):
@@ -6929,14 +9659,24 @@ class EnvironmentPrior:
         accepted_attempts,
         accepted_state_gains,
         accepted_action_gains,
+        accepted_noise_gains,
         accepted_state_to_action_ratios,
+        accepted_state_to_noise_ratios,
         total_candidate_draws,
         device,
     ):
         thresholds = self._reward_topology_conditioning_thresholds()
         state_min = float(thresholds["state_min"])
         action_min = float(thresholds["action_min"])
+        noise_min = float(thresholds["noise_min"])
+        state_metric = str(thresholds["state_metric"])
+        action_metric = str(thresholds["action_metric"])
+        noise_metric = str(thresholds["noise_metric"])
         ratio_max = float(thresholds["state_to_action_max"])
+        state_to_action_metric = str(thresholds["state_to_action_metric"])
+        state_to_noise_max = float(thresholds["state_to_noise_max"])
+        state_to_noise_metric = str(thresholds["state_to_noise_metric"])
+        freeze_h_across_attempts = bool(thresholds.get("freeze_h_across_attempts", False))
         explicit_enabled = bool(
             self._resolve_scalar(
                 self.config.get("reward_topology_conditioned_sampling_enabled", False)
@@ -6953,9 +9693,16 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        env["reward_topology_conditioned_state_gain_metric"] = [state_metric for _ in h_list]
         env["reward_topology_conditioned_sampling_enabled"] = torch.full(
             (len(h_list),),
             bool(explicit_enabled),
+            device=device,
+            dtype=torch.bool,
+        )
+        env["reward_topology_conditioned_freeze_h_across_attempts"] = torch.full(
+            (len(h_list),),
+            bool(freeze_h_across_attempts),
             device=device,
             dtype=torch.bool,
         )
@@ -6965,12 +9712,32 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        env["reward_topology_conditioned_action_gain_metric"] = [action_metric for _ in h_list]
+        env["reward_noise_input_gain_fraction_conditioned_min"] = torch.full(
+            (len(h_list),),
+            float(noise_min),
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_topology_conditioned_noise_gain_metric"] = [noise_metric for _ in h_list]
         env["reward_state_to_action_gain_ratio_conditioned_max"] = torch.full(
             (len(h_list),),
             float(ratio_max),
             device=device,
             dtype=torch.float32,
         )
+        env["reward_topology_conditioned_state_to_action_ratio_metric"] = [
+            state_to_action_metric for _ in h_list
+        ]
+        env["reward_state_to_noise_gain_ratio_conditioned_max"] = torch.full(
+            (len(h_list),),
+            float(state_to_noise_max),
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_topology_conditioned_state_to_noise_ratio_metric"] = [
+            state_to_noise_metric for _ in h_list
+        ]
         env["reward_state_input_gain_fraction_conditioned_attempt"] = torch.as_tensor(
             accepted_attempts,
             device=device,
@@ -6997,8 +9764,18 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        env["reward_noise_input_gain_fraction_conditioned_accepted_gain"] = torch.as_tensor(
+            accepted_noise_gains,
+            device=device,
+            dtype=torch.float32,
+        )
         env["reward_state_to_action_gain_ratio_conditioned_accepted_ratio"] = torch.as_tensor(
             accepted_state_to_action_ratios,
+            device=device,
+            dtype=torch.float32,
+        )
+        env["reward_state_to_noise_gain_ratio_conditioned_accepted_ratio"] = torch.as_tensor(
+            accepted_state_to_noise_ratios,
             device=device,
             dtype=torch.float32,
         )
@@ -7041,12 +9818,27 @@ class EnvironmentPrior:
         thresholds = self._reward_topology_conditioning_thresholds()
         state_min = float(thresholds["state_min"])
         action_min = float(thresholds["action_min"])
+        noise_min = float(thresholds["noise_min"])
+        state_metric = str(thresholds["state_metric"])
+        action_metric = str(thresholds["action_metric"])
+        noise_metric = str(thresholds["noise_metric"])
         ratio_max = float(thresholds["state_to_action_max"])
+        state_to_action_metric = str(thresholds["state_to_action_metric"])
+        state_to_noise_max = float(thresholds["state_to_noise_max"])
+        state_to_noise_metric = str(thresholds["state_to_noise_metric"])
         max_attempts = int(thresholds["max_attempts"])
-        if state_min <= 0.0 and action_min <= 0.0 and ratio_max <= 0.0:
+        freeze_h_across_attempts = bool(thresholds.get("freeze_h_across_attempts", False))
+        if (
+            state_min <= 0.0
+            and action_min <= 0.0
+            and noise_min <= 0.0
+            and ratio_max <= 0.0
+            and state_to_noise_max <= 0.0
+        ):
             raise ValueError(
                 "topology-conditioned sampling requires at least one active criterion: "
-                "state_gain_min > 0, action_gain_min > 0, or state_to_action_ratio_max > 0"
+                "state_gain_min > 0, action_gain_min > 0, noise_gain_min > 0, "
+                "state_to_action_ratio_max > 0, or state_to_noise_ratio_max > 0"
             )
         base_seeds = (
             [int(s) for s in rng_seeds]
@@ -7061,13 +9853,29 @@ class EnvironmentPrior:
         accepted_attempts = [0] * batch_size
         accepted_state_gains = [float("nan")] * batch_size
         accepted_action_gains = [float("nan")] * batch_size
+        accepted_noise_gains = [float("nan")] * batch_size
         accepted_state_to_action_ratios = [float("nan")] * batch_size
+        accepted_state_to_noise_ratios = [float("nan")] * batch_size
         best_state_gains = [-float("inf")] * batch_size
         best_action_gains = [-float("inf")] * batch_size
+        best_noise_gains = [-float("inf")] * batch_size
         best_state_to_action_ratios = [float("inf")] * batch_size
+        best_state_to_noise_ratios = [float("inf")] * batch_size
         pending = set(range(batch_size))
         attempt_idx = 0
         total_draws = 0
+        frozen_attempt_h_list = None
+        if freeze_h_across_attempts:
+            frozen_attempt_h_list = self._sample_batch_hypers(batch_size)
+            frozen_attempt_h_list = self._apply_visible_state_mix_batch_slot_policy(
+                frozen_attempt_h_list,
+                list(range(batch_size)),
+                batch_size=batch_size,
+            )
+            frozen_attempt_h_list = self._materialize_constrained_dim_sampling_latents(
+                frozen_attempt_h_list
+            )
+            self._validate_vectorized_reward_state_gain_conditioned_h_list(frozen_attempt_h_list)
 
         while pending:
             if attempt_idx >= max_attempts:
@@ -7075,7 +9883,9 @@ class EnvironmentPrior:
                     (
                         f"{idx}:best_state={float(best_state_gains[idx]):.6f},"
                         f"best_action={float(best_action_gains[idx]):.6f},"
-                        f"best_ratio={float(best_state_to_action_ratios[idx]):.6f}"
+                        f"best_noise={float(best_noise_gains[idx]):.6f},"
+                        f"best_state_action_ratio={float(best_state_to_action_ratios[idx]):.6f},"
+                        f"best_state_noise_ratio={float(best_state_to_noise_ratios[idx]):.6f}"
                     )
                     for idx in sorted(pending)
                 )
@@ -7083,11 +9893,23 @@ class EnvironmentPrior:
                     "failed to sample exact SCM environments satisfying topology-conditioned "
                     f"criteria within {int(max_attempts)} candidate rounds; "
                     f"state_min={state_min:.6f}, action_min={action_min:.6f}, "
-                    f"state_to_action_max={ratio_max:.6f}; {pending_str}"
+                    f"state_metric={state_metric}, action_metric={action_metric}, noise_min={noise_min:.6f}, "
+                    f"noise_metric={noise_metric}, state_to_action_max={ratio_max:.6f}, "
+                    f"state_to_action_metric={state_to_action_metric}, "
+                    f"state_to_noise_max={state_to_noise_max:.6f}, "
+                    f"state_to_noise_metric={state_to_noise_metric}; {pending_str}"
                 )
             active = [i for i in range(batch_size) if i in pending]
-            candidate_h_list = self._sample_batch_hypers(len(active))
-            self._validate_vectorized_reward_state_gain_conditioned_h_list(candidate_h_list)
+            if frozen_attempt_h_list is None:
+                candidate_h_list = self._sample_batch_hypers(len(active))
+                candidate_h_list = self._apply_visible_state_mix_batch_slot_policy(
+                    candidate_h_list,
+                    active,
+                    batch_size=batch_size,
+                )
+                self._validate_vectorized_reward_state_gain_conditioned_h_list(candidate_h_list)
+            else:
+                candidate_h_list = [copy.deepcopy(frozen_attempt_h_list[i]) for i in active]
             candidate_seeds = [int(base_seeds[i]) + int(attempt_idx) for i in active]
             candidate_env = self._sample_environment_family_coarse_batch(
                 h_list=candidate_h_list,
@@ -7098,13 +9920,42 @@ class EnvironmentPrior:
                 _disable_rejection=True,
             )
             total_draws += len(active)
-            state_gains = candidate_env.get("reward_state_input_gain_fraction", None)
-            action_gains = candidate_env.get("reward_action_input_gain_fraction", None)
-            state_to_action_ratios = candidate_env.get("reward_state_to_action_gain_ratio", None)
+            state_gains = candidate_env.get(
+                "reward_state_input_gain_density_ratio"
+                if state_metric == "density_ratio"
+                else "reward_state_input_gain_fraction",
+                None,
+            )
+            action_gains = candidate_env.get(
+                "reward_action_input_gain_density_ratio"
+                if action_metric == "density_ratio"
+                else "reward_action_input_gain_fraction",
+                None,
+            )
+            noise_gains = candidate_env.get(
+                "reward_noise_input_gain_density_ratio"
+                if noise_metric == "density_ratio"
+                else "reward_noise_input_gain_fraction",
+                None,
+            )
+            state_to_action_ratios = candidate_env.get(
+                "reward_state_to_action_gain_density_ratio"
+                if state_to_action_metric == "density_ratio"
+                else "reward_state_to_action_gain_ratio",
+                None,
+            )
+            state_to_noise_ratios = candidate_env.get(
+                "reward_state_to_noise_gain_density_ratio"
+                if state_to_noise_metric == "density_ratio"
+                else "reward_state_to_noise_gain_ratio",
+                None,
+            )
             if (
                 not torch.is_tensor(state_gains)
                 or not torch.is_tensor(action_gains)
+                or not torch.is_tensor(noise_gains)
                 or not torch.is_tensor(state_to_action_ratios)
+                or not torch.is_tensor(state_to_noise_ratios)
             ):
                 raise RuntimeError(
                     "conditioned reward topology training sampling requires "
@@ -7112,30 +9963,48 @@ class EnvironmentPrior:
                 )
             state_gains_cpu = state_gains.detach().cpu().reshape(-1).tolist()
             action_gains_cpu = action_gains.detach().cpu().reshape(-1).tolist()
+            noise_gains_cpu = noise_gains.detach().cpu().reshape(-1).tolist()
             ratios_cpu = state_to_action_ratios.detach().cpu().reshape(-1).tolist()
+            noise_ratios_cpu = state_to_noise_ratios.detach().cpu().reshape(-1).tolist()
             if (
                 len(state_gains_cpu) != len(active)
                 or len(action_gains_cpu) != len(active)
+                or len(noise_gains_cpu) != len(active)
                 or len(ratios_cpu) != len(active)
+                or len(noise_ratios_cpu) != len(active)
             ):
                 raise RuntimeError("batched gain summary length does not match conditioned candidates")
             for local_idx, global_idx in enumerate(active):
                 state_gain = float(state_gains_cpu[local_idx])
                 action_gain = float(action_gains_cpu[local_idx])
+                noise_gain = float(noise_gains_cpu[local_idx])
                 ratio = float(ratios_cpu[local_idx])
+                noise_ratio = float(noise_ratios_cpu[local_idx])
                 if math.isfinite(state_gain):
                     best_state_gains[global_idx] = max(best_state_gains[global_idx], state_gain)
                 if math.isfinite(action_gain):
                     best_action_gains[global_idx] = max(best_action_gains[global_idx], action_gain)
+                if math.isfinite(noise_gain):
+                    best_noise_gains[global_idx] = max(best_noise_gains[global_idx], noise_gain)
                 if math.isfinite(ratio):
                     best_state_to_action_ratios[global_idx] = min(
                         best_state_to_action_ratios[global_idx],
                         ratio,
                     )
+                if math.isfinite(noise_ratio):
+                    best_state_to_noise_ratios[global_idx] = min(
+                        best_state_to_noise_ratios[global_idx],
+                        noise_ratio,
+                    )
                 accepted = (
                     (state_min <= 0.0 or (math.isfinite(state_gain) and state_gain >= state_min))
                     and (action_min <= 0.0 or (math.isfinite(action_gain) and action_gain >= action_min))
+                    and (noise_min <= 0.0 or (math.isfinite(noise_gain) and noise_gain >= noise_min))
                     and (ratio_max <= 0.0 or (math.isfinite(ratio) and ratio <= ratio_max))
+                    and (
+                        state_to_noise_max <= 0.0
+                        or (math.isfinite(noise_ratio) and noise_ratio <= state_to_noise_max)
+                    )
                 )
                 if accepted:
                     accepted_h = copy.deepcopy(candidate_h_list[local_idx])
@@ -7145,7 +10014,9 @@ class EnvironmentPrior:
                     accepted_attempts[global_idx] = int(attempt_idx + 1)
                     accepted_state_gains[global_idx] = float(state_gain)
                     accepted_action_gains[global_idx] = float(action_gain)
+                    accepted_noise_gains[global_idx] = float(noise_gain)
                     accepted_state_to_action_ratios[global_idx] = float(ratio)
+                    accepted_state_to_noise_ratios[global_idx] = float(noise_ratio)
                     pending.discard(global_idx)
             # Candidate envs are only used for their gain summaries here. Drop
             # heavy transition closures before the next candidate build so the
@@ -7175,7 +10046,9 @@ class EnvironmentPrior:
             accepted_attempts=accepted_attempts,
             accepted_state_gains=accepted_state_gains,
             accepted_action_gains=accepted_action_gains,
+            accepted_noise_gains=accepted_noise_gains,
             accepted_state_to_action_ratios=accepted_state_to_action_ratios,
+            accepted_state_to_noise_ratios=accepted_state_to_noise_ratios,
             total_candidate_draws=total_draws,
             device=device,
         )
@@ -7362,6 +10235,120 @@ class EnvironmentPrior:
     def _sample_vectorized_batch_hypers(self, batch_size):
         return self._sample_batch_hypers(batch_size)
 
+    def _apply_reference_state_inertia_post_sample_policy(self, h_list):
+        policy = str(self.config.get("reference_state_inertia_post_sample_policy", "none")).strip().lower()
+        if policy in {"", "none", "config"}:
+            return h_list
+        if policy != "index_hash_fraction":
+            raise ValueError(
+                "reference_state_inertia_post_sample_policy must be one of "
+                "{none, config, index_hash_fraction}; got "
+                f"{policy!r}."
+            )
+        n = int(len(h_list))
+        if n <= 0:
+            return h_list
+        fraction = float(self.config.get("reference_state_inertia_post_sample_fraction", 0.5))
+        fraction = max(0.0, min(1.0, fraction))
+        enabled_count = int(round(float(n) * fraction))
+        seed = int(self.config.get("reference_state_inertia_post_sample_hash_seed", 0))
+
+        def _score(idx: int) -> int:
+            value = (int(idx) + 1) & 0xFFFFFFFF
+            value ^= seed & 0xFFFFFFFF
+            value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
+            value ^= (value >> 16)
+            value = (value * 2246822519) & 0xFFFFFFFF
+            return int(value)
+
+        enabled_indices = set(sorted(range(n), key=_score)[:enabled_count])
+        for idx, h in enumerate(h_list):
+            h["reference_state_inertia_enabled"] = bool(idx in enabled_indices)
+            h["reference_state_inertia_post_sample_policy"] = policy
+            h["reference_state_inertia_post_sample_fraction"] = fraction
+            h["reference_state_inertia_post_sample_hash_seed"] = seed
+        return h_list
+
+    def _apply_terminal_reset_min_step_post_sample_policy(self, h_list):
+        policy = str(self.config.get("terminal_reset_min_step_post_sample_policy", "none")).strip().lower()
+        if policy in {"", "none", "config"}:
+            return h_list
+        if policy != "gym_first_done_piecewise_index_hash":
+            raise ValueError(
+                "terminal_reset_min_step_post_sample_policy must be one of "
+                "{none, config, gym_first_done_piecewise_index_hash}; got "
+                f"{policy!r}."
+            )
+        seed = int(self.config.get("terminal_reset_min_step_post_sample_hash_seed", 0))
+
+        def _score01(idx: int) -> float:
+            value = (int(idx) + 1) & 0xFFFFFFFF
+            value ^= seed & 0xFFFFFFFF
+            value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
+            value ^= (value >> 16)
+            value = (value * 2246822519) & 0xFFFFFFFF
+            return float(value) / float(2**32)
+
+        def _piecewise_first_done_target(u: float) -> int:
+            bands = (
+                (0.25, 0, 18),
+                (0.50, 19, 52),
+                (0.75, 53, 281),
+                (1.00, 282, 511),
+            )
+            prev_p = 0.0
+            for p, lo, hi in bands:
+                if u < p:
+                    local = (float(u) - prev_p) / max(float(p) - prev_p, 1e-12)
+                    return int(lo) + int(local * (int(hi) - int(lo) + 1))
+                prev_p = float(p)
+            return int(bands[-1][2])
+
+        for idx, h in enumerate(h_list):
+            target = _piecewise_first_done_target(_score01(idx))
+            h["terminal_reset_min_step_enabled"] = True
+            h["terminal_reset_min_step_target"] = float(target)
+            h["terminal_reset_min_step_post_sample_policy"] = policy
+            h["terminal_reset_min_step_post_sample_hash_seed"] = seed
+        return h_list
+
+    def _materialize_constrained_dim_sampling_latents(self, h_list):
+        for h in h_list:
+            if self._resolve_constrained_dim_sampling_enabled(h):
+                # _sample_dims writes lazy constrained-dim uniforms into h.
+                # A topology-conditioned retry loop with frozen h must freeze
+                # these latents too, otherwise the topology guard silently
+                # becomes a selector over obs/action/state/noise structure.
+                self._sample_dims(h)
+        return h_list
+
+    def _apply_visible_state_mix_batch_slot_policy(self, h_list, batch_indices, *, batch_size=None):
+        policy = str(self.config.get("constrained_dim_sampling_policy", "")).strip().lower()
+        if policy != "gym_obs_action_visible_state_mix":
+            return h_list
+        if len(h_list) != len(batch_indices):
+            raise ValueError("visible state mix batch-slot policy requires one batch index per h")
+        fraction = float(self.config.get("constrained_dim_visible_state_mix_fraction", 0.15))
+        fraction = min(max(fraction, 0.0), 1.0)
+        total_batch_size = int(batch_size) if batch_size is not None else int(max([int(idx) for idx in batch_indices], default=-1) + 1)
+        enabled_count = int(round(float(total_batch_size) * fraction))
+        seed = int(self.config.get("constrained_dim_visible_state_mix_hash_seed", 9730))
+
+        def _score(idx: int) -> int:
+            value = (int(idx) + 1) & 0xFFFFFFFF
+            value ^= seed & 0xFFFFFFFF
+            value = (value * 1664525 + 1013904223) & 0xFFFFFFFF
+            value ^= value >> 16
+            value = (value * 2246822519) & 0xFFFFFFFF
+            return int(value)
+
+        enabled_indices = set(sorted(range(total_batch_size), key=_score)[:enabled_count])
+        for h, idx in zip(h_list, batch_indices):
+            h["constrained_dim_visible_state_mix_fully_observed"] = bool(int(idx) in enabled_indices)
+            h["constrained_dim_visible_state_mix_fraction"] = fraction
+            h["constrained_dim_visible_state_mix_hash_seed"] = seed
+        return h_list
+
     def _sample_batch_hypers(self, batch_size):
         batch_size = int(batch_size)
         if batch_size <= 0:
@@ -7369,7 +10356,13 @@ class EnvironmentPrior:
         fixed_h = getattr(self, "_fixed_frozen_h", None)
         if isinstance(fixed_h, dict):
             return [copy.deepcopy(fixed_h) for _ in range(batch_size)]
-        return [sample_distributions(self.config) for _ in range(batch_size)]
+        h_list = [sample_distributions(self.config) for _ in range(batch_size)]
+        h_list = self._apply_reference_state_inertia_post_sample_policy(h_list)
+        h_list = self._apply_terminal_reset_min_step_post_sample_policy(h_list)
+        h_list = self._apply_exact_scm_gym_lowtail_potential_progress_source_label_policy(h_list)
+        h_list = self._apply_exact_scm_gym_lowtail_family_post_sample_policy(h_list)
+        return h_list
+
 
     def _environment_structure_signature(self, h):
         family = self._normalize_family(h.get("family", "scm"))
@@ -7680,6 +10673,7 @@ class EnvironmentPrior:
         generators=None,
         input_mask=None,
         apply_output_tanh=True,
+        zero_output_bias_indices=None,
     ):
         batch_size = len(h_list)
         device_obj = device if isinstance(device, torch.device) else torch.device(str(device))
@@ -7701,6 +10695,12 @@ class EnvironmentPrior:
             )
         if int(depth_per_sample.numel()) != batch_size:
             raise ValueError("depth_values must match h_list length")
+        if zero_output_bias_indices is None:
+            zero_output_bias_per_sample = [-1] * batch_size
+        else:
+            zero_output_bias_per_sample = [int(idx) for idx in zero_output_bias_indices]
+            if len(zero_output_bias_per_sample) != batch_size:
+                raise ValueError("zero_output_bias_indices must match h_list length")
         depth = int(depth_per_sample.max().item())
         in_dims = torch.as_tensor(in_dims, device=device, dtype=torch.long)
         out_dims = torch.as_tensor(out_dims, device=device, dtype=torch.long)
@@ -7795,6 +10795,12 @@ class EnvironmentPrior:
                         b_b = torch.randn((out_i,), device=device, dtype=torch.float32, generator=g)
                     w_b = w_b * float(weight_std)
                     w[bi, active_idx, :out_i] = w_b
+                    zero_bias_idx = int(zero_output_bias_per_sample[bi])
+                    if (
+                        layer_idx == int(depth_per_sample[bi].item() - 1)
+                        and 0 <= zero_bias_idx < out_i
+                    ):
+                        b_b[zero_bias_idx] = 0.0
                     b[bi, :out_i] = b_b * (init_std[bi] * 0.1)
                 if layer_idx > 0 or input_mask is None:
                     in_mask[bi, :in_i] = 1.0
@@ -9624,6 +12630,12 @@ class EnvironmentPrior:
 
         state_cap = int(max(1, int(state_dims.max().item())))
         joint_out_dims = state_dims + 1
+        zero_output_bias_indices = [
+            int(state_dims[bi].item())
+            if bool(h.get("reward_output_bias_zero_enabled", False))
+            else -1
+            for bi, h in enumerate(h_list)
+        ]
         joint_fn = self._build_scm_hetero_batch_fn(
             in_dims=in_dims,
             out_dims=joint_out_dims,
@@ -9634,6 +12646,7 @@ class EnvironmentPrior:
             generators=generators,
             input_mask=input_mask,
             apply_output_tanh=False,
+            zero_output_bias_indices=zero_output_bias_indices,
         )
         state_mask = (
             torch.arange(state_cap, device=device, dtype=torch.long).unsqueeze(0)
@@ -10035,7 +13048,7 @@ class EnvironmentPrior:
                 input_mask[bi, action_start: action_start + a_i] = 1.0
             if n_i > 0:
                 input_mask[bi, noise_start: noise_start + n_i] = 1.0
-            if z_i > 0:
+            if z_i > 0 and (not self._resolve_reference_scm_zero_pad_inactive_init_enabled(h_list[bi])):
                 input_mask[bi, zero_start: zero_start + z_i] = 1.0
 
         transition_only_build_enabled = False
@@ -10184,6 +13197,16 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        terminal_reset_min_step_target = torch.tensor(
+            [
+                float(self._resolve_terminal_reset_min_step_target(h))
+                if self._resolve_terminal_reset_min_step_enabled(h)
+                else 0.0
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
         terminal_bonus_tanh_c = torch.tensor(
             [float(self._resolve_terminal_bonus_tanh_c(h)) for h in h_list],
             device=device,
@@ -10209,8 +13232,8 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
-        state_output_scale = torch.tensor(
-            [float(self._resolve_state_output_scale(h)) for h in h_list],
+        obs_output_scale = torch.tensor(
+            [float(self._resolve_obs_output_scale(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -10269,6 +13292,16 @@ class EnvironmentPrior:
         )
         state_full_rms_target = torch.tensor(
             [float(self._resolve_state_full_rms_target(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_full_rms_floor_enabled = torch.tensor(
+            [bool(self._resolve_state_full_rms_floor_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_full_rms_max_upscale = torch.tensor(
+            [float(self._resolve_state_full_rms_max_upscale(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -10334,16 +13367,6 @@ class EnvironmentPrior:
             reward_scale = torch.where(reference_semantics_mask, torch.ones_like(reward_scale), reward_scale)
             reward_clip = torch.where(reference_semantics_mask, torch.full_like(reward_clip, float("inf")), reward_clip)
             state_clip = torch.where(reference_semantics_mask, torch.full_like(state_clip, float("inf")), state_clip)
-            state_highway_enabled = torch.where(
-                reference_semantics_mask,
-                torch.zeros_like(state_highway_enabled),
-                state_highway_enabled,
-            )
-            state_highway_lambda = torch.where(
-                reference_semantics_mask,
-                torch.zeros_like(state_highway_lambda),
-                state_highway_lambda,
-            )
             reward_dropout_enabled = torch.where(
                 reference_semantics_mask,
                 torch.zeros_like(reward_dropout_enabled),
@@ -10378,6 +13401,165 @@ class EnvironmentPrior:
                 terminal_enabled=terminal_reset_enabled,
                 terminal_bonus_tanh_c=terminal_bonus_tanh_c,
             )
+        pendulum_settle_enabled = [
+            bool(self._sample_pendulum_settle_yield_repair_enabled(h))
+            for h in h_list
+        ]
+        transition_generator, pendulum_settle_meta = self._wrap_transition_with_pendulum_settle_yield_repair(
+            transition_generator,
+            h_list=h_list,
+            enabled_values=pendulum_settle_enabled,
+            state_dims=state_dims,
+            obs_input_dims=obs_input_dims,
+            action_dims=action_dims,
+            common_action_start=torch.full(
+                (batch_size,),
+                int(action_start),
+                device=device,
+                dtype=torch.long,
+            ),
+            family=family,
+        )
+        gym_lowtail_enabled = [
+            bool(self._sample_exact_scm_gym_lowtail_family_enabled(h))
+            for h in h_list
+        ]
+        transition_generator, gym_lowtail_meta = self._wrap_transition_with_exact_scm_gym_lowtail_family(
+            transition_generator,
+            h_list=h_list,
+            enabled_values=gym_lowtail_enabled,
+            state_dims=state_dims,
+            obs_dims=obs_dims,
+            obs_input_dims=obs_input_dims,
+            action_dims=action_dims,
+            noise_dims=noise_dims,
+            common_action_start=torch.full(
+                (batch_size,),
+                int(action_start),
+                device=device,
+                dtype=torch.long,
+            ),
+            common_noise_start=torch.full(
+                (batch_size,),
+                int(noise_start),
+                device=device,
+                dtype=torch.long,
+            ),
+            family=family,
+        )
+        materialized_initial_state = getattr(
+            transition_generator,
+            "_exact_scm_gym_lowtail_materialized_initial_state",
+            None,
+        )
+        if torch.is_tensor(materialized_initial_state):
+            materialized_initial_state = materialized_initial_state.to(device=device, dtype=initial_state.dtype)
+            if materialized_initial_state.shape == initial_state.shape:
+                materialized_mask = torch.as_tensor(
+                    gym_lowtail_meta.get(
+                        "materialized_theta_preimage_enabled",
+                        [False for _ in range(batch_size)],
+                    ),
+                    device=device,
+                    dtype=torch.bool,
+                ).reshape(-1, 1)
+                initial_state = torch.where(materialized_mask, materialized_initial_state, initial_state)
+        gym_lowtail_reward_mix = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_mix", 1.0, min_value=0.0, max_value=1.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        base_reward_retention_fraction = torch.tensor(
+            [
+                float(h.get("base_reward_retention_fraction", 1.0 - float(gym_lowtail_reward_mix[i].item())))
+                for i, h in enumerate(h_list)
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        potential_progress_preserves_base_reward_via_mix = torch.as_tensor(
+            [bool(h.get("potential_progress_preserves_base_reward_via_mix", False)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        potential_progress_reward_axis_target = tuple(
+            str(h.get("potential_progress_reward_axis_target", "none")) for h in h_list
+        )
+        potential_progress_reward_axis_rule = tuple(
+            str(h.get("potential_progress_reward_axis_rule", "none")) for h in h_list
+        )
+        potential_progress_reward_formula_path = tuple(
+            str(h.get("potential_progress_reward_formula_path", "none")) for h in h_list
+        )
+        gym_lowtail_reward_linear_weight = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_linear_weight", 1.25, min_value=-10.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_potential_delta_weight = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h,
+                    "exact_scm_gym_lowtail_reward_potential_delta_weight",
+                    0.0,
+                    min_value=-10.0,
+                    max_value=10.0,
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_state_cost = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_state_cost", 0.05, min_value=0.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_ctrl_cost = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_ctrl_cost", 0.02, min_value=0.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_action_gain = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_action_gain", 0.60, min_value=-4.0, max_value=4.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_noise_gain = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_noise_gain", 0.35, min_value=0.0, max_value=4.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
         obs_slot_dims = torch.tensor(
             [int(max(1, h.get("obs_slot_dim", 400))) for h in h_list],
             device=device,
@@ -10445,6 +13627,7 @@ class EnvironmentPrior:
             "reward_clip": reward_clip,
             "state_clip": state_clip,
             "state_output_scale": state_output_scale,
+            "obs_output_scale": obs_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "ctrl_reward_weight": ctrl_reward_weight,
@@ -10453,6 +13636,8 @@ class EnvironmentPrior:
             "survival_reward_enabled": survival_reward_enabled,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "state_full_rms_floor_enabled": state_full_rms_floor_enabled,
+            "state_full_rms_max_upscale": state_full_rms_max_upscale,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(h_list[0]),
             "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
@@ -10462,6 +13647,7 @@ class EnvironmentPrior:
             "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
+            "terminal_reset_min_step_target": terminal_reset_min_step_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
             "terminal_bonus_scale_min": terminal_bonus_scale_min,
             "terminal_bonus_scale_max": terminal_bonus_scale_max,
@@ -10470,9 +13656,125 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
+            "pendulum_settle_yield_repair_enabled": torch.as_tensor(
+                pendulum_settle_meta["enabled"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "pendulum_settle_yield_repair_active": torch.as_tensor(
+                pendulum_settle_meta["active"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "pendulum_settle_yield_repair_standalone_generator": False,
+            "pendulum_settle_yield_repair_uses_existing_state_action_slots": True,
+            "pendulum_settle_yield_repair_reward_path_summary_valid": bool(
+                pendulum_settle_meta.get("reward_path_summary_valid", True)
+            ),
+            "exact_scm_gym_lowtail_family_enabled": torch.as_tensor(
+                gym_lowtail_meta["enabled"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_family_active": torch.as_tensor(
+                gym_lowtail_meta["active"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_family_standalone_generator": False,
+            "exact_scm_gym_lowtail_family_uses_existing_state_action_noise_slots": True,
+            "exact_scm_gym_lowtail_shared_energy_terminal_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("shared_energy_terminal_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_preimage_shared_scalar_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("preimage_shared_scalar_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("state_obs_rank_preimage_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "state_obs_temporal_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "state_obs_envelope_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "state_obs_hetero_scale_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_markov_carrier_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "markov_carrier_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_reward_distribution_head_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "reward_distribution_head_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_clock_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "clock_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_paired_response_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "paired_response_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_reward_linear_weight": gym_lowtail_reward_linear_weight,
+            "exact_scm_gym_lowtail_reward_potential_delta_weight": gym_lowtail_reward_potential_delta_weight,
+            "exact_scm_gym_lowtail_reward_state_cost": gym_lowtail_reward_state_cost,
+            "exact_scm_gym_lowtail_reward_ctrl_cost": gym_lowtail_reward_ctrl_cost,
+            "exact_scm_gym_lowtail_action_gain": gym_lowtail_action_gain,
+            "exact_scm_gym_lowtail_noise_gain": gym_lowtail_noise_gain,
+            "exact_scm_gym_lowtail_reward_mix": gym_lowtail_reward_mix,
+            "base_reward_retention_fraction": base_reward_retention_fraction,
+            "potential_progress_preserves_base_reward_via_mix": potential_progress_preserves_base_reward_via_mix,
+            "potential_progress_reward_axis_target": potential_progress_reward_axis_target,
+            "potential_progress_reward_axis_rule": potential_progress_reward_axis_rule,
+            "potential_progress_reward_formula_path": potential_progress_reward_formula_path,
         }
         reward_gain_summary = self._reference_exact_scm_reward_input_gain_summary_batch(env)
-        if reward_gain_summary is not None:
+        lowtail_gain_summary = self._exact_scm_gym_lowtail_reward_input_gain_summary_batch(env)
+        reward_gain_summary = self._merge_exact_scm_gym_lowtail_reward_input_gain_summary(
+            reward_gain_summary,
+            lowtail_gain_summary,
+            env["exact_scm_gym_lowtail_family_active"],
+        )
+        if reward_gain_summary is not None and bool(env.get("pendulum_settle_yield_repair_reward_path_summary_valid", True)):
             env.update(reward_gain_summary)
         return env
 
@@ -10801,6 +14103,16 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
         )
+        terminal_reset_min_step_target = torch.tensor(
+            [
+                float(self._resolve_terminal_reset_min_step_target(h))
+                if self._resolve_terminal_reset_min_step_enabled(h)
+                else 0.0
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
         terminal_bonus_tanh_c = torch.tensor(
             [float(self._resolve_terminal_bonus_tanh_c(h)) for h in h_list],
             device=device,
@@ -10823,6 +14135,126 @@ class EnvironmentPrior:
                 terminal_enabled=terminal_reset_enabled,
                 terminal_bonus_tanh_c=terminal_bonus_tanh_c,
             )
+        pendulum_settle_enabled = [
+            bool(self._sample_pendulum_settle_yield_repair_enabled(h))
+            for h in h_list
+        ]
+        transition_generator, pendulum_settle_meta = self._wrap_transition_with_pendulum_settle_yield_repair(
+            transition_generator,
+            h_list=h_list,
+            enabled_values=pendulum_settle_enabled,
+            state_dims=torch.full((batch_size,), int(state_dim), device=device, dtype=torch.long),
+            obs_input_dims=torch.full(
+                (batch_size,),
+                int(input_layout["obs_input_dim"]),
+                device=device,
+                dtype=torch.long,
+            ),
+            action_dims=torch.full((batch_size,), int(action_dim), device=device, dtype=torch.long),
+            common_action_start=torch.full(
+                (batch_size,),
+                int(input_layout["action_start"]),
+                device=device,
+                dtype=torch.long,
+            ),
+            family=family,
+        )
+        gym_lowtail_enabled = [
+            bool(self._sample_exact_scm_gym_lowtail_family_enabled(h))
+            for h in h_list
+        ]
+        transition_generator, gym_lowtail_meta = self._wrap_transition_with_exact_scm_gym_lowtail_family(
+            transition_generator,
+            h_list=h_list,
+            enabled_values=gym_lowtail_enabled,
+            state_dims=torch.full((batch_size,), int(state_dim), device=device, dtype=torch.long),
+            obs_dims=torch.full((batch_size,), int(obs_dim), device=device, dtype=torch.long),
+            obs_input_dims=torch.full(
+                (batch_size,),
+                int(input_layout["obs_input_dim"]),
+                device=device,
+                dtype=torch.long,
+            ),
+            action_dims=torch.full((batch_size,), int(action_dim), device=device, dtype=torch.long),
+            noise_dims=torch.full((batch_size,), int(noise_dim), device=device, dtype=torch.long),
+            common_action_start=torch.full(
+                (batch_size,),
+                int(input_layout["action_start"]),
+                device=device,
+                dtype=torch.long,
+            ),
+            common_noise_start=torch.full(
+                (batch_size,),
+                int(input_layout["noise_start"]),
+                device=device,
+                dtype=torch.long,
+            ),
+            family=family,
+        )
+        gym_lowtail_reward_linear_weight = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_linear_weight", 1.25, min_value=-10.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_potential_delta_weight = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h,
+                    "exact_scm_gym_lowtail_reward_potential_delta_weight",
+                    0.0,
+                    min_value=-10.0,
+                    max_value=10.0,
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_state_cost = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_state_cost", 0.05, min_value=0.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_reward_ctrl_cost = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_ctrl_cost", 0.02, min_value=0.0, max_value=10.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_action_gain = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_action_gain", 0.60, min_value=-4.0, max_value=4.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        gym_lowtail_noise_gain = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_noise_gain", 0.35, min_value=0.0, max_value=4.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
         state_clip = torch.tensor(
             [float(max(1.0, self._resolve_scalar(h.get("state_clip", 8.0)))) for h in h_list],
             device=device,
@@ -10830,6 +14262,11 @@ class EnvironmentPrior:
         )
         state_output_scale = torch.tensor(
             [float(self._resolve_state_output_scale(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        obs_output_scale = torch.tensor(
+            [float(self._resolve_obs_output_scale(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -10850,6 +14287,16 @@ class EnvironmentPrior:
         )
         state_full_rms_target = torch.tensor(
             [float(self._resolve_state_full_rms_target(h)) for h in h_list],
+            device=device,
+            dtype=torch.float32,
+        )
+        state_full_rms_floor_enabled = torch.tensor(
+            [bool(self._resolve_state_full_rms_floor_enabled(h)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        state_full_rms_max_upscale = torch.tensor(
+            [float(self._resolve_state_full_rms_max_upscale(h)) for h in h_list],
             device=device,
             dtype=torch.float32,
         )
@@ -10889,8 +14336,6 @@ class EnvironmentPrior:
             reward_scale.fill_(1.0)
             reward_clip.fill_(float("inf"))
             state_clip.fill_(float("inf"))
-            state_highway_enabled.zero_()
-            state_highway_lambda.zero_()
             reward_dropout_enabled.zero_()
             reward_dropout_impute_zero.fill_(True)
             reward_dropout_ratio.zero_()
@@ -10901,6 +14346,55 @@ class EnvironmentPrior:
             device=device,
             dtype=torch.float32,
             generators=generators,
+        )
+        materialized_initial_state = getattr(
+            transition_generator,
+            "_exact_scm_gym_lowtail_materialized_initial_state",
+            None,
+        )
+        if torch.is_tensor(materialized_initial_state):
+            materialized_initial_state = materialized_initial_state.to(device=device, dtype=initial_state.dtype)
+            if materialized_initial_state.shape == initial_state.shape:
+                materialized_mask = torch.as_tensor(
+                    gym_lowtail_meta.get(
+                        "materialized_theta_preimage_enabled",
+                        [False for _ in range(batch_size)],
+                    ),
+                    device=device,
+                    dtype=torch.bool,
+                ).reshape(-1, 1)
+                initial_state = torch.where(materialized_mask, materialized_initial_state, initial_state)
+        gym_lowtail_reward_mix = torch.tensor(
+            [
+                float(self._resolve_exact_scm_gym_lowtail_param(
+                    h, "exact_scm_gym_lowtail_reward_mix", 1.0, min_value=0.0, max_value=1.0
+                ))
+                for h in h_list
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        base_reward_retention_fraction = torch.tensor(
+            [
+                float(h.get("base_reward_retention_fraction", 1.0 - float(gym_lowtail_reward_mix[i].item())))
+                for i, h in enumerate(h_list)
+            ],
+            device=device,
+            dtype=torch.float32,
+        )
+        potential_progress_preserves_base_reward_via_mix = torch.as_tensor(
+            [bool(h.get("potential_progress_preserves_base_reward_via_mix", False)) for h in h_list],
+            device=device,
+            dtype=torch.bool,
+        )
+        potential_progress_reward_axis_target = tuple(
+            str(h.get("potential_progress_reward_axis_target", "none")) for h in h_list
+        )
+        potential_progress_reward_axis_rule = tuple(
+            str(h.get("potential_progress_reward_axis_rule", "none")) for h in h_list
+        )
+        potential_progress_reward_formula_path = tuple(
+            str(h.get("potential_progress_reward_formula_path", "none")) for h in h_list
         )
 
         env = {
@@ -10939,10 +14433,13 @@ class EnvironmentPrior:
             "reward_clip": reward_clip,
             "state_clip": state_clip,
             "state_output_scale": state_output_scale,
+            "obs_output_scale": obs_output_scale,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
+            "state_full_rms_floor_enabled": state_full_rms_floor_enabled,
+            "state_full_rms_max_upscale": state_full_rms_max_upscale,
             "reinforce_reward_transform": self._resolve_reinforce_reward_transform(h_list[0]),
             "reinforce_reward_rms_eps": reinforce_reward_rms_eps,
             "reinforce_reward_tanh_c": reinforce_reward_tanh_c,
@@ -10952,6 +14449,7 @@ class EnvironmentPrior:
             "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
+            "terminal_reset_min_step_target": terminal_reset_min_step_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
             "terminal_bonus_scale_min": terminal_bonus_scale_min,
             "terminal_bonus_scale_max": terminal_bonus_scale_max,
@@ -10960,9 +14458,109 @@ class EnvironmentPrior:
             "reward_dropout_enabled": reward_dropout_enabled,
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "reward_dropout_ratio": reward_dropout_ratio,
+            "pendulum_settle_yield_repair_enabled": torch.as_tensor(
+                pendulum_settle_meta["enabled"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "pendulum_settle_yield_repair_active": torch.as_tensor(
+                pendulum_settle_meta["active"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "pendulum_settle_yield_repair_standalone_generator": False,
+            "pendulum_settle_yield_repair_uses_existing_state_action_slots": True,
+            "pendulum_settle_yield_repair_reward_path_summary_valid": bool(
+                pendulum_settle_meta.get("reward_path_summary_valid", True)
+            ),
+            "exact_scm_gym_lowtail_family_enabled": torch.as_tensor(
+                gym_lowtail_meta["enabled"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_family_active": torch.as_tensor(
+                gym_lowtail_meta["active"],
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_family_standalone_generator": False,
+            "exact_scm_gym_lowtail_family_uses_existing_state_action_noise_slots": True,
+            "exact_scm_gym_lowtail_shared_energy_terminal_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("shared_energy_terminal_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_preimage_shared_scalar_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("preimage_shared_scalar_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get("state_obs_rank_preimage_enabled", [False for _ in gym_lowtail_meta["active"]]),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "state_obs_temporal_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "state_obs_envelope_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_reward_distribution_head_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "reward_distribution_head_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_clock_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "clock_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_paired_response_preimage_enabled": torch.as_tensor(
+                gym_lowtail_meta.get(
+                    "paired_response_preimage_enabled",
+                    [False for _ in gym_lowtail_meta["active"]],
+                ),
+                device=device,
+                dtype=torch.bool,
+            ),
+            "exact_scm_gym_lowtail_reward_linear_weight": gym_lowtail_reward_linear_weight,
+            "exact_scm_gym_lowtail_reward_potential_delta_weight": gym_lowtail_reward_potential_delta_weight,
+            "exact_scm_gym_lowtail_reward_state_cost": gym_lowtail_reward_state_cost,
+            "exact_scm_gym_lowtail_reward_ctrl_cost": gym_lowtail_reward_ctrl_cost,
+            "exact_scm_gym_lowtail_action_gain": gym_lowtail_action_gain,
+            "exact_scm_gym_lowtail_noise_gain": gym_lowtail_noise_gain,
+            "exact_scm_gym_lowtail_reward_mix": gym_lowtail_reward_mix,
+            "base_reward_retention_fraction": base_reward_retention_fraction,
+            "potential_progress_preserves_base_reward_via_mix": potential_progress_preserves_base_reward_via_mix,
+            "potential_progress_reward_axis_target": potential_progress_reward_axis_target,
+            "potential_progress_reward_axis_rule": potential_progress_reward_axis_rule,
+            "potential_progress_reward_formula_path": potential_progress_reward_formula_path,
         }
         reward_gain_summary = self._reference_exact_scm_reward_input_gain_summary_batch(env)
-        if reward_gain_summary is not None:
+        lowtail_gain_summary = self._exact_scm_gym_lowtail_reward_input_gain_summary_batch(env)
+        reward_gain_summary = self._merge_exact_scm_gym_lowtail_reward_input_gain_summary(
+            reward_gain_summary,
+            lowtail_gain_summary,
+            env["exact_scm_gym_lowtail_family_active"],
+        )
+        if reward_gain_summary is not None and bool(env.get("pendulum_settle_yield_repair_reward_path_summary_valid", True)):
             env.update(reward_gain_summary)
         return env
 
@@ -11925,13 +15523,114 @@ class EnvironmentPrior:
                     "action_noise_eval_std": float(action_noise_eval_std_cpu[b]),
                     "reward_dropout_ratio": float(reward_dropout_ratio_cpu[b]),
                     "reward_drop_frac_realized": float(reward_drop_frac_cpu[b]),
+                    "terminal_reset_count_target": (
+                        float(_env_value_at("terminal_reset_count_target", b))
+                        if "terminal_reset_count_target" in env
+                        else 0.0
+                    ),
+                    "terminal_reset_min_step_target": (
+                        float(_env_value_at("terminal_reset_min_step_target", b))
+                        if "terminal_reset_min_step_target" in env
+                        else 0.0
+                    ),
                     "state_output_scale": float(_env_value_at("state_output_scale", b)),
+                    "obs_output_scale": float(_env_value_at("obs_output_scale", b)) if "obs_output_scale" in env else 1.0,
                     "state_input_scale_enabled": bool(_env_value_at("state_input_scale_enabled", b)),
                     "state_input_scale": float(_env_value_at("state_input_scale", b)),
                     "state_full_rms_enabled": bool(_env_value_at("state_full_rms_enabled", b)),
                     "state_full_rms_target": float(_env_value_at("state_full_rms_target", b)),
                     "state_highway_enabled": bool(state_highway_enabled_cpu[b]),
                     "state_highway_lambda": float(state_highway_lambda_cpu[b]),
+                    "exact_scm_gym_lowtail_family_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_family_enabled", b))
+                        if "exact_scm_gym_lowtail_family_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_family_active": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_family_active", b))
+                        if "exact_scm_gym_lowtail_family_active" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_shared_energy_terminal_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_shared_energy_terminal_enabled", b))
+                        if "exact_scm_gym_lowtail_shared_energy_terminal_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_preimage_shared_scalar_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_preimage_shared_scalar_enabled", b))
+                        if "exact_scm_gym_lowtail_preimage_shared_scalar_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_state_obs_rank_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_markov_carrier_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_markov_carrier_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_markov_carrier_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_reward_distribution_head_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_reward_distribution_head_enabled", b))
+                        if "exact_scm_gym_lowtail_reward_distribution_head_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_clock_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_clock_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_clock_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_paired_response_preimage_enabled": (
+                        bool(_env_value_at("exact_scm_gym_lowtail_paired_response_preimage_enabled", b))
+                        if "exact_scm_gym_lowtail_paired_response_preimage_enabled" in env
+                        else False
+                    ),
+                    "exact_scm_gym_lowtail_reward_mix": (
+                        float(_env_value_at("exact_scm_gym_lowtail_reward_mix", b))
+                        if "exact_scm_gym_lowtail_reward_mix" in env
+                        else 1.0
+                    ),
+                    "exact_scm_gym_lowtail_reward_potential_delta_weight": (
+                        float(_env_value_at("exact_scm_gym_lowtail_reward_potential_delta_weight", b))
+                        if "exact_scm_gym_lowtail_reward_potential_delta_weight" in env
+                        else 0.0
+                    ),
+                    "base_reward_retention_fraction": (
+                        float(_env_value_at("base_reward_retention_fraction", b))
+                        if "base_reward_retention_fraction" in env
+                        else 0.0
+                    ),
+                    "potential_progress_preserves_base_reward_via_mix": (
+                        bool(_env_value_at("potential_progress_preserves_base_reward_via_mix", b))
+                        if "potential_progress_preserves_base_reward_via_mix" in env
+                        else False
+                    ),
+                    "potential_progress_reward_axis_target": (
+                        str(_env_value_at("potential_progress_reward_axis_target", b))
+                        if "potential_progress_reward_axis_target" in env
+                        else "none"
+                    ),
+                    "potential_progress_reward_axis_rule": (
+                        str(_env_value_at("potential_progress_reward_axis_rule", b))
+                        if "potential_progress_reward_axis_rule" in env
+                        else "none"
+                    ),
                     "strict_joint_transition_enabled": bool(_env_value_at("strict_joint_transition_enabled", b)),
                     "reference_semantics_enabled": bool(_env_value_at("reference_semantics_enabled", b)),
                     "transition_reference_mode": EnvironmentPrior._transition_reference_mode(
@@ -12051,10 +15750,36 @@ class EnvironmentPrior:
             terminal_reset_enabled = torch.full((batch_size,), bool(terminal_reset_enabled), device=device, dtype=torch.bool)
         else:
             terminal_reset_enabled = terminal_reset_enabled.to(device=device, dtype=torch.bool)
+        terminal_reset_count_target = env.get(
+            "terminal_reset_count_target",
+            torch.zeros((batch_size,), device=device, dtype=torch.float32),
+        )
+        if not torch.is_tensor(terminal_reset_count_target):
+            terminal_reset_count_target = torch.full(
+                (batch_size,),
+                float(terminal_reset_count_target),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            terminal_reset_count_target = terminal_reset_count_target.to(device=device, dtype=torch.float32)
         terminal_reset_prob = self._terminal_reset_prob_from_count(
-            env.get("terminal_reset_count_target", torch.zeros((batch_size,), device=device, dtype=torch.float32)),
+            terminal_reset_count_target,
             n_samples,
         ).to(device=device, dtype=torch.float32)
+        terminal_reset_min_step_target = env.get(
+            "terminal_reset_min_step_target",
+            torch.zeros((batch_size,), device=device, dtype=torch.float32),
+        )
+        if not torch.is_tensor(terminal_reset_min_step_target):
+            terminal_reset_min_step_target = torch.full(
+                (batch_size,),
+                float(terminal_reset_min_step_target),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            terminal_reset_min_step_target = terminal_reset_min_step_target.to(device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         if not torch.is_tensor(terminal_bonus_tanh_c):
             terminal_bonus_tanh_c = torch.full((batch_size,), float(terminal_bonus_tanh_c), device=device, dtype=torch.float32)
@@ -12128,17 +15853,20 @@ class EnvironmentPrior:
         env_obs_start = env_layout["obs_start"]
         env_action_start = env_layout["action_start"]
         env_noise_start = env_layout["noise_start"]
+        obs_output_scale = env.get("obs_output_scale", 1.0)
         state_input_scale = env.get("state_input_scale", 1.0)
+        obs_output_scale = env.get("obs_output_scale", 1.0)
         action_transform_mode = env.get("reinforce_action_transform", "clip")
         action_rms_eps = env.get("reinforce_action_rms_eps", 1e-6)
         action_clip_bound = env.get("reinforce_action_clip_bound", 5.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
+            obs_token_t = self._scale_obs_output_token(obs_t, obs_output_scale)
             token_row = x_steps[t]
             token_row.zero_()
             if num_features > 0 and token_obs_cap > 0:
                 obs_write = min(token_obs_cap, num_features)
-                token_row[:, :obs_write] = obs_t[:, :obs_write]
+                token_row[:, :obs_write] = obs_token_t[:, :obs_write]
             if token_reward_idx < num_features:
                 token_row[:, token_reward_idx] = reward_t
             if token_mask_idx < num_features:
@@ -12231,6 +15959,8 @@ class EnvironmentPrior:
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
                 state_full_rms_target=env.get("state_full_rms_target", 1.0),
+                state_full_rms_floor_enabled=env.get("state_full_rms_floor_enabled", False),
+                state_full_rms_max_upscale=env.get("state_full_rms_max_upscale", 4.0),
             )
             if terminal_token_enabled:
                 state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
@@ -12250,6 +15980,8 @@ class EnvironmentPrior:
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
                     history_relaxed_mask=terminal_history_relaxed,
+                    terminal_reset_min_step_target=terminal_reset_min_step_target,
+                    step_index=t,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -13341,6 +17073,19 @@ class EnvironmentPrior:
             terminal_reset_count_target,
             n_samples,
         ).to(device=device, dtype=torch.float32)
+        terminal_reset_min_step_target = env.get(
+            "terminal_reset_min_step_target",
+            torch.zeros((batch_size,), device=device, dtype=torch.float32),
+        )
+        if not torch.is_tensor(terminal_reset_min_step_target):
+            terminal_reset_min_step_target = torch.full(
+                (batch_size,),
+                float(terminal_reset_min_step_target),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            terminal_reset_min_step_target = terminal_reset_min_step_target.to(device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         if not torch.is_tensor(terminal_bonus_tanh_c):
             terminal_bonus_tanh_c = torch.full(
@@ -13637,13 +17382,14 @@ class EnvironmentPrior:
         state_input_scale = env.get("state_input_scale", 1.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
+            obs_token_t = self._scale_obs_output_token(obs_t, obs_output_scale)
             if collect_x:
                 with torch.no_grad():
                     token_row = x_steps[t]
                     token_row.zero_()
                     if num_features > 0 and token_obs_cap > 0:
                         obs_write = min(token_obs_cap, num_features)
-                        token_row[:, :obs_write] = obs_t[:, :obs_write].detach()
+                        token_row[:, :obs_write] = obs_token_t[:, :obs_write].detach()
                     if token_reward_idx < num_features:
                         token_row[:, token_reward_idx] = reward_t.detach()
                     if token_mask_idx < num_features:
@@ -13981,6 +17727,8 @@ class EnvironmentPrior:
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
                 state_full_rms_target=env.get("state_full_rms_target", 1.0),
+                state_full_rms_floor_enabled=env.get("state_full_rms_floor_enabled", False),
+                state_full_rms_max_upscale=env.get("state_full_rms_max_upscale", 4.0),
             )
             if terminal_token_enabled:
                 if strict_seed_mode:
@@ -14016,6 +17764,8 @@ class EnvironmentPrior:
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
                     history_relaxed_mask=terminal_history_relaxed,
+                    terminal_reset_min_step_target=terminal_reset_min_step_target,
+                    step_index=t,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -14203,7 +17953,7 @@ class EnvironmentPrior:
         self.last_rollout_ppo_trace = None
         if collect_ppo_trace:
             final_obs = torch.zeros((batch_size, num_features), device=device, dtype=torch.float32)
-            final_obs_t = state_t[:, :max_obs_dim] * obs_mask
+            final_obs_t = self._scale_obs_output_token(state_t[:, :max_obs_dim] * obs_mask, obs_output_scale)
             if num_features > 0:
                 if token_layout_prepack:
                     if token_obs_valid is not None:
@@ -14484,12 +18234,14 @@ class EnvironmentPrior:
         reinforce_action_clip_bound = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_reset_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         terminal_reset_count_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        terminal_reset_min_step_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_bonus_scale_min = torch.empty((batch_size,), device=device, dtype=torch.float32)
         terminal_bonus_scale_max = torch.empty((batch_size,), device=device, dtype=torch.float32)
         alpha = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_clip = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_output_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        obs_output_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_input_scale_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_input_scale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         ctrl_reward_weight = torch.empty((batch_size,), device=device, dtype=torch.float32)
@@ -14498,6 +18250,8 @@ class EnvironmentPrior:
         survival_reward_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_full_rms_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_full_rms_target = torch.empty((batch_size,), device=device, dtype=torch.float32)
+        state_full_rms_floor_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
+        state_full_rms_max_upscale = torch.empty((batch_size,), device=device, dtype=torch.float32)
         state_highway_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
         state_highway_lambda = torch.empty((batch_size,), device=device, dtype=torch.float32)
         reward_dropout_enabled = torch.empty((batch_size,), device=device, dtype=torch.bool)
@@ -14645,12 +18399,20 @@ class EnvironmentPrior:
                 reinforce_action_clip_bound[group_idx] = env_batch["reinforce_action_clip_bound"]
                 terminal_reset_enabled[group_idx] = env_batch["terminal_reset_enabled"]
                 terminal_reset_count_target[group_idx] = env_batch["terminal_reset_count_target"].to(dtype=torch.float32)
+                terminal_reset_min_step_target[group_idx] = env_batch.get(
+                    "terminal_reset_min_step_target",
+                    torch.zeros((group_bs,), device=device, dtype=torch.float32),
+                ).to(dtype=torch.float32)
                 terminal_bonus_tanh_c[group_idx] = env_batch["terminal_bonus_tanh_c"].to(dtype=torch.float32)
                 terminal_bonus_scale_min[group_idx] = env_batch["terminal_bonus_scale_min"].to(dtype=torch.float32)
                 terminal_bonus_scale_max[group_idx] = env_batch["terminal_bonus_scale_max"].to(dtype=torch.float32)
                 alpha[group_idx] = env_batch["alpha"]
                 state_clip[group_idx] = env_batch["state_clip"]
                 state_output_scale[group_idx] = env_batch["state_output_scale"]
+                obs_output_scale[group_idx] = env_batch.get(
+                    "obs_output_scale",
+                    torch.ones((group_bs,), device=device, dtype=torch.float32),
+                )
                 state_input_scale_enabled[group_idx] = env_batch["state_input_scale_enabled"]
                 state_input_scale[group_idx] = env_batch["state_input_scale"]
                 ctrl_reward_weight[group_idx] = env_batch["ctrl_reward_weight"]
@@ -14659,6 +18421,14 @@ class EnvironmentPrior:
                 survival_reward_enabled[group_idx] = env_batch["survival_reward_enabled"]
                 state_full_rms_enabled[group_idx] = env_batch["state_full_rms_enabled"]
                 state_full_rms_target[group_idx] = env_batch["state_full_rms_target"]
+                state_full_rms_floor_enabled[group_idx] = env_batch.get(
+                    "state_full_rms_floor_enabled",
+                    torch.zeros((group_bs,), device=device, dtype=torch.bool),
+                )
+                state_full_rms_max_upscale[group_idx] = env_batch.get(
+                    "state_full_rms_max_upscale",
+                    torch.ones((group_bs,), device=device, dtype=torch.float32),
+                )
                 state_highway_enabled[group_idx] = env_batch["state_highway_enabled"]
                 state_highway_lambda[group_idx] = env_batch["state_highway_lambda"]
                 reward_dropout_enabled[group_idx] = env_batch["reward_dropout_enabled"]
@@ -14779,8 +18549,11 @@ class EnvironmentPrior:
                         "env_noise_start": state_dim_g + obs_input_dim_g + action_dim_g,
                         "env_in": torch.zeros((group_bs, group_env_total_dim), device=device, dtype=torch.float32),
                         "state_input_scale_view": state_input_scale[group_idx],
+                        "obs_output_scale_view": obs_output_scale[group_idx],
                         "state_full_rms_enabled_view": state_full_rms_enabled[group_idx],
                         "state_full_rms_target_view": state_full_rms_target[group_idx],
+                        "state_full_rms_floor_enabled_view": state_full_rms_floor_enabled[group_idx],
+                        "state_full_rms_max_upscale_view": state_full_rms_max_upscale[group_idx],
                         "packed_input_enabled": packed_input_enabled,
                         "packed_input_cap": packed_input_cap,
                         "packed_input": packed_input_buf,
@@ -14839,14 +18612,17 @@ class EnvironmentPrior:
             reinforce_reward_tanh_c = reinforce_reward_tanh_c.index_select(0, perm)
             reinforce_reward_tanh_bound = reinforce_reward_tanh_bound.index_select(0, perm)
             reinforce_action_rms_eps = reinforce_action_rms_eps.index_select(0, perm)
+            reinforce_action_clip_bound = reinforce_action_clip_bound.index_select(0, perm)
             terminal_reset_enabled = terminal_reset_enabled.index_select(0, perm)
             terminal_reset_count_target = terminal_reset_count_target.index_select(0, perm)
+            terminal_reset_min_step_target = terminal_reset_min_step_target.index_select(0, perm)
             terminal_bonus_tanh_c = terminal_bonus_tanh_c.index_select(0, perm)
             terminal_bonus_scale_min = terminal_bonus_scale_min.index_select(0, perm)
             terminal_bonus_scale_max = terminal_bonus_scale_max.index_select(0, perm)
             alpha = alpha.index_select(0, perm)
             state_clip = state_clip.index_select(0, perm)
             state_output_scale = state_output_scale.index_select(0, perm)
+            obs_output_scale = obs_output_scale.index_select(0, perm)
             state_input_scale_enabled = state_input_scale_enabled.index_select(0, perm)
             state_input_scale = state_input_scale.index_select(0, perm)
             state_highway_enabled = state_highway_enabled.index_select(0, perm)
@@ -15924,7 +19700,10 @@ class EnvironmentPrior:
                         reward_next_raw_replay,
                         aux_reward=reward_next_aux_replay,
                         reward_clip=reward_clip,
-                        mode=self._resolve_reinforce_reward_transform(self.config),
+                        mode=env_info.get(
+                            "reinforce_reward_transform",
+                            self._resolve_reinforce_reward_transform(self.config),
+                        ),
                         rms_eps=reinforce_reward_rms_eps,
                         tanh_c=reinforce_reward_tanh_c,
                         tanh_bound=reinforce_reward_tanh_bound,
@@ -15954,6 +19733,8 @@ class EnvironmentPrior:
                         state_highway_lambda=state_highway_lambda,
                         state_full_rms_enabled=state_full_rms_enabled,
                         state_full_rms_target=state_full_rms_target,
+                        state_full_rms_floor_enabled=state_full_rms_floor_enabled,
+                        state_full_rms_max_upscale=state_full_rms_max_upscale,
                         state_mask=state_mask,
                     )
                     if terminal_token_enabled:
@@ -15974,6 +19755,8 @@ class EnvironmentPrior:
                             history_index=t_replay,
                             history_warmup_count=terminal_reset_count_target,
                             history_relaxed_mask=terminal_history_relaxed_local,
+                            terminal_reset_min_step_target=terminal_reset_min_step_target,
+                            step_index=t_replay,
                         )
                     else:
                         terminal_next_replay = torch.zeros((batch_size,), device=device, dtype=reward_next_replay.dtype)
@@ -16109,6 +19892,7 @@ class EnvironmentPrior:
             "reward_dropout_impute_zero": reward_dropout_impute_zero,
             "state_input_scale_enabled": state_input_scale_enabled,
             "state_output_scale": state_output_scale,
+            "obs_output_scale": obs_output_scale,
             "state_input_scale": state_input_scale,
             "state_full_rms_enabled": state_full_rms_enabled,
             "state_full_rms_target": state_full_rms_target,
@@ -16121,6 +19905,7 @@ class EnvironmentPrior:
             "reinforce_action_clip_bound": reinforce_action_clip_bound,
             "terminal_reset_enabled": terminal_reset_enabled,
             "terminal_reset_count_target": terminal_reset_count_target,
+            "terminal_reset_min_step_target": terminal_reset_min_step_target,
             "terminal_bonus_tanh_c": terminal_bonus_tanh_c,
             "terminal_bonus_scale_min": terminal_bonus_scale_min,
             "terminal_bonus_scale_max": terminal_bonus_scale_max,
@@ -16222,6 +20007,11 @@ class EnvironmentPrior:
             transition_gp_shared_post_wall_s += float(gp_stats.get("shared_post_wall_s", 0.0) or 0.0)
             transition_gp_shared_call_count += int(gp_stats.get("shared_call_count", 0) or 0)
 
+        if device_obj.type == "cuda" and torch.cuda.is_available():
+            empty_after_setup = str(os.environ.get("TICL_ROLLOUT_EMPTY_CACHE_AFTER_SETUP", "1")).strip().lower()
+            if empty_after_setup not in {"0", "false", "no", "off"}:
+                torch.cuda.empty_cache()
+
         for t in range(n_samples):
             actor_outputs = None
             if tbptt_one_hop_boundary_active and (tbptt_reward_buffer is not None) and (len(tbptt_reward_buffer) == 0):
@@ -16268,6 +20058,7 @@ class EnvironmentPrior:
                     )
             token_pack_t0 = time.perf_counter() if profile_rollout_timing else None
             obs_t = state_t[:, :max_obs_dim] * obs_mask
+            obs_token_t = self._scale_obs_output_token(obs_t, obs_output_scale)
             token_row = None
             if collect_x:
                 token_row = x_steps[t]
@@ -16280,7 +20071,7 @@ class EnvironmentPrior:
                         if token_layout_prepack:
                             if token_obs_valid is not None:
                                 token_row[:, :token_obs_write_cap] = (
-                                    obs_t[:, :token_obs_write_cap].detach() * token_obs_valid
+                                    obs_token_t[:, :token_obs_write_cap].detach() * token_obs_valid
                                 )
 
                             if token_reward_rows is not None and token_reward_rows.numel() > 0:
@@ -16318,7 +20109,7 @@ class EnvironmentPrior:
                             if obs_write_cap > 0:
                                 obs_cols = torch.arange(obs_write_cap, device=device).unsqueeze(0)
                                 obs_valid = (obs_cols < obs_cap.unsqueeze(1)).to(dtype=obs_t.dtype)
-                                token_row[:, :obs_write_cap] = obs_t[:, :obs_write_cap].detach() * obs_valid
+                                token_row[:, :obs_write_cap] = obs_token_t[:, :obs_write_cap].detach() * obs_valid
 
                             reward_cols = obs_slot_dims
                             reward_rows = torch.nonzero(reward_cols < num_features, as_tuple=False).squeeze(1)
@@ -16913,7 +20704,10 @@ class EnvironmentPrior:
             reward_env_next = self._transform_exact_scm_base_reward(
                 reward_next_raw,
                 reward_clip=reward_clip,
-                mode=self._resolve_reinforce_reward_transform(self.config),
+                mode=env_info.get(
+                    "reinforce_reward_transform",
+                    self._resolve_reinforce_reward_transform(self.config),
+                ),
                 rms_eps=reinforce_reward_rms_eps,
                 tanh_c=reinforce_reward_tanh_c,
                 tanh_bound=reinforce_reward_tanh_bound,
@@ -16922,7 +20716,10 @@ class EnvironmentPrior:
                 reward_next_raw,
                 aux_reward=reward_next_aux,
                 reward_clip=reward_clip,
-                mode=self._resolve_reinforce_reward_transform(self.config),
+                mode=env_info.get(
+                    "reinforce_reward_transform",
+                    self._resolve_reinforce_reward_transform(self.config),
+                ),
                 rms_eps=reinforce_reward_rms_eps,
                 tanh_c=reinforce_reward_tanh_c,
                 tanh_bound=reinforce_reward_tanh_bound,
@@ -16956,6 +20753,8 @@ class EnvironmentPrior:
                 state_highway_lambda=state_highway_lambda,
                 state_full_rms_enabled=state_full_rms_enabled,
                 state_full_rms_target=state_full_rms_target,
+                state_full_rms_floor_enabled=state_full_rms_floor_enabled,
+                state_full_rms_max_upscale=state_full_rms_max_upscale,
                 state_mask=state_mask,
             )
             reward_terminal_bonus_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)
@@ -16977,6 +20776,8 @@ class EnvironmentPrior:
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
                     history_relaxed_mask=terminal_history_relaxed,
+                    terminal_reset_min_step_target=terminal_reset_min_step_target,
+                    step_index=t,
                     return_aux=True,
                 )
                 reward_terminal_bonus_next = terminal_aux["terminal_bonus_applied"].to(
@@ -17297,6 +21098,7 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims.index_select(0, inv_perm)
                 action_slot_dims_meta = action_slot_dims.index_select(0, inv_perm)
                 reward_dropout_ratio_meta = reward_dropout_ratio.index_select(0, inv_perm)
+                obs_output_scale_meta = obs_output_scale.index_select(0, inv_perm)
                 state_input_scale_enabled_meta = state_input_scale_enabled.index_select(0, inv_perm)
                 state_input_scale_meta = state_input_scale.index_select(0, inv_perm)
                 state_full_rms_enabled_meta = state_full_rms_enabled.index_select(0, inv_perm)
@@ -17312,6 +21114,7 @@ class EnvironmentPrior:
                 obs_slot_dims_meta = obs_slot_dims
                 action_slot_dims_meta = action_slot_dims
                 reward_dropout_ratio_meta = reward_dropout_ratio
+                obs_output_scale_meta = obs_output_scale
                 state_input_scale_enabled_meta = state_input_scale_enabled
                 state_input_scale_meta = state_input_scale
                 state_full_rms_enabled_meta = state_full_rms_enabled
@@ -17335,6 +21138,7 @@ class EnvironmentPrior:
                 "obs_slot_dim": obs_slot_dims_meta,
                 "action_slot_dim": action_slot_dims_meta,
                 "reward_dropout_ratio": reward_dropout_ratio_meta,
+                "obs_output_scale": obs_output_scale_meta,
                 "state_input_scale_enabled": state_input_scale_enabled_meta,
                 "state_input_scale": state_input_scale_meta,
                 "state_full_rms_enabled": state_full_rms_enabled_meta,
@@ -17506,7 +21310,7 @@ class EnvironmentPrior:
         self.last_rollout_ppo_trace = None
         if collect_ppo_trace:
             final_obs = torch.zeros((batch_size, num_features), device=device, dtype=torch.float32)
-            final_obs_t = state_t[:, :max_obs_dim] * obs_mask
+            final_obs_t = self._scale_obs_output_token(state_t[:, :max_obs_dim] * obs_mask, obs_output_scale)
             if num_features > 0:
                 if token_layout_prepack:
                     if token_obs_valid is not None:
@@ -17845,6 +21649,7 @@ class EnvironmentPrior:
             env.get("terminal_reset_count_target", 0),
             n_samples,
         )
+        terminal_reset_min_step_target = float(env.get("terminal_reset_min_step_target", 0.0))
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         terminal_bonus_scale_min = env.get("terminal_bonus_scale_min", 1.0)
         terminal_bonus_scale_max = env.get("terminal_bonus_scale_max", 2.0)
@@ -17994,13 +21799,14 @@ class EnvironmentPrior:
                         include_terminal=tbptt_boundary_usage["include_terminal"],
                     )
             obs_t = state_t[:obs_dim]
+            obs_token_t = self._scale_obs_output_token(obs_t, env.get("obs_output_scale", 1.0))
             if collect_x:
                 with torch.no_grad():
                     token_row = x_steps[t]
                     token_row.zero_()
                     if num_features > 0 and token_obs_cap > 0:
                         obs_write = min(token_obs_cap, num_features)
-                        token_row[:obs_write] = obs_t[:obs_write].detach()
+                        token_row[:obs_write] = obs_token_t[:obs_write].detach()
                     if token_reward_idx < num_features:
                         token_row[token_reward_idx] = reward_t.detach()
                     if token_mask_idx < num_features:
@@ -18354,6 +22160,8 @@ class EnvironmentPrior:
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
                 state_full_rms_target=env.get("state_full_rms_target", 1.0),
+                state_full_rms_floor_enabled=env.get("state_full_rms_floor_enabled", False),
+                state_full_rms_max_upscale=env.get("state_full_rms_max_upscale", 4.0),
             )
             if terminal_reset_enabled:
                 state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
@@ -18373,6 +22181,8 @@ class EnvironmentPrior:
                     history_index=t,
                     history_warmup_count=env.get("terminal_reset_count_target", None),
                     history_relaxed_mask=terminal_history_relaxed,
+                    terminal_reset_min_step_target=terminal_reset_min_step_target,
+                    step_index=t,
                 )
                 state_next = state_next.squeeze(0)
                 reward_next = reward_next.reshape(())
@@ -18557,6 +22367,7 @@ class EnvironmentPrior:
                 "reward_drop_frac_realized": float(reward_drop_count / max(1, int(n_samples))),
                 "state_input_scale_enabled": bool(env.get("state_input_scale_enabled", False)),
                 "state_input_scale": float(env.get("state_input_scale", 1.0)),
+                "obs_output_scale": float(env.get("obs_output_scale", 1.0)),
                 "state_full_rms_enabled": bool(env.get("state_full_rms_enabled", False)),
                 "state_full_rms_target": float(env.get("state_full_rms_target", 1.0)),
                 "state_highway_enabled": bool(env.get("state_highway_enabled", False)),
@@ -18775,6 +22586,19 @@ class EnvironmentPrior:
             env.get("terminal_reset_count_target", torch.zeros((batch_size,), device=device, dtype=torch.float32)),
             n_samples,
         ).to(device=device, dtype=torch.float32)
+        terminal_reset_min_step_target = env.get(
+            "terminal_reset_min_step_target",
+            torch.zeros((batch_size,), device=device, dtype=torch.float32),
+        )
+        if not torch.is_tensor(terminal_reset_min_step_target):
+            terminal_reset_min_step_target = torch.full(
+                (batch_size,),
+                float(terminal_reset_min_step_target),
+                device=device,
+                dtype=torch.float32,
+            )
+        else:
+            terminal_reset_min_step_target = terminal_reset_min_step_target.to(device=device, dtype=torch.float32)
         terminal_bonus_tanh_c = env.get("terminal_bonus_tanh_c", 10.0)
         if not torch.is_tensor(terminal_bonus_tanh_c):
             terminal_bonus_tanh_c = torch.full((batch_size,), float(terminal_bonus_tanh_c), device=device, dtype=torch.float32)
@@ -18851,13 +22675,15 @@ class EnvironmentPrior:
             reward_clip = reward_clip.to(device=device, dtype=torch.float32)
         state_clip = env["state_clip"].to(device=device, dtype=torch.float32) if torch.is_tensor(env["state_clip"]) else torch.full((batch_size,), float(env["state_clip"]), device=device, dtype=torch.float32)
         state_input_scale = env.get("state_input_scale", 1.0)
+        obs_output_scale = env.get("obs_output_scale", 1.0)
         for t in range(n_samples):
             obs_t = state_t[:, :obs_dim]
+            obs_token_t = self._scale_obs_output_token(obs_t, obs_output_scale)
             token_row = x_steps[t]
             token_row.zero_()
             if num_features > 0 and token_obs_cap > 0:
                 obs_write = min(token_obs_cap, num_features)
-                token_row[:, :obs_write] = obs_t[:, :obs_write]
+                token_row[:, :obs_write] = obs_token_t[:, :obs_write]
             if token_reward_idx < num_features:
                 token_row[:, token_reward_idx] = reward_t
             if token_mask_idx < num_features:
@@ -18967,6 +22793,8 @@ class EnvironmentPrior:
                 state_highway_lambda=env.get("state_highway_lambda", 0.0),
                 state_full_rms_enabled=env.get("state_full_rms_enabled", False),
                 state_full_rms_target=env.get("state_full_rms_target", 1.0),
+                state_full_rms_floor_enabled=env.get("state_full_rms_floor_enabled", False),
+                state_full_rms_max_upscale=env.get("state_full_rms_max_upscale", 4.0),
             )
             if terminal_token_enabled:
                 state_next, reward_next, terminal_next = self._apply_terminal_reset_step(
@@ -18986,6 +22814,8 @@ class EnvironmentPrior:
                     history_index=t,
                     history_warmup_count=terminal_reset_count_target,
                     history_relaxed_mask=terminal_history_relaxed,
+                    terminal_reset_min_step_target=terminal_reset_min_step_target,
+                    step_index=t,
                 )
             else:
                 terminal_next = torch.zeros((batch_size,), device=device, dtype=reward_next.dtype)

@@ -1,0 +1,53 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.296875,
+      "min_rate": 0.296875,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.035,
+      "role": "protected_band",
+      "trust_status": "quota_ready_protected_band"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.035,
+      "role": "protected_band",
+      "trust_status": "quota_ready_protected_band_but_not_sufficient"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.035,
+      "role": "protected_band",
+      "trust_status": "diagnostic_broad_axis"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "joint_profile_cell_cap_rate": 0.25,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "strict feedback broad count is not raised; this config only reduces constant/gain-2.0 dominance inside the existing strict feedback branch",
+      "trust_status": "candidate_subprofile_pressure_control"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "future-basin detector remains a logged Gym-anchored guard, not a quota axis",
+      "trust_status": "candidate_detector_not_quota_ready"
+    }
+  },
+  "profile_version_id": "profile_band_v2_locomotion_feedback_branch",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 20,
+      "gym_q90_obs_action_range": 20
+    },
+    "include_all_non_gain2": true,
+    "include_all_nonconstant": true,
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "candidate_branch_control_short_smoke_pass"
+  },
+  "target_per_rule": 64
+}

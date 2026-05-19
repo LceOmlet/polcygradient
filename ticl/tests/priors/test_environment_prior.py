@@ -53,6 +53,29 @@ def test_environment_prior_state_highway_postprocess_toggle_semantics():
     assert torch.allclose(out_l1, state_prev)
 
 
+def test_environment_prior_state_full_rms_floor_can_raise_low_rms():
+    state_next = torch.tensor([[0.25, -0.25], [4.0, -4.0]], dtype=torch.float32)
+
+    cap_only = EnvironmentPrior._apply_state_full_rms(
+        state_next,
+        enabled=True,
+        target=1.0,
+        floor_enabled=False,
+    )
+    floor = EnvironmentPrior._apply_state_full_rms(
+        state_next,
+        enabled=True,
+        target=1.0,
+        floor_enabled=True,
+        max_upscale=4.0,
+    )
+
+    np.testing.assert_allclose(cap_only[0].numpy(), state_next[0].numpy())
+    np.testing.assert_allclose(floor[0].numpy(), np.asarray([1.0, -1.0], dtype=np.float32), atol=1e-5)
+    np.testing.assert_allclose(cap_only[1].numpy(), np.asarray([1.0, -1.0], dtype=np.float32), atol=1e-5)
+    np.testing.assert_allclose(floor[1].numpy(), np.asarray([1.0, -1.0], dtype=np.float32), atol=1e-5)
+
+
 def test_environment_prior_state_highway_enabled_rollout_smoke():
     _seed_everything(123)
     config = get_prior_config()
@@ -81,6 +104,571 @@ def test_environment_prior_state_highway_enabled_rollout_smoke():
     for row in prior.last_runtime_info:
         assert bool(row["state_highway_enabled"])
         assert abs(float(row["state_highway_lambda"]) - 0.25) < 1e-6
+
+
+def test_environment_prior_exact_scm_gym_lowtail_source_materializes_terminal_family():
+    _seed_everything(51701)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+    env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 8.0
+
+    prior = EnvironmentPrior(env_cfg)
+    h_list = prior._sample_batch_hypers(4)
+
+    assert all(bool(h["exact_scm_gym_lowtail_family_selected"]) for h in h_list)
+    assert all(bool(h["terminal_reset_enabled"]) for h in h_list)
+    targets = [float(h["terminal_reset_count_target"]) for h in h_list]
+    assert all(4.0 <= target <= 8.0 for target in targets)
+
+
+def test_environment_prior_exact_scm_gym_lowtail_can_keep_terminal_independent():
+    _seed_everything(51703)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["terminal_reset_enabled"] = False
+    env_cfg["terminal_reset_count_target"] = 0
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = False
+
+    prior = EnvironmentPrior(env_cfg)
+    h_list = prior._sample_batch_hypers(4)
+
+    assert all(bool(h["exact_scm_gym_lowtail_family_selected"]) for h in h_list)
+    assert all(not bool(h["terminal_reset_enabled"]) for h in h_list)
+    assert all(float(h["terminal_reset_count_target"]) == 0.0 for h in h_list)
+    assert all(
+        h["exact_scm_gym_lowtail_family_terminal_count_source"] == "independent_terminal_source"
+        for h in h_list
+    )
+
+
+def test_environment_prior_exact_scm_gym_lowtail_family_vectorized_smoke_and_gain_summary():
+    _seed_everything(51702)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.75
+    prior = EnvironmentPrior(env_cfg)
+
+    h_list = prior._sample_batch_hypers(4)
+    env = prior._sample_environment_family_coarse_batch(
+        h_list,
+        torch.device("cpu"),
+        rng_seeds=[101, 102, 103, 104],
+    )
+    assert env["exact_scm_gym_lowtail_family_active"].all()
+    assert torch.allclose(
+        env["exact_scm_gym_lowtail_reward_potential_delta_weight"],
+        torch.full((4,), 0.75),
+    )
+    assert torch.all(env["reward_action_input_gain_density_ratio"] >= 0.5)
+    assert torch.all(env["reward_state_to_action_gain_density_ratio"] <= 15.0)
+
+    x, y, _ = prior.get_batch(
+        batch_size=4,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+    )
+    assert torch.isfinite(x).all()
+    assert torch.isfinite(y).all()
+    assert len(prior.last_runtime_info) == 4
+    assert all(row["exact_scm_gym_lowtail_family_active"] for row in prior.last_runtime_info)
+
+
+def test_environment_prior_potential_progress_source_label_live_sampler_materializes_axis():
+    _seed_everything(51904)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_shared_environment"] = False
+    env_cfg["exact_scm_gym_lowtail_potential_progress_source_label_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_potential_progress_source_label_prob"] = 0.5
+
+    prior = EnvironmentPrior(env_cfg)
+    h_list = prior._sample_batch_hypers(32)
+    targets = {str(h["potential_progress_reward_axis_target"]) for h in h_list}
+    assert targets == {"progress_only", "potential_delta_progress"}
+    assert all(bool(h["exact_scm_gym_lowtail_family_selected"]) for h in h_list)
+    assert all(float(h["exact_scm_gym_lowtail_reward_mix"]) == pytest.approx(0.35) for h in h_list)
+    assert all(float(h["base_reward_retention_fraction"]) == pytest.approx(0.65) for h in h_list)
+    for h in h_list:
+        expected = 0.65 if h["potential_progress_reward_axis_target"] == "potential_delta_progress" else 0.0
+        assert float(h["exact_scm_gym_lowtail_reward_potential_delta_weight"]) == pytest.approx(expected)
+
+    x, y, _ = prior.get_batch(
+        batch_size=8,
+        n_samples=16,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=8,
+    )
+    assert torch.isfinite(x).all()
+    assert torch.isfinite(y).all()
+    info_targets = {row["potential_progress_reward_axis_target"] for row in prior.last_runtime_info}
+    assert info_targets <= {"progress_only", "potential_delta_progress"}
+    assert all(row["potential_progress_preserves_base_reward_via_mix"] for row in prior.last_runtime_info)
+    assert all(float(row["exact_scm_gym_lowtail_reward_mix"]) == pytest.approx(0.35) for row in prior.last_runtime_info)
+
+
+def test_environment_prior_exact_scm_lowtail_shared_energy_terminal_signal_matches_reward_unit():
+    _seed_everything(51718)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51718)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_shared_energy_terminal_enabled"]
+    assert env["terminal_reset_enabled"]
+
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, : int(env["state_dim"])] = torch.tensor([[0.3, -0.2, 0.1, 0.4, -0.5, 0.2]])
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = torch.tensor(
+        [[0.25, -0.35]],
+        dtype=torch.float32,
+    )
+    env_in[:, int(env["env_noise_start"]): int(env["env_noise_start"]) + int(env["noise_dim"])] = torch.tensor(
+        [[0.1, -0.2, 0.05]],
+        dtype=torch.float32,
+    )
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+    assert torch.isfinite(state_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    torch.testing.assert_close(terminal_signal.reshape_as(reward_unit), reward_unit, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_exact_scm_lowtail_preimage_scalar_drives_obs_reward_done():
+    _seed_everything(51719)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_bias"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51719)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"]
+
+    action = torch.tensor([[0.25, -0.35]], dtype=torch.float32)
+    expected_driver = torch.tanh(action).mean(dim=1, keepdim=True)
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    torch.testing.assert_close(
+        state_next[:, : int(env["obs_dim"])],
+        expected_driver.expand(1, int(env["obs_dim"])),
+        atol=1e-6,
+        rtol=1e-6,
+    )
+    torch.testing.assert_close(reward_unit, expected_driver, atol=1e-6, rtol=1e-6)
+    torch.testing.assert_close(terminal_signal.reshape_as(reward_unit), expected_driver, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_exact_scm_lowtail_rank_preimage_drives_vector_obs():
+    _seed_everything(51720)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 5
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51720)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"]
+
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    action = torch.tensor([[0.35, -0.20, 0.50, -0.45, 0.15]], dtype=torch.float32)
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    obs_next = state_next[:, : int(env["obs_dim"])]
+    assert torch.isfinite(obs_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    assert float(torch.std(obs_next, dim=1).item()) > 1e-3
+    assert not torch.allclose(obs_next, obs_next[:, :1].expand_as(obs_next))
+
+
+def test_environment_prior_exact_scm_lowtail_reward_distribution_head_uses_rank6_latent():
+    _seed_everything(51801)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_bias"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51801)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"]
+    assert env["exact_scm_gym_lowtail_reward_distribution_head_enabled"]
+
+    action = torch.tensor([[0.60, -0.40, 0.25, -0.15, 0.45, -0.30]], dtype=torch.float32)
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    assert torch.isfinite(state_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    assert abs(float(reward_unit.item())) > 1e-3
+    torch.testing.assert_close(terminal_signal.reshape_as(reward_unit), reward_unit, atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_exact_scm_lowtail_paired_response_uses_independent_done_head():
+    _seed_everything(51818)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.5
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51818)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"]
+    assert env["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"]
+    assert env["exact_scm_gym_lowtail_reward_distribution_head_enabled"]
+    assert env["exact_scm_gym_lowtail_paired_response_preimage_enabled"]
+
+    action = torch.tensor([[0.60, -0.40, 0.25, -0.15, 0.45, -0.30]], dtype=torch.float32)
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, : int(env["obs_dim"])] = torch.tensor([[0.25, -0.20, 0.15, -0.10, 0.05, -0.03]])
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    assert torch.isfinite(state_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    assert abs(float(reward_unit.item())) > 1e-3
+    assert abs(float(terminal_signal.item())) > 1e-3
+    assert abs(float((terminal_signal.reshape_as(reward_unit) - reward_unit).item())) > 1e-4
+
+
+def test_environment_prior_exact_scm_lowtail_obs_hetero_scale_modulates_vector_obs():
+    _seed_everything(51819)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.5
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+    env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_strength"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51819)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled"]
+
+    action = torch.tensor([[0.60, -0.40, 0.25, -0.15, 0.45, -0.30]], dtype=torch.float32)
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, : int(env["obs_dim"])] = torch.tensor([[0.25, -0.20, 0.15, -0.10, 0.05, -0.03]])
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    assert torch.isfinite(state_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    assert float(torch.std(state_next[:, : int(env["obs_dim"])], unbiased=False).item()) > 1e-5
+
+
+def test_environment_prior_exact_scm_lowtail_markov_carrier_updates_state_slots():
+    _seed_everything(51820)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.5
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_markov_carrier_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+    env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51820)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_markov_carrier_preimage_enabled"]
+
+    action = torch.tensor([[0.60, -0.40, 0.25, -0.15, 0.45, -0.30]], dtype=torch.float32)
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    carrier_prev = torch.tensor([[0.2, -0.1, 0.3, 0.4, -0.2, 0.1]], dtype=torch.float32)
+    env_in[:, :6] = carrier_prev
+    env_in[:, int(env["env_action_start"]): int(env["env_action_start"]) + int(env["action_dim"])] = action
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    assert torch.isfinite(state_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    assert not torch.allclose(state_next[:, :6], carrier_prev)
+
+
+def test_environment_prior_exact_scm_lowtail_temporal_rank_preimage_projects_previous_obs():
+    _seed_everything(51721)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.5
+    env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 1
+    env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 0.0
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51721)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"]
+    assert env["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"]
+
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    env_in[:, : int(env["obs_dim"])] = torch.tensor([[1.0, -1.0, 1.0, -1.0, 1.0, -1.0]])
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    obs_next = state_next[:, : int(env["obs_dim"])]
+    assert torch.isfinite(obs_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    torch.testing.assert_close(obs_next, torch.zeros_like(obs_next), atol=1e-6, rtol=1e-6)
+
+
+def test_environment_prior_exact_scm_lowtail_envelope_preimage_controls_obs_envelope():
+    _seed_everything(51722)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 8, "max": 8}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 1, "max": 1}
+    env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+    env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+    env_cfg["exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled"] = True
+    prior = EnvironmentPrior(env_cfg)
+
+    h = prior._sample_batch_hypers(1)[0]
+    env = prior._sample_environment(h, torch.device("cpu"), rng_seed=51722)
+    assert env["exact_scm_gym_lowtail_family_active"]
+    assert env["exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled"]
+
+    env_in = torch.zeros((1, int(env["env_input_dim"])), dtype=torch.float32)
+    state_next, reward_unit, terminal_signal, _terminal_bonus_base = prior._unpack_transition_output(
+        env["transition_generator"](env_in)
+    )
+
+    obs_next = state_next[:, : int(env["obs_dim"])]
+    assert torch.isfinite(obs_next).all()
+    assert torch.isfinite(reward_unit).all()
+    assert torch.isfinite(terminal_signal).all()
+    torch.testing.assert_close(obs_next.mean(dim=1), torch.zeros(1), atol=1e-6, rtol=1e-6)
+    assert float(obs_next.std(dim=1).item()) > 0.1
+    assert not torch.allclose(obs_next, obs_next[:, :1].expand_as(obs_next))
+
+
+def test_environment_prior_obs_output_scale_only_changes_tokens_not_env_targets():
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    env_cfg["family"] = {"distribution": "meta_choice", "choice_values": ["scm"]}
+    env_cfg["state_dim"] = {"distribution": "uniform_int", "min": 6, "max": 6}
+    env_cfg["obs_dim"] = {"distribution": "uniform_int", "min": 4, "max": 4}
+    env_cfg["action_dim"] = {"distribution": "uniform_int", "min": 3, "max": 3}
+    env_cfg["noise_dim"] = {"distribution": "uniform_int", "min": 5, "max": 5}
+    env_cfg["zero_pad_dim"] = {"distribution": "uniform_int", "min": 2, "max": 2}
+    env_cfg["batch_parallel_backend"] = "torch_vectorized"
+    env_cfg["batch_shared_environment"] = False
+
+    cfg_base = dict(env_cfg)
+    cfg_scaled = dict(env_cfg)
+    cfg_base["obs_output_scale"] = 1.0
+    cfg_scaled["obs_output_scale"] = 2.0
+
+    _seed_everything(20860517)
+    prior_base = EnvironmentPrior(cfg_base)
+    x_base, y_base, y_base_target = prior_base.get_batch(
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+    )
+
+    _seed_everything(20860517)
+    prior_scaled = EnvironmentPrior(cfg_scaled)
+    x_scaled, y_scaled, y_scaled_target = prior_scaled.get_batch(
+        batch_size=3,
+        n_samples=12,
+        num_features=24,
+        device="cpu",
+        single_eval_pos=6,
+    )
+
+    assert torch.allclose(x_scaled[:, :, :4], x_base[:, :, :4] * 2.0)
+    assert torch.allclose(x_scaled[:, :, 4:], x_base[:, :, 4:])
+    assert torch.allclose(y_scaled, y_base)
+    assert torch.allclose(y_scaled_target, y_base_target)
 
 
 def test_environment_prior_shapes_and_finite():
@@ -181,6 +769,310 @@ def test_environment_prior_constrained_dim_sampling_is_stable_per_h_and_respects
     assert noise_dim >= 0
     assert zero_pad_dim >= 0
     assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_state_obs_coupled_dim_policy_keeps_hidden_state_near_obs():
+    prior = EnvironmentPrior({})
+    h = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_state_obs_coupled",
+        "constrained_dim_sampling_total_budget": 400,
+        "_constrained_state_extra_u": 0.30,
+        "_constrained_noise_u": 0.25,
+    }
+
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h)
+
+    assert action_dim == 7
+    assert obs_dim == 64
+    assert 64 <= state_dim <= 96
+    assert noise_dim >= 0
+    assert zero_pad_dim >= 0
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_state_obs_coupled_dim_policy_keeps_high_residual_support():
+    prior = EnvironmentPrior({})
+    h = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_state_obs_coupled",
+        "constrained_dim_sampling_total_budget": 400,
+        "_constrained_state_extra_u": 0.95,
+        "_constrained_noise_u": 0.25,
+    }
+
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h)
+
+    assert action_dim == 7
+    assert obs_dim == 64
+    assert state_dim > 192
+    assert state_dim <= 400
+    assert noise_dim >= 0
+    assert zero_pad_dim >= 0
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_obs_action_visible_state_mix_has_fully_observed_support():
+    prior = EnvironmentPrior({})
+    h = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_obs_action_visible_state_mix",
+        "constrained_dim_sampling_total_budget": 400,
+        "_constrained_obs_u": 0.20,
+        "_constrained_action_u": 0.20,
+        "_constrained_state_extra_u": 0.10,
+        "_constrained_noise_u": 0.25,
+    }
+
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h)
+
+    assert 2 <= obs_dim <= 17
+    assert state_dim == obs_dim
+    assert 1 <= action_dim <= 6
+    assert noise_dim >= 0
+    assert zero_pad_dim >= 0
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_obs_action_visible_state_mix_keeps_hidden_state_support():
+    prior = EnvironmentPrior({})
+    h = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_obs_action_visible_state_mix",
+        "constrained_dim_sampling_total_budget": 400,
+        "_constrained_obs_u": 0.20,
+        "_constrained_action_u": 0.20,
+        "_constrained_state_extra_u": 0.95,
+        "_constrained_noise_u": 0.25,
+    }
+
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h)
+
+    assert state_dim > obs_dim
+    assert state_dim <= 400
+    assert 1 <= action_dim <= 6
+    assert noise_dim >= 0
+    assert zero_pad_dim >= 0
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_empirical_obs_action_dim_policy_uses_gym_support():
+    prior = EnvironmentPrior({})
+    h_low = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_empirical_obs_action",
+        "constrained_dim_sampling_total_budget": 400,
+        "_constrained_obs_u": 0.0,
+        "_constrained_action_u": 0.0,
+        "_constrained_state_extra_u": 0.0,
+        "_constrained_noise_u": 0.25,
+    }
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h_low)
+    assert obs_dim == 2
+    assert action_dim == 1
+    assert state_dim >= obs_dim
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+    h_high = dict(h_low)
+    h_high["_constrained_obs_u"] = 0.99
+    h_high["_constrained_action_u"] = 0.99
+    h_high["_constrained_state_extra_u"] = 0.95
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h_high)
+    assert obs_dim == 348
+    assert action_dim == 17
+    assert state_dim >= obs_dim
+    assert state_dim <= 400
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_gym_low_noise_policy_does_not_scale_noise_with_remaining_budget():
+    prior = EnvironmentPrior({})
+    h = {
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_empirical_obs_action",
+        "constrained_dim_sampling_total_budget": 400,
+        "constrained_dim_noise_policy": "gym_low",
+        "_constrained_obs_u": 0.0,
+        "_constrained_action_u": 0.0,
+        "_constrained_state_extra_u": 0.0,
+        "_constrained_noise_u": 0.99,
+    }
+
+    state_dim, obs_dim, action_dim, noise_dim, zero_pad_dim = prior._sample_dims(h)
+
+    assert obs_dim == 2
+    assert action_dim == 1
+    assert state_dim < 20
+    assert 17 <= noise_dim <= 64
+    assert zero_pad_dim > 300
+    assert state_dim + noise_dim + zero_pad_dim == 400
+
+
+def test_environment_prior_visible_state_mix_batch_slot_policy_is_index_bound():
+    prior = EnvironmentPrior(
+        {
+            "constrained_dim_sampling_policy": "gym_obs_action_visible_state_mix",
+            "constrained_dim_visible_state_mix_fraction": 0.25,
+            "constrained_dim_visible_state_mix_hash_seed": 123,
+        }
+    )
+    h_list = [{} for _ in range(8)]
+
+    out_a = prior._apply_visible_state_mix_batch_slot_policy(h_list, list(range(8)), batch_size=8)
+    flags_a = [bool(h["constrained_dim_visible_state_mix_fully_observed"]) for h in out_a]
+    out_b = prior._apply_visible_state_mix_batch_slot_policy([{} for _ in range(4)], [1, 3, 5, 7], batch_size=8)
+    flags_b = [bool(h["constrained_dim_visible_state_mix_fully_observed"]) for h in out_b]
+
+    assert sum(flags_a) == 2
+    assert flags_b == [flags_a[idx] for idx in [1, 3, 5, 7]]
+
+
+def test_environment_prior_topology_freeze_h_freezes_constrained_dim_latents(monkeypatch):
+    _seed_everything(1234)
+    prior = EnvironmentPrior(
+        {
+            "constrained_dim_sampling_enabled": True,
+            "constrained_dim_sampling_policy": "gym_empirical_obs_action",
+            "constrained_dim_sampling_total_budget": 400,
+            "reward_state_input_gain_fraction_conditioned_min": 0.5,
+            "reward_topology_conditioned_sampling_max_attempts": 3,
+            "reward_topology_conditioned_freeze_h_across_attempts": True,
+        }
+    )
+    base_h = {
+        "family": "scm",
+        "action_dim": 7,
+        "state_dim": 399,
+        "obs_dim": 64,
+        "noise_dim": 61,
+        "zero_pad_dim": 123,
+        "constrained_dim_sampling_enabled": True,
+        "constrained_dim_sampling_policy": "gym_empirical_obs_action",
+        "constrained_dim_sampling_total_budget": 400,
+    }
+    dim_calls = []
+
+    def _sample_hypers(batch_size):
+        return [dict(base_h) for _ in range(int(batch_size))]
+
+    def _sample_env(h_list, device, rng_seeds=None, **kwargs):
+        del device, rng_seeds, kwargs
+        dim_calls.append([prior._sample_dims(h) for h in h_list])
+        accepted_gain = 0.0 if len(dim_calls) == 1 else 1.0
+        n = len(h_list)
+        return {
+            "reward_state_input_gain_fraction": torch.full((n,), accepted_gain),
+            "reward_action_input_gain_fraction": torch.ones(n),
+            "reward_noise_input_gain_fraction": torch.ones(n),
+            "reward_state_to_action_gain_ratio": torch.ones(n),
+            "reward_state_to_noise_gain_ratio": torch.ones(n),
+        }
+
+    monkeypatch.setattr(prior, "_sample_batch_hypers", _sample_hypers)
+    monkeypatch.setattr(prior, "_sample_environment_family_coarse_batch", _sample_env)
+
+    final_h_list, final_env, final_seeds = (
+        prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+            batch_size=8,
+            device="cpu",
+            rng_seeds=list(range(100, 108)),
+            return_final_env=False,
+        )
+    )
+
+    assert final_env is None
+    assert final_seeds == list(range(101, 109))
+    assert len(dim_calls) == 2
+    assert dim_calls[0] == dim_calls[1]
+    for h in final_h_list:
+        assert "_constrained_obs_u" in h
+        assert "_constrained_action_u" in h
+        assert "_constrained_state_extra_u" in h
+        assert "_constrained_noise_u" in h
+
+
+def test_environment_prior_topology_density_metrics_are_dimension_decoupled(monkeypatch):
+    prior = EnvironmentPrior(
+        {
+            "reward_state_input_gain_fraction_conditioned_min": 0.7,
+            "reward_action_input_gain_fraction_conditioned_min": 0.5,
+            "reward_topology_conditioned_state_gain_metric": "density_ratio",
+            "reward_topology_conditioned_action_gain_metric": "density_ratio",
+            "reward_state_to_action_gain_ratio_conditioned_max": 15.0,
+            "reward_topology_conditioned_state_to_action_ratio_metric": "density_ratio",
+            "reward_topology_conditioned_sampling_max_attempts": 1,
+            "reward_topology_conditioned_freeze_h_across_attempts": True,
+        }
+    )
+    base_h = {
+        "family": "scm",
+        "action_dim": 2,
+        "state_dim": 370,
+        "obs_dim": 8,
+        "noise_dim": 21,
+        "zero_pad_dim": 9,
+    }
+
+    monkeypatch.setattr(prior, "_sample_batch_hypers", lambda batch_size: [dict(base_h) for _ in range(batch_size)])
+
+    def _sample_env(h_list, device, rng_seeds=None, **kwargs):
+        del h_list, device, rng_seeds, kwargs
+        n = 2
+        return {
+            "reward_state_input_gain_fraction": torch.full((n,), 0.05),
+            "reward_state_input_gain_density_ratio": torch.ones(n),
+            "reward_action_input_gain_density_ratio": torch.ones(n),
+            "reward_noise_input_gain_fraction": torch.zeros(n),
+            "reward_state_to_action_gain_ratio": torch.full((n,), 100.0),
+            "reward_state_to_action_gain_density_ratio": torch.ones(n),
+            "reward_state_to_noise_gain_ratio": torch.ones(n),
+            "reward_state_to_noise_gain_density_ratio": torch.ones(n),
+        }
+
+    monkeypatch.setattr(prior, "_sample_environment_family_coarse_batch", _sample_env)
+
+    final_h_list, final_env, final_seeds = (
+        prior._sample_batch_hypers_and_environment_family_coarse_batch_conditioned(
+            batch_size=2,
+            device="cpu",
+            rng_seeds=[10, 20],
+            return_final_env=False,
+        )
+    )
+
+    assert final_env is None
+    assert len(final_h_list) == 2
+    assert final_seeds == [10, 20]
 
 
 def test_environment_prior_constrained_dim_sampling_rollout_reports_budgeted_dims():
@@ -743,6 +1635,53 @@ def test_environment_prior_scm_hidden_fused_transition_falls_back_when_temp_budg
                 os.environ.pop(key, None)
             else:
                 os.environ[key] = value
+
+
+def test_environment_prior_reward_output_bias_zero_flag_only_changes_reward_output():
+    _seed_everything(20260515)
+    config = get_prior_config()
+    env_cfg = dict(config["prior"]["environment"])
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+
+    def _run(enabled):
+        _seed_everything(20260515)
+        prior = EnvironmentPrior(env_cfg)
+        sampled = [
+            _manual_sampled_h(
+                family="scm",
+                state_dim=5,
+                obs_dim=3,
+                action_dim=2,
+                noise_dim=4,
+                zero_pad_dim=1,
+                num_layers=3,
+            )
+        ]
+        sampled[0]["reward_output_bias_zero_enabled"] = bool(enabled)
+        in_cap = (
+            int(sampled[0]["state_dim"])
+            + int(sampled[0]["obs_dim"])
+            + int(sampled[0]["action_dim"])
+            + int(sampled[0]["noise_dim"])
+            + int(sampled[0]["zero_pad_dim"])
+        )
+        transition_fn = prior._build_scm_hetero_joint_transition_batch_fn(
+            in_dims=torch.tensor([in_cap], device=device, dtype=torch.long),
+            state_dims=torch.tensor([int(sampled[0]["state_dim"])], device=device, dtype=torch.long),
+            h_list=sampled,
+            device=device,
+            depth_values=[int(sampled[0]["num_layers"])],
+            activation_names=[sampled[0]["prior_mlp_activations"]],
+            input_mask=torch.ones((1, in_cap), device=device, dtype=torch.float32),
+        )
+        x = torch.zeros((1, in_cap), device=device, dtype=torch.float32)
+        state, reward = transition_fn(x)
+        return state.detach().cpu(), reward.detach().cpu()
+
+    state_base, reward_base = _run(False)
+    state_zero, reward_zero = _run(True)
+    assert torch.allclose(state_base, state_zero, atol=1e-7, rtol=1e-7)
+    assert not torch.allclose(reward_base, reward_zero, atol=1e-7, rtol=1e-7)
 
 
 def test_environment_prior_gp_input_rff_fused_transition_matches_legacy_dual_semantics():
@@ -5715,6 +6654,8 @@ def test_environment_prior_strict_reference_semantics_override_env_fields_and_se
     assert float(env["reward_scale"]) == 1.0
     assert math.isinf(float(env["reward_clip"]))
     assert math.isinf(float(env["state_clip"]))
+    assert bool(env["state_highway_enabled"]) is True
+    assert float(env["state_highway_lambda"]) == pytest.approx(1.0)
     assert bool(env["reward_dropout_enabled"]) is False
     assert float(env["reward_dropout_ratio"]) == 0.0
     assert bool(env["state_input_scale_enabled"]) is True
@@ -5737,8 +6678,8 @@ def test_environment_prior_strict_reference_semantics_override_env_fields_and_se
 
     assert captured["serial_env_input_dim"] == 6
     assert torch.allclose(y, torch.full_like(y, 3.0))
-    assert torch.allclose(x[1, :2], torch.tensor([2.0, 2.0]))
-    assert torch.allclose(captured["serial_env_in"][0, :3], torch.full((3,), 0.5))
+    assert torch.allclose(x[1, :2], x[0, :2])
+    assert torch.allclose(captured["serial_env_in"][0, :2], x[1, :2])
     assert float(info["reward_drop_frac_realized"]) == 0.0
 
 
@@ -7927,6 +8868,58 @@ def test_environment_prior_terminal_tail_event_keeps_forced_reset_during_cold_st
     )
 
     assert torch.equal(out, torch.tensor([True, True, True, True]))
+
+
+def test_environment_prior_terminal_min_step_gates_events_but_keeps_history():
+    prior = EnvironmentPrior({})
+    history = torch.full((4, 2), -1.0, dtype=torch.float32)
+    state_next = torch.ones((2, 1), dtype=torch.float32)
+    reward_next = torch.zeros(2, dtype=torch.float32)
+    terminal_signal = torch.tensor([0.25, -0.5], dtype=torch.float32)
+
+    gated_state, gated_reward, gated_terminal = prior._apply_terminal_reset_step(
+        state_next=state_next,
+        reward_next=reward_next,
+        terminal_draw=torch.zeros(2, dtype=torch.float32),
+        reset_prob=torch.ones(2, dtype=torch.float32),
+        bonus_scale_draw=torch.zeros(2, dtype=torch.float32),
+        bonus_scale_min=torch.ones(2, dtype=torch.float32),
+        bonus_scale_max=torch.ones(2, dtype=torch.float32),
+        bonus_tanh_c=torch.ones(2, dtype=torch.float32),
+        reset_state=torch.zeros((2, 1), dtype=torch.float32),
+        enabled=torch.ones(2, dtype=torch.bool),
+        terminal_signal=terminal_signal,
+        terminal_signal_history=history,
+        history_index=2,
+        history_warmup_count=torch.zeros(2, dtype=torch.float32),
+        terminal_reset_min_step_target=torch.full((2,), 3.0, dtype=torch.float32),
+        step_index=2,
+    )
+
+    assert torch.equal(gated_terminal, torch.zeros(2, dtype=torch.float32))
+    assert torch.equal(gated_state, state_next)
+    assert torch.equal(gated_reward, reward_next)
+    assert torch.equal(history[2], terminal_signal)
+
+    open_state, _, open_terminal = prior._apply_terminal_reset_step(
+        state_next=state_next,
+        reward_next=reward_next,
+        terminal_draw=torch.zeros(2, dtype=torch.float32),
+        reset_prob=torch.ones(2, dtype=torch.float32),
+        bonus_scale_draw=torch.zeros(2, dtype=torch.float32),
+        bonus_scale_min=torch.ones(2, dtype=torch.float32),
+        bonus_scale_max=torch.ones(2, dtype=torch.float32),
+        bonus_tanh_c=torch.ones(2, dtype=torch.float32),
+        reset_state=torch.zeros((2, 1), dtype=torch.float32),
+        enabled=torch.ones(2, dtype=torch.bool),
+        terminal_signal=terminal_signal,
+        history_warmup_count=torch.zeros(2, dtype=torch.float32),
+        terminal_reset_min_step_target=torch.full((2,), 3.0, dtype=torch.float32),
+        step_index=3,
+    )
+
+    assert torch.equal(open_terminal, torch.ones(2, dtype=torch.float32))
+    assert torch.equal(open_state, torch.zeros((2, 1), dtype=torch.float32))
 
 
 def test_environment_prior_terminal_tail_event_uses_sample_history_after_warmup():

@@ -1,5 +1,7 @@
 import argparse
 import copy
+import ctypes
+import gc
 import json
 import math
 import sys
@@ -341,6 +343,59 @@ def _summarize_rollout_buffer_light(
     }
 
 
+def _trim_host_allocator_for_pack_bridge() -> None:
+    gc.collect()
+    try:
+        libc = ctypes.CDLL("libc.so.6")
+        malloc_trim = getattr(libc, "malloc_trim", None)
+        if malloc_trim is not None:
+            malloc_trim(0)
+    except Exception:
+        pass
+
+
+def _clear_rollout_buffer_payload_refs(buffer: MaskedRecurrentRolloutBuffer) -> None:
+    for name in [
+        "observations",
+        "actions",
+        "rewards",
+        "returns",
+        "episode_starts",
+        "values",
+        "log_probs",
+        "advantages",
+        "hidden_states_pi",
+        "cell_states_pi",
+        "hidden_states_vf",
+        "cell_states_vf",
+        "objective_masks",
+        "rollout_return_means",
+        "rollout_return_stds",
+        "rollout_raw_returns",
+        "actor_advantages",
+        "value_target_bucket_idx",
+        "action_masks",
+        "next_states",
+        "next_state_masks",
+        "_global_normalized_q_targets_flat",
+        "_global_q_target_seq_ids_flat",
+        "_global_q_target_seq_lengths",
+        "_global_value_target_bucket_idx_flat",
+        "_flat_env_indices",
+        "_flat_step_indices",
+        "_flat_objective_episode_indices",
+        "_flat_objective_episode_positions",
+        "_flat_objective_global_positions",
+    ]:
+        if hasattr(buffer, name):
+            setattr(buffer, name, None)
+    buffer.seq_start_indices = None
+    buffer.seq_end_indices = None
+    buffer.generator_ready = False
+    buffer.pos = 0
+    buffer.full = False
+
+
 def _fill_existing_rollout_buffer_from_pack(
     buffer: MaskedRecurrentRolloutBuffer,
     pack: dict[str, np.ndarray],
@@ -354,6 +409,8 @@ def _fill_existing_rollout_buffer_from_pack(
     last_values_by_env: np.ndarray | None = None,
     compute_returns: bool = True,
     summary_mode: str = "full",
+    take_ownership: bool = False,
+    allow_missing_next_state_targets: bool = False,
 ) -> dict[str, Any]:
     fill_t0 = time.perf_counter()
     timings: dict[str, float] = {}
@@ -378,8 +435,12 @@ def _fill_existing_rollout_buffer_from_pack(
     pack_next_state_masks = pack.get("next_state_masks")
     if buffer_next_state_dim > 0:
         if pack_next_states is None or pack_next_state_masks is None:
-            raise ValueError("pack omitted next_state targets but rollout buffer requires them")
-        if int(np.asarray(pack_next_states).shape[-1]) != int(buffer_next_state_dim):
+            if bool(allow_missing_next_state_targets):
+                buffer_next_state_dim = 0
+                buffer.next_state_dim = 0
+            else:
+                raise ValueError("pack omitted next_state targets but rollout buffer requires them")
+        elif int(np.asarray(pack_next_states).shape[-1]) != int(buffer_next_state_dim):
             raise ValueError(
                 "next_state target dim mismatch: "
                 f"{np.asarray(pack_next_states).shape[-1]} vs buffer={int(buffer_next_state_dim)}"
@@ -391,9 +452,6 @@ def _fill_existing_rollout_buffer_from_pack(
     if log_probs_by_step_env is not None:
         log_probs_arr[:] = np.asarray(log_probs_by_step_env, dtype=np.float32).reshape((int(n_steps), int(n_envs)))
 
-    phase_t0 = time.perf_counter()
-    buffer.reset()
-    timings["reset_s"] = float(time.perf_counter() - phase_t0)
     device_obj = torch.device(buffer.device)
     phase_t0 = time.perf_counter()
     objective_masks = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
@@ -414,34 +472,147 @@ def _fill_existing_rollout_buffer_from_pack(
         if copy_dim > 0:
             dst[..., :copy_dim] = src_arr[..., :copy_dim]
 
-    if tuple(tokens.shape) != tuple(buffer.observations.shape):
-        raise ValueError(f"tokens shape mismatch: source={tuple(tokens.shape)} target={tuple(buffer.observations.shape)}")
-    if tuple(rewards.shape) != tuple(buffer.rewards.shape):
-        raise ValueError(f"rewards shape mismatch: source={tuple(rewards.shape)} target={tuple(buffer.rewards.shape)}")
-    if tuple(episode_starts.shape) != tuple(buffer.episode_starts.shape):
+    target_tokens_shape = (int(buffer.buffer_size), int(buffer.n_envs), int(num_features))
+    if tuple(tokens.shape) != tuple(target_tokens_shape):
+        raise ValueError(f"tokens shape mismatch: source={tuple(tokens.shape)} target={tuple(target_tokens_shape)}")
+    target_rewards_shape = (int(buffer.buffer_size), int(buffer.n_envs))
+    if tuple(rewards.shape) != tuple(target_rewards_shape):
+        raise ValueError(f"rewards shape mismatch: source={tuple(rewards.shape)} target={tuple(target_rewards_shape)}")
+    target_episode_starts_shape = (int(buffer.buffer_size), int(buffer.n_envs))
+    if tuple(episode_starts.shape) != tuple(target_episode_starts_shape):
         raise ValueError(
             f"episode_starts shape mismatch: source={tuple(episode_starts.shape)} "
-            f"target={tuple(buffer.episode_starts.shape)}"
+            f"target={tuple(target_episode_starts_shape)}"
         )
+    transferred_keys: list[str] = []
+    copied_keys: list[str] = []
+
+    def _take_array(key: str, arr: np.ndarray, *, expected_shape: tuple[int, ...], name: str) -> np.ndarray:
+        if tuple(arr.shape) != tuple(expected_shape):
+            raise ValueError(f"{name} shape mismatch: source={tuple(arr.shape)} target={tuple(expected_shape)}")
+        pack.pop(key, None)
+        out = np.ascontiguousarray(arr, dtype=np.float32)
+        if out is arr:
+            transferred_keys.append(key)
+        else:
+            copied_keys.append(key)
+        return out
+
     phase_t0 = time.perf_counter()
-    buffer.observations[:] = tokens
-    _assign_step_env_last_dim(buffer.actions, actions, name="actions")
-    buffer.rewards[:] = rewards
-    buffer.episode_starts[:] = episode_starts
-    buffer.values[:] = values_arr
-    buffer.log_probs[:] = log_probs_arr
-    _assign_step_env_last_dim(buffer.action_masks, np.asarray(pack["action_masks"], dtype=np.float32), name="action_masks")
-    if buffer_next_state_dim > 0:
-        _assign_step_env_last_dim(buffer.next_states, np.asarray(pack_next_states, dtype=np.float32), name="next_states")
-        _assign_step_env_last_dim(
-            buffer.next_state_masks,
-            np.asarray(pack_next_state_masks, dtype=np.float32),
-            name="next_state_masks",
+    if bool(take_ownership):
+        _clear_rollout_buffer_payload_refs(buffer)
+        _trim_host_allocator_for_pack_bridge()
+        timings["reset_s"] = float(time.perf_counter() - phase_t0)
+        phase_t0 = time.perf_counter()
+        buffer._lazy_step_env_flatten = True
+        buffer._lazy_step_env_unflattened = False
+        buffer.mask_dims = int(np.prod(buffer.action_space.shape, dtype=np.int64))
+        buffer.observations = _take_array("tokens", tokens, expected_shape=(int(n_steps), int(n_envs), int(num_features)), name="tokens")
+        if tuple(actions.shape) == (int(n_steps), int(n_envs), int(buffer.action_dim)):
+            buffer.actions = _take_array(
+                "actions",
+                actions,
+                expected_shape=(int(n_steps), int(n_envs), int(buffer.action_dim)),
+                name="actions",
+            )
+        else:
+            buffer.actions = np.zeros((int(n_steps), int(n_envs), int(buffer.action_dim)), dtype=np.float32)
+            _assign_step_env_last_dim(buffer.actions, actions, name="actions")
+            pack.pop("actions", None)
+            copied_keys.append("actions")
+        buffer.rewards = _take_array("rewards", rewards, expected_shape=(int(n_steps), int(n_envs)), name="rewards")
+        buffer.episode_starts = _take_array(
+            "episode_starts",
+            episode_starts,
+            expected_shape=(int(n_steps), int(n_envs)),
+            name="episode_starts",
         )
-    buffer.objective_masks[:] = objective_masks
+        buffer.values = np.ascontiguousarray(values_arr, dtype=np.float32)
+        buffer.log_probs = np.ascontiguousarray(log_probs_arr, dtype=np.float32)
+        buffer.advantages = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
+        buffer.returns = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
+        action_masks_arr = np.asarray(pack["action_masks"], dtype=np.float32)
+        if tuple(action_masks_arr.shape) == (int(n_steps), int(n_envs), int(buffer.mask_dims)):
+            buffer.action_masks = _take_array(
+                "action_masks",
+                action_masks_arr,
+                expected_shape=(int(n_steps), int(n_envs), int(buffer.mask_dims)),
+                name="action_masks",
+            )
+        else:
+            buffer.action_masks = np.ones((int(n_steps), int(n_envs), int(buffer.mask_dims)), dtype=np.float32)
+            _assign_step_env_last_dim(buffer.action_masks, action_masks_arr, name="action_masks")
+            pack.pop("action_masks", None)
+            copied_keys.append("action_masks")
+        if buffer_next_state_dim > 0:
+            next_states_arr = np.asarray(pack_next_states, dtype=np.float32)
+            next_state_masks_arr = np.asarray(pack_next_state_masks, dtype=np.float32)
+            buffer.next_states = _take_array(
+                "next_state_targets",
+                next_states_arr,
+                expected_shape=(int(n_steps), int(n_envs), int(buffer_next_state_dim)),
+                name="next_states",
+            )
+            buffer.next_state_masks = _take_array(
+                "next_state_masks",
+                next_state_masks_arr,
+                expected_shape=(int(n_steps), int(n_envs), int(buffer_next_state_dim)),
+                name="next_state_masks",
+            )
+        else:
+            buffer.next_states = np.zeros((int(n_steps), int(n_envs), 0), dtype=np.float32)
+            buffer.next_state_masks = np.zeros((int(n_steps), int(n_envs), 0), dtype=np.float32)
+            pack.pop("next_state_targets", None)
+            pack.pop("next_state_masks", None)
+        buffer.objective_masks = objective_masks
+        buffer.rollout_return_means = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
+        buffer.rollout_return_stds = np.ones((int(n_steps), int(n_envs)), dtype=np.float32)
+        buffer.rollout_raw_returns = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
+        buffer.actor_advantages = np.zeros((int(n_steps), int(n_envs)), dtype=np.float32)
+        buffer.value_target_bucket_idx = np.full((int(n_steps), int(n_envs)), -1, dtype=np.int64)
+        buffer.hidden_states_pi = np.zeros(buffer.hidden_state_shape, dtype=np.float32)
+        buffer.cell_states_pi = np.zeros(buffer.hidden_state_shape, dtype=np.float32)
+        buffer.hidden_states_vf = np.zeros(buffer.hidden_state_shape, dtype=np.float32)
+        buffer.cell_states_vf = np.zeros(buffer.hidden_state_shape, dtype=np.float32)
+    else:
+        phase_t0 = time.perf_counter()
+        buffer.reset()
+        buffer._lazy_step_env_flatten = False
+        buffer._lazy_step_env_unflattened = False
+        timings["reset_s"] = float(time.perf_counter() - phase_t0)
+        if tuple(tokens.shape) != tuple(buffer.observations.shape):
+            raise ValueError(f"tokens shape mismatch: source={tuple(tokens.shape)} target={tuple(buffer.observations.shape)}")
+        if tuple(rewards.shape) != tuple(buffer.rewards.shape):
+            raise ValueError(f"rewards shape mismatch: source={tuple(rewards.shape)} target={tuple(buffer.rewards.shape)}")
+        if tuple(episode_starts.shape) != tuple(buffer.episode_starts.shape):
+            raise ValueError(
+                f"episode_starts shape mismatch: source={tuple(episode_starts.shape)} "
+                f"target={tuple(buffer.episode_starts.shape)}"
+            )
+        phase_t0 = time.perf_counter()
+        buffer.observations[:] = tokens
+        _assign_step_env_last_dim(buffer.actions, actions, name="actions")
+        buffer.rewards[:] = rewards
+        buffer.episode_starts[:] = episode_starts
+        buffer.values[:] = values_arr
+        buffer.log_probs[:] = log_probs_arr
+        _assign_step_env_last_dim(buffer.action_masks, np.asarray(pack["action_masks"], dtype=np.float32), name="action_masks")
+        if buffer_next_state_dim > 0:
+            _assign_step_env_last_dim(buffer.next_states, np.asarray(pack_next_states, dtype=np.float32), name="next_states")
+            _assign_step_env_last_dim(
+                buffer.next_state_masks,
+                np.asarray(pack_next_state_masks, dtype=np.float32),
+                name="next_state_masks",
+            )
+        elif bool(allow_missing_next_state_targets):
+            buffer.next_states = np.zeros((int(n_steps), int(n_envs), 0), dtype=np.float32)
+            buffer.next_state_masks = np.zeros((int(n_steps), int(n_envs), 0), dtype=np.float32)
+        buffer.objective_masks[:] = objective_masks
     buffer.pos = int(buffer.buffer_size)
     buffer.full = True
     buffer.generator_ready = False
+    buffer.seq_start_indices = None
+    buffer.seq_end_indices = None
     timings["array_assign_s"] = float(time.perf_counter() - phase_t0)
     if bool(compute_returns):
         phase_t0 = time.perf_counter()
@@ -459,13 +630,20 @@ def _fill_existing_rollout_buffer_from_pack(
     timings["pre_summary_total_s"] = float(time.perf_counter() - fill_t0)
     if summary_mode_norm in {"light", "minimal", "none", "off", "false", "0"}:
         timings["total_s"] = float(time.perf_counter() - fill_t0)
-        return _summarize_rollout_buffer_light(buffer, timings=timings)
+        summary = _summarize_rollout_buffer_light(buffer, timings=timings)
+        summary["take_ownership"] = bool(take_ownership)
+        summary["transferred_keys"] = list(transferred_keys)
+        summary["copied_keys"] = list(copied_keys)
+        return summary
     phase_t0 = time.perf_counter()
     summary = _summarize_rollout_buffer(buffer)
     timings["summary_s"] = float(time.perf_counter() - phase_t0)
     timings["total_s"] = float(time.perf_counter() - fill_t0)
     summary["summary_mode"] = "full"
     summary["timings"] = timings
+    summary["take_ownership"] = bool(take_ownership)
+    summary["transferred_keys"] = list(transferred_keys)
+    summary["copied_keys"] = list(copied_keys)
     return summary
 
 

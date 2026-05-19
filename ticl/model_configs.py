@@ -80,6 +80,9 @@ def get_optimizer_config():
         "ppo_pack_seed": 4040,
         "ppo_pack_prior_milestone": "sampled_topology",
         "ppo_pack_prior_mode": "sampled_topology",
+        "ppo_pack_fixed_frozen_h_list_csv": None,
+        "ppo_pack_fixed_frozen_h_list_rule": None,
+        "ppo_pack_fixed_frozen_h_list_limit": None,
         "ppo_pack_fixed_env_group_across_updates": False,
         "ppo_pack_sb3_reward_normalization_enabled": True,
         "ppo_pack_sb3_observation_normalization_enabled": True,
@@ -260,6 +263,7 @@ def get_prior_config(max_features=100, n_samples=2048):
         "constrained_dim_sampling_enabled": False,
         "constrained_dim_sampling_total_budget": 400,
         "strict_joint_transition_enabled": True,
+        "reference_scm_zero_pad_inactive_init_enabled": False,
         # Fixed token slots for PFN input:
         # head-1 uses [s_t(obs slot), r_t, r_mask_t] => 402 dims by default.
         # head-2 uses [a_t] => 30 dims by default.
@@ -279,7 +283,9 @@ def get_prior_config(max_features=100, n_samples=2048):
         "reward_state_input_gain_fraction_conditioned_min": 0.0,
         "reward_topology_conditioned_sampling_enabled": False,
         "reward_action_input_gain_fraction_conditioned_min": 0.0,
+        "reward_noise_input_gain_fraction_conditioned_min": 0.0,
         "reward_state_to_action_gain_ratio_conditioned_max": 0.0,
+        "reward_state_to_noise_gain_ratio_conditioned_max": 0.0,
         "reward_topology_conditioned_sampling_max_attempts": 4096,
         # Parallel generation across independent batch columns in get_batch().
         "batch_parallel_workers": 4,

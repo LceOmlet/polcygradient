@@ -1,0 +1,45 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.375,
+      "min_rate": 0.25,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "online_probe_quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.08,
+      "role": "protected_band",
+      "trust_status": "online_probe_protected_band_centered"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.35,
+      "role": "protected_band",
+      "trust_status": "online_probe_source_saturated_relaxed_guard"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.15,
+      "role": "protected_band",
+      "trust_status": "online_probe_source_limited_relaxed_guard"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "generator_level_read": "bounded online candidate-pool prototype; broad axes only",
+  "joint_profile_cell_cap_rate": 0.375,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "feedback strict labels still require a generator-level source-pool detector before quota use",
+      "trust_status": "not_online_quota_ready"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "MountainCar future-basin remains prior-side detector/coverage guard only",
+      "trust_status": "detector_not_quota_ready"
+    }
+  },
+  "profile_version_id": "profile_band_online_broad_prototype",
+  "strict_feedback_subprofile_branch": {
+    "enabled": false,
+    "trust_status": "disabled_in_online_broad_prototype"
+  },
+  "target_per_rule": 16
+}

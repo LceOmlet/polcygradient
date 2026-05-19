@@ -50,12 +50,10 @@ from ticl.analysis.phase2_gym_prior_pack_training_runner import (  # noqa: E402
     _set_topology_conditioned_sampling,
     _build_algo as _build_pack_algo,
 )
-from ticl.analysis.phase2_gated_reward_path_milestone import (  # noqa: E402
-    GATED_REWARD_PATH_MILESTONE,
-    GATED_REWARD_PATH_MILESTONES,
-    GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+from ticl.analysis.phase2_m4_potential_progress_milestone import (  # noqa: E402
+    M4_POTENTIAL_PROGRESS_MILESTONE,
     SAMPLED_TOPOLOGY_MILESTONE,
-    install_gated_reward_path_balance_milestone,
+    install_m4_potential_progress_live_milestone,
     normalize_prior_milestone,
 )
 from ticl.analysis.phase2_fit_model_migration_gradient_compare import (  # noqa: E402
@@ -140,7 +138,14 @@ def _enforce_healthy_sampled_topology_contract(
     *,
     topology_state_gain_min: float,
     topology_action_gain_min: float,
+    topology_noise_gain_min: float,
+    topology_state_gain_metric: str,
+    topology_action_gain_metric: str,
+    topology_noise_gain_metric: str,
     topology_state_to_action_ratio_max: float,
+    topology_state_to_action_ratio_metric: str,
+    topology_state_to_noise_ratio_max: float,
+    topology_state_to_noise_ratio_metric: str,
     topology_max_attempts: int,
     ppo_batch_size: int,
     ppo_n_epochs: int,
@@ -160,7 +165,14 @@ def _enforce_healthy_sampled_topology_contract(
         env_cfg,
         state_gain_min=float(topology_state_gain_min),
         action_gain_min=float(topology_action_gain_min),
+        noise_gain_min=float(topology_noise_gain_min),
+        state_gain_metric=str(topology_state_gain_metric),
+        action_gain_metric=str(topology_action_gain_metric),
+        noise_gain_metric=str(topology_noise_gain_metric),
         state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+        state_to_action_ratio_metric=str(topology_state_to_action_ratio_metric),
+        state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
+        state_to_noise_ratio_metric=str(topology_state_to_noise_ratio_metric),
         max_attempts=int(topology_max_attempts),
     )
 
@@ -193,7 +205,18 @@ def _load_contract_config(args: argparse.Namespace) -> dict[str, Any]:
         cfg,
         topology_state_gain_min=float(args.topology_state_gain_min),
         topology_action_gain_min=float(args.topology_action_gain_min),
+        topology_noise_gain_min=float(getattr(args, "topology_noise_gain_min", 0.0)),
+        topology_state_gain_metric=str(getattr(args, "topology_state_gain_metric", "fraction")),
+        topology_action_gain_metric=str(getattr(args, "topology_action_gain_metric", "fraction")),
+        topology_noise_gain_metric=str(getattr(args, "topology_noise_gain_metric", "fraction")),
         topology_state_to_action_ratio_max=float(args.topology_state_to_action_ratio_max),
+        topology_state_to_action_ratio_metric=str(
+            getattr(args, "topology_state_to_action_ratio_metric", "total_gain")
+        ),
+        topology_state_to_noise_ratio_max=float(getattr(args, "topology_state_to_noise_ratio_max", 0.0)),
+        topology_state_to_noise_ratio_metric=str(
+            getattr(args, "topology_state_to_noise_ratio_metric", "total_gain")
+        ),
         topology_max_attempts=int(args.topology_max_attempts),
         ppo_batch_size=int(args.ppo_batch_size),
         ppo_n_epochs=int(args.ppo_n_epochs),
@@ -219,7 +242,7 @@ def _make_fixed_single_eval_prior(
 
 def _prior_mode_for_milestone(ppo_pack_prior_milestone: str) -> str:
     milestone = normalize_prior_milestone(ppo_pack_prior_milestone)
-    if milestone in GATED_REWARD_PATH_MILESTONES:
+    if milestone == M4_POTENTIAL_PROGRESS_MILESTONE:
         return milestone
     if milestone == SAMPLED_TOPOLOGY_MILESTONE:
         return "sampled_topology"
@@ -233,17 +256,14 @@ def _install_fit_prior_milestone_if_needed(
     ppo_pack_prior_milestone: str,
 ) -> None:
     milestone = normalize_prior_milestone(ppo_pack_prior_milestone)
-    if milestone not in GATED_REWARD_PATH_MILESTONES:
+    if milestone != M4_POTENTIAL_PROGRESS_MILESTONE:
         return
-    install_gated_reward_path_balance_milestone(
+    install_m4_potential_progress_live_milestone(
         prior,
         state_gain_min=float(env_cfg["reward_state_input_gain_fraction_conditioned_min"]),
         action_gain_min=float(env_cfg["reward_action_input_gain_fraction_conditioned_min"]),
         state_to_action_ratio_max=float(env_cfg["reward_state_to_action_gain_ratio_conditioned_max"]),
         max_attempts=int(env_cfg["reward_topology_conditioned_sampling_max_attempts"]),
-        terminal_count_coverage_enabled=(
-            milestone == GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE
-        ),
     )
 
 
@@ -380,10 +400,32 @@ def _build_pack_training_algo(
         gain_min=float(0.7),
         topology_state_gain_min=float(cfg["prior"]["environment"]["reward_state_input_gain_fraction_conditioned_min"]),
         topology_action_gain_min=float(cfg["prior"]["environment"]["reward_action_input_gain_fraction_conditioned_min"]),
+        topology_noise_gain_min=float(cfg["prior"]["environment"].get("reward_noise_input_gain_fraction_conditioned_min", 0.0)),
+        topology_state_gain_metric=str(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_state_gain_metric", "fraction")
+        ),
+        topology_action_gain_metric=str(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_action_gain_metric", "fraction")
+        ),
+        topology_noise_gain_metric=str(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_noise_gain_metric", "fraction")
+        ),
         topology_state_to_action_ratio_max=float(
             cfg["prior"]["environment"]["reward_state_to_action_gain_ratio_conditioned_max"]
         ),
+        topology_state_to_action_ratio_metric=str(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_state_to_action_ratio_metric", "total_gain")
+        ),
+        topology_state_to_noise_ratio_max=float(
+            cfg["prior"]["environment"].get("reward_state_to_noise_gain_ratio_conditioned_max", 0.0)
+        ),
+        topology_state_to_noise_ratio_metric=str(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_state_to_noise_ratio_metric", "total_gain")
+        ),
         topology_max_attempts=int(cfg["prior"]["environment"]["reward_topology_conditioned_sampling_max_attempts"]),
+        topology_freeze_h_across_attempts=bool(
+            cfg["prior"]["environment"].get("reward_topology_conditioned_freeze_h_across_attempts", False)
+        ),
         fixed_env_group_across_updates=False,
         ppo_learning_rate=float(cfg["optimizer"]["learning_rate"]),
         ppo_batch_size=int(ppo_batch_size),
@@ -989,16 +1031,16 @@ def main() -> None:
     parser.add_argument(
         "--ppo-pack-prior-milestone",
         type=str,
-        default=SAMPLED_TOPOLOGY_MILESTONE,
+        default=M4_POTENTIAL_PROGRESS_MILESTONE,
         choices=[
-            SAMPLED_TOPOLOGY_MILESTONE,
-            GATED_REWARD_PATH_MILESTONE,
-            GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+            M4_POTENTIAL_PROGRESS_MILESTONE,
         ],
     )
     parser.add_argument("--topology-state-gain-min", type=float, default=0.7)
     parser.add_argument("--topology-action-gain-min", type=float, default=0.06)
+    parser.add_argument("--topology-noise-gain-min", type=float, default=0.0)
     parser.add_argument("--topology-state-to-action-ratio-max", type=float, default=10.0)
+    parser.add_argument("--topology-state-to-noise-ratio-max", type=float, default=0.0)
     parser.add_argument("--topology-max-attempts", type=int, default=4096)
     parser.add_argument("--sb3-reward-normalization-enabled", type=str2bool, default=True)
     parser.add_argument("--sb3-observation-normalization-enabled", type=str2bool, default=True)

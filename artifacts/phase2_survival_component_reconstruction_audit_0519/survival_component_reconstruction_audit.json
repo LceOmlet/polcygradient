@@ -1,0 +1,96 @@
+{
+  "analysis_entry": "phase2_survival_component_reconstruction_audit",
+  "contract": {
+    "does_not_modify_sampler": true,
+    "does_not_train": true,
+    "paired_only_difference": "survival_reward_weight/enable_prob/source_label",
+    "read_only": true,
+    "source_label_sampler_authorized_only_on_hard_pass": true
+  },
+  "inputs": {
+    "action_seed": 519123,
+    "action_std": 0.7,
+    "device": "cuda:0",
+    "env_seed": 519000,
+    "h_seed": 190519,
+    "n_envs": 8,
+    "n_pairs": 4,
+    "n_steps": 64,
+    "survival_weight": 0.02
+  },
+  "outputs": {
+    "json": "/home/chen/RLPFN/reinforce-terminal-explore/artifacts/phase2_survival_component_reconstruction_audit_0519/survival_component_reconstruction_audit.json",
+    "markdown": "/home/chen/RLPFN/reinforce-terminal-explore/artifacts/phase2_survival_component_reconstruction_audit_0519/survival_component_reconstruction_audit.md"
+  },
+  "read": {
+    "action_pair_err": 0.0,
+    "base_preservation_pass": true,
+    "component_logging_pass": true,
+    "done_pair_mismatch": 0,
+    "finite_pass": true,
+    "hard_pass": true,
+    "missing_component_steps": 0,
+    "reconstruction_err": 1.1920928955078125e-07,
+    "reconstruction_pass": true,
+    "reward_ctrl_pair_err": 0.0,
+    "reward_env_pair_err": 0.0,
+    "reward_terminal_pair_err": 0.0,
+    "source_label_sampler_authorized_after_this_audit": true,
+    "state_pair_err": 0.0,
+    "survival_formula_err": 0.0,
+    "survival_formula_pass": true,
+    "survival_observed": true,
+    "thresholds": {
+      "pair_atol": 1e-05,
+      "reconstruction_atol": 1e-05
+    },
+    "total_delta_minus_survival_err": 1.0058283805847168e-07
+  },
+  "sampled_axis_counts": {
+    "survival_off": 4,
+    "survival_on": 4
+  },
+  "schema": "phase2_survival_component_reconstruction_audit.v1",
+  "stats": {
+    "reward": {
+      "max_abs": 2.892239570617676,
+      "mean": 0.0705432101549377,
+      "n": 512,
+      "q50": -0.02688125241547823,
+      "q90": 1.1827249646186833,
+      "std": 0.8184373493475567
+    },
+    "reward_ctrl": {
+      "max_abs": 0.026263775303959846,
+      "mean": -0.010932128675221975,
+      "n": 512,
+      "q50": -0.009776114020496607,
+      "q90": -0.00390689498744905,
+      "std": 0.005661505373599466
+    },
+    "reward_env": {
+      "max_abs": 2.8891048431396484,
+      "mean": 0.07147534006799106,
+      "n": 512,
+      "q50": -0.026045506820082664,
+      "q90": 1.1892010331153877,
+      "std": 0.8176864332288596
+    },
+    "reward_survival": {
+      "max_abs": 0.019999999552965164,
+      "mean": 0.009999999776482582,
+      "n": 512,
+      "q50": 0.009999999776482582,
+      "q90": 0.019999999552965164,
+      "std": 0.009999999776482582
+    },
+    "reward_terminal_bonus": {
+      "max_abs": 0.0,
+      "mean": 0.0,
+      "n": 512,
+      "q50": 0.0,
+      "q90": 0.0,
+      "std": 0.0
+    }
+  }
+}

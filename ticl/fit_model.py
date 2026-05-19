@@ -2,17 +2,85 @@ import socket
 import sys
 import time
 import random
-
-import mlflow
-
-import torch
 import os
-import numpy as np
+import threading
+import atexit
 
 if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(line_buffering=True)
 if hasattr(sys.stderr, "reconfigure"):
     sys.stderr.reconfigure(line_buffering=True)
+
+_FIT_MODEL_HEARTBEAT_STAGE = "module_import"
+_FIT_MODEL_HEARTBEAT_STOP = threading.Event()
+_FIT_MODEL_HEARTBEAT_STARTED = False
+
+
+def _fit_model_env_truthy(name: str, default: bool = False) -> bool:
+    value = os.environ.get(name)
+    if value is None:
+        return bool(default)
+    return str(value).strip().lower() in {"1", "true", "yes", "y", "on"}
+
+
+def _set_fit_model_heartbeat_stage(stage: str) -> None:
+    global _FIT_MODEL_HEARTBEAT_STAGE
+    _FIT_MODEL_HEARTBEAT_STAGE = str(stage)
+
+
+def _fit_model_heartbeat_interval_sec() -> float:
+    raw_value = os.environ.get(
+        "TICL_FIT_MODEL_HEARTBEAT_INTERVAL_SEC",
+        os.environ.get("TICL_PPO_PHASE_LOG_MIN_INTERVAL_SEC", "30"),
+    )
+    try:
+        return max(1.0, float(raw_value))
+    except Exception:
+        return 30.0
+
+
+def _emit_fit_model_heartbeat(start_time: float) -> None:
+    print(
+        "[fit-model-heartbeat] "
+        f"date={time.strftime('%Y-%m-%dT%H:%M:%S%z')} "
+        f"pid={os.getpid()} "
+        f"elapsed_s={float(time.perf_counter() - start_time):.1f} "
+        f"stage={_FIT_MODEL_HEARTBEAT_STAGE}",
+        flush=True,
+    )
+
+
+def _fit_model_heartbeat_loop(start_time: float, interval_sec: float) -> None:
+    while not _FIT_MODEL_HEARTBEAT_STOP.wait(float(interval_sec)):
+        _emit_fit_model_heartbeat(start_time)
+
+
+def _start_fit_model_heartbeat_if_enabled() -> None:
+    global _FIT_MODEL_HEARTBEAT_STARTED
+    if _FIT_MODEL_HEARTBEAT_STARTED:
+        return
+    if not _fit_model_env_truthy("TICL_FIT_MODEL_HEARTBEAT_ENABLED", default=False):
+        return
+    _FIT_MODEL_HEARTBEAT_STARTED = True
+    interval_sec = _fit_model_heartbeat_interval_sec()
+    start_time = time.perf_counter()
+    _emit_fit_model_heartbeat(start_time)
+    thread = threading.Thread(
+        target=_fit_model_heartbeat_loop,
+        args=(start_time, interval_sec),
+        name="fit-model-heartbeat",
+        daemon=True,
+    )
+    thread.start()
+
+
+_start_fit_model_heartbeat_if_enabled()
+atexit.register(_FIT_MODEL_HEARTBEAT_STOP.set)
+
+import mlflow
+
+import torch
+import numpy as np
 
 from git import Repo
 
@@ -293,15 +361,19 @@ def _apply_continue_run_cli_overrides(config, args, argv, parser=None):
 def main(argv, extra_config=None):
     # extra config is used for testing purposes only
     # this is the generic entry point for training any model, so it has A LOT of options
+    _set_fit_model_heartbeat_stage("main_parse_args")
     parser = make_model_level_argparser()
     args = parser.parse_args(args=argv or ['--help'])
     model = None
     if hasattr(args, "linear_attention") and hasattr(args.linear_attention, "model"):
         model = args.linear_attention.model
+    _set_fit_model_heartbeat_stage("load_default_config")
     config = get_model_default_config(args.model_type, model)
 
+    _set_fit_model_heartbeat_stage("init_device")
     device, rank, num_gpus = init_device(args.general.gpu_id, args.general.use_cpu)
     # handle syne-tune restarts
+    _set_fit_model_heartbeat_stage("checkpoint_orchestration")
     orchestration = args.orchestration
     orchestration.base_path, orchestration.continue_run, orchestration.warm_start_from, report = synetune_handle_checkpoint(orchestration)
 
@@ -310,6 +382,7 @@ def main(argv, extra_config=None):
     base_path = orchestration.base_path
     torch.set_num_threads(24)
     for group_name in vars(args):
+        _set_fit_model_heartbeat_stage("merge_cli_config")
         if group_name == "model_type":
             # the only non-group argument from the top level parser
             config['model_type'] = args.model_type
@@ -326,8 +399,10 @@ def main(argv, extra_config=None):
                 config[group_name][k] = v
         config[group_name].update()
     if args.orchestration.seed_everything_value is not None:
+        _set_fit_model_heartbeat_stage("seed_everything")
         _seed_python_numpy_torch(int(args.orchestration.seed_everything_value))
     elif args.orchestration.seed_everything:
+        _set_fit_model_heartbeat_stage("seed_everything")
         import lightning as L
         L.seed_everything(42)
 
@@ -362,12 +437,14 @@ def main(argv, extra_config=None):
         _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
 
     if extra_config is not None:
+        _set_fit_model_heartbeat_stage("apply_extra_config")
         update_config(config, extra_config)
         if args.orchestration.extra_fast_test:
             _apply_extra_fast_rwkv_safe_overrides(config, attention_type)
 
     host_rss_guard = None
     host_rss_guard_status = None
+    _set_fit_model_heartbeat_stage("host_rss_guard_setup")
     try:
         host_rss_guard, host_rss_guard_status = install_host_rss_limit_guard(
             limit_gib=config["optimizer"].get("train_host_rss_limit_gib", None),
@@ -411,6 +488,7 @@ def main(argv, extra_config=None):
 
     model_state, optimizer_state, scheduler = None, None, None
     if warm_start_weights is not None:
+        _set_fit_model_heartbeat_stage("warm_start_load_checkpoint")
         # PyTorch 2.6 changed torch.load() default to weights_only=True.
         # Our training checkpoints store config / optimizer / scheduler state,
         # so warm-start loading must opt back into full checkpoint loading.
@@ -490,6 +568,7 @@ def main(argv, extra_config=None):
         print("ENABLING GRADIENT DEBUGGING (detect-anomaly)! Don't use for training.")
         torch.autograd.set_detect_anomaly(True)
 
+    _set_fit_model_heartbeat_stage("resolve_model_string")
     model_string = get_model_string(config, num_gpus, device, parser)
     pg_phase_log_file_default = os.path.join(base_path, "log", f"{model_string}.log")
     if "optimizer" not in config:
@@ -529,6 +608,7 @@ def main(argv, extra_config=None):
                 f" {pack_output_dir_safe}"
             )
         config["optimizer"]["ppo_pack_output_dir"] = pack_output_dir_safe
+    _set_fit_model_heartbeat_stage("training_callback_setup")
     save_callback = make_training_callback(
         save_every, 
         model_string, 
@@ -558,6 +638,7 @@ def main(argv, extra_config=None):
     try:
         if (not orchestration.use_mlflow) or mlflow_hostname is None:
             print("Not logging run with mlflow, set MLFLOW_HOSTNAME environment to variable enable mlflow.")
+            _set_fit_model_heartbeat_stage("get_model_train_start")
             total_loss, model, dl, epoch = get_model(
                 config, 
                 device, 
@@ -569,8 +650,10 @@ def main(argv, extra_config=None):
                 scheduler=scheduler,
                 load_model_strict=orchestration.continue_run or orchestration.load_strict
             )
+            _set_fit_model_heartbeat_stage("get_model_train_done")
         else:
             print(f"Logging run with mlflow at host {mlflow_hostname}")
+            _set_fit_model_heartbeat_stage("mlflow_setup")
             mlflow.set_tracking_uri(f"http://{mlflow_hostname}:5000")
 
             tries = 0
@@ -600,6 +683,7 @@ def main(argv, extra_config=None):
             run_args['tags'] = {'mlflow.source.git.commit': Repo(path, search_parent_directories=True).head.object.hexsha}
 
             with mlflow.start_run(**run_args):
+                _set_fit_model_heartbeat_stage("get_model_train_start")
                 mlflow.log_param('hostname', socket.gethostname())
                 mlflow.log_params({k: v for k, v in flatten_dict(config).items() if k not in ['wallclock_times', 'losses', 'learning_rates']})
                 total_loss, model, dl, epoch = get_model(
@@ -613,7 +697,9 @@ def main(argv, extra_config=None):
                     scheduler=scheduler,
                     load_model_strict=orchestration.continue_run or orchestration.load_strict
                 )
+                _set_fit_model_heartbeat_stage("get_model_train_done")
     finally:
+        _set_fit_model_heartbeat_stage("shutdown")
         if host_rss_guard is not None:
             host_rss_guard.stop()
 

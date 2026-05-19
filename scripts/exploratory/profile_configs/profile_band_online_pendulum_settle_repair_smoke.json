@@ -1,0 +1,73 @@
+{
+  "axes": {
+    "locomotion_witness": {
+      "max_rate": 0.375,
+      "min_rate": 0.25,
+      "objective_weight": 1.0,
+      "role": "raised_band",
+      "trust_status": "online_probe_quota_ready_only_with_joint_profile_guard"
+    },
+    "low_energy_not_ctrl_only": {
+      "baseline_tolerance": 0.08,
+      "role": "protected_band",
+      "trust_status": "online_probe_protected_band_centered"
+    },
+    "sign_or_phase_sensitive": {
+      "baseline_tolerance": 0.35,
+      "role": "protected_band",
+      "trust_status": "online_probe_source_saturated_relaxed_guard"
+    },
+    "state_conditioned_energy_injection": {
+      "baseline_tolerance": 0.15,
+      "role": "protected_band",
+      "trust_status": "online_probe_source_limited_relaxed_guard"
+    }
+  },
+  "background_milestone": "gated_reward_path_balance",
+  "generator_level_read": "bounded online candidate-pool smoke with prior-internal Pendulum settle-yield materialization",
+  "joint_profile_cell_cap_rate": 0.375,
+  "logged_not_quota_axes": {
+    "context_identifiable_closed_loop_settle_feedback": {
+      "reason": "feedback source-pool and near-best gain labels remain profile guards; this config only materializes the missing Pendulum settle-yield support branch",
+      "trust_status": "guarded_cached_label_materialization"
+    },
+    "mountaincar_upfront_investment_future_basin": {
+      "reason": "MountainCar future-basin remains coverage-only; no quota in this smoke",
+      "trust_status": "coverage_only_not_quota"
+    }
+  },
+  "pendulum_settle_yield_repair_branch": {
+    "branch_id": "prior_internal_cached_settle_yield_repair_smoke",
+    "enabled": true,
+    "exact_count_by_rule": {
+      "gym_full_obs_action_range": 4,
+      "gym_q90_obs_action_range": 4
+    },
+    "prefer_missing_cached_guard": true,
+    "require_cached_label_available": true,
+    "trust_status": "prior_internal_materialized_repair_smoke"
+  },
+  "profile_version_id": "profile_band_online_pendulum_settle_repair_smoke",
+  "strict_feedback_subprofile_branch": {
+    "enabled": true,
+    "include_all_non_gain2": false,
+    "include_all_nonconstant": false,
+    "min_count_by_rule": {
+      "gym_full_obs_action_range": 8,
+      "gym_q90_obs_action_range": 8
+    },
+    "min_non_gain2_by_rule": {
+      "gym_full_obs_action_range": 8,
+      "gym_q90_obs_action_range": 8
+    },
+    "min_nonconstant_by_rule": {
+      "gym_full_obs_action_range": 8,
+      "gym_q90_obs_action_range": 8
+    },
+    "non_gain2_objective_weight": 0.0,
+    "nonconstant_objective_weight": 0.0,
+    "objective_weight": 0.0,
+    "trust_status": "online_near_best_support_set_definition"
+  },
+  "target_per_rule": 16
+}

@@ -27,6 +27,7 @@ from ticl.analysis.critic_value_fit_probe import _clone_h_repeated  # noqa: E402
 from ticl.analysis.phase2_gym_prior_pack_isomorphism_sentinel import (  # noqa: E402
     DEFAULT_FROZEN_H_JSON,
     _box_bounds,
+    _clear_rollout_buffer_payload_refs,
     _fill_existing_rollout_buffer_from_pack,
     _finite_stats,
     _json_safe,
@@ -42,6 +43,11 @@ from ticl.analysis.phase2_legacy_bar_longrun_probe import (  # noqa: E402
     _sanitize_loaded_frozen_h_for_batch_use,
 )
 from ticl.config_utils import str2bool  # noqa: E402
+try:
+    from ticl.host_memory_guard import set_host_rss_context  # noqa: E402
+except Exception:  # pragma: no cover - optional diagnostic hook
+    def set_host_rss_context(phase, detail=None):  # type: ignore[no-redef]
+        return None
 from ticl.model_builder import get_model  # noqa: E402
 from ticl.model_configs import get_model_default_config  # noqa: E402
 from ticl.priors.environment_prior import EnvironmentPrior  # noqa: E402
@@ -55,11 +61,9 @@ from ticl.sb3_recurrent_ppo import (  # noqa: E402
 )
 from stable_baselines3.common.logger import configure as configure_logger  # noqa: E402
 from stable_baselines3.common.running_mean_std import RunningMeanStd  # noqa: E402
-from ticl.analysis.phase2_gated_reward_path_milestone import (  # noqa: E402
-    GATED_REWARD_PATH_MILESTONE,
-    GATED_REWARD_PATH_MILESTONES,
-    GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
-    install_gated_reward_path_balance_milestone,
+from ticl.analysis.phase2_m4_potential_progress_milestone import (  # noqa: E402
+    M4_POTENTIAL_PROGRESS_MILESTONE,
+    install_m4_potential_progress_live_milestone,
 )
 
 
@@ -89,9 +93,109 @@ def _pack_phase_logging_enabled() -> bool:
     return _env_truthy("TICL_PPO_PACK_PHASE_LOG_ENABLED", default=_env_truthy("TICL_PPO_PHASE_LOG_ENABLED", False))
 
 
+def _pack_phase_log_file() -> Path | None:
+    return _env_path("TICL_PPO_PACK_PHASE_LOG_FILE")
+
+
 def _pack_phase_log(message: str) -> None:
+    set_host_rss_context("ppo-pack-phase", message)
+    line = f"[ppo-pack-phase] {message}"
     if bool(_pack_phase_logging_enabled()):
-        print(f"[ppo-pack-phase] {message}", flush=True)
+        if not _env_truthy("TICL_PPO_PACK_PHASE_LOG_STDOUT_SUPPRESS", default=False):
+            print(line, flush=True)
+    log_path = _pack_phase_log_file()
+    if log_path is None:
+        return
+    try:
+        log_dir = log_path.parent
+        if str(log_dir):
+            log_dir.mkdir(parents=True, exist_ok=True)
+        with open(log_path, "a", encoding="utf-8") as fh:
+            fh.write(line + "\n")
+    except Exception:
+        return
+
+
+def _pack_tensor_memory_rows(
+    value: Any,
+    prefix: str,
+    rows: list[tuple[int, str, str, str]],
+    *,
+    seen: set[int] | None = None,
+    depth: int = 0,
+) -> None:
+    if seen is None:
+        seen = set()
+    obj_id = id(value)
+    if obj_id in seen:
+        return
+    if depth > 8:
+        return
+    seen.add(obj_id)
+    if torch.is_tensor(value):
+        try:
+            rows.append(
+                (
+                    int(value.numel()) * int(value.element_size()),
+                    prefix,
+                    str(value.dtype).replace("torch.", ""),
+                    str(value.device),
+                )
+            )
+        except Exception:
+            return
+        return
+    if isinstance(value, dict):
+        for key, child in value.items():
+            _pack_tensor_memory_rows(
+                child,
+                f"{prefix}.{key}" if prefix else str(key),
+                rows,
+                seen=seen,
+                depth=depth + 1,
+            )
+        return
+    if isinstance(value, (list, tuple)):
+        for idx, child in enumerate(value):
+            _pack_tensor_memory_rows(child, f"{prefix}[{idx}]", rows, seen=seen, depth=depth + 1)
+        return
+    obj_dict = getattr(value, "__dict__", None)
+    if isinstance(obj_dict, dict):
+        _pack_tensor_memory_rows(obj_dict, f"{prefix}.__dict__" if prefix else "__dict__", rows, seen=seen, depth=depth + 1)
+    closure = getattr(value, "__closure__", None)
+    if closure is not None:
+        for idx, cell in enumerate(closure):
+            try:
+                cell_value = cell.cell_contents
+            except ValueError:
+                continue
+            _pack_tensor_memory_rows(
+                cell_value,
+                f"{prefix}.__closure__[{idx}]" if prefix else f"__closure__[{idx}]",
+                rows,
+                seen=seen,
+                depth=depth + 1,
+            )
+
+
+def _pack_phase_log_tensor_memory(label: str, value: Any, *, top_k: int = 24) -> None:
+    rows: list[tuple[int, str, str, str]] = []
+    _pack_tensor_memory_rows(value, "", rows)
+    rows.sort(key=lambda item: item[0], reverse=True)
+    total_mib = sum(bytes_i for bytes_i, _name, _dtype, _device in rows) / float(1024 * 1024)
+    top_payload = [
+        {
+            "name": name,
+            "mib": round(bytes_i / float(1024 * 1024), 3),
+            "dtype": dtype,
+            "device": device,
+        }
+        for bytes_i, name, dtype, device in rows[: int(max(1, top_k))]
+    ]
+    _pack_phase_log(
+        f"{label} tensor_count={len(rows)} tensor_total_mib={total_mib:.1f} "
+        f"top={json.dumps(top_payload, sort_keys=True)}"
+    )
 
 
 def _torch_load_local(path: Path) -> Any:
@@ -112,7 +216,7 @@ def _validate_update_pack_cache(
     *,
     path: Path,
     payload: dict[str, Any],
-    arm: str,
+    arm: str = "pack",
     n_steps: int,
     n_envs: int,
     num_features: int,
@@ -163,7 +267,7 @@ def _validate_update_pack_cache(
 def _save_update_pack_cache(
     *,
     path: Path,
-    arm: str,
+    arm: str = "pack",
     update_idx: int,
     env_seed: int,
     n_steps: int,
@@ -266,6 +370,29 @@ def _trim_host_allocator_after_pack_release() -> None:
         return
 
 
+def _drop_pack_payload_refs(pack: dict[str, Any]) -> list[str]:
+    dropped: list[str] = []
+    for key in [
+        "tokens",
+        "actions",
+        "action_masks",
+        "rewards",
+        "raw_rewards",
+        "episode_starts",
+        "next_state_targets",
+        "next_state_masks",
+        "dones",
+        "truncated",
+        "last_values",
+    ]:
+        if key in pack:
+            pack.pop(key, None)
+            dropped.append(key)
+    if dropped:
+        _trim_host_allocator_after_pack_release()
+    return dropped
+
+
 def _release_prior_vec_env_before_update(vec_env: EnvironmentPriorPPOBatchVecEnv | None) -> dict[str, Any]:
     if vec_env is None:
         return {"enabled": False, "reason": "missing_vec_env"}
@@ -309,6 +436,57 @@ def _release_policy_rollout_cache_before_update(algo: Any) -> dict[str, Any]:
     return summary
 
 
+def _release_rollout_buffer_payload_after_update(algo: Any) -> dict[str, Any]:
+    if not _env_truthy("TICL_PPO_PACK_RELEASE_ROLLOUT_BUFFER_AFTER_UPDATE", default=False):
+        return {"enabled": False, "reason": "disabled_by_env"}
+    buffer = getattr(algo, "rollout_buffer", None)
+    if buffer is None:
+        return {"enabled": False, "reason": "missing_rollout_buffer"}
+
+    payload_names = [
+        "observations",
+        "actions",
+        "rewards",
+        "returns",
+        "episode_starts",
+        "values",
+        "log_probs",
+        "advantages",
+        "hidden_states_pi",
+        "cell_states_pi",
+        "hidden_states_vf",
+        "cell_states_vf",
+        "objective_masks",
+        "rollout_return_means",
+        "rollout_return_stds",
+        "rollout_raw_returns",
+        "actor_advantages",
+        "value_target_bucket_idx",
+        "action_masks",
+        "next_states",
+        "next_state_masks",
+    ]
+    present_payload_bytes = 0
+    present_payload_keys: list[str] = []
+    for name in payload_names:
+        value = getattr(buffer, name, None)
+        if isinstance(value, np.ndarray):
+            present_payload_bytes += int(value.nbytes)
+            present_payload_keys.append(str(name))
+
+    _clear_rollout_buffer_payload_refs(buffer)
+    trim_t0 = time.perf_counter()
+    _trim_host_allocator_after_pack_release()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    return {
+        "enabled": True,
+        "released_payload_keys": present_payload_keys,
+        "released_payload_gib": float(present_payload_bytes) / float(1024**3),
+        "trim_elapsed_s": float(time.perf_counter() - trim_t0),
+    }
+
+
 def _normalize_env_id_list(value: str, n_envs: int) -> list[str]:
     ids = [part.strip() for part in str(value).split(",") if part.strip()]
     if not ids:
@@ -325,6 +503,66 @@ def _optional_float(value: str | float | int | None) -> float | None:
             return None
         return float(text)
     return float(value)
+
+
+def _csv_truthy(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if value is None:
+        return False
+    return str(value).strip().lower() in {"1", "true", "yes", "y"}
+
+
+def _validate_fixed_frozen_h_list_profile_materialization(
+    *,
+    csv_path: Path,
+    selected_rows: list[dict[str, str]],
+    h_list: list[dict[str, Any]],
+) -> None:
+    """Fail fast when a profile-band CSV points to stale, unmaterialized h files."""
+    if not _env_truthy("TICL_PPO_PACK_STRICT_PROFILE_MATERIALIZATION", default=False):
+        return
+    if not selected_rows:
+        return
+    profile_rows = [
+        row
+        for row in selected_rows
+        if str(row.get("profile_band_guard", "")).strip() == "unified_profile_band_selector"
+    ]
+    if not profile_rows:
+        return
+    expected_materialized = sum(
+        1
+        for row in profile_rows
+        if _csv_truthy(row.get("pendulum_settle_yield_repair_planned"))
+        or str(row.get("pendulum_settle_yield_repair_source", "")).strip()
+        == "profile_band_selector_materialize"
+    )
+    if expected_materialized <= 0:
+        return
+    expected_active = sum(
+        1
+        for row in profile_rows
+        if _csv_truthy(row.get("pendulum_axis_support"))
+        or _csv_truthy(row.get("pendulum_axis_supported_sustained_settle"))
+        or _csv_truthy(row.get("pendulum_settle_yield_repair_planned"))
+    )
+    loaded_materialized = sum(
+        1
+        for h in h_list
+        if str(h.get("pendulum_settle_yield_repair_source", "")).strip()
+        == "profile_band_selector_materialize"
+    )
+    loaded_active = sum(1 for h in h_list if _csv_truthy(h.get("pendulum_settle_yield_repair_enabled")))
+    if loaded_materialized == expected_materialized and loaded_active == expected_active:
+        return
+    raise ValueError(
+        "M3 profile-band fixed_frozen_h_list CSV points to stale or unmaterialized frozen_h files: "
+        f"path={csv_path} expected_materialized={expected_materialized} "
+        f"loaded_materialized={loaded_materialized} expected_active={expected_active} "
+        f"loaded_active={loaded_active}. Use the materialized selector fixed_env_group h paths "
+        "before launching PPO."
+    )
 
 
 def _load_fixed_frozen_h_list_from_csv(
@@ -356,12 +594,17 @@ def _load_fixed_frozen_h_list_from_csv(
         h, resolved = _load_full_frozen_h(h_path)
         h_list.append(_sanitize_loaded_frozen_h_for_batch_use(h))
         h_paths.append(str(resolved))
-        seed_value = row.get("seed", "")
+        seed_value = row.get("env_seed", row.get("seed", ""))
         try:
             env_seed = int(float(seed_value))
         except (TypeError, ValueError):
             env_seed = int(idx)
         env_seeds.append(env_seed)
+    _validate_fixed_frozen_h_list_profile_materialization(
+        csv_path=path,
+        selected_rows=selected,
+        h_list=h_list,
+    )
     return h_list, h_paths, env_seeds
 
 
@@ -496,6 +739,143 @@ def _obs_active_mask(obs_dims: list[int], obs_slot_dim: int) -> np.ndarray:
     return mask
 
 
+def _new_per_env_obs_stats(n_envs: int, obs_slot_dim: int) -> dict[str, np.ndarray]:
+    shape = (int(n_envs), int(obs_slot_dim))
+    return {
+        "sum": np.zeros(shape, dtype=np.float64),
+        "sumsq": np.zeros(shape, dtype=np.float64),
+        "count": np.zeros(shape, dtype=np.int64),
+        "min": np.full(shape, np.inf, dtype=np.float64),
+        "max": np.full(shape, -np.inf, dtype=np.float64),
+    }
+
+
+def _accumulate_per_env_obs_stats(
+    acc: dict[str, np.ndarray],
+    obs: np.ndarray,
+    obs_dims: list[int],
+    obs_slot_dim: int,
+) -> None:
+    obs_arr = np.asarray(obs, dtype=np.float32)
+    if obs_arr.ndim != 2 or obs_arr.shape[1] < int(obs_slot_dim):
+        raise ValueError(
+            "per-env obs stats expect a 2D obs prefix array with obs_slot_dim columns; "
+            f"got shape={tuple(obs_arr.shape)}, obs_slot_dim={int(obs_slot_dim)}"
+        )
+    prefix = obs_arr[:, : int(obs_slot_dim)].astype(np.float64, copy=False)
+    active = _obs_active_mask(obs_dims, int(obs_slot_dim))
+    finite = active & np.isfinite(prefix)
+    values = np.where(finite, prefix, 0.0)
+    acc["sum"] += values
+    acc["sumsq"] += np.square(values)
+    acc["count"] += finite.astype(np.int64)
+    acc["min"] = np.minimum(acc["min"], np.where(finite, prefix, np.inf))
+    acc["max"] = np.maximum(acc["max"], np.where(finite, prefix, -np.inf))
+
+
+def _finalize_per_env_obs_stats(
+    acc: dict[str, np.ndarray],
+    obs_dims: list[int],
+    obs_slot_dim: int,
+    *,
+    prefix: str,
+) -> dict[str, list[Any]]:
+    sums = np.asarray(acc["sum"], dtype=np.float64)
+    sumsq = np.asarray(acc["sumsq"], dtype=np.float64)
+    counts = np.asarray(acc["count"], dtype=np.int64)
+    mins = np.asarray(acc["min"], dtype=np.float64)
+    maxs = np.asarray(acc["max"], dtype=np.float64)
+    out: dict[str, list[Any]] = {
+        f"{prefix}_active_value_count": [],
+        f"{prefix}_value_mean": [],
+        f"{prefix}_value_std": [],
+        f"{prefix}_value_absmax": [],
+        f"{prefix}_per_dim_std_mean": [],
+        f"{prefix}_per_dim_std_q90": [],
+        f"{prefix}_per_dim_rms_mean": [],
+    }
+    for env_idx, obs_dim_raw in enumerate(obs_dims):
+        obs_dim = int(max(0, min(int(obs_dim_raw), int(obs_slot_dim))))
+        if obs_dim <= 0:
+            for key in out:
+                out[key].append(0 if key.endswith("_active_value_count") else None)
+            continue
+        count = counts[env_idx, :obs_dim].astype(np.float64)
+        valid = count > 0
+        if not bool(valid.any()):
+            for key in out:
+                out[key].append(0 if key.endswith("_active_value_count") else None)
+            continue
+        total_count = float(np.sum(count[valid]))
+        total_sum = float(np.sum(sums[env_idx, :obs_dim][valid]))
+        total_sumsq = float(np.sum(sumsq[env_idx, :obs_dim][valid]))
+        value_mean = total_sum / max(total_count, 1.0)
+        value_var = max(total_sumsq / max(total_count, 1.0) - value_mean * value_mean, 0.0)
+        dim_mean = np.zeros((obs_dim,), dtype=np.float64)
+        dim_var = np.zeros((obs_dim,), dtype=np.float64)
+        dim_mean[valid] = sums[env_idx, :obs_dim][valid] / count[valid]
+        dim_var[valid] = np.maximum(
+            sumsq[env_idx, :obs_dim][valid] / count[valid] - np.square(dim_mean[valid]),
+            0.0,
+        )
+        dim_std = np.sqrt(dim_var[valid])
+        dim_rms = np.sqrt(np.maximum(sumsq[env_idx, :obs_dim][valid] / count[valid], 0.0))
+        min_v = float(np.min(mins[env_idx, :obs_dim][valid]))
+        max_v = float(np.max(maxs[env_idx, :obs_dim][valid]))
+        out[f"{prefix}_active_value_count"].append(int(total_count))
+        out[f"{prefix}_value_mean"].append(float(value_mean))
+        out[f"{prefix}_value_std"].append(float(math.sqrt(value_var)))
+        out[f"{prefix}_value_absmax"].append(float(max(abs(min_v), abs(max_v))))
+        out[f"{prefix}_per_dim_std_mean"].append(float(np.mean(dim_std)) if dim_std.size else None)
+        out[f"{prefix}_per_dim_std_q90"].append(float(np.quantile(dim_std, 0.90)) if dim_std.size else None)
+        out[f"{prefix}_per_dim_rms_mean"].append(float(np.mean(dim_rms)) if dim_rms.size else None)
+    return out
+
+
+def _obs_norm_state_per_env_meta(
+    algo,
+    obs_dims: list[int],
+    obs_slot_dim: int,
+    *,
+    prefix: str,
+) -> dict[str, list[Any]]:
+    n_envs = int(len(obs_dims))
+    out: dict[str, list[Any]] = {
+        f"{prefix}_enabled": [bool(getattr(algo, "_rwkv_sb3_observation_normalization_enabled", False))]
+        * n_envs,
+        f"{prefix}_rms_per_dim_mean": [],
+        f"{prefix}_rms_per_dim_q50": [],
+        f"{prefix}_rms_per_dim_q90": [],
+        f"{prefix}_count_per_dim_min": [],
+        f"{prefix}_count_per_dim_max": [],
+    }
+    if not bool(getattr(algo, "_rwkv_sb3_observation_normalization_enabled", False)):
+        for key in out:
+            if key != f"{prefix}_enabled":
+                out[key] = [None] * n_envs
+        return out
+    _mean, var, count = _ensure_obs_norm_state(algo, int(obs_slot_dim))
+    rms = np.sqrt(np.maximum(np.asarray(var, dtype=np.float64), 0.0))
+    counts = np.asarray(count, dtype=np.float64)
+    for obs_dim_raw in obs_dims:
+        obs_dim = int(max(0, min(int(obs_dim_raw), int(obs_slot_dim))))
+        if obs_dim <= 0:
+            out[f"{prefix}_rms_per_dim_mean"].append(None)
+            out[f"{prefix}_rms_per_dim_q50"].append(None)
+            out[f"{prefix}_rms_per_dim_q90"].append(None)
+            out[f"{prefix}_count_per_dim_min"].append(None)
+            out[f"{prefix}_count_per_dim_max"].append(None)
+            continue
+        env_rms = rms[:obs_dim]
+        env_count = counts[:obs_dim]
+        out[f"{prefix}_rms_per_dim_mean"].append(float(np.mean(env_rms)))
+        out[f"{prefix}_rms_per_dim_q50"].append(float(np.quantile(env_rms, 0.50)))
+        out[f"{prefix}_rms_per_dim_q90"].append(float(np.quantile(env_rms, 0.90)))
+        out[f"{prefix}_count_per_dim_min"].append(float(np.min(env_count)))
+        out[f"{prefix}_count_per_dim_max"].append(float(np.max(env_count)))
+    return out
+
+
 def _ensure_obs_norm_state(algo, obs_slot_dim: int) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     obs_slot_dim = int(obs_slot_dim)
     mean = getattr(algo, "_rwkv_sb3_observation_normalization_mean", None)
@@ -528,26 +908,38 @@ def _masked_running_mean_var_update(
 ) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     obs64 = np.asarray(obs, dtype=np.float64)
     mask_bool = np.asarray(mask, dtype=bool)
-    for dim_idx in range(int(obs64.shape[1])):
-        active = mask_bool[:, dim_idx]
-        batch_count = int(active.sum())
-        if batch_count <= 0:
-            continue
-        values = obs64[active, dim_idx]
-        batch_mean = float(np.mean(values))
-        batch_var = float(np.var(values))
-        old_count = float(count[dim_idx])
-        old_mean = float(mean[dim_idx])
-        old_var = float(var[dim_idx])
-        total_count = old_count + float(batch_count)
-        delta = batch_mean - old_mean
-        new_mean = old_mean + delta * float(batch_count) / total_count
-        m_a = old_var * old_count
-        m_b = batch_var * float(batch_count)
-        m2 = m_a + m_b + delta * delta * old_count * float(batch_count) / total_count
-        mean[dim_idx] = new_mean
-        var[dim_idx] = max(m2 / total_count, 1e-12)
-        count[dim_idx] = total_count
+    if obs64.ndim != 2 or mask_bool.shape != obs64.shape:
+        raise ValueError(
+            "masked running mean/var update expects matching 2D obs and mask; "
+            f"got obs={tuple(obs64.shape)} mask={tuple(mask_bool.shape)}"
+        )
+    batch_count = mask_bool.sum(axis=0).astype(np.float64)
+    active_dims = batch_count > 0.0
+    if not bool(active_dims.any()):
+        return mean, var, count
+    values = np.where(mask_bool, obs64, 0.0)
+    batch_sum = values.sum(axis=0)
+    batch_sumsq = np.square(values).sum(axis=0)
+    batch_mean = np.zeros_like(mean, dtype=np.float64)
+    batch_var = np.zeros_like(var, dtype=np.float64)
+    batch_mean[active_dims] = batch_sum[active_dims] / batch_count[active_dims]
+    batch_var[active_dims] = np.maximum(
+        batch_sumsq[active_dims] / batch_count[active_dims] - np.square(batch_mean[active_dims]),
+        0.0,
+    )
+    old_count = count.astype(np.float64, copy=False)
+    old_mean = mean.astype(np.float64, copy=False)
+    old_var = var.astype(np.float64, copy=False)
+    total_count = old_count + batch_count
+    delta = batch_mean - old_mean
+    m_a = old_var * old_count
+    m_b = batch_var * batch_count
+    m2 = m_a + m_b + np.square(delta) * old_count * batch_count / np.maximum(total_count, 1e-12)
+    mean[active_dims] = old_mean[active_dims] + (
+        delta[active_dims] * batch_count[active_dims] / total_count[active_dims]
+    )
+    var[active_dims] = np.maximum(m2[active_dims] / total_count[active_dims], 1e-12)
+    count[active_dims] = total_count[active_dims]
     return mean, var, count
 
 
@@ -784,8 +1176,32 @@ def _rollout_reward_stats_from_pack(
     ctrl = np.zeros_like(raw_reward, dtype=np.float64)
     survival = np.zeros_like(raw_reward, dtype=np.float64)
     terminal_bonus = np.zeros_like(raw_reward, dtype=np.float64)
+    reward_env_from_pack = None
+    component_keys = (
+        "reward_env_components",
+        "reward_ctrl_components",
+        "reward_survival_components",
+        "reward_terminal_bonus_components",
+    )
+    if all(key in pack for key in component_keys):
+        reward_env_arr = np.asarray(pack["reward_env_components"], dtype=np.float64)
+        ctrl_arr = np.asarray(pack["reward_ctrl_components"], dtype=np.float64)
+        survival_arr = np.asarray(pack["reward_survival_components"], dtype=np.float64)
+        terminal_arr = np.asarray(pack["reward_terminal_bonus_components"], dtype=np.float64)
+        if (
+            reward_env_arr.shape == raw_reward.shape
+            and ctrl_arr.shape == raw_reward.shape
+            and survival_arr.shape == raw_reward.shape
+            and terminal_arr.shape == raw_reward.shape
+        ):
+            reward_env_from_pack = reward_env_arr
+            ctrl = ctrl_arr
+            survival = survival_arr
+            terminal_bonus = terminal_arr
 
     if (
+        reward_env_from_pack is None
+        and
         str(arm) == "prior"
         and actions.ndim == 3
         and action_masks.shape == actions.shape
@@ -815,7 +1231,7 @@ def _rollout_reward_stats_from_pack(
             np.broadcast_to(survival_weight, (n_steps, n_envs)),
             0.0,
         )
-    reward_env = raw_reward - ctrl - survival - terminal_bonus
+    reward_env = reward_env_from_pack if reward_env_from_pack is not None else raw_reward - ctrl - survival - terminal_bonus
 
     acc = _PpoRolloutLogAccumulator(n_envs, device=None)
     suffix_start = int(min(max(int(single_eval_pos), 0), n_steps))
@@ -832,7 +1248,11 @@ def _rollout_reward_stats_from_pack(
         )
     stats = acc.finalize()
     stats["enabled"] = True
-    stats["source"] = "trusted_pack_raw_rewards"
+    stats["source"] = (
+        "trusted_pack_reward_components"
+        if reward_env_from_pack is not None
+        else "trusted_pack_raw_rewards"
+    )
     stats["single_eval_pos"] = int(single_eval_pos)
     return stats
 
@@ -912,10 +1332,14 @@ def _semantic_probe_from_pack(
     obs_slot_dims = _dim_list(meta, "obs_slot_dims", int(obs_slot_dim), n_envs)
     action_dims = _dim_list(meta, "action_dims", int(action_slot_dim), n_envs)
     state_dims = _dim_list(meta, "state_dims", int(next_states.shape[-1]), n_envs)
+    noise_dims = _dim_list(meta, "noise_dims", 0, n_envs)
+    zero_pad_dims = _dim_list(meta, "zero_pad_dims", 0, n_envs)
 
     obs_values: list[np.ndarray] = []
     obs_per_env_dim_std: list[float] = []
     obs_per_env_dim_rms: list[float] = []
+    obs_step_l2_delta: list[float] = []
+    obs_step_l2_delta_to_rms_ratio: list[float] = []
     reward_token_values: list[np.ndarray] = []
     action_active_values: list[np.ndarray] = []
     action_temporal_std: list[float] = []
@@ -930,7 +1354,16 @@ def _semantic_probe_from_pack(
             obs = tokens[:, env_idx, :obs_dim]
             obs_values.append(obs.reshape(-1))
             obs_per_env_dim_std.append(float(np.mean(np.std(obs, axis=0))))
-            obs_per_env_dim_rms.append(float(np.mean(np.sqrt(np.mean(np.square(obs), axis=0)))))
+            obs_dim_rms = float(np.mean(np.sqrt(np.mean(np.square(obs), axis=0))))
+            obs_per_env_dim_rms.append(obs_dim_rms)
+            obs_rms = float(np.sqrt(np.mean(np.square(obs)))) if obs.size else 0.0
+            if n_steps > 1:
+                obs_delta = np.sqrt(np.mean(np.square(np.diff(obs, axis=0)), axis=1))
+                obs_delta = obs_delta[np.isfinite(obs_delta)]
+                if obs_delta.size:
+                    obs_delta_mean = float(np.mean(obs_delta))
+                    obs_step_l2_delta.append(obs_delta_mean)
+                    obs_step_l2_delta_to_rms_ratio.append(obs_delta_mean / max(obs_rms, 1e-12))
 
         reward_idx = int(obs_slot_dims[env_idx])
         if 0 <= reward_idx < int(tokens.shape[-1]):
@@ -990,12 +1423,18 @@ def _semantic_probe_from_pack(
         "reward_noise_input_gain_fraction",
         "reward_state_to_noise_gain_ratio",
         "reward_state_to_action_gain_ratio",
+        "reward_state_input_gain_density_ratio",
+        "reward_action_input_gain_density_ratio",
+        "reward_noise_input_gain_density_ratio",
+        "reward_state_to_action_gain_density_ratio",
+        "reward_state_to_noise_gain_density_ratio",
         "reward_state_input_gain_fraction_conditioned_accepted_gain",
         "reward_action_input_gain_fraction_conditioned_accepted_gain",
         "reward_state_to_action_gain_ratio_conditioned_accepted_ratio",
         "reward_state_input_gain_fraction_conditioned_attempt",
         "reward_topology_conditioned_attempt",
         "reward_topology_conditioned_total_candidate_draws",
+        "reward_topology_conditioned_freeze_h_across_attempts",
     ]
     prior_terminal_keys = [
         "terminal_reset_enabled",
@@ -1030,6 +1469,8 @@ def _semantic_probe_from_pack(
             "values": _vector_stats(np.concatenate(obs_values) if obs_values else []),
             "per_env_mean_dim_std": _vector_stats(obs_per_env_dim_std),
             "per_env_mean_dim_rms": _vector_stats(obs_per_env_dim_rms),
+            "step_l2_delta": _vector_stats(obs_step_l2_delta),
+            "step_l2_delta_to_obs_rms_ratio": _vector_stats(obs_step_l2_delta_to_rms_ratio),
         },
         "model_input_prev_reward_token": _vector_stats(
             np.concatenate(reward_token_values) if reward_token_values else []
@@ -1123,6 +1564,8 @@ def _per_env_semantic_probe_rows_from_pack(
     obs_slot_dims = _dim_list(meta, "obs_slot_dims", int(obs_slot_dim), n_envs)
     action_dims = _dim_list(meta, "action_dims", int(action_slot_dim), n_envs)
     state_dims = _dim_list(meta, "state_dims", int(next_states.shape[-1]), n_envs)
+    noise_dims = _dim_list(meta, "noise_dims", 0, n_envs)
+    zero_pad_dims = _dim_list(meta, "zero_pad_dims", 0, n_envs)
     gym_env_ids = meta.get("gym_env_ids", None)
     env_group_seeds = meta.get("env_group_seeds", None)
     prior_gain_keys = (
@@ -1131,12 +1574,19 @@ def _per_env_semantic_probe_rows_from_pack(
         "reward_noise_input_gain_fraction",
         "reward_state_to_noise_gain_ratio",
         "reward_state_to_action_gain_ratio",
+        "reward_state_input_gain_density_ratio",
+        "reward_action_input_gain_density_ratio",
+        "reward_noise_input_gain_density_ratio",
+        "reward_state_to_action_gain_density_ratio",
+        "reward_state_to_noise_gain_density_ratio",
         "reward_state_input_gain_fraction_conditioned_accepted_gain",
         "reward_action_input_gain_fraction_conditioned_accepted_gain",
         "reward_state_to_action_gain_ratio_conditioned_accepted_ratio",
         "reward_state_input_gain_fraction_conditioned_attempt",
         "reward_topology_conditioned_attempt",
         "reward_topology_conditioned_total_candidate_draws",
+        "reward_topology_conditioned_freeze_h_across_attempts",
+        "obs_output_scale",
     )
     prior_terminal_keys = (
         "terminal_reset_enabled",
@@ -1146,10 +1596,36 @@ def _per_env_semantic_probe_rows_from_pack(
         "gated_terminal_coverage_original_target",
         "gated_terminal_coverage_target",
     )
+    prior_exact_scm_keys = (
+        "exact_scm_gym_lowtail_family_enabled",
+        "exact_scm_gym_lowtail_family_active",
+        "exact_scm_gym_lowtail_reward_linear_weight",
+        "exact_scm_gym_lowtail_reward_potential_delta_weight",
+        "exact_scm_gym_lowtail_reward_state_cost",
+        "exact_scm_gym_lowtail_reward_ctrl_cost",
+        "exact_scm_gym_lowtail_action_gain",
+        "exact_scm_gym_lowtail_noise_gain",
+        "exact_scm_gym_lowtail_shared_energy_terminal_enabled",
+        "exact_scm_gym_lowtail_preimage_shared_scalar_enabled",
+        "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled",
+        "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled",
+        "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled",
+        "exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled",
+        "exact_scm_gym_lowtail_markov_carrier_preimage_enabled",
+        "exact_scm_gym_lowtail_materialized_theta_preimage_enabled",
+        "exact_scm_gym_lowtail_reward_distribution_head_enabled",
+        "exact_scm_gym_lowtail_clock_preimage_enabled",
+        "exact_scm_gym_lowtail_paired_response_preimage_enabled",
+    )
     rows: list[dict[str, Any]] = []
     for env_idx in range(n_envs):
         obs_dim = int(min(obs_dims[env_idx], tokens.shape[-1]))
         obs = tokens[:, env_idx, :obs_dim] if obs_dim > 0 else np.zeros((n_steps, 0), dtype=np.float64)
+        obs_step_l2_delta = np.zeros((0,), dtype=np.float64)
+        obs_rms = float(np.sqrt(np.mean(np.square(obs)))) if obs.size else None
+        if n_steps > 1 and obs_dim > 0:
+            obs_step_l2_delta = np.sqrt(np.mean(np.square(np.diff(obs, axis=0)), axis=1))
+            obs_step_l2_delta = obs_step_l2_delta[np.isfinite(obs_step_l2_delta)]
         reward_idx = int(obs_slot_dims[env_idx])
         reward_token = (
             tokens[:, env_idx, reward_idx]
@@ -1201,6 +1677,24 @@ def _per_env_semantic_probe_rows_from_pack(
         done_idx = np.nonzero(dones[:, env_idx])[0]
         reward = rewards[:, env_idx]
         raw_reward = raw_rewards[:, env_idx]
+        if n_steps > 1:
+            expected_reward_token = np.where(dones[:-1, env_idx], 0.0, reward[:-1])
+            reward_token_after_first = reward_token[1:]
+            reward_token_delta = reward_token_after_first - expected_reward_token
+            previous_done_mask = dones[:-1, env_idx]
+            previous_keepalive_mask = ~previous_done_mask
+            if bool(previous_done_mask.any()):
+                done_reset_reward_token_abs = np.abs(reward_token_after_first[previous_done_mask])
+            else:
+                done_reset_reward_token_abs = np.zeros((0,), dtype=np.float64)
+            if bool(previous_keepalive_mask.any()):
+                keepalive_reward_token_delta_abs = np.abs(reward_token_delta[previous_keepalive_mask])
+            else:
+                keepalive_reward_token_delta_abs = np.zeros((0,), dtype=np.float64)
+        else:
+            reward_token_delta = np.zeros((0,), dtype=np.float64)
+            done_reset_reward_token_abs = np.zeros((0,), dtype=np.float64)
+            keepalive_reward_token_delta_abs = np.zeros((0,), dtype=np.float64)
         reward_components, reward_component_meta = _reward_component_arrays_from_pack(
             arm=str(arm),
             reward=raw_reward,
@@ -1244,6 +1738,8 @@ def _per_env_semantic_probe_rows_from_pack(
             "obs_slot_dim": int(obs_slot_dims[env_idx]),
             "action_dim": int(action_dims[env_idx]),
             "state_dim": int(state_dims[env_idx]),
+            "noise_dim": int(noise_dims[env_idx]),
+            "zero_pad_dim": int(zero_pad_dims[env_idx]),
             "first_done_step": int(done_idx[0]) if done_idx.size else None,
             "done_count": int(dones[:, env_idx].sum()),
             "truncated_count": int(truncated[:, env_idx].sum()),
@@ -1276,6 +1772,21 @@ def _per_env_semantic_probe_rows_from_pack(
             "input_reward_token_mean": float(np.mean(reward_token)),
             "input_reward_token_std": float(np.std(reward_token)),
             "input_reward_token_absmax": float(np.max(np.abs(reward_token))) if reward_token.size else 0.0,
+            "input_reward_token_prev_training_reward_mae": (
+                float(np.mean(np.abs(reward_token_delta))) if reward_token_delta.size else None
+            ),
+            "input_reward_token_prev_training_reward_max_abs": (
+                float(np.max(np.abs(reward_token_delta))) if reward_token_delta.size else None
+            ),
+            "input_reward_token_done_reset_absmean": (
+                float(np.mean(done_reset_reward_token_abs)) if done_reset_reward_token_abs.size else 0.0
+            ),
+            "input_reward_token_done_reset_nonzero_fraction": (
+                float(np.mean(done_reset_reward_token_abs > 1e-6)) if done_reset_reward_token_abs.size else 0.0
+            ),
+            "input_reward_token_keepalive_prev_training_reward_mae": (
+                float(np.mean(keepalive_reward_token_delta_abs)) if keepalive_reward_token_delta_abs.size else None
+            ),
             "obs_value_mean": float(np.mean(obs)) if obs.size else None,
             "obs_value_std": float(np.std(obs)) if obs.size else None,
             "obs_value_absmax": float(np.max(np.abs(obs))) if obs.size else None,
@@ -1283,6 +1794,46 @@ def _per_env_semantic_probe_rows_from_pack(
             "obs_per_dim_std_q90": float(np.quantile(np.std(obs, axis=0), 0.90)) if obs.size else None,
             "obs_per_dim_rms_mean": (
                 float(np.mean(np.sqrt(np.mean(np.square(obs), axis=0)))) if obs.size else None
+            ),
+            "obs_step_l2_delta_mean": float(np.mean(obs_step_l2_delta)) if obs_step_l2_delta.size else None,
+            "obs_step_l2_delta_q90": (
+                float(np.quantile(obs_step_l2_delta, 0.90)) if obs_step_l2_delta.size else None
+            ),
+            "obs_step_l2_delta_to_rms_ratio": (
+                float(np.mean(obs_step_l2_delta)) / max(float(obs_rms), 1e-12)
+                if obs_step_l2_delta.size and obs_rms is not None
+                else None
+            ),
+            "pre_norm_obs_active_value_count": _meta_list_value(
+                meta, "pre_norm_obs_active_value_count", env_idx, None
+            ),
+            "pre_norm_obs_value_mean": _meta_list_value(meta, "pre_norm_obs_value_mean", env_idx, None),
+            "pre_norm_obs_value_std": _meta_list_value(meta, "pre_norm_obs_value_std", env_idx, None),
+            "pre_norm_obs_value_absmax": _meta_list_value(meta, "pre_norm_obs_value_absmax", env_idx, None),
+            "pre_norm_obs_per_dim_std_mean": _meta_list_value(
+                meta, "pre_norm_obs_per_dim_std_mean", env_idx, None
+            ),
+            "pre_norm_obs_per_dim_std_q90": _meta_list_value(
+                meta, "pre_norm_obs_per_dim_std_q90", env_idx, None
+            ),
+            "pre_norm_obs_per_dim_rms_mean": _meta_list_value(
+                meta, "pre_norm_obs_per_dim_rms_mean", env_idx, None
+            ),
+            "obs_norm_state_enabled": _meta_list_value(meta, "obs_norm_state_enabled", env_idx, None),
+            "obs_norm_state_rms_per_dim_mean": _meta_list_value(
+                meta, "obs_norm_state_rms_per_dim_mean", env_idx, None
+            ),
+            "obs_norm_state_rms_per_dim_q50": _meta_list_value(
+                meta, "obs_norm_state_rms_per_dim_q50", env_idx, None
+            ),
+            "obs_norm_state_rms_per_dim_q90": _meta_list_value(
+                meta, "obs_norm_state_rms_per_dim_q90", env_idx, None
+            ),
+            "obs_norm_state_count_per_dim_min": _meta_list_value(
+                meta, "obs_norm_state_count_per_dim_min", env_idx, None
+            ),
+            "obs_norm_state_count_per_dim_max": _meta_list_value(
+                meta, "obs_norm_state_count_per_dim_max", env_idx, None
             ),
             "action_value_mean": float(np.mean(active_actions)) if active_actions.size else None,
             "action_value_std": float(np.std(active_actions)) if active_actions.size else None,
@@ -1365,6 +1916,10 @@ def _per_env_semantic_probe_rows_from_pack(
             values = meta.get(key)
             if isinstance(values, list) and env_idx < len(values):
                 row[key] = values[env_idx]
+        for key in prior_exact_scm_keys:
+            values = meta.get(key)
+            if isinstance(values, list) and env_idx < len(values):
+                row[key] = values[env_idx]
         rows.append(row)
     return rows
 
@@ -1380,15 +1935,503 @@ def _set_topology_conditioned_sampling(
     *,
     state_gain_min: float,
     action_gain_min: float,
+    noise_gain_min: float,
+    state_gain_metric: str,
+    action_gain_metric: str,
+    noise_gain_metric: str,
     state_to_action_ratio_max: float,
+    state_to_action_ratio_metric: str,
+    state_to_noise_ratio_max: float,
+    state_to_noise_ratio_metric: str,
     max_attempts: int,
+    freeze_h_across_attempts: bool = False,
 ) -> None:
     env_cfg["reward_topology_conditioned_sampling_enabled"] = True
     env_cfg["reward_state_input_gain_fraction_conditioned_min"] = float(state_gain_min)
     env_cfg["reward_action_input_gain_fraction_conditioned_min"] = float(action_gain_min)
+    env_cfg["reward_noise_input_gain_fraction_conditioned_min"] = float(noise_gain_min)
+    env_cfg["reward_topology_conditioned_state_gain_metric"] = str(state_gain_metric)
+    env_cfg["reward_topology_conditioned_action_gain_metric"] = str(action_gain_metric)
+    env_cfg["reward_topology_conditioned_noise_gain_metric"] = str(noise_gain_metric)
     env_cfg["reward_state_to_action_gain_ratio_conditioned_max"] = float(state_to_action_ratio_max)
+    env_cfg["reward_topology_conditioned_state_to_action_ratio_metric"] = str(state_to_action_ratio_metric)
+    env_cfg["reward_state_to_noise_gain_ratio_conditioned_max"] = float(state_to_noise_ratio_max)
+    env_cfg["reward_topology_conditioned_state_to_noise_ratio_metric"] = str(state_to_noise_ratio_metric)
     env_cfg["reward_topology_conditioned_sampling_max_attempts"] = int(max_attempts)
+    env_cfg["reward_topology_conditioned_freeze_h_across_attempts"] = bool(freeze_h_across_attempts)
     env_cfg["reward_state_input_gain_fraction_rejection_min"] = 0.0
+
+
+def _set_reference_state_inertia_source(env_cfg: dict[str, Any], source: str) -> str:
+    source_norm = str(source or "default").strip().lower()
+    if source_norm in {"", "default"}:
+        return "default"
+    if source_norm == "off":
+        env_cfg["reference_state_inertia_enabled"] = False
+        return "off"
+    if source_norm == "on":
+        env_cfg["reference_state_inertia_enabled"] = True
+        return "on"
+    if source_norm == "meta_choice":
+        env_cfg["reference_state_inertia_enabled"] = {
+            "distribution": "meta_choice",
+            "choice_values": [False, True],
+        }
+        return "meta_choice"
+    if source_norm == "index_hash_half":
+        env_cfg["reference_state_inertia_post_sample_policy"] = "index_hash_fraction"
+        env_cfg["reference_state_inertia_post_sample_fraction"] = 0.5
+        env_cfg["reference_state_inertia_post_sample_hash_seed"] = 9730
+        return "index_hash_half"
+    raise ValueError(
+        "reference_state_inertia_source must be one of "
+        "{default, off, on, meta_choice, index_hash_half}; got "
+        f"{source!r}."
+    )
+
+
+def _set_dim_source_policy(env_cfg: dict[str, Any], policy: str) -> str:
+    policy_norm = str(policy or "default").strip().lower()
+    if policy_norm in {"", "default"}:
+        return "default"
+    if policy_norm == "gym_obs_action_piecewise":
+        env_cfg["constrained_dim_sampling_enabled"] = True
+        env_cfg["constrained_dim_sampling_policy"] = "gym_obs_action_piecewise"
+        return "gym_obs_action_piecewise"
+    if policy_norm == "gym_obs_action_visible_state_mix":
+        env_cfg["constrained_dim_sampling_enabled"] = True
+        env_cfg["constrained_dim_sampling_policy"] = "gym_obs_action_visible_state_mix"
+        return "gym_obs_action_visible_state_mix"
+    if policy_norm == "gym_empirical_obs_action":
+        env_cfg["constrained_dim_sampling_enabled"] = True
+        env_cfg["constrained_dim_sampling_policy"] = "gym_empirical_obs_action"
+        return "gym_empirical_obs_action"
+    raise ValueError(
+        "dim_source_policy must be one of "
+        "{default, gym_obs_action_piecewise, gym_obs_action_visible_state_mix, gym_empirical_obs_action}; got "
+        f"{policy!r}."
+    )
+
+
+def _set_dim_noise_policy(env_cfg: dict[str, Any], policy: str) -> str:
+    policy_norm = str(policy or "default").strip().lower()
+    if policy_norm in {"", "default"}:
+        return "default"
+    if policy_norm in {"gym_low", "gym_low_noise", "low_gym"}:
+        env_cfg["constrained_dim_noise_policy"] = "gym_low"
+        return "gym_low"
+    raise ValueError(
+        "dim_noise_policy must be one of {default, gym_low}; got "
+        f"{policy!r}."
+    )
+
+
+def _set_terminal_min_step_source(env_cfg: dict[str, Any], source: str) -> str:
+    source_norm = str(source or "default").strip().lower()
+    if source_norm in {"", "default"}:
+        return "default"
+    if source_norm == "gym_first_done_piecewise":
+        env_cfg["terminal_reset_min_step_post_sample_policy"] = "gym_first_done_piecewise_index_hash"
+        env_cfg["terminal_reset_min_step_post_sample_hash_seed"] = 9730
+        return "gym_first_done_piecewise"
+    raise ValueError(
+        "terminal_min_step_source must be one of {default, gym_first_done_piecewise}; got "
+        f"{source!r}."
+    )
+
+
+def _set_state_full_rms_source(env_cfg: dict[str, Any], source: str) -> str:
+    source_norm = str(source or "default").strip().lower()
+    if source_norm in {"", "default"}:
+        return "default"
+    if source_norm == "gym_obs_std_q50":
+        env_cfg["state_full_rms_enabled"] = True
+        env_cfg["state_full_rms_target"] = 1.5
+        return "gym_obs_std_q50"
+    if source_norm == "gym_obs_std_q50_floor":
+        env_cfg["state_full_rms_enabled"] = True
+        env_cfg["state_full_rms_target"] = 1.5
+        env_cfg["state_full_rms_floor_enabled"] = True
+        env_cfg["state_full_rms_max_upscale"] = 4.0
+        return "gym_obs_std_q50_floor"
+    raise ValueError(
+        "state_full_rms_source must be one of {default, gym_obs_std_q50, gym_obs_std_q50_floor}; got "
+        f"{source!r}."
+    )
+
+
+def _set_exact_scm_family_source(env_cfg: dict[str, Any], source: str) -> str:
+    source_norm = str(source or "default").strip().lower()
+    if source_norm in {"", "default"}:
+        return "default"
+    deprecated_preimage_sources = {
+        "gym_lowtail_preimage_shared_scalar",
+        "gym_lowtail_state_obs_rank_preimage",
+        "gym_lowtail_state_obs_rank_preimage_high_variance",
+        "gym_lowtail_state_obs_temporal_rank_preimage",
+        "gym_lowtail_state_obs_envelope_preimage",
+        "gym_lowtail_reward_transform_chain_preimage",
+        "gym_lowtail_clock_preimage",
+        "gym_lowtail_paired_env_response_preimage",
+        "gym_lowtail_paired_obs_hetero_preimage",
+        "gym_lowtail_markov_carrier_preimage",
+    }
+    if source_norm in deprecated_preimage_sources and not _env_truthy(
+        "TICL_ALLOW_DEPRECATED_EXACT_SCM_PREIMAGE_SOURCES",
+        default=False,
+    ):
+        raise ValueError(
+            f"{source_norm!r} is a deprecated lowtail/preimage exploratory source. "
+            "It is retained only for negative-result reproduction. Set "
+            "TICL_ALLOW_DEPRECATED_EXACT_SCM_PREIMAGE_SOURCES=1 to replay it explicitly; "
+            "do not use it for maintained M4/live fit_model runs."
+        )
+    if source_norm == "gym_lowtail_markov":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.96
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.04
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.60
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 1.25
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.05
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        return "gym_lowtail_markov"
+    if source_norm == "gym_lowtail_cost_markov":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 1.0
+        return "gym_lowtail_cost_markov"
+    if source_norm == "gym_lowtail_potential_markov":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        return "gym_lowtail_potential_markov"
+    if source_norm == "gym_lowtail_potential_markov_shared_terminal":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+        return "gym_lowtail_potential_markov_shared_terminal"
+    if source_norm == "gym_lowtail_preimage_shared_scalar":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = True
+        return "gym_lowtail_preimage_shared_scalar"
+    if source_norm == "gym_lowtail_state_obs_rank_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.90
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 5
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = False
+        return "gym_lowtail_state_obs_rank_preimage"
+    if source_norm == "gym_lowtail_state_obs_rank_preimage_high_variance":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.90
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 5
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 2.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = False
+        return "gym_lowtail_state_obs_rank_preimage_high_variance"
+    if source_norm == "gym_lowtail_state_obs_temporal_rank_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.92
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 5
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = False
+        return "gym_lowtail_state_obs_temporal_rank_preimage"
+    if source_norm == "gym_lowtail_state_obs_envelope_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.86
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_preimage_shared_scalar_enabled"] = False
+        return "gym_lowtail_state_obs_envelope_preimage"
+    if source_norm == "gym_lowtail_reward_transform_chain_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.92
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.40
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.04
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 0.75
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.35
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+        env_cfg["reinforce_reward_transform"] = "tanh"
+        env_cfg["reinforce_reward_tanh_c"] = 1.5
+        env_cfg["reinforce_reward_tanh_bound"] = 2.0
+        env_cfg["reward_dropout_enabled"] = False
+        env_cfg["reward_dropout_randomize"] = False
+        env_cfg["reward_dropout_ratio"] = 0.0
+        return "gym_lowtail_reward_transform_chain_preimage"
+    if source_norm == "gym_lowtail_clock_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.88
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.10
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.5
+        env_cfg["exact_scm_gym_lowtail_clock_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_clock_omega"] = 0.19634954084936207
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.03
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = True
+        env_cfg["reinforce_reward_transform"] = "tanh"
+        env_cfg["reinforce_reward_tanh_c"] = 1.5
+        env_cfg["reinforce_reward_tanh_bound"] = 2.0
+        env_cfg["reward_dropout_enabled"] = False
+        env_cfg["reward_dropout_randomize"] = False
+        env_cfg["reward_dropout_ratio"] = 0.0
+        return "gym_lowtail_clock_preimage"
+    if source_norm == "gym_lowtail_paired_env_response_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.90
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_bias"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.10
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 0.85
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_paired_response_reward_scale"] = 0.75
+        env_cfg["exact_scm_gym_lowtail_paired_response_done_scale"] = 0.75
+        env_cfg["reinforce_reward_transform"] = "tanh"
+        env_cfg["reinforce_reward_tanh_c"] = 1.5
+        env_cfg["reinforce_reward_tanh_bound"] = 2.0
+        env_cfg["reward_dropout_enabled"] = False
+        env_cfg["reward_dropout_randomize"] = False
+        env_cfg["reward_dropout_ratio"] = 0.0
+        return "gym_lowtail_paired_env_response_preimage"
+    if source_norm == "gym_lowtail_paired_obs_hetero_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.90
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_strength"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_bias"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.10
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 0.85
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_paired_response_reward_scale"] = 0.75
+        env_cfg["exact_scm_gym_lowtail_paired_response_done_scale"] = 0.75
+        env_cfg["reinforce_reward_transform"] = "tanh"
+        env_cfg["reinforce_reward_tanh_c"] = 1.5
+        env_cfg["reinforce_reward_tanh_bound"] = 2.0
+        env_cfg["reward_dropout_enabled"] = False
+        env_cfg["reward_dropout_randomize"] = False
+        env_cfg["reward_dropout_ratio"] = 0.0
+        return "gym_lowtail_paired_obs_hetero_preimage"
+    if source_norm == "gym_lowtail_markov_carrier_preimage":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.90
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.55
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.20
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_markov_carrier_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_rank"] = 6
+        env_cfg["exact_scm_gym_lowtail_state_obs_rank_preimage_innovation_scale"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_state_obs_hetero_scale_strength"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_markov_carrier_horizon"] = 512
+        env_cfg["exact_scm_gym_lowtail_reward_mix"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_bias"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.10
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_scale"] = 0.85
+        env_cfg["exact_scm_gym_lowtail_reward_distribution_head_vol_scale"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_shared_energy_terminal_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_paired_response_preimage_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_paired_response_reward_scale"] = 0.75
+        env_cfg["exact_scm_gym_lowtail_paired_response_done_scale"] = 0.75
+        env_cfg["reinforce_reward_transform"] = "tanh"
+        env_cfg["reinforce_reward_tanh_c"] = 1.5
+        env_cfg["reinforce_reward_tanh_bound"] = 2.0
+        env_cfg["reward_dropout_enabled"] = False
+        env_cfg["reward_dropout_randomize"] = False
+        env_cfg["reward_dropout_ratio"] = 0.0
+        return "gym_lowtail_markov_carrier_preimage"
+    if source_norm == "gym_lowtail_potential_cost_markov":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = True
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_potential_delta_weight"] = 0.5
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 0.5
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 0.5
+        return "gym_lowtail_potential_cost_markov"
+    if source_norm == "gym_lowtail_cost_markov_terminal_independent":
+        env_cfg["exact_scm_gym_lowtail_family_prob"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_terminal_override_enabled"] = False
+        env_cfg["exact_scm_gym_lowtail_terminal_count_min"] = 4.0
+        env_cfg["exact_scm_gym_lowtail_terminal_count_max"] = 28.0
+        env_cfg["exact_scm_gym_lowtail_state_rho"] = 0.98
+        env_cfg["exact_scm_gym_lowtail_neighbor_coupling"] = 0.02
+        env_cfg["exact_scm_gym_lowtail_action_gain"] = 0.15
+        env_cfg["exact_scm_gym_lowtail_noise_gain"] = 0.25
+        env_cfg["exact_scm_gym_lowtail_reward_linear_weight"] = 0.0
+        env_cfg["exact_scm_gym_lowtail_reward_state_cost"] = 1.0
+        env_cfg["exact_scm_gym_lowtail_reward_ctrl_cost"] = 1.0
+        return "gym_lowtail_cost_markov_terminal_independent"
+    raise ValueError(
+        "exact_scm_family_source must be one of {default, gym_lowtail_markov, "
+        "gym_lowtail_cost_markov, gym_lowtail_potential_markov, "
+        "gym_lowtail_potential_markov_shared_terminal, "
+        "gym_lowtail_preimage_shared_scalar, "
+        "gym_lowtail_state_obs_rank_preimage, "
+        "gym_lowtail_state_obs_rank_preimage_high_variance, "
+        "gym_lowtail_state_obs_temporal_rank_preimage, "
+        "gym_lowtail_state_obs_envelope_preimage, "
+        "gym_lowtail_reward_transform_chain_preimage, "
+        "gym_lowtail_clock_preimage, "
+        "gym_lowtail_paired_env_response_preimage, "
+        "gym_lowtail_paired_obs_hetero_preimage, "
+        "gym_lowtail_markov_carrier_preimage, "
+        "gym_lowtail_potential_cost_markov, "
+        "gym_lowtail_cost_markov_terminal_independent}; got "
+        f"{source!r}."
+    )
 
 
 def _build_algo(
@@ -1413,8 +2456,16 @@ def _build_algo(
     gain_min: float,
     topology_state_gain_min: float,
     topology_action_gain_min: float,
+    topology_noise_gain_min: float,
+    topology_state_gain_metric: str,
+    topology_action_gain_metric: str,
+    topology_noise_gain_metric: str,
     topology_state_to_action_ratio_max: float,
+    topology_state_to_action_ratio_metric: str,
+    topology_state_to_noise_ratio_max: float,
+    topology_state_to_noise_ratio_metric: str,
     topology_max_attempts: int,
+    topology_freeze_h_across_attempts: bool,
     fixed_env_group_across_updates: bool,
     ppo_learning_rate: float,
     ppo_batch_size: int | None,
@@ -1423,6 +2474,13 @@ def _build_algo(
     ppo_normalize_advantage: bool,
     ppo_target_kl: float | None,
 ):
+    build_t0 = time.perf_counter()
+    _pack_phase_log(
+        "build_algo_start "
+        f"prior_mode={prior_mode} "
+        f"n_envs={int(n_envs)} n_steps={int(n_steps)} "
+        f"model_override={model_override is not None}"
+    )
     _seed_all(int(build_seed))
     if model_override is None:
         _, model, _, _ = get_model(copy.deepcopy(cfg), device=str(device_obj), should_train=False, verbose=False)
@@ -1430,6 +2488,7 @@ def _build_algo(
         model = model_override
     model.to(device_obj)
     model.train()
+    _pack_phase_log(f"build_algo_model_ready elapsed_s={float(time.perf_counter() - build_t0):.1f}")
 
     prior_cfg = copy.deepcopy(env_cfg)
     prior_mode_norm = str(prior_mode).strip().lower()
@@ -1440,28 +2499,44 @@ def _build_algo(
             prior_cfg,
             state_gain_min=float(topology_state_gain_min),
             action_gain_min=float(topology_action_gain_min),
+            noise_gain_min=float(topology_noise_gain_min),
+            state_gain_metric=str(topology_state_gain_metric),
+            action_gain_metric=str(topology_action_gain_metric),
+            noise_gain_metric=str(topology_noise_gain_metric),
             state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+            state_to_action_ratio_metric=str(topology_state_to_action_ratio_metric),
+            state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
+            state_to_noise_ratio_metric=str(topology_state_to_noise_ratio_metric),
             max_attempts=int(topology_max_attempts),
+            freeze_h_across_attempts=bool(topology_freeze_h_across_attempts),
         )
-    elif prior_mode_norm in GATED_REWARD_PATH_MILESTONES:
+    elif prior_mode_norm == M4_POTENTIAL_PROGRESS_MILESTONE:
         _set_topology_conditioned_sampling(
             prior_cfg,
             state_gain_min=float(topology_state_gain_min),
             action_gain_min=float(topology_action_gain_min),
+            noise_gain_min=float(topology_noise_gain_min),
+            state_gain_metric=str(topology_state_gain_metric),
+            action_gain_metric=str(topology_action_gain_metric),
+            noise_gain_metric=str(topology_noise_gain_metric),
             state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+            state_to_action_ratio_metric=str(topology_state_to_action_ratio_metric),
+            state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
+            state_to_noise_ratio_metric=str(topology_state_to_noise_ratio_metric),
             max_attempts=int(topology_max_attempts),
+            freeze_h_across_attempts=bool(topology_freeze_h_across_attempts),
         )
     prior = EnvironmentPrior(prior_cfg)
-    if prior_mode_norm in GATED_REWARD_PATH_MILESTONES:
-        install_gated_reward_path_balance_milestone(
+    _pack_phase_log(f"build_algo_prior_created elapsed_s={float(time.perf_counter() - build_t0):.1f}")
+    if prior_mode_norm == M4_POTENTIAL_PROGRESS_MILESTONE:
+        install_m4_potential_progress_live_milestone(
             prior,
             state_gain_min=float(topology_state_gain_min),
             action_gain_min=float(topology_action_gain_min),
+            noise_gain_min=float(topology_noise_gain_min),
             state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+            state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
             max_attempts=int(topology_max_attempts),
-            terminal_count_coverage_enabled=(
-                prior_mode_norm == GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE
-            ),
         )
     if prior_mode_norm == "fixed_frozen":
         if frozen_h is None:
@@ -1499,7 +2574,7 @@ def _build_algo(
             return [copy.deepcopy(h) for h in _fixed_h_list]
 
         prior._sample_batch_hypers = _sample_fixed_frozen_list
-    elif prior_mode_norm in {"sampled_gain", "sampled_topology", *GATED_REWARD_PATH_MILESTONES}:
+    elif prior_mode_norm in {"sampled_gain", "sampled_topology", M4_POTENTIAL_PROGRESS_MILESTONE}:
         if bool(fixed_env_group_across_updates):
             base_seeds = [int(build_seed) + int(env_idx) for env_idx in range(int(n_envs))]
             fixed_h_list, _unused_env, fixed_env_seeds = (
@@ -1530,8 +2605,8 @@ def _build_algo(
     else:
         raise ValueError(
             "prior_mode must be 'fixed_frozen', 'fixed_frozen_list', 'sampled_gain', "
-            "'sampled_topology', 'gated_reward_path_balance', or "
-            "'gated_reward_path_balance_terminal_coverage'."
+            "'sampled_topology', or "
+            "'m4_potential_progress_live'."
         )
     prior._phase2_original_sample_single_eval_pos = prior._sample_single_eval_pos
     if fixed_single_eval_pos is not None:
@@ -1540,6 +2615,7 @@ def _build_algo(
         )
     _apply_boundary_contract_mode_flags(prior, "normal")
     _apply_sep_state_reset_flag(prior, True)
+    _pack_phase_log(f"build_algo_prior_configured elapsed_s={float(time.perf_counter() - build_t0):.1f}")
 
     algo, _callback, vec_env = build_recurrent_ppo(
         model=model,
@@ -1579,6 +2655,7 @@ def _build_algo(
         actor_objective_mode="tokenwise",
         verbose=0,
     )
+    _pack_phase_log(f"build_algo_recurrent_ppo_built elapsed_s={float(time.perf_counter() - build_t0):.1f}")
     algo._rwkv_aux_q_weight = 0.0
     algo._rwkv_aux_flow_weight = 0.0
     algo._rwkv_policy_loss_coef = 1.0
@@ -1615,6 +2692,7 @@ def _build_algo(
         algo._rwkv_train_outer_batch_selector_trace_rows = []
         algo._rwkv_train_outer_batch_selector_trace_completed = False
     algo.set_logger(configure_logger(folder=None, format_strings=[]))
+    _pack_phase_log(f"build_algo_done elapsed_s={float(time.perf_counter() - build_t0):.1f}")
     return algo, vec_env
 
 
@@ -1706,6 +2784,39 @@ def _normalize_reward_step_online(
     return np.asarray(scaled, dtype=np.float32).reshape(raw.shape)
 
 
+def _next_prior_obs_reward_token_after_step(scaled_rewards: np.ndarray, dones: np.ndarray) -> np.ndarray:
+    """Match EnvironmentPrior reset semantics for the next observation reward token."""
+
+    scaled = np.asarray(scaled_rewards, dtype=np.float32).reshape(-1)
+    done_arr = np.asarray(dones, dtype=bool).reshape(scaled.shape)
+    return np.where(done_arr, 0.0, scaled).astype(np.float32, copy=False)
+
+
+_LOWTAIL_REWARD_COMPONENT_PACK_NAMES = (
+    "valid_mask",
+    "override_mask",
+    "reward_mix",
+    "reward_unit_base_before_mix",
+    "reward_bias_component",
+    "reward_progress_component",
+    "reward_potential_delta_component",
+    "reward_state_cost_component",
+    "reward_ctrl_cost_component",
+    "reward_distribution_head_component",
+    "reward_paired_response_component",
+    "reward_base_formula_candidate",
+    "reward_component_sum",
+    "reward_candidate_final",
+    "reward_unit_after_mix",
+    "reward_reconstruction_residual",
+    "reward_new_reconstruction_residual",
+    "reward_scale",
+    "reward_raw_scaled",
+    "reward_env_transformed",
+    "reward_total_return",
+)
+
+
 def _collect_prior_policy_pack(
     *,
     algo,
@@ -1735,6 +2846,35 @@ def _collect_prior_policy_pack(
         f"elapsed_s={reset_elapsed_s:.3f} "
         f"total_s={float(time.perf_counter() - collect_t0):.3f}"
     )
+    if _env_truthy("TICL_PPO_PACK_ENV_TENSOR_MEM_AUDIT", default=False):
+        _pack_phase_log_tensor_memory("collect_prior_env_tensor_mem_after_reset", getattr(vec_env, "_env", None))
+        _pack_phase_log_tensor_memory(
+            "collect_prior_env_prior_attr_tensor_mem_after_reset",
+            vars(getattr(vec_env, "env_prior", object())),
+            top_k=40,
+        )
+    if torch.cuda.is_available() and torch.device(getattr(algo, "device", "cpu")).type == "cuda":
+        try:
+            allocated_before_mib = torch.cuda.memory_allocated(device=algo.device) / float(1024 * 1024)
+            reserved_before_mib = torch.cuda.memory_reserved(device=algo.device) / float(1024 * 1024)
+            torch.cuda.empty_cache()
+            allocated_after_mib = torch.cuda.memory_allocated(device=algo.device) / float(1024 * 1024)
+            reserved_after_mib = torch.cuda.memory_reserved(device=algo.device) / float(1024 * 1024)
+            _pack_phase_log(
+                "collect_prior_cuda_empty_cache_after_reset "
+                f"allocated_before_mib={allocated_before_mib:.1f} "
+                f"reserved_before_mib={reserved_before_mib:.1f} "
+                f"allocated_after_mib={allocated_after_mib:.1f} "
+                f"reserved_after_mib={reserved_after_mib:.1f}"
+            )
+        except Exception:
+            pass
+    if _env_truthy("TICL_PPO_COLLECT_PROBE_EXIT_AFTER_RESET", default=False):
+        _pack_phase_log(
+            "collect_prior_probe_exit_after_reset "
+            f"elapsed_s={float(time.perf_counter() - collect_t0):.1f}"
+        )
+        raise SystemExit(0)
     obs_dims = [int(obs_slot_dim)] * n_envs
     obs_slot_dims = [int(obs_slot_dim)] * n_envs
     if isinstance(getattr(vec_env, "_env", None), dict):
@@ -1748,14 +2888,43 @@ def _collect_prior_policy_pack(
     algo.policy.reset_rollout_cache(n_envs)
     algo.policy.set_training_mode(False)
     episode_starts_t = np.ones((n_envs,), dtype=np.float32)
-    obs_norm_acc = _new_obs_norm_stats_acc()
+    transition_count = int(n_envs) * int(n_steps)
+    light_meta_min_transitions = int(os.environ.get("TICL_PPO_PACK_LIGHT_META_MIN_TRANSITIONS", "1048576") or "1048576")
+    light_meta_default = bool(transition_count >= max(1, int(light_meta_min_transitions)))
+    collect_obs_norm_stats = _env_truthy("TICL_PPO_PACK_COLLECT_OBS_NORM_STATS", default=not light_meta_default)
+    collect_per_env_obs_stats = _env_truthy("TICL_PPO_PACK_COLLECT_PER_ENV_OBS_STATS", default=not light_meta_default)
+    collect_reward_components = _env_truthy("TICL_PPO_PACK_COLLECT_REWARD_COMPONENTS", default=not light_meta_default)
+    obs_norm_acc = _new_obs_norm_stats_acc() if bool(collect_obs_norm_stats) else None
+    pre_norm_obs_acc = _new_per_env_obs_stats(n_envs, int(obs_slot_dim)) if bool(collect_per_env_obs_stats) else None
     obs_norm_last_stats: dict[str, Any] = {"enabled": bool(getattr(algo, "_rwkv_sb3_observation_normalization_enabled", False))}
+    _pack_phase_log(
+        "collect_prior_runtime_options "
+        f"transition_count={int(transition_count)} "
+        f"light_meta_default={bool(light_meta_default)} "
+        f"collect_obs_norm_stats={bool(collect_obs_norm_stats)} "
+        f"collect_per_env_obs_stats={bool(collect_per_env_obs_stats)} "
+        f"collect_reward_components={bool(collect_reward_components)}"
+    )
 
     tokens = np.zeros((int(n_steps), n_envs, int(num_features)), dtype=np.float32)
     actions = np.zeros((int(n_steps), n_envs, int(action_slot_dim)), dtype=np.float32)
     action_masks = np.zeros_like(actions)
     rewards = np.zeros((int(n_steps), n_envs), dtype=np.float32)
     raw_rewards = np.zeros_like(rewards)
+    reward_env_components = np.zeros_like(rewards) if bool(collect_reward_components) else None
+    reward_ctrl_components = np.zeros_like(rewards) if bool(collect_reward_components) else None
+    reward_survival_components = np.zeros_like(rewards) if bool(collect_reward_components) else None
+    reward_terminal_bonus_components = np.zeros_like(rewards) if bool(collect_reward_components) else None
+    reward_components_available = bool(collect_reward_components)
+    collect_lowtail_reward_components = bool(
+        int(os.environ.get("TICL_PACK_LOG_LOWTAIL_REWARD_COMPONENTS", "0") or "0")
+    )
+    lowtail_reward_components_available = bool(collect_lowtail_reward_components)
+    lowtail_reward_component_arrays = (
+        {name: np.zeros_like(rewards) for name in _LOWTAIL_REWARD_COMPONENT_PACK_NAMES}
+        if bool(collect_lowtail_reward_components)
+        else {}
+    )
     episode_starts = np.zeros_like(rewards)
     dones = np.zeros((int(n_steps), n_envs), dtype=bool)
     terminated = np.zeros_like(dones)
@@ -1773,8 +2942,12 @@ def _collect_prior_policy_pack(
 
     original_defer_time_limit_reset = getattr(vec_env, "_defer_time_limit_reset_at_rollout_end", False)
     original_compact_pack_step_infos = getattr(vec_env, "_compact_pack_step_infos", False)
+    original_collect_reward_components = getattr(vec_env, "_collect_reward_component_arrays_for_pack", True)
+    original_collect_lowtail_components = getattr(vec_env, "_collect_exact_scm_lowtail_reward_components_for_pack", False)
     vec_env._defer_time_limit_reset_at_rollout_end = True
     vec_env._compact_pack_step_infos = True
+    vec_env._collect_reward_component_arrays_for_pack = bool(collect_reward_components)
+    vec_env._collect_exact_scm_lowtail_reward_components_for_pack = bool(collect_lowtail_reward_components)
     collect_probe_max_steps = int(os.environ.get("TICL_PPO_COLLECT_PROBE_MAX_STEPS_EXIT", "0") or "0")
     phase_acc = {
         "mask": 0.0,
@@ -1791,6 +2964,13 @@ def _collect_prior_policy_pack(
         masks = vec_env.action_masks().astype(np.float32, copy=False)
         phase_acc["mask"] += float(time.perf_counter() - phase_t0)
         phase_t0 = time.perf_counter()
+        if pre_norm_obs_acc is not None:
+            _accumulate_per_env_obs_stats(
+                pre_norm_obs_acc,
+                np.asarray(obs, dtype=np.float32),
+                obs_dims=obs_dims,
+                obs_slot_dim=int(obs_slot_dim),
+            )
         obs_for_policy, obs_norm_last_stats = _apply_observation_normalization_if_enabled(
             algo,
             np.asarray(obs, dtype=np.float32),
@@ -1821,6 +3001,34 @@ def _collect_prior_policy_pack(
         else:
             truncated_arr = np.asarray([bool(info.get("TimeLimit.truncated", False)) for info in infos], dtype=bool)
         scaled_reward_arr = _normalize_reward_step_online(algo, raw_reward_arr, done_arr)
+        if bool(collect_reward_components):
+            component_attrs = (
+                ("_last_reward_env_np", reward_env_components),
+                ("_last_reward_ctrl_np", reward_ctrl_components),
+                ("_last_reward_survival_np", reward_survival_components),
+                ("_last_reward_terminal_bonus_np", reward_terminal_bonus_components),
+            )
+            for attr_name, target_arr in component_attrs:
+                component_value = getattr(vec_env, attr_name, None)
+                if (
+                    target_arr is None
+                    or component_value is None
+                    or tuple(np.asarray(component_value).shape) != (n_envs,)
+                ):
+                    reward_components_available = False
+                    continue
+                target_arr[step_idx] = np.asarray(component_value, dtype=np.float32)
+        if bool(collect_lowtail_reward_components):
+            lowtail_payload = getattr(vec_env, "_last_exact_scm_lowtail_reward_components_np", None)
+            if not isinstance(lowtail_payload, dict):
+                lowtail_reward_components_available = False
+            else:
+                for component_name, target_arr in lowtail_reward_component_arrays.items():
+                    component_value = lowtail_payload.get(component_name)
+                    if component_value is None or tuple(np.asarray(component_value).shape) != (n_envs,):
+                        lowtail_reward_components_available = False
+                        continue
+                    target_arr[step_idx] = np.asarray(component_value, dtype=np.float32)
         if bool(truncated_arr.any()):
             terminal_tokens = np.asarray(obs, dtype=np.float32).copy()
             terminal_observations = getattr(vec_env, "_last_terminal_observation_np", None)
@@ -1885,8 +3093,8 @@ def _collect_prior_policy_pack(
         phase_acc["next_state"] += float(time.perf_counter() - phase_t0)
         phase_t0 = time.perf_counter()
         obs = np.asarray(obs, dtype=np.float32).copy()
-        if not bool(truncated_arr.any()) and int(obs.shape[1]) > int(obs_slot_dim):
-            obs[:, int(obs_slot_dim)] = scaled_reward_arr
+        if int(obs.shape[1]) > int(obs_slot_dim):
+            obs[:, int(obs_slot_dim)] = _next_prior_obs_reward_token_after_step(scaled_reward_arr, done_arr)
         episode_starts_t = dones[step_idx].astype(np.float32, copy=False)
         phase_acc["obs_post"] += float(time.perf_counter() - phase_t0)
         if (
@@ -1916,6 +3124,8 @@ def _collect_prior_policy_pack(
             )
             vec_env._defer_time_limit_reset_at_rollout_end = original_defer_time_limit_reset
             vec_env._compact_pack_step_infos = original_compact_pack_step_infos
+            vec_env._collect_reward_component_arrays_for_pack = original_collect_reward_components
+            vec_env._collect_exact_scm_lowtail_reward_components_for_pack = original_collect_lowtail_components
             _pack_phase_log(
                 "collect_prior_probe_exit "
                 f"step={measured_steps}/{int(n_steps)} "
@@ -1936,6 +3146,8 @@ def _collect_prior_policy_pack(
     last_values = _predict_terminal_values_from_tokens(algo, final_obs_for_value, episode_starts_t)
     vec_env._defer_time_limit_reset_at_rollout_end = original_defer_time_limit_reset
     vec_env._compact_pack_step_infos = original_compact_pack_step_infos
+    vec_env._collect_reward_component_arrays_for_pack = original_collect_reward_components
+    vec_env._collect_exact_scm_lowtail_reward_components_for_pack = original_collect_lowtail_components
     _pack_phase_log(
         "collect_prior_done "
         f"elapsed_s={float(time.perf_counter() - collect_t0):.1f} "
@@ -1956,10 +3168,19 @@ def _collect_prior_policy_pack(
         "next_state_targets_stored": bool(store_next_state_targets),
         "last_values": last_values,
     }
+    if bool(reward_components_available) and reward_env_components is not None:
+        pack["reward_env_components"] = reward_env_components
+        pack["reward_ctrl_components"] = reward_ctrl_components
+        pack["reward_survival_components"] = reward_survival_components
+        pack["reward_terminal_bonus_components"] = reward_terminal_bonus_components
+    if bool(lowtail_reward_components_available):
+        for component_name, component_values in lowtail_reward_component_arrays.items():
+            pack[f"exact_scm_lowtail_{component_name}"] = component_values
     if bool(store_next_state_targets):
         pack["next_state_targets"] = next_state_targets
         pack["next_state_masks"] = next_state_masks
     vec_env.next_state_target_dim = int(original_vec_next_state_dim)
+    fixed_h_list_for_digest = getattr(vec_env.env_prior, "_phase2_fixed_env_group_h_list", None)
     meta = {
         "collector": "prior_policy_pack",
         "env_seed": int(seed),
@@ -1967,13 +3188,38 @@ def _collect_prior_policy_pack(
         "env_group_seeds": [int(v) for v in env_group_seeds],
         "env_group_digest": _stable_digest(
             {
-                "h_list": getattr(vec_env, "_h_list", None),
+                "h_list": (
+                    fixed_h_list_for_digest
+                    if fixed_h_list_for_digest is not None
+                    else getattr(vec_env, "_h_list", None)
+                ),
                 "env_group_seeds": [int(v) for v in env_group_seeds],
             }
         ),
         "n_envs": int(n_envs),
-        "obs_normalization": _finalize_obs_norm_stats_acc(obs_norm_acc, obs_norm_last_stats),
+        "obs_normalization": (
+            _finalize_obs_norm_stats_acc(obs_norm_acc, obs_norm_last_stats)
+            if obs_norm_acc is not None
+            else dict(obs_norm_last_stats)
+        ),
     }
+    if pre_norm_obs_acc is not None:
+        meta.update(
+            _finalize_per_env_obs_stats(
+                pre_norm_obs_acc,
+                obs_dims=obs_dims,
+                obs_slot_dim=int(obs_slot_dim),
+                prefix="pre_norm_obs",
+            )
+        )
+    meta.update(
+        _obs_norm_state_per_env_meta(
+            algo,
+            obs_dims=obs_dims,
+            obs_slot_dim=int(obs_slot_dim),
+            prefix="obs_norm_state",
+        )
+    )
     _add_prior_reward_component_meta_from_h_list(
         meta,
         getattr(vec_env.env_prior, "_phase2_fixed_env_group_h_list", None),
@@ -1987,6 +3233,8 @@ def _collect_prior_policy_pack(
             "action_dim_per_sample",
             "action_slot_dim_per_sample",
             "state_dim_per_sample",
+            "noise_dim_per_sample",
+            "zero_pad_dim_per_sample",
         ):
             meta_values = _tensor_int_vector(env_batch, key)
             if meta_values is not None:
@@ -1996,6 +3244,8 @@ def _collect_prior_policy_pack(
                     "action_dim_per_sample": "action_dims",
                     "action_slot_dim_per_sample": "action_slot_dims",
                     "state_dim_per_sample": "state_dims",
+                    "noise_dim_per_sample": "noise_dims",
+                    "zero_pad_dim_per_sample": "zero_pad_dims",
                 }[key]
                 meta[public_key] = meta_values
         for key in (
@@ -2004,8 +3254,20 @@ def _collect_prior_policy_pack(
             "reward_noise_input_gain_fraction",
             "reward_state_to_noise_gain_ratio",
             "reward_state_to_action_gain_ratio",
+            "reward_state_input_gain_density_ratio",
+            "reward_action_input_gain_density_ratio",
+            "reward_noise_input_gain_density_ratio",
+            "reward_state_to_action_gain_density_ratio",
+            "reward_state_to_noise_gain_density_ratio",
             "reward_state_input_gain_fraction_conditioned_accepted_gain",
+            "reward_action_input_gain_fraction_conditioned_accepted_gain",
+            "reward_noise_input_gain_fraction_conditioned_accepted_gain",
+            "reward_state_to_action_gain_ratio_conditioned_accepted_ratio",
+            "reward_state_to_noise_gain_ratio_conditioned_accepted_ratio",
             "reward_state_input_gain_fraction_conditioned_attempt",
+            "reward_topology_conditioned_attempt",
+            "reward_topology_conditioned_total_candidate_draws",
+            "reward_topology_conditioned_freeze_h_across_attempts",
         ):
             meta_values = _tensor_vector(env_batch, key)
             if meta_values is not None:
@@ -2021,6 +3283,24 @@ def _collect_prior_policy_pack(
             "gated_terminal_coverage_applied",
             "gated_terminal_coverage_original_target",
             "gated_terminal_coverage_target",
+            "reference_semantics_enabled",
+            "state_highway_enabled",
+            "state_highway_lambda",
+            "exact_scm_gym_lowtail_family_enabled",
+            "exact_scm_gym_lowtail_family_active",
+            "exact_scm_gym_lowtail_reward_linear_weight",
+            "exact_scm_gym_lowtail_reward_potential_delta_weight",
+            "exact_scm_gym_lowtail_reward_state_cost",
+            "exact_scm_gym_lowtail_reward_ctrl_cost",
+            "exact_scm_gym_lowtail_action_gain",
+            "exact_scm_gym_lowtail_noise_gain",
+            "exact_scm_gym_lowtail_shared_energy_terminal_enabled",
+            "exact_scm_gym_lowtail_preimage_shared_scalar_enabled",
+            "exact_scm_gym_lowtail_state_obs_rank_preimage_enabled",
+            "exact_scm_gym_lowtail_state_obs_temporal_preimage_enabled",
+            "exact_scm_gym_lowtail_state_obs_envelope_preimage_enabled",
+            "exact_scm_gym_lowtail_reward_distribution_head_enabled",
+            "exact_scm_gym_lowtail_clock_preimage_enabled",
         ):
             if key not in meta:
                 meta_values = _tensor_vector(env_batch, key)
@@ -2086,6 +3366,7 @@ def _collect_gym_policy_pack(
         prev_terminal = np.zeros((n_envs,), dtype=np.float32)
         episode_starts_t = np.ones((n_envs,), dtype=np.float32)
         obs_norm_acc = _new_obs_norm_stats_acc()
+        pre_norm_obs_acc = _new_per_env_obs_stats(n_envs, int(obs_slot_dim))
         obs_norm_last_stats: dict[str, Any] = {
             "enabled": bool(getattr(algo, "_rwkv_sb3_observation_normalization_enabled", False))
         }
@@ -2109,6 +3390,12 @@ def _collect_gym_policy_pack(
         log_probs = np.zeros_like(rewards)
 
         for step_idx in range(int(n_steps)):
+            _accumulate_per_env_obs_stats(
+                pre_norm_obs_acc,
+                obs_t,
+                obs_dims=obs_dims,
+                obs_slot_dim=int(obs_slot_dim),
+            )
             obs_t_for_policy, obs_norm_last_stats = _apply_observation_normalization_if_enabled(
                 algo,
                 obs_t,
@@ -2299,6 +3586,22 @@ def _collect_gym_policy_pack(
             ],
             "obs_normalization": _finalize_obs_norm_stats_acc(obs_norm_acc, obs_norm_last_stats),
         }
+        meta.update(
+            _finalize_per_env_obs_stats(
+                pre_norm_obs_acc,
+                obs_dims=obs_dims,
+                obs_slot_dim=int(obs_slot_dim),
+                prefix="pre_norm_obs",
+            )
+        )
+        meta.update(
+            _obs_norm_state_per_env_meta(
+                algo,
+                obs_dims=obs_dims,
+                obs_slot_dim=int(obs_slot_dim),
+                prefix="obs_norm_state",
+            )
+        )
         return pack, values, log_probs, meta
     finally:
         for env in envs:
@@ -2471,6 +3774,7 @@ def _dump_fixed_prior_group_if_available(
 
 def _run_update_from_pack(
     *,
+    arm: str = "pack",
     algo,
     pack: dict[str, np.ndarray],
     values: np.ndarray,
@@ -2479,23 +3783,65 @@ def _run_update_from_pack(
     action_slot_dim: int,
     next_state_target_dim: int,
     single_eval_pos: int,
+    store_next_state_targets: bool = True,
+    take_ownership_override: bool | None = None,
 ) -> tuple[dict[str, Any], dict[str, Any]]:
     bridge_t0 = time.perf_counter()
+    take_ownership = (
+        _env_truthy("TICL_PPO_PACK_ROLLOUT_BUFFER_TAKE_OWNERSHIP", default=False)
+        if take_ownership_override is None
+        else bool(take_ownership_override)
+    )
     buffer_pack, reward_norm_stats = _apply_reward_normalization_if_enabled(algo, pack)
     _pack_phase_log(f"reward_normalization_done elapsed_s={float(time.perf_counter() - bridge_t0):.3f}")
+    pack_summary = None
+    pack_summary_mode = str(os.environ.get("TICL_PPO_PACK_SUMMARY_MODE", "light")).strip().lower()
+    if bool(take_ownership):
+        phase_t0 = time.perf_counter()
+        pack_summary = (
+            _summarize_pack(pack, label=str(arm))
+            if pack_summary_mode in {"full", "complete", "digest"}
+            else _summarize_pack_light(pack, label=str(arm))
+        )
+        _pack_phase_log(
+            "pre_destructive_pack_summary_done "
+            f"elapsed_s={float(time.perf_counter() - phase_t0):.3f} "
+            f"summary_mode={pack_summary.get('summary_mode', 'full')}"
+        )
+    dropped_original_pack_refs: list[str] = []
+    if bool(take_ownership) and buffer_pack is not pack:
+        phase_t0 = time.perf_counter()
+        dropped_original_pack_refs = _drop_pack_payload_refs(pack)
+        _pack_phase_log(
+            "original_pack_payload_refs_dropped "
+            f"elapsed_s={float(time.perf_counter() - phase_t0):.3f} "
+            f"keys={','.join(dropped_original_pack_refs)}"
+        )
+    original_buffer_next_state_dim = int(getattr(algo.rollout_buffer, "next_state_dim", int(next_state_target_dim)))
+    active_next_state_target_dim = int(next_state_target_dim if bool(store_next_state_targets) else 0)
+    if not bool(store_next_state_targets):
+        algo.rollout_buffer.next_state_dim = 0
     fill_t0 = time.perf_counter()
+    _pack_phase_log(
+        "rollout_buffer_fill_start "
+        f"take_ownership={bool(take_ownership)} "
+        f"store_next_state_targets={bool(store_next_state_targets)} "
+        f"next_state_target_dim={int(active_next_state_target_dim)}"
+    )
     buffer_summary = _fill_existing_rollout_buffer_from_pack(
         algo.rollout_buffer,
         buffer_pack,
         num_features=int(num_features),
         action_slot_dim=int(action_slot_dim),
-        next_state_target_dim=int(next_state_target_dim),
+        next_state_target_dim=int(active_next_state_target_dim),
         single_eval_pos=int(single_eval_pos),
         values_by_step_env=values,
         log_probs_by_step_env=log_probs,
-        last_values_by_env=pack.get("last_values"),
+        last_values_by_env=buffer_pack.get("last_values"),
         compute_returns=True,
         summary_mode=os.environ.get("TICL_PPO_ROLLOUT_BUFFER_SUMMARY_MODE", "light"),
+        take_ownership=bool(take_ownership),
+        allow_missing_next_state_targets=not bool(store_next_state_targets),
     )
     _pack_phase_log(
         "rollout_buffer_fill_done "
@@ -2511,6 +3857,8 @@ def _run_update_from_pack(
         algo.train()
     except Exception as exc:  # pragma: no cover
         exception = repr(exc)
+    if not bool(store_next_state_targets):
+        algo.rollout_buffer.next_state_dim = int(original_buffer_next_state_dim)
     _pack_phase_log(f"algo_train_returned elapsed_s={float(time.perf_counter() - train_t0):.1f}")
     update = {
         "exception": exception,
@@ -2518,7 +3866,24 @@ def _run_update_from_pack(
         "logger": _logger_values(algo),
         "param_delta": _param_delta_summary(algo, before),
     }
-    return update, {"buffer_summary": buffer_summary, "reward_norm": reward_norm_stats}
+    phase_t0 = time.perf_counter()
+    rollout_buffer_release = _release_rollout_buffer_payload_after_update(algo)
+    _pack_phase_log(
+        "rollout_buffer_payload_release_done "
+        f"elapsed_s={float(time.perf_counter() - phase_t0):.3f} "
+        f"summary={json.dumps(_json_safe(rollout_buffer_release), sort_keys=True)}"
+    )
+    return update, {
+        "buffer_summary": buffer_summary,
+        "reward_norm": reward_norm_stats,
+        "rollout_buffer_take_ownership": bool(take_ownership),
+        "store_next_state_targets": bool(store_next_state_targets),
+        "original_buffer_next_state_dim": int(original_buffer_next_state_dim),
+        "active_next_state_target_dim": int(active_next_state_target_dim),
+        "dropped_original_pack_refs": list(dropped_original_pack_refs),
+        "pre_fill_pack_summary": pack_summary,
+        "rollout_buffer_release_after_update": rollout_buffer_release,
+    }
 
 
 def _run_pack_update_once(
@@ -2560,7 +3925,7 @@ def _run_pack_update_once(
     store_next_state_targets = bool(
         semantic_probes_enabled
         or float(getattr(algo, "_rwkv_aux_flow_weight", 0.0)) > 0.0
-        or int(getattr(algo.rollout_buffer, "next_state_dim", 0)) > 0
+        or _env_truthy("TICL_PPO_PACK_STORE_UNUSED_NEXT_STATE_TARGETS", default=False)
     )
     update_pack_load_path = _env_path("TICL_PPO_UPDATE_PACK_LOAD_PATH")
     update_pack_save_path = _env_path("TICL_PPO_UPDATE_PACK_SAVE_PATH")
@@ -2698,6 +4063,7 @@ def _run_pack_update_once(
         _pack_phase_log(f"semantic_sidecar_done elapsed_s={float(time.perf_counter() - phase_t0):.3f}")
     phase_t0 = time.perf_counter()
     update, bridge = _run_update_from_pack(
+        arm=str(arm),
         algo=algo,
         pack=pack,
         values=values,
@@ -2706,6 +4072,7 @@ def _run_pack_update_once(
         action_slot_dim=int(action_slot_dim),
         next_state_target_dim=int(next_state_target_dim),
         single_eval_pos=int(effective_single_eval_pos),
+        store_next_state_targets=bool(store_next_state_targets),
     )
     _pack_phase_log(
         "update_from_pack_done "
@@ -2714,11 +4081,13 @@ def _run_pack_update_once(
     )
     pack_summary_mode = str(os.environ.get("TICL_PPO_PACK_SUMMARY_MODE", "light")).strip().lower()
     pack_summary_t0 = time.perf_counter()
-    pack_summary = (
-        _summarize_pack(pack, label=str(arm))
-        if pack_summary_mode in {"full", "complete", "digest"}
-        else _summarize_pack_light(pack, label=str(arm))
-    )
+    pack_summary = bridge.get("pre_fill_pack_summary")
+    if pack_summary is None:
+        pack_summary = (
+            _summarize_pack(pack, label=str(arm))
+            if pack_summary_mode in {"full", "complete", "digest"}
+            else _summarize_pack_light(pack, label=str(arm))
+        )
     _pack_phase_log(
         "pack_summary_done "
         f"elapsed_s={float(time.perf_counter() - pack_summary_t0):.3f} "
@@ -2802,8 +4171,16 @@ def _run_arm(
     gain_min: float,
     topology_state_gain_min: float,
     topology_action_gain_min: float,
+    topology_noise_gain_min: float,
+    topology_state_gain_metric: str,
+    topology_action_gain_metric: str,
+    topology_noise_gain_metric: str,
     topology_state_to_action_ratio_max: float,
+    topology_state_to_action_ratio_metric: str,
+    topology_state_to_noise_ratio_max: float,
+    topology_state_to_noise_ratio_metric: str,
     topology_max_attempts: int,
+    topology_freeze_h_across_attempts: bool,
     fixed_env_group_across_updates: bool,
     semantic_probes_enabled: bool,
     semantic_probe_sidecar_enabled: bool,
@@ -2837,8 +4214,16 @@ def _run_arm(
         gain_min=float(gain_min),
         topology_state_gain_min=float(topology_state_gain_min),
         topology_action_gain_min=float(topology_action_gain_min),
+        topology_noise_gain_min=float(topology_noise_gain_min),
+        topology_state_gain_metric=str(topology_state_gain_metric),
+        topology_action_gain_metric=str(topology_action_gain_metric),
+        topology_noise_gain_metric=str(topology_noise_gain_metric),
         topology_state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+        topology_state_to_action_ratio_metric=str(topology_state_to_action_ratio_metric),
+        topology_state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
+        topology_state_to_noise_ratio_metric=str(topology_state_to_noise_ratio_metric),
         topology_max_attempts=int(topology_max_attempts),
+        topology_freeze_h_across_attempts=bool(topology_freeze_h_across_attempts),
         fixed_env_group_across_updates=bool(fixed_env_group_across_updates),
         ppo_learning_rate=float(ppo_learning_rate),
         ppo_batch_size=ppo_batch_size,
@@ -2932,8 +4317,22 @@ def run_runner(
     gain_min: float,
     topology_state_gain_min: float,
     topology_action_gain_min: float,
+    topology_noise_gain_min: float,
+    topology_state_gain_metric: str,
+    topology_action_gain_metric: str,
+    topology_noise_gain_metric: str,
     topology_state_to_action_ratio_max: float,
+    topology_state_to_action_ratio_metric: str,
+    topology_state_to_noise_ratio_max: float,
+    topology_state_to_noise_ratio_metric: str,
     topology_max_attempts: int,
+    topology_freeze_h_across_attempts: bool,
+    dim_source_policy: str,
+    dim_noise_policy: str,
+    reference_state_inertia_source: str,
+    terminal_min_step_source: str,
+    state_full_rms_source: str,
+    exact_scm_family_source: str,
     fixed_env_group_across_updates: bool,
     semantic_probes_enabled: bool,
     semantic_probe_sidecar_enabled: bool,
@@ -2951,6 +4350,15 @@ def run_runner(
     cfg = copy.deepcopy(get_model_default_config("rlpfn"))
     validate_rlpfn_maintained_path_config(cfg)
     env_cfg = copy.deepcopy(cfg["prior"]["environment"])
+    dim_source_policy_norm = _set_dim_source_policy(env_cfg, dim_source_policy)
+    dim_noise_policy_norm = _set_dim_noise_policy(env_cfg, dim_noise_policy)
+    reference_state_inertia_source_norm = _set_reference_state_inertia_source(
+        env_cfg,
+        reference_state_inertia_source,
+    )
+    terminal_min_step_source_norm = _set_terminal_min_step_source(env_cfg, terminal_min_step_source)
+    state_full_rms_source_norm = _set_state_full_rms_source(env_cfg, state_full_rms_source)
+    exact_scm_family_source_norm = _set_exact_scm_family_source(env_cfg, exact_scm_family_source)
     num_features = int(cfg["prior"]["num_features"])
     layout = resolve_rlpfn_token_layout(env_cfg, num_features=num_features)
     obs_slot_dim = int(layout["obs_slot_dim"])
@@ -3016,8 +4424,16 @@ def run_runner(
                 gain_min=float(gain_min),
                 topology_state_gain_min=float(topology_state_gain_min),
                 topology_action_gain_min=float(topology_action_gain_min),
+                topology_noise_gain_min=float(topology_noise_gain_min),
+                topology_state_gain_metric=str(topology_state_gain_metric),
+                topology_action_gain_metric=str(topology_action_gain_metric),
+                topology_noise_gain_metric=str(topology_noise_gain_metric),
                 topology_state_to_action_ratio_max=float(topology_state_to_action_ratio_max),
+                topology_state_to_action_ratio_metric=str(topology_state_to_action_ratio_metric),
+                topology_state_to_noise_ratio_max=float(topology_state_to_noise_ratio_max),
+                topology_state_to_noise_ratio_metric=str(topology_state_to_noise_ratio_metric),
                 topology_max_attempts=int(topology_max_attempts),
+                topology_freeze_h_across_attempts=bool(topology_freeze_h_across_attempts),
                 fixed_env_group_across_updates=bool(fixed_env_group_across_updates),
                 semantic_probes_enabled=bool(semantic_probes_enabled),
                 semantic_probe_sidecar_enabled=bool(semantic_probe_sidecar_enabled),
@@ -3091,8 +4507,22 @@ def run_runner(
             "prior_mode": str(prior_mode),
             "topology_state_gain_min": float(topology_state_gain_min),
             "topology_action_gain_min": float(topology_action_gain_min),
+            "topology_noise_gain_min": float(topology_noise_gain_min),
+            "topology_state_gain_metric": str(topology_state_gain_metric),
+            "topology_action_gain_metric": str(topology_action_gain_metric),
+            "topology_noise_gain_metric": str(topology_noise_gain_metric),
             "topology_state_to_action_ratio_max": float(topology_state_to_action_ratio_max),
+            "topology_state_to_action_ratio_metric": str(topology_state_to_action_ratio_metric),
+            "topology_state_to_noise_ratio_max": float(topology_state_to_noise_ratio_max),
+            "topology_state_to_noise_ratio_metric": str(topology_state_to_noise_ratio_metric),
             "topology_max_attempts": int(topology_max_attempts),
+            "topology_freeze_h_across_attempts": bool(topology_freeze_h_across_attempts),
+            "dim_source_policy": str(dim_source_policy_norm),
+            "dim_noise_policy": str(dim_noise_policy_norm),
+            "reference_state_inertia_source": str(reference_state_inertia_source_norm),
+            "terminal_min_step_source": str(terminal_min_step_source_norm),
+            "state_full_rms_source": str(state_full_rms_source_norm),
+            "exact_scm_family_source": str(exact_scm_family_source_norm),
             "frozen_h_json": None if frozen_h_path is None else str(frozen_h_path),
             "fixed_frozen_h_list_csv": None if fixed_frozen_h_list_csv is None else str(fixed_frozen_h_list_csv),
             "fixed_frozen_h_list_rule": None if fixed_frozen_h_list_rule is None else str(fixed_frozen_h_list_rule),
@@ -3125,8 +4555,7 @@ def main(argv: list[str] | None = None) -> None:
             "fixed_frozen_list",
             "sampled_gain",
             "sampled_topology",
-            GATED_REWARD_PATH_MILESTONE,
-            GATED_REWARD_PATH_TERMINAL_COVERAGE_MILESTONE,
+            M4_POTENTIAL_PROGRESS_MILESTONE,
         ],
     )
     parser.add_argument("--fixed-frozen-h-json", type=str, default=DEFAULT_FROZEN_H_JSON)
@@ -3142,8 +4571,160 @@ def main(argv: list[str] | None = None) -> None:
     parser.add_argument("--gain-min", type=float, default=0.7)
     parser.add_argument("--topology-state-gain-min", type=float, default=0.7)
     parser.add_argument("--topology-action-gain-min", type=float, default=0.06)
+    parser.add_argument("--topology-noise-gain-min", type=float, default=0.0)
+    parser.add_argument(
+        "--topology-state-gain-metric",
+        type=str,
+        default="fraction",
+        choices=["fraction", "density_ratio"],
+        help=(
+            "Metric used for topology state sensitivity. fraction preserves legacy total-gain "
+            "semantics; density_ratio uses per-state-dimension path density divided by average "
+            "non-pad path density to avoid state_dim/noise_dim coupling."
+        ),
+    )
+    parser.add_argument(
+        "--topology-action-gain-metric",
+        type=str,
+        default="fraction",
+        choices=["fraction", "density_ratio"],
+        help=(
+            "Metric used for topology action sensitivity. fraction preserves the "
+            "legacy group-sum fraction; density_ratio uses per-action-dimension "
+            "path density divided by average non-pad path density to avoid action_dim coupling."
+        ),
+    )
+    parser.add_argument(
+        "--topology-noise-gain-metric",
+        type=str,
+        default="fraction",
+        choices=["fraction", "density_ratio"],
+        help="Metric used for topology noise sensitivity; see --topology-action-gain-metric.",
+    )
     parser.add_argument("--topology-state-to-action-ratio-max", type=float, default=15.0)
+    parser.add_argument(
+        "--topology-state-to-action-ratio-metric",
+        type=str,
+        default="total_gain",
+        choices=["total_gain", "density_ratio"],
+        help=(
+            "Metric for the topology state/action balance guard. total_gain preserves legacy "
+            "state_gain/action_gain; density_ratio compares per-dimension state and action path densities."
+        ),
+    )
+    parser.add_argument("--topology-state-to-noise-ratio-max", type=float, default=0.0)
+    parser.add_argument(
+        "--topology-state-to-noise-ratio-metric",
+        type=str,
+        default="total_gain",
+        choices=["total_gain", "density_ratio"],
+        help="Metric for the topology state/noise balance guard.",
+    )
     parser.add_argument("--topology-max-attempts", type=int, default=512)
+    parser.add_argument(
+        "--topology-freeze-h-across-attempts",
+        type=str2bool,
+        default=False,
+        help=(
+            "When topology-conditioned sampling retries reward/transition candidates, keep structural "
+            "h fields fixed for each batch slot and only advance env seeds. This prevents the guard from "
+            "implicitly selecting action/obs/state/noise/zero-pad dimensions."
+        ),
+    )
+    parser.add_argument(
+        "--dim-source-policy",
+        type=str,
+        default="default",
+        choices=[
+            "default",
+            "gym_obs_action_piecewise",
+            "gym_obs_action_visible_state_mix",
+            "gym_empirical_obs_action",
+        ],
+        help=(
+            "Optional source-level dim sampler override. gym_obs_action_piecewise uses "
+            "Gym-derived low/mid/high obs/action dimension bands without binding them to profile modes. "
+            "gym_obs_action_visible_state_mix keeps the same obs/action source but reserves a "
+            "mode-independent fully-observed state subset for Gym-like simple environments. "
+            "gym_empirical_obs_action samples obs/action dims from the empirical Gym pack dimension "
+            "counts used by the sidecar comparator, independent of profile modes."
+        ),
+    )
+    parser.add_argument(
+        "--dim-noise-policy",
+        type=str,
+        default="default",
+        choices=["default", "gym_low"],
+        help=(
+            "Optional constrained-dim noise source. gym_low samples low explicit noise dimensions "
+            "and leaves inactive budget in zero_pad, avoiding noise_dim growth tied to 400-state_dim."
+        ),
+    )
+    parser.add_argument(
+        "--reference-state-inertia-source",
+        type=str,
+        default="default",
+        choices=["default", "off", "on", "meta_choice", "index_hash_half"],
+        help=(
+            "Source-level control for reference_state_inertia_enabled. "
+            "meta_choice samples whether alpha enters the reference transition update per environment; "
+            "index_hash_half enables a paired 50% source diagnostic without consuming extra sampler RNG."
+        ),
+    )
+    parser.add_argument(
+        "--terminal-min-step-source",
+        type=str,
+        default="default",
+        choices=["default", "gym_first_done_piecewise"],
+        help=(
+            "Optional source-level minimum-survival gate for terminal resets. "
+            "gym_first_done_piecewise uses Gym first-done quantile bands via an index hash, "
+            "without binding the gate to profile modes or dimensions."
+        ),
+    )
+    parser.add_argument(
+        "--state-full-rms-source",
+        type=str,
+        default="default",
+        choices=["default", "gym_obs_std_q50", "gym_obs_std_q50_floor"],
+        help=(
+            "Optional source-level visible-state RMS target. gym_obs_std_q50 raises "
+            "the exact-SCM state_full_rms_target to 1.5, matching the Gym update3 "
+            "obs_per_dim_std_q90 median scale without changing selector or PPO semantics. "
+            "gym_obs_std_q50_floor also permits bounded up-scaling of low-RMS visible states."
+        ),
+    )
+    parser.add_argument(
+        "--exact-scm-family-source",
+        type=str,
+        default="default",
+        choices=[
+            "default",
+            "gym_lowtail_markov",
+            "gym_lowtail_cost_markov",
+            "gym_lowtail_potential_markov",
+            "gym_lowtail_potential_markov_shared_terminal",
+            "gym_lowtail_preimage_shared_scalar",
+            "gym_lowtail_state_obs_rank_preimage",
+            "gym_lowtail_state_obs_rank_preimage_high_variance",
+            "gym_lowtail_state_obs_temporal_rank_preimage",
+            "gym_lowtail_state_obs_envelope_preimage",
+            "gym_lowtail_reward_transform_chain_preimage",
+            "gym_lowtail_clock_preimage",
+            "gym_lowtail_paired_env_response_preimage",
+            "gym_lowtail_paired_obs_hetero_preimage",
+            "gym_lowtail_markov_carrier_preimage",
+            "gym_lowtail_potential_cost_markov",
+            "gym_lowtail_cost_markov_terminal_independent",
+        ],
+        help=(
+            "Optional exact-SCM source family. The gym_lowtail_* variants sample a "
+            "mode-independent subset whose observed coordinates follow a stable controlled "
+            "Markov SCM using the existing state/action/noise slots, with low terminal "
+            "expectation sampled as part of the family definition. The terminal_independent "
+            "variant keeps terminal sampling on the baseline source and is experimental."
+        ),
+    )
     parser.add_argument("--fixed-env-group-across-updates", type=str2bool, default=True)
     parser.add_argument("--semantic-probes-enabled", type=str2bool, default=True)
     parser.add_argument("--semantic-probe-sidecar-enabled", type=str2bool, default=False)
@@ -3180,8 +4761,22 @@ def main(argv: list[str] | None = None) -> None:
         gain_min=float(args.gain_min),
         topology_state_gain_min=float(args.topology_state_gain_min),
         topology_action_gain_min=float(args.topology_action_gain_min),
+        topology_noise_gain_min=float(args.topology_noise_gain_min),
+        topology_state_gain_metric=str(args.topology_state_gain_metric),
+        topology_action_gain_metric=str(args.topology_action_gain_metric),
+        topology_noise_gain_metric=str(args.topology_noise_gain_metric),
         topology_state_to_action_ratio_max=float(args.topology_state_to_action_ratio_max),
+        topology_state_to_action_ratio_metric=str(args.topology_state_to_action_ratio_metric),
+        topology_state_to_noise_ratio_max=float(args.topology_state_to_noise_ratio_max),
+        topology_state_to_noise_ratio_metric=str(args.topology_state_to_noise_ratio_metric),
         topology_max_attempts=int(args.topology_max_attempts),
+        topology_freeze_h_across_attempts=bool(args.topology_freeze_h_across_attempts),
+        dim_source_policy=args.dim_source_policy,
+        dim_noise_policy=args.dim_noise_policy,
+        reference_state_inertia_source=args.reference_state_inertia_source,
+        terminal_min_step_source=args.terminal_min_step_source,
+        state_full_rms_source=args.state_full_rms_source,
+        exact_scm_family_source=args.exact_scm_family_source,
         fixed_env_group_across_updates=bool(args.fixed_env_group_across_updates),
         semantic_probes_enabled=bool(args.semantic_probes_enabled),
         semantic_probe_sidecar_enabled=bool(args.semantic_probe_sidecar_enabled),
